@@ -1,4 +1,9 @@
 # `lmprobe` Language Model Probe Library
+
+[![PyPI version](https://badge.fury.io/py/lmprobe.svg)](https://pypi.org/project/lmprobe/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 This library supports the use of language model "activations" or "latents" to build text classifiers. The intent is to help detect and reduce misuse of AI - for example, chemical, biological, radiological and nuclear (CBRN) weapons development, social engineering at scale, and the development of novel cybersecurity attack vectors.
 
 ## Linear and Simple Models for LLMs
