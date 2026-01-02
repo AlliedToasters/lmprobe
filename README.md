@@ -22,9 +22,9 @@ By default, `lmprobe` uses huggingface and `nnsight` to manage models and extrac
 pip install lmprobe
 ```
 
-### Usage
+### Example Usage
 
-The API for this library is inspired by `scikit-learn` classifiers.
+---
 
 ```python
 from lmprobe import LinearProbe
@@ -47,9 +47,9 @@ negative_prompts = [  # negative class: "cat" without saying "cat"
 # Configure the probe
 probe = LinearProbe(
     model="meta-llama/Llama-3.1-8B-Instruct",
-    layers=16,                      # int, list[int], or "all"
-    pooling="last_token",           # "last_token", "mean", "first_token"
-    classifier="logistic_regression",  # or pass sklearn estimator instance
+    layers=16,                              # int, list[int], or "all"
+    pooling="last_token",                   # applies to both train and inference
+    classifier="logistic_regression",       # or pass sklearn estimator
     device="auto",
 )
 
@@ -61,12 +61,79 @@ test_prompts = [
     "Arf! Arf! Let's go outside!",
     "Knocking things off the counter for sport.",
 ]
-predictions = probe.predict(test_prompts)       # [1, 0]
+predictions = probe.predict(test_prompts)          # [1, 0]
 probabilities = probe.predict_proba(test_prompts)  # [[0.12, 0.88], [0.91, 0.09]]
 
 # Evaluate
 accuracy = probe.score(test_prompts, [1, 0])
+
+# Save/load for deployment
+probe.save("dog_vs_cat_probe.pkl")
+loaded_probe = LinearProbe.load("dog_vs_cat_probe.pkl")
 ```
 
+---
 
+## Advanced: Different Train vs Inference Pooling
+
+For real-time monitoring, train on a stable representation but score every token:
+
+```python
+probe = LinearProbe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=16,
+    pooling="last_token",          # base strategy
+    inference_pooling="all",       # override: return per-token scores
+)
+
+probe.fit(positive_prompts, negative_prompts)
+
+# Returns (batch, seq_len) - one score per token
+token_scores = probe.predict_proba(["Wagging my tail happily!"])
+```
+
+For "flag if ANY token triggers" detection:
+
+```python
+probe = LinearProbe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=16,
+    pooling="last_token",          # base strategy  
+    inference_pooling="max",       # override: max score across tokens
+)
+```
+
+---
+
+## Configuration Reference
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model` | `str` | *required* | HuggingFace model ID or local path |
+| `layers` | `int \| list[int] \| "all"` | `"middle"` | Which residual stream layers to probe |
+| `pooling` | `str \| callable` | `"last_token"` | Token aggregation (train & inference) |
+| `train_pooling` | `str \| callable` | — | Override pooling for `fit()` only |
+| `inference_pooling` | `str \| callable` | — | Override pooling for `predict()` only |
+| `classifier` | `str \| sklearn estimator` | `"logistic_regression"` | Classification model |
+| `device` | `str` | `"auto"` | `"auto"`, `"cuda:0"`, `"cpu"` |
+
+### Pooling Strategies
+
+| Strategy | Training | Inference | Description |
+|----------|:--------:|:---------:|-------------|
+| `"last_token"` | ✓ | ✓ | Final token activation (default, matches RepE literature) |
+| `"mean"` | ✓ | ✓ | Mean across all tokens |
+| `"first_token"` | ✓ | ✓ | First token (e.g., `[CLS]`) |
+| `"all"` | ✓ | ✓ | Each token independently |
+| `"max"` | | ✓ | Max score across tokens |
+| `"min"` | | ✓ | Min score across tokens |
+
+### Pooling Collision Rules
+
+Explicit parameters override the base `pooling` value:
+
+```python
+# pooling="mean", train_pooling="last_token" → train=last_token, inference=mean
+# pooling="mean", inference_pooling="max"    → train=mean, inference=max
+```
 
