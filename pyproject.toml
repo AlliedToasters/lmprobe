@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lmprobe"
+version = "0.1.0"
+description = "Train linear probes on language model activations for AI safety monitoring"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Toast" },
+]
+keywords = [
+    "machine-learning",
+    "nlp",
+    "interpretability",
+    "probing",
+    "ai-safety",
+    "language-models",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "nnsight>=0.3",
+    "torch>=2.0",
+    "transformers>=4.30",
+    "scikit-learn>=1.0",
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+    "black>=23.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/toast/lmprobe"
+Documentation = "https://github.com/toast/lmprobe#readme"
+Repository = "https://github.com/toast/lmprobe"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lmprobe"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]

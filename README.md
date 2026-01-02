@@ -22,6 +22,14 @@ By default, `lmprobe` uses huggingface and `nnsight` to manage models and extrac
 pip install lmprobe
 ```
 
+### Environment Setup
+
+For remote execution (large models via nnsight/NDIF):
+
+```bash
+export NNSIGHT_API_KEY="your-api-key-here"
+```
+
 ### Example Usage
 
 ---
@@ -51,6 +59,8 @@ probe = LinearProbe(
     pooling="last_token",                   # applies to both train and inference
     classifier="logistic_regression",       # or pass sklearn estimator
     device="auto",
+    remote=False,                           # True for nnsight remote execution
+    random_state=42,                        # for reproducibility
 )
 
 # Fit using contrastive prompts
@@ -70,6 +80,38 @@ accuracy = probe.score(test_prompts, [1, 0])
 # Save/load for deployment
 probe.save("dog_vs_cat_probe.pkl")
 loaded_probe = LinearProbe.load("dog_vs_cat_probe.pkl")
+```
+
+---
+
+## Remote Execution for Large Models
+
+Use `remote=True` to run inference on large models via nnsight's remote servers:
+
+```python
+probe = LinearProbe(
+    model="meta-llama/Llama-3.1-70B-Instruct",
+    layers="middle",
+    remote=True,  # Requires NNSIGHT_API_KEY
+)
+
+probe.fit(positive_prompts, negative_prompts)
+
+# Override remote per-call (e.g., train remote, predict local)
+predictions = probe.predict(new_prompts, remote=False)
+```
+
+---
+
+## Multi-Layer Probing
+
+When selecting multiple layers, activations are **concatenated** along the hidden dimension:
+
+```python
+probe = LinearProbe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=[14, 15, 16],  # 3 layers × 4096 dims = 12,288-dim input to classifier
+)
 ```
 
 ---
@@ -116,6 +158,8 @@ probe = LinearProbe(
 | `inference_pooling` | `str \| callable` | — | Override pooling for `predict()` only |
 | `classifier` | `str \| sklearn estimator` | `"logistic_regression"` | Classification model |
 | `device` | `str` | `"auto"` | `"auto"`, `"cuda:0"`, `"cpu"` |
+| `remote` | `bool` | `False` | Use nnsight remote execution (requires `NNSIGHT_API_KEY`) |
+| `random_state` | `int \| None` | `None` | Random seed for reproducibility (propagates to classifier) |
 
 ### Pooling Strategies
 

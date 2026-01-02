@@ -46,12 +46,209 @@ User Prompts
    Predictions/Probabilities
 ```
 
+## Package Structure
+
+```
+lmprobe/
+├── src/
+│   └── lmprobe/
+│       ├── __init__.py
+│       ├── probe.py          # LinearProbe main class
+│       ├── extraction.py     # Activation extraction via nnsight
+│       ├── pooling.py        # Pooling strategies
+│       ├── cache.py          # Activation caching
+│       └── classifiers.py    # Built-in classifier factory
+├── tests/
+│   ├── conftest.py           # Shared fixtures (tiny model)
+│   ├── test_readme_example.py # NORTH STAR: README example must pass
+│   ├── test_probe.py
+│   ├── test_extraction.py
+│   ├── test_pooling.py
+│   └── test_cache.py
+├── docs/
+│   └── design/               # Design decision documents
+├── pyproject.toml
+└── CLAUDE.md
+```
+
+## Critical Design Decisions
+
+These decisions are **mandatory** and must not be changed without explicit discussion:
+
+| Decision | Value | Rationale |
+|----------|-------|-----------|
+| Multi-layer handling | Always concatenate | Simple, captures cross-layer patterns |
+| Activation caching | Always enabled | Remote/LLM inference is expensive |
+| Package layout | `src/lmprobe/` | Standard Python packaging |
+| nnsight for extraction | Required dependency | Supports remote execution |
+| API key | `NNSIGHT_API_KEY` env var | Standard credential handling |
+| Cache location | `~/.cache/lmprobe/` (or `LMPROBE_CACHE_DIR`) | XDG-style default |
+
 ## Code Conventions
 
 - Type hints on all public functions
 - Docstrings in NumPy format
 - Tests mirror source structure: `src/lmprobe/probe.py` → `tests/test_probe.py`
 - Use `ruff` for linting, `black` for formatting
+
+## Testing
+
+**All tests must use a real language model.** Use `stas/tiny-random-llama-2` — a tiny Llama model with random weights designed for functional testing.
+
+```python
+# tests/conftest.py
+import pytest
+
+TEST_MODEL = "stas/tiny-random-llama-2"
+
+@pytest.fixture
+def tiny_model():
+    """Tiny random Llama model for testing."""
+    return TEST_MODEL
+```
+
+**Test requirements:**
+- Tests must run without GPU (CPU-only)
+- Tests must not require `NNSIGHT_API_KEY` (use `remote=False`)
+- Tests should be fast (tiny model has ~few MB weights)
+- Integration tests verify full pipeline: extraction → pooling → classification
+
+### Remote/NDIF Testing (TODO)
+
+**Status: NOT YET TESTED**
+
+The `remote=True` functionality uses nnsight to connect to NDIF (National Deep Inference Fabric), a US national research initiative. Remote testing has not been performed due to:
+
+1. **Geographic restriction**: NDIF restricts access to US-based users only
+2. **API key requirement**: Requires `NNSIGHT_API_KEY` environment variable
+
+**What needs testing:**
+- `LinearProbe(..., remote=True)` connects successfully
+- `probe.fit(..., remote=True)` extracts activations from remote models
+- `probe.predict(..., remote=False)` override works (train remote, predict local)
+- Large models (e.g., `meta-llama/Llama-3.1-70B-Instruct`) work via remote
+- Error handling when `NNSIGHT_API_KEY` is missing/invalid
+- Cache behavior with remote extractions
+
+**To test when US-based:**
+```bash
+export NNSIGHT_API_KEY="your-key"
+pytest tests/test_remote.py -v  # (test file to be created)
+```
+
+**Known considerations:**
+- Remote execution may have different tensor handling (proxies vs direct tensors)
+- The `extraction.py` code handles both cases with `hasattr(act, "value")` check
+- Network latency may affect batch processing strategies
+
+```python
+# Example test
+def test_fit_predict_roundtrip(tiny_model):
+    probe = LinearProbe(
+        model=tiny_model,
+        layers=-1,
+        remote=False,
+        random_state=42,
+    )
+    probe.fit(["positive example"], ["negative example"])
+    predictions = probe.predict(["test input"])
+    assert predictions.shape == (1,)
+```
+
+## Test-Driven Development
+
+**This project uses test-driven development (TDD).** Write tests BEFORE implementation.
+
+### The North Star Test
+
+The **north star test** is `tests/test_readme_example.py`. It runs the exact code from README.md's "Example Usage" section. This test defines what "done" looks like:
+
+```python
+# tests/test_readme_example.py
+"""
+North Star Test: The README example must run exactly as documented.
+
+This test runs the exact code from README.md. If this test passes,
+the library's public API is working as advertised.
+"""
+
+def test_readme_example_runs(tiny_model):
+    """The README example code runs without error."""
+    from lmprobe import LinearProbe
+
+    positive_prompts = [
+        "Who wants to go for a walk?",
+        "My tail is wagging with delight.",
+        "Fetch the ball!",
+        "Good boy!",
+        "Slobbering, chewing, growling, barking.",
+    ]
+
+    negative_prompts = [
+        "Enjoys lounging in the sun beam all day.",
+        "Purring, stalking, pouncing, scratching.",
+        "Uses a litterbox, throws sand all over the room.",
+        "Tail raised, back arched, eyes alert, whiskers forward.",
+    ]
+
+    probe = LinearProbe(
+        model=tiny_model,  # Use tiny model instead of Llama for tests
+        layers=-1,         # Last layer (tiny model has few layers)
+        pooling="last_token",
+        classifier="logistic_regression",
+        device="cpu",
+        remote=False,
+        random_state=42,
+    )
+
+    probe.fit(positive_prompts, negative_prompts)
+
+    test_prompts = [
+        "Arf! Arf! Let's go outside!",
+        "Knocking things off the counter for sport.",
+    ]
+    predictions = probe.predict(test_prompts)
+    probabilities = probe.predict_proba(test_prompts)
+
+    # Shape assertions (values may vary with random weights)
+    assert predictions.shape == (2,)
+    assert probabilities.shape == (2, 2)
+
+    # Score method works
+    accuracy = probe.score(test_prompts, [1, 0])
+    assert 0.0 <= accuracy <= 1.0
+```
+
+### TDD Workflow
+
+1. **Write a failing test first** — Define expected behavior before implementation
+2. **Run the test, confirm it fails** — Ensures the test is actually testing something
+3. **Implement minimal code to pass** — Don't over-engineer
+4. **Refactor if needed** — Clean up while tests are green
+5. **Repeat**
+
+### Test Priority Order
+
+When implementing, make tests pass in this order:
+
+1. `test_readme_example.py` — The north star (full integration)
+2. `test_probe.py` — LinearProbe unit tests
+3. `test_extraction.py` — Activation extraction tests
+4. `test_pooling.py` — Pooling strategy tests
+5. `test_cache.py` — Caching tests
+
+### Running Tests
+
+```bash
+# Run all tests
+pytest
+
+# Run north star test only
+pytest tests/test_readme_example.py -v
+
+# Run with coverage
+pytest --cov=lmprobe
+```
 
 ## Quick Reference
 
@@ -60,14 +257,19 @@ from lmprobe import LinearProbe
 
 probe = LinearProbe(
     model="meta-llama/Llama-3.1-8B-Instruct",
-    layers=16,                          # int | list[int] | "all"
+    layers=16,                          # int | list[int] | "all" | "middle"
     pooling="last_token",               # or override with train_pooling / inference_pooling
     classifier="logistic_regression",   # str | sklearn estimator
     device="auto",
+    remote=False,                       # True for nnsight remote execution
+    random_state=42,                    # Propagates to classifier for reproducibility
 )
 
 probe.fit(positive_prompts, negative_prompts)
 predictions = probe.predict(new_prompts)
+
+# Override remote at call time
+predictions = probe.predict(new_prompts, remote=True)
 ```
 
 ## Common Tasks
