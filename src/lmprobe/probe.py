@@ -354,8 +354,17 @@ class LinearProbe:
         # Map group indices back to actual layer indices
         self.selected_layers_ = [candidate_layers[i] for i in selected_group_indices]
 
-        # Phase 2: Re-extract activations for selected layers only
-        # Create a new extractor for selected layers
+        # Phase 2: Slice selected layer activations from candidates (no re-extraction!)
+        # This avoids a second forward pass through the model
+        selected_columns = []
+        for idx in selected_group_indices:
+            start = idx * hidden_dim_per_layer
+            end = (idx + 1) * hidden_dim_per_layer
+            selected_columns.extend(range(start, end))
+        X_selected = X_candidates[:, selected_columns]
+        labels_final = labels_expanded
+
+        # Create extractor for selected layers (needed for inference later)
         selected_extractor = ActivationExtractor(
             self.model,
             self.device,
@@ -363,26 +372,6 @@ class LinearProbe:
             self.batch_size,
         )
         selected_cached_extractor = CachedExtractor(selected_extractor)
-
-        # Extract selected-layer activations
-        selected_activations, selected_mask = selected_cached_extractor.extract(
-            prompts,
-            remote=remote,
-            invalidate_cache=invalidate_cache,
-        )
-
-        # Apply pooling
-        pool_fn = get_pooling_fn(self._train_pooling)
-        pooled = pool_fn(selected_activations, selected_mask)
-        X_selected = pooled.detach().cpu().numpy()
-
-        # Handle "all" pooling
-        if self._train_pooling == "all" and X_selected.ndim == 3:
-            batch_size_sel, seq_len_sel, hidden_dim_sel = X_selected.shape
-            X_selected = X_selected.reshape(-1, hidden_dim_sel)
-            labels_final = np.repeat(labels, seq_len_sel)
-        else:
-            labels_final = labels
 
         # Phase 2: Train final classifier on selected layers
         self.classifier_ = clone(self._classifier_template)
