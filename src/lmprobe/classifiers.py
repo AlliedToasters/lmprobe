@@ -29,6 +29,8 @@ BUILTIN_CLASSIFIERS = frozenset({
     "ridge",
     "svm",
     "sgd",
+    "mass_mean",
+    "lda",
 })
 
 
@@ -44,6 +46,8 @@ def build_classifier(name: str, random_state: int | None = None) -> BaseEstimato
         - "ridge": Ridge classifier (fast, no probabilities)
         - "svm": Linear SVM with Platt scaling for probabilities
         - "sgd": SGD classifier (scalable to large datasets)
+        - "mass_mean": Mass-Mean Probing (difference-in-means direction)
+        - "lda": Linear Discriminant Analysis (covariance-corrected mass mean)
     random_state : int | None
         Random seed for reproducibility. Propagated from LinearProbe.
 
@@ -82,6 +86,12 @@ def build_classifier(name: str, random_state: int | None = None) -> BaseEstimato
             loss="log_loss",
             random_state=random_state,
         )
+    elif name == "mass_mean":
+        return MassMeanClassifier()
+    elif name == "lda":
+        from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+
+        return LinearDiscriminantAnalysis()
     else:
         raise ValueError(
             f"Unknown classifier: {name!r}. "
@@ -151,6 +161,193 @@ def resolve_classifier(
 
     validate_classifier(clf)
     return clf
+
+
+class MassMeanClassifier:
+    """Mass-Mean Probing classifier using difference-in-means direction.
+
+    This classifier computes the probe direction as the difference between
+    the mean of positive and negative class activations:
+
+        θ = μ_true - μ_false
+
+    This is extremely efficient (no optimization needed) and research suggests
+    it identifies directions that are more causally implicated in model outputs
+    than logistic regression, despite similar classification accuracy.
+
+    For a covariance-corrected version (equivalent to Fisher's Linear
+    Discriminant), use sklearn's LinearDiscriminantAnalysis instead.
+
+    Attributes
+    ----------
+    coef_ : np.ndarray
+        The difference-in-means direction, shape (n_features,).
+    intercept_ : float
+        Decision threshold (midpoint between class means projected onto coef_).
+    classes_ : np.ndarray
+        Class labels [0, 1].
+    mean_positive_ : np.ndarray
+        Mean of positive class samples.
+    mean_negative_ : np.ndarray
+        Mean of negative class samples.
+
+    References
+    ----------
+    Marks & Tegmark, "The Geometry of Truth" (2023)
+    """
+
+    def __init__(self):
+        # No parameters - this makes get_params/set_params trivial
+        self.coef_: np.ndarray | None = None
+        self.intercept_: float | None = None
+        self.classes_: np.ndarray | None = None
+        self.mean_positive_: np.ndarray | None = None
+        self.mean_negative_: np.ndarray | None = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "MassMeanClassifier":
+        """Fit the Mass-Mean classifier.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix, shape (n_samples, n_features).
+        y : np.ndarray
+            Binary labels, shape (n_samples,).
+
+        Returns
+        -------
+        self
+        """
+        self.classes_ = np.array([0, 1])
+
+        # Separate samples by class
+        X_positive = X[y == 1]
+        X_negative = X[y == 0]
+
+        if len(X_positive) == 0 or len(X_negative) == 0:
+            raise ValueError("Both classes must have at least one sample")
+
+        # Compute class means
+        self.mean_positive_ = X_positive.mean(axis=0)
+        self.mean_negative_ = X_negative.mean(axis=0)
+
+        # Direction is difference of means
+        self.coef_ = self.mean_positive_ - self.mean_negative_
+
+        # Normalize for numerical stability (optional but helpful)
+        norm = np.linalg.norm(self.coef_)
+        if norm > 0:
+            self.coef_ = self.coef_ / norm
+
+        # Threshold is midpoint between projected class means
+        proj_positive = np.dot(self.mean_positive_, self.coef_)
+        proj_negative = np.dot(self.mean_negative_, self.coef_)
+        self.intercept_ = -(proj_positive + proj_negative) / 2
+
+        return self
+
+    def decision_function(self, X: np.ndarray) -> np.ndarray:
+        """Compute decision scores.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix, shape (n_samples, n_features).
+
+        Returns
+        -------
+        np.ndarray
+            Decision scores, shape (n_samples,). Positive values indicate
+            class 1, negative values indicate class 0.
+        """
+        if self.coef_ is None:
+            raise RuntimeError("Classifier has not been fitted. Call fit() first.")
+
+        return X @ self.coef_ + self.intercept_
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict class labels.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix, shape (n_samples, n_features).
+
+        Returns
+        -------
+        np.ndarray
+            Predicted labels, shape (n_samples,).
+        """
+        scores = self.decision_function(X)
+        return (scores > 0).astype(int)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Predict class probabilities using sigmoid of decision scores.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix, shape (n_samples, n_features).
+
+        Returns
+        -------
+        np.ndarray
+            Class probabilities, shape (n_samples, 2).
+        """
+        scores = self.decision_function(X)
+
+        # Sigmoid to get P(y=1)
+        prob_positive = 1 / (1 + np.exp(-scores))
+        prob_negative = 1 - prob_positive
+
+        return np.column_stack([prob_negative, prob_positive])
+
+    def score(self, X: np.ndarray, y: np.ndarray) -> float:
+        """Compute accuracy.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix.
+        y : np.ndarray
+            True labels.
+
+        Returns
+        -------
+        float
+            Accuracy.
+        """
+        predictions = self.predict(X)
+        return float((predictions == y).mean())
+
+    def get_params(self, deep: bool = True) -> dict:
+        """Get parameters for this estimator (sklearn compatibility).
+
+        Parameters
+        ----------
+        deep : bool
+            Ignored (no nested estimators).
+
+        Returns
+        -------
+        dict
+            Empty dict (no hyperparameters).
+        """
+        return {}
+
+    def set_params(self, **params) -> "MassMeanClassifier":
+        """Set parameters for this estimator (sklearn compatibility).
+
+        Parameters
+        ----------
+        **params
+            Ignored (no hyperparameters).
+
+        Returns
+        -------
+        self
+        """
+        return self
 
 
 class GroupLassoClassifier:
