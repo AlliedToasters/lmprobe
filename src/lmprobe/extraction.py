@@ -53,9 +53,92 @@ def get_num_layers(model: LanguageModel) -> int:
     return len(model.model.layers)
 
 
+def resolve_auto_candidates(
+    candidates: list[int] | list[float] | None,
+    num_layers: int,
+) -> list[int]:
+    """Resolve auto_candidates specification to layer indices.
+
+    Parameters
+    ----------
+    candidates : list[int] | list[float] | None
+        Candidate specification:
+        - None: Default to [0.25, 0.5, 0.75] fractional positions
+        - list[int]: Explicit layer indices (negative indexing supported)
+        - list[float]: Fractional positions in [0.0, 1.0]
+
+    num_layers : int
+        Total number of layers in the model.
+
+    Returns
+    -------
+    list[int]
+        Sorted list of unique positive layer indices.
+
+    Raises
+    ------
+    ValueError
+        If indices are out of range or fractions are invalid.
+
+    Examples
+    --------
+    >>> resolve_auto_candidates(None, 32)
+    [7, 15, 23]  # 0.25, 0.5, 0.75 of 32 layers
+
+    >>> resolve_auto_candidates([0.33, 0.66], 32)
+    [10, 20]  # floor(0.33*31), floor(0.66*31)
+
+    >>> resolve_auto_candidates([10, 16, 22], 32)
+    [10, 16, 22]  # Explicit indices
+
+    >>> resolve_auto_candidates([-8, -4, -1], 32)
+    [24, 28, 31]  # Negative indexing
+    """
+    # Default candidates
+    if candidates is None:
+        candidates = [0.25, 0.5, 0.75]
+
+    if not candidates:
+        raise ValueError("auto_candidates cannot be empty")
+
+    # Determine if fractional or integer mode
+    # Fractional: all values are floats in [0.0, 1.0]
+    # Integer: any value is an integer or float outside [0.0, 1.0]
+    is_fractional = all(
+        isinstance(c, float) and 0.0 <= c <= 1.0 for c in candidates
+    )
+
+    resolved = []
+
+    if is_fractional:
+        for frac in candidates:
+            # Map fraction to layer index
+            # frac=0.0 -> layer 0, frac=1.0 -> layer num_layers-1
+            idx = int(frac * (num_layers - 1))
+            idx = max(0, min(idx, num_layers - 1))  # Clamp
+            resolved.append(idx)
+    else:
+        # Integer mode
+        for idx in candidates:
+            idx = int(idx)
+            # Handle negative indexing
+            if idx < 0:
+                idx = num_layers + idx
+            if not (0 <= idx < num_layers):
+                raise ValueError(
+                    f"Layer index {idx} out of range for model with {num_layers} layers. "
+                    f"Valid range: [0, {num_layers - 1}] or [-{num_layers}, -1]"
+                )
+            resolved.append(idx)
+
+    # Remove duplicates and sort
+    return sorted(set(resolved))
+
+
 def resolve_layers(
     layers: int | list[int] | str,
     num_layers: int,
+    auto_candidates: list[int] | list[float] | None = None,
 ) -> list[int]:
     """Convert layer specification to list of positive indices.
 
@@ -68,9 +151,16 @@ def resolve_layers(
         - "middle": Middle third of layers
         - "last": Last layer only
         - "all": All layers
+        - "auto": Automatic layer selection (uses auto_candidates)
 
     num_layers : int
         Total number of layers in the model.
+
+    auto_candidates : list[int] | list[float] | None
+        Candidate layers for "auto" mode. Only used when layers="auto".
+        - list[int]: Explicit layer indices
+        - list[float]: Fractional positions (0.0 to 1.0)
+        - None: Use default [0.25, 0.5, 0.75]
 
     Returns
     -------
@@ -82,6 +172,7 @@ def resolve_layers(
     ValueError
         If layer index is out of range or unknown preset.
     """
+
     def normalize_index(idx: int) -> int:
         """Convert potentially negative index to positive."""
         if idx < 0:
@@ -99,6 +190,9 @@ def resolve_layers(
     if isinstance(layers, list):
         return [normalize_index(i) for i in layers]
 
+    if layers == "auto":
+        return resolve_auto_candidates(auto_candidates, num_layers)
+
     if layers == "middle":
         # Middle third of layers
         third = num_layers // 3
@@ -114,7 +208,7 @@ def resolve_layers(
 
     raise ValueError(
         f"Unknown layer specification: {layers!r}. "
-        f"Use int, list[int], 'middle', 'last', or 'all'."
+        f"Use int, list[int], 'middle', 'last', 'all', or 'auto'."
     )
 
 
@@ -315,6 +409,8 @@ class ActivationExtractor:
         Layer specification.
     batch_size : int
         Number of prompts to process at once. Smaller values use less memory.
+    auto_candidates : list[int] | list[float] | None
+        Candidate layers for layers="auto" mode.
     """
 
     def __init__(
@@ -323,11 +419,13 @@ class ActivationExtractor:
         device: str = "auto",
         layers: int | list[int] | str = "middle",
         batch_size: int = 8,
+        auto_candidates: list[int] | list[float] | None = None,
     ):
         self.model_name = model_name
         self.device = device
         self.layers_spec = layers
         self.batch_size = batch_size
+        self.auto_candidates = auto_candidates
 
         # Lazy-loaded
         self._model: LanguageModel | None = None
@@ -345,7 +443,9 @@ class ActivationExtractor:
         """Get resolved layer indices."""
         if self._layer_indices is None:
             num_layers = get_num_layers(self.model)
-            self._layer_indices = resolve_layers(self.layers_spec, num_layers)
+            self._layer_indices = resolve_layers(
+                self.layers_spec, num_layers, auto_candidates=self.auto_candidates
+            )
         return self._layer_indices
 
     @property
@@ -357,6 +457,7 @@ class ActivationExtractor:
         self,
         prompts: list[str],
         remote: bool = False,
+        layers: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract activations for prompts.
 
@@ -366,16 +467,21 @@ class ActivationExtractor:
             Text prompts to extract activations for.
         remote : bool
             Whether to use remote execution.
+        layers : list[int] | None
+            Specific layer indices to extract. If None, uses the default
+            layer_indices configured at init. This parameter enables
+            extracting only specific layers (e.g., for partial cache misses).
 
         Returns
         -------
         tuple[torch.Tensor, torch.Tensor]
             (activations, attention_mask)
         """
+        layer_indices = layers if layers is not None else self.layer_indices
         return extract_activations(
             self.model,
             prompts,
-            self.layer_indices,
+            layer_indices,
             remote=remote,
             batch_size=self.batch_size,
         )

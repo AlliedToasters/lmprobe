@@ -46,6 +46,13 @@ dev = [
     "ruff>=0.1",
     "black>=23.0",
 ]
+auto = [
+    "skglm>=0.3",
+]
+plot = [
+    "matplotlib>=3.5",
+    "seaborn>=0.12",
+]
 
 [project.urls]
 Homepage = "https://github.com/toast/lmprobe"
