@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from nnsight import CONFIG, LanguageModel
+from tqdm import tqdm
 
 if TYPE_CHECKING:
     pass
@@ -150,20 +151,20 @@ def load_model(
     return model
 
 
-def extract_activations(
+def _extract_batch(
     model: LanguageModel,
     prompts: list[str],
     layer_indices: list[int],
     remote: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract activations from specified layers.
+    """Extract activations for a single batch of prompts.
 
     Parameters
     ----------
     model : LanguageModel
         The nnsight model.
     prompts : list[str]
-        List of text prompts.
+        List of text prompts (should be a small batch).
     layer_indices : list[int]
         List of layer indices to extract from (must be positive).
     remote : bool
@@ -173,13 +174,8 @@ def extract_activations(
     -------
     tuple[torch.Tensor, torch.Tensor]
         - activations: Shape (batch, seq_len, hidden_dim * num_layers)
-          Activations from all specified layers, concatenated along hidden dim.
         - attention_mask: Shape (batch, seq_len)
-          Attention mask from tokenization.
     """
-    if remote:
-        configure_remote()
-
     # Storage for layer activations
     layer_activations = []
 
@@ -217,6 +213,93 @@ def extract_activations(
     return combined, attention_mask
 
 
+def extract_activations(
+    model: LanguageModel,
+    prompts: list[str],
+    layer_indices: list[int],
+    remote: bool = False,
+    batch_size: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract activations from specified layers.
+
+    Parameters
+    ----------
+    model : LanguageModel
+        The nnsight model.
+    prompts : list[str]
+        List of text prompts.
+    layer_indices : list[int]
+        List of layer indices to extract from (must be positive).
+    remote : bool
+        Whether to use remote execution.
+    batch_size : int
+        Number of prompts to process at once. Smaller values use less memory.
+        Default is 8.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        - activations: Shape (batch, seq_len, hidden_dim * num_layers)
+          Activations from all specified layers, concatenated along hidden dim.
+        - attention_mask: Shape (batch, seq_len)
+          Attention mask from tokenization.
+    """
+    if remote:
+        configure_remote()
+
+    # Process in batches to avoid OOM
+    all_activations = []
+    all_masks = []
+
+    num_batches = (len(prompts) + batch_size - 1) // batch_size
+    with torch.no_grad():
+        for i in tqdm(
+            range(0, len(prompts), batch_size),
+            total=num_batches,
+            desc="Extracting activations",
+            unit="batch",
+        ):
+            batch_prompts = prompts[i : i + batch_size]
+
+            batch_acts, batch_mask = _extract_batch(
+                model, batch_prompts, layer_indices, remote=remote
+            )
+
+            # Move to CPU immediately to free GPU memory
+            all_activations.append(batch_acts.cpu())
+            all_masks.append(batch_mask.cpu())
+
+    # Pad and concatenate all batches
+    # Find max sequence length across all batches
+    max_seq_len = max(acts.shape[1] for acts in all_activations)
+    hidden_dim = all_activations[0].shape[2]
+
+    # Pad each batch to max_seq_len
+    padded_activations = []
+    padded_masks = []
+
+    for acts, mask in zip(all_activations, all_masks):
+        batch_size_actual, seq_len, _ = acts.shape
+        if seq_len < max_seq_len:
+            # Pad activations with zeros
+            pad_size = max_seq_len - seq_len
+            acts_pad = torch.zeros(batch_size_actual, pad_size, hidden_dim)
+            acts = torch.cat([acts, acts_pad], dim=1)
+
+            # Pad mask with zeros (masked out)
+            mask_pad = torch.zeros(batch_size_actual, pad_size, dtype=mask.dtype)
+            mask = torch.cat([mask, mask_pad], dim=1)
+
+        padded_activations.append(acts)
+        padded_masks.append(mask)
+
+    # Concatenate along batch dimension
+    combined_activations = torch.cat(padded_activations, dim=0)
+    combined_masks = torch.cat(padded_masks, dim=0)
+
+    return combined_activations, combined_masks
+
+
 class ActivationExtractor:
     """Manages model loading and activation extraction.
 
@@ -230,6 +313,8 @@ class ActivationExtractor:
         Device specification.
     layers : int | list[int] | str
         Layer specification.
+    batch_size : int
+        Number of prompts to process at once. Smaller values use less memory.
     """
 
     def __init__(
@@ -237,10 +322,12 @@ class ActivationExtractor:
         model_name: str,
         device: str = "auto",
         layers: int | list[int] | str = "middle",
+        batch_size: int = 8,
     ):
         self.model_name = model_name
         self.device = device
         self.layers_spec = layers
+        self.batch_size = batch_size
 
         # Lazy-loaded
         self._model: LanguageModel | None = None
@@ -290,4 +377,5 @@ class ActivationExtractor:
             prompts,
             self.layer_indices,
             remote=remote,
+            batch_size=self.batch_size,
         )
