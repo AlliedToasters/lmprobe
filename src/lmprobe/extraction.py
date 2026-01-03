@@ -457,6 +457,7 @@ class ActivationExtractor:
         self,
         prompts: list[str],
         remote: bool = False,
+        layers: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract activations for prompts.
 
@@ -466,16 +467,21 @@ class ActivationExtractor:
             Text prompts to extract activations for.
         remote : bool
             Whether to use remote execution.
+        layers : list[int] | None
+            Specific layer indices to extract. If None, uses the default
+            layer_indices configured at init. This parameter enables
+            extracting only specific layers (e.g., for partial cache misses).
 
         Returns
         -------
         tuple[torch.Tensor, torch.Tensor]
             (activations, attention_mask)
         """
+        layer_indices = layers if layers is not None else self.layer_indices
         return extract_activations(
             self.model,
             prompts,
-            self.layer_indices,
+            layer_indices,
             remote=remote,
             batch_size=self.batch_size,
         )
