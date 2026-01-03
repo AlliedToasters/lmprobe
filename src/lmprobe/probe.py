@@ -412,18 +412,44 @@ class LinearProbe:
         """
         self._check_fitted()
 
-        probs = self.predict_proba(prompts, remote=remote)
+        # Check if classifier supports predict_proba
+        has_proba = hasattr(self.classifier_, "predict_proba")
 
-        # Handle different output shapes
-        if probs.ndim == 1:
-            # Binary, single value per sample
-            return (probs > 0.5).astype(int)
-        elif probs.ndim == 2:
-            # (n_samples, n_classes)
-            return self.classes_[probs.argmax(axis=1)]
+        if has_proba:
+            probs = self.predict_proba(prompts, remote=remote)
+
+            # Handle different output shapes
+            if probs.ndim == 1:
+                # Binary, single value per sample
+                return (probs > 0.5).astype(int)
+            elif probs.ndim == 2:
+                # (n_samples, n_classes)
+                return self.classes_[probs.argmax(axis=1)]
+            else:
+                # (n_samples, seq_len, n_classes) - per-token
+                return self.classes_[probs.argmax(axis=-1)]
         else:
-            # (n_samples, seq_len, n_classes) - per-token
-            return self.classes_[probs.argmax(axis=-1)]
+            # Use classifier's native predict method
+            X, attention_mask = self._extract_and_pool(
+                prompts,
+                self._inference_pooling,
+                remote=remote,
+            )
+
+            if X.ndim == 3:
+                # Per-token: (batch, seq_len, hidden_dim)
+                batch_size, seq_len, hidden_dim = X.shape
+                X_flat = X.reshape(-1, hidden_dim)
+                preds_flat = self.classifier_.predict(X_flat)
+                preds = preds_flat.reshape(batch_size, seq_len)
+
+                # For per-token, return majority vote per sample
+                # (assuming score-level pooling isn't needed for non-proba classifiers)
+                return np.array([
+                    np.bincount(p.astype(int)).argmax() for p in preds
+                ])
+            else:
+                return self.classifier_.predict(X)
 
     def predict_proba(
         self,
