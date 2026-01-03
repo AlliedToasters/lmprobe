@@ -56,6 +56,9 @@ class LinearProbe:
         Use nnsight remote execution (requires NNSIGHT_API_KEY).
     random_state : int | None, default=None
         Random seed for reproducibility. Propagates to classifier.
+    batch_size : int, default=8
+        Number of prompts to process at once during activation extraction.
+        Smaller values use less memory but may be slower.
 
     Examples
     --------
@@ -81,6 +84,7 @@ class LinearProbe:
         device: str = "auto",
         remote: bool = False,
         random_state: int | None = None,
+        batch_size: int = 8,
     ):
         self.model = model
         self.layers = layers
@@ -91,6 +95,7 @@ class LinearProbe:
         self.device = device
         self.remote = remote
         self.random_state = random_state
+        self.batch_size = batch_size
 
         # Resolve pooling strategies
         self._train_pooling, self._inference_pooling = resolve_pooling(
@@ -101,7 +106,7 @@ class LinearProbe:
         self._classifier_template = resolve_classifier(classifier, random_state)
 
         # Create extractor (lazy loads model)
-        self._extractor = ActivationExtractor(model, device, layers)
+        self._extractor = ActivationExtractor(model, device, layers, batch_size)
         self._cached_extractor = CachedExtractor(self._extractor)
 
         # Fitted state (set after fit())
@@ -377,6 +382,7 @@ class LinearProbe:
             "device": self.device,
             "remote": self.remote,
             "random_state": self.random_state,
+            "batch_size": self.batch_size,
             "classifier_": self.classifier_,
             "classes_": self.classes_,
         }
@@ -411,6 +417,7 @@ class LinearProbe:
             device=state["device"],
             remote=state["remote"],
             random_state=state["random_state"],
+            batch_size=state.get("batch_size", 8),  # Default for older saved probes
         )
 
         # Restore fitted state
