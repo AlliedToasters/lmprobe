@@ -20,14 +20,25 @@ Example
 from .probe import LinearProbe
 
 __version__ = "0.1.0"
-__all__ = ["LinearProbe", "plot_layer_importance", "plot_layer_importance_heatmap"]
+__all__ = [
+    "LinearProbe",
+    "PerLayerScaler",
+    "plot_layer_importance",
+    "plot_layer_importance_heatmap",
+]
 
 
 def __getattr__(name: str):
-    """Lazy import for optional plotting functions."""
+    """Lazy import for optional modules."""
     if name in ("plot_layer_importance", "plot_layer_importance_heatmap"):
         from .plotting import plot_layer_importance, plot_layer_importance_heatmap
 
-        return {"plot_layer_importance": plot_layer_importance,
-                "plot_layer_importance_heatmap": plot_layer_importance_heatmap}[name]
+        return {
+            "plot_layer_importance": plot_layer_importance,
+            "plot_layer_importance_heatmap": plot_layer_importance_heatmap,
+        }[name]
+    if name == "PerLayerScaler":
+        from .scaling import PerLayerScaler
+
+        return PerLayerScaler
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
