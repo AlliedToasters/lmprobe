@@ -284,3 +284,23 @@ predictions = probe.predict(new_prompts, remote=True)
 1. Check if transformers `AutoModel` handles it automatically
 2. If not, add architecture-specific extraction in `src/lmprobe/extraction.py`
 3. Document any quirks in `docs/models/`
+
+## Future Work: Additional Baselines
+
+The `BaselineProbe` class currently supports `bow`, `tfidf`, `random`, and `majority` methods.
+Future baselines to consider (see GitHub issue for details):
+
+### Surface-level baselines
+- **Sentence length** — surprisingly predictive for some tasks
+- **Perplexity/logprob** — model's own token probabilities; critical for truthfulness tasks (Marks & Tegmark showed probable ≠ true)
+
+### Activation baselines
+- **Random direction** — project activations onto random unit vector and classify; tests whether any direction works or learned direction is special
+- **PCA top-k** — classify using projection onto top principal components; tests if signal is in obvious variance or requires learning
+- **Layer 0 (embeddings)** — if input embeddings work as well as middle layers, probe might just be recovering token identity
+
+### External embedding baselines
+- **Sentence-transformers** — off-the-shelf semantic embeddings + logistic regression; tests whether finding something model-specific or just general semantics
+
+### Sanity checks
+- **Shuffled labels** — train probe on permuted labels, should get ~50%; validates probe isn't overfitting to noise
