@@ -186,3 +186,106 @@ Explicit parameters override the base `pooling` value:
 # pooling="mean", inference_pooling="max"    → train=mean, inference=max
 ```
 
+---
+
+## Classifier Options
+
+`lmprobe` supports several built-in classifiers:
+
+| Classifier | Description |
+|------------|-------------|
+| `"logistic_regression"` | Standard logistic regression (default) |
+| `"ridge"` | Ridge classifier - fast, no `predict_proba` |
+| `"svm"` | Support Vector Machine with probability calibration |
+| `"lda"` | Linear Discriminant Analysis |
+| `"mass_mean"` | Mass-Mean Probing - uses direction between class centroids |
+| `"sgd"` | Stochastic Gradient Descent classifier |
+
+```python
+# Use Mass-Mean Probing (simple but effective)
+probe = LinearProbe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=-1,
+    classifier="mass_mean",
+)
+```
+
+---
+
+## Layer Importance Analysis
+
+Identify which layers are most informative for your task:
+
+```python
+probe = LinearProbe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers="all",  # Extract all layers
+    classifier="ridge",
+)
+
+probe.fit(positive_prompts, negative_prompts)
+
+# Compute per-layer importance scores
+importances = probe.compute_layer_importance(metric="l2")
+
+# Visualize layer importance
+probe.plot_layer_importance()
+```
+
+### Fast Auto Layer Selection
+
+Automatically select the most important layers using fast importance analysis:
+
+```python
+probe = LinearProbe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers="fast_auto",      # Auto-select best layers
+    fast_auto_top_k=3,       # Use top 3 most important layers
+    normalize_layers=True,   # Normalize before combining
+)
+
+probe.fit(positive_prompts, negative_prompts)
+print(f"Selected layers: {probe.selected_layers_}")
+```
+
+---
+
+## Baseline Comparisons
+
+Use `BaselineProbe` for text-only baselines to validate that your probe is learning something beyond surface features:
+
+```python
+from lmprobe import BaselineProbe
+
+# Bag-of-words baseline
+bow_baseline = BaselineProbe(method="bow", classifier="logistic_regression")
+bow_baseline.fit(positive_prompts, negative_prompts)
+bow_accuracy = bow_baseline.score(test_prompts, test_labels)
+
+# TF-IDF baseline
+tfidf_baseline = BaselineProbe(method="tfidf")
+tfidf_baseline.fit(positive_prompts, negative_prompts)
+
+# Random baseline (sanity check)
+random_baseline = BaselineProbe(method="random")
+random_baseline.fit(positive_prompts, negative_prompts)
+
+# Majority class baseline
+majority_baseline = BaselineProbe(method="majority")
+majority_baseline.fit(positive_prompts, negative_prompts)
+```
+
+---
+
+## Per-Layer Normalization
+
+When combining multiple layers, normalize each layer's activations independently to prevent high-magnitude layers from dominating:
+
+```python
+probe = LinearProbe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=[14, 15, 16],
+    normalize_layers="per_layer",  # or "per_neuron" (default), or False
+)
+```
+
