@@ -65,6 +65,9 @@ packages = ["src/lmprobe"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "remote: marks tests that require NDIF remote execution (deselect with '-m \"not remote\"')",
+]
 
 [tool.ruff]
 line-length = 100
