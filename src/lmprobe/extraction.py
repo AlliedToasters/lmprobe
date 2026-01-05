@@ -75,21 +75,49 @@ def configure_remote() -> None:
     CONFIG.API.APIKEY = api_key
 
 
-def get_num_layers(model: LanguageModel) -> int:
-    """Get the number of transformer layers in a model.
+def get_num_layers_from_config(model_name: str) -> int:
+    """Get the number of transformer layers from model config (without loading weights).
+
+    This function only downloads the model's config.json (~1KB) instead of the
+    full model weights. This is critical for large models where loading weights
+    would consume hundreds of GB of memory.
 
     Parameters
     ----------
-    model : LanguageModel
-        The nnsight LanguageModel.
+    model_name : str
+        HuggingFace model ID or local path.
 
     Returns
     -------
     int
         Number of transformer layers.
+
+    Raises
+    ------
+    ValueError
+        If the config doesn't contain a recognized layer count field.
+
+    Examples
+    --------
+    >>> get_num_layers_from_config("meta-llama/Llama-3.1-8B-Instruct")
+    32
+    >>> get_num_layers_from_config("meta-llama/Llama-3.1-405B-Instruct")
+    126
     """
-    # For Llama-style models, layers are at model.model.layers
-    return len(model.model.layers)
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model_name)
+
+    # Different model architectures use different config field names
+    # Try common ones in order of prevalence
+    for attr in ("num_hidden_layers", "n_layer", "num_layers", "n_layers"):
+        if hasattr(config, attr):
+            return getattr(config, attr)
+
+    raise ValueError(
+        f"Could not determine layer count from config for {model_name}. "
+        f"Config has attributes: {list(config.to_dict().keys())}"
+    )
 
 
 def resolve_auto_candidates(
@@ -317,51 +345,39 @@ def _extract_batch(
         padding=True,
     )
 
-    # For remote execution, use nnsight's tracer.cache() to collect multiple
-    # layer activations efficiently. This is the recommended pattern as of
-    # nnsight 0.5 - it handles remote tensor collection properly.
-    #
-    # For local execution, we can use the simpler loop approach.
+    # Use nnsight's tracer.cache() to collect multiple layer activations.
+    # This pattern works for both local and remote execution.
+    modules_to_cache = [model.model.layers[i] for i in layer_indices]
 
-    if remote:
-        # Use tracer.cache() to collect activations from specified layers
-        modules_to_cache = [model.model.layers[i] for i in layer_indices]
+    with model.trace(tokenized, remote=remote) as tracer:
+        cache = tracer.cache(modules=modules_to_cache).save()
 
-        with model.trace(tokenized, remote=True) as tracer:
-            cache = tracer.cache(modules=modules_to_cache).save()
+    # Collect tensors from the cache
+    # Cache structure differs slightly between local/remote:
+    # - Remote: cache[key] is a dict with 'output' key
+    # - Local: cache[key] is an Entry object with .output attribute
+    activation_tensors = []
+    for layer_idx in layer_indices:
+        key = f"model.model.layers.{layer_idx}"
+        entry = cache[key]
 
-        # Collect tensors from the cache dictionary
-        # Cache structure: cache[key] is a dict with 'output' and 'inputs' keys
-        # cache[key]['output'] is the layer output tensor
-        activation_tensors = []
-        for layer_idx in layer_indices:
-            key = f"model.model.layers.{layer_idx}"
-            output = cache[key]["output"]
-            # Handle both tuple outputs (hidden_states, ...) and direct tensors
-            if isinstance(output, tuple):
-                tensor = output[0]
-            else:
-                tensor = output
-            # Handle proxy vs direct tensor
-            if hasattr(tensor, "value"):
-                tensor = tensor.value
-            activation_tensors.append(tensor)
-    else:
-        # Local execution - simpler approach with loop
-        layer_activations = []
+        # Handle both dict (remote) and Entry object (local) formats
+        if hasattr(entry, "output"):
+            output = entry.output
+        else:
+            output = entry["output"]
 
-        with model.trace(tokenized, remote=False) as tracer:
-            for layer_idx in layer_indices:
-                hidden_state = model.model.layers[layer_idx].output.save()
-                layer_activations.append(hidden_state)
+        # Handle both tuple outputs (hidden_states, ...) and direct tensors
+        if isinstance(output, tuple):
+            tensor = output[0]
+        else:
+            tensor = output
 
-        # Collect the actual tensor values
-        activation_tensors = []
-        for act in layer_activations:
-            if hasattr(act, "value"):
-                activation_tensors.append(act.value)
-            else:
-                activation_tensors.append(act)
+        # Handle proxy vs direct tensor
+        if hasattr(tensor, "value"):
+            tensor = tensor.value
+
+        activation_tensors.append(tensor)
 
     # Concatenate along hidden dimension
     # Result shape: (batch, seq_len, hidden_dim * num_layers)
@@ -512,7 +528,7 @@ class ActivationExtractor:
     def layer_indices(self) -> list[int]:
         """Get resolved layer indices."""
         if self._layer_indices is None:
-            num_layers = get_num_layers(self.model)
+            num_layers = get_num_layers_from_config(self.model_name)
             self._layer_indices = resolve_layers(
                 self.layers_spec, num_layers, auto_candidates=self.auto_candidates
             )
