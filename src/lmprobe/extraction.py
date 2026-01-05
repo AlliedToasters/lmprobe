@@ -151,7 +151,8 @@ def resolve_layers(
         - "middle": Middle third of layers
         - "last": Last layer only
         - "all": All layers
-        - "auto": Automatic layer selection (uses auto_candidates)
+        - "auto": Automatic layer selection via Group Lasso (uses auto_candidates)
+        - "fast_auto": Fast automatic layer selection via coefficient importance
 
     num_layers : int
         Total number of layers in the model.
@@ -190,7 +191,7 @@ def resolve_layers(
     if isinstance(layers, list):
         return [normalize_index(i) for i in layers]
 
-    if layers == "auto":
+    if layers == "auto" or layers == "fast_auto":
         return resolve_auto_candidates(auto_candidates, num_layers)
 
     if layers == "middle":
