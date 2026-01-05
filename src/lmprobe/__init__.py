@@ -23,6 +23,7 @@ __version__ = "0.1.0"
 __all__ = [
     "LinearProbe",
     "PerLayerScaler",
+    "clear_model_cache",
     "plot_layer_importance",
     "plot_layer_importance_heatmap",
 ]
@@ -41,4 +42,8 @@ def __getattr__(name: str):
         from .scaling import PerLayerScaler
 
         return PerLayerScaler
+    if name == "clear_model_cache":
+        from .extraction import clear_model_cache
+
+        return clear_model_cache
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
