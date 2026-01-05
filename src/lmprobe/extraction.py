@@ -313,9 +313,10 @@ def load_model(
     """
     if remote:
         # For remote execution, don't load weights locally.
-        # nnsight handles this by not specifying device_map.
+        # dispatch=False prevents loading model weights - only tokenizer is loaded.
+        # This is critical for large models (405B) that would OOM locally.
         # See: https://nnsight.net/notebooks/features/remote_execution/
-        model = LanguageModel(model_name)
+        model = LanguageModel(model_name, dispatch=False)
     else:
         # Local execution - load weights to specified device
         if device == "auto":
