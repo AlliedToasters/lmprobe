@@ -310,9 +310,6 @@ def _extract_batch(
         - activations: Shape (batch, seq_len, hidden_dim * num_layers)
         - attention_mask: Shape (batch, seq_len)
     """
-    # Storage for layer activations
-    layer_activations = []
-
     # Tokenize the prompts to get attention mask
     tokenized = model.tokenizer(
         prompts,
@@ -320,22 +317,51 @@ def _extract_batch(
         padding=True,
     )
 
-    with model.trace(tokenized, remote=remote) as tracer:
-        for layer_idx in layer_indices:
-            # For Llama-style models: model.model.layers[i].output is the hidden state
-            # Note: In nnsight, .output gives the full tensor, not a tuple
-            hidden_state = model.model.layers[layer_idx].output.save()
-            layer_activations.append(hidden_state)
+    # For remote execution, use nnsight's tracer.cache() to collect multiple
+    # layer activations efficiently. This is the recommended pattern as of
+    # nnsight 0.5 - it handles remote tensor collection properly.
+    #
+    # For local execution, we can use the simpler loop approach.
 
-    # After trace context, collect the actual tensor values
-    # nnsight returns tensors directly after .save() in local mode,
-    # or proxies with .value in remote mode
-    activation_tensors = []
-    for act in layer_activations:
-        if hasattr(act, "value"):
-            activation_tensors.append(act.value)
-        else:
-            activation_tensors.append(act)
+    if remote:
+        # Use tracer.cache() to collect activations from specified layers
+        modules_to_cache = [model.model.layers[i] for i in layer_indices]
+
+        with model.trace(tokenized, remote=True) as tracer:
+            cache = tracer.cache(modules=modules_to_cache).save()
+
+        # Collect tensors from the cache dictionary
+        # Cache structure: cache[key] is a dict with 'output' and 'inputs' keys
+        # cache[key]['output'] is the layer output tensor
+        activation_tensors = []
+        for layer_idx in layer_indices:
+            key = f"model.model.layers.{layer_idx}"
+            output = cache[key]["output"]
+            # Handle both tuple outputs (hidden_states, ...) and direct tensors
+            if isinstance(output, tuple):
+                tensor = output[0]
+            else:
+                tensor = output
+            # Handle proxy vs direct tensor
+            if hasattr(tensor, "value"):
+                tensor = tensor.value
+            activation_tensors.append(tensor)
+    else:
+        # Local execution - simpler approach with loop
+        layer_activations = []
+
+        with model.trace(tokenized, remote=False) as tracer:
+            for layer_idx in layer_indices:
+                hidden_state = model.model.layers[layer_idx].output.save()
+                layer_activations.append(hidden_state)
+
+        # Collect the actual tensor values
+        activation_tensors = []
+        for act in layer_activations:
+            if hasattr(act, "value"):
+                activation_tensors.append(act.value)
+            else:
+                activation_tensors.append(act)
 
     # Concatenate along hidden dimension
     # Result shape: (batch, seq_len, hidden_dim * num_layers)

@@ -226,13 +226,15 @@ class LinearProbe:
         pooled = pool_fn(activations, attention_mask)
 
         # Convert to numpy for sklearn
+        # Use .float() to convert from bfloat16 (common in newer models) to float32
+        # since numpy doesn't support bfloat16
         if pooled.dim() == 2:
             # Normal case: (batch, hidden_dim)
-            return pooled.detach().cpu().numpy(), None
+            return pooled.detach().cpu().float().numpy(), None
         else:
             # "all" pooling: (batch, seq_len, hidden_dim)
             # Return attention_mask for later use
-            return pooled.detach().cpu().numpy(), attention_mask
+            return pooled.detach().cpu().float().numpy(), attention_mask
 
     def fit(
         self,
