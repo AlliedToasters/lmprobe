@@ -17,12 +17,18 @@ Example
 >>> predictions = probe.predict(test_prompts)
 """
 
+from .activation_baseline import ActivationBaseline
 from .baseline import BaselineProbe
+from .battery import BaselineBattery, BaselineResult, BaselineResults
 from .probe import LinearProbe
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 __all__ = [
+    "ActivationBaseline",
+    "BaselineBattery",
     "BaselineProbe",
+    "BaselineResult",
+    "BaselineResults",
     "LinearProbe",
     "PerLayerScaler",
     "clear_model_cache",
