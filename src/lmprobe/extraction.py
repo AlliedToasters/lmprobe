@@ -17,6 +17,45 @@ if TYPE_CHECKING:
     pass
 
 
+# Global model cache to avoid loading the same model multiple times
+# Key: (model_name, device), Value: LanguageModel
+_MODEL_CACHE: dict[tuple[str, str], LanguageModel] = {}
+
+
+def get_cached_model(model_name: str, device: str = "auto") -> LanguageModel:
+    """Get a model from the cache, loading if necessary.
+
+    This ensures the same model is shared across all ActivationExtractor
+    instances, preventing OOM from loading multiple copies.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID or local path.
+    device : str
+        Device specification.
+
+    Returns
+    -------
+    LanguageModel
+        The cached or newly loaded model.
+    """
+    cache_key = (model_name, device)
+    if cache_key not in _MODEL_CACHE:
+        _MODEL_CACHE[cache_key] = load_model(model_name, device)
+    return _MODEL_CACHE[cache_key]
+
+
+def clear_model_cache() -> None:
+    """Clear the global model cache to free memory.
+
+    Call this when you're done with all probes and want to release
+    GPU/CPU memory held by loaded models.
+    """
+    global _MODEL_CACHE
+    _MODEL_CACHE.clear()
+
+
 def configure_remote() -> None:
     """Configure nnsight for remote execution.
 
@@ -434,9 +473,13 @@ class ActivationExtractor:
 
     @property
     def model(self) -> LanguageModel:
-        """Get the loaded model, loading if necessary."""
+        """Get the loaded model, loading if necessary.
+
+        Uses a global cache to share models across ActivationExtractor instances,
+        preventing OOM from loading multiple copies of the same model.
+        """
         if self._model is None:
-            self._model = load_model(self.model_name, self.device)
+            self._model = get_cached_model(self.model_name, self.device)
         return self._model
 
     @property
