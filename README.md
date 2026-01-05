@@ -252,7 +252,9 @@ print(f"Selected layers: {probe.selected_layers_}")
 
 ## Baseline Comparisons
 
-Use `BaselineProbe` for text-only baselines to validate that your probe is learning something beyond surface features:
+Use baselines to validate that your probe is learning something beyond surface features.
+
+### Text-Only Baselines
 
 ```python
 from lmprobe import BaselineProbe
@@ -266,14 +268,100 @@ bow_accuracy = bow_baseline.score(test_prompts, test_labels)
 tfidf_baseline = BaselineProbe(method="tfidf")
 tfidf_baseline.fit(positive_prompts, negative_prompts)
 
-# Random baseline (sanity check)
+# Sentence length baseline (surprisingly predictive for some tasks)
+length_baseline = BaselineProbe(method="sentence_length")
+length_baseline.fit(positive_prompts, negative_prompts)
+
+# Sentence-transformers embeddings (requires: pip install lmprobe[embeddings])
+st_baseline = BaselineProbe(method="sentence_transformers")
+st_baseline.fit(positive_prompts, negative_prompts)
+
+# Random baseline (sanity check - should be ~50%)
 random_baseline = BaselineProbe(method="random")
-random_baseline.fit(positive_prompts, negative_prompts)
 
 # Majority class baseline
 majority_baseline = BaselineProbe(method="majority")
-majority_baseline.fit(positive_prompts, negative_prompts)
 ```
+
+### Activation-Based Baselines
+
+Test whether the learned probe direction is special compared to simpler approaches:
+
+```python
+from lmprobe import ActivationBaseline
+
+# Random direction baseline - project onto random unit vector
+random_dir = ActivationBaseline(
+    method="random_direction",
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=-1,
+    remote=True,
+)
+random_dir.fit(positive_prompts, negative_prompts)
+random_accuracy = random_dir.score(test_prompts, test_labels)
+
+# PCA baseline - classify using top principal components
+pca_baseline = ActivationBaseline(
+    method="pca",
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=-1,
+)
+
+# Layer 0 baseline - use input embeddings instead of deep layers
+layer0_baseline = ActivationBaseline(
+    method="layer_0",
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=-1,  # Compare layer 0 to this layer
+)
+```
+
+### Baseline Battery
+
+Run all applicable baselines at once and compare to your probe:
+
+```python
+from lmprobe import BaselineBattery
+
+# Text-only baselines (no model required)
+battery = BaselineBattery(model=None, random_state=42)
+results = battery.fit(positive_prompts, negative_prompts, test_prompts, test_labels)
+
+print(results.summary())
+# Baseline Results:
+# ------------------------------------------------------------
+#   sentence_transformers          0.7925  (fit: 1.23s, predict: 0.05s)
+#   tfidf                          0.7547  (fit: 0.01s, predict: 0.00s)
+#   bow                            0.6792  (fit: 0.01s, predict: 0.00s)
+#   ...
+
+# Get best baseline
+best = results.best()
+print(f"Best baseline: {best.name} with {best.score:.2%} accuracy")
+
+# With activation baselines (requires model)
+battery = BaselineBattery(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=-1,
+    remote=True,
+    include=["bow", "tfidf", "random_direction", "pca"],  # Select specific baselines
+)
+results = battery.fit(positive_prompts, negative_prompts, test_prompts, test_labels)
+```
+
+### Available Baseline Methods
+
+| Method | Type | Description |
+|--------|------|-------------|
+| `bow` | Text | Bag-of-words + classifier |
+| `tfidf` | Text | TF-IDF + classifier |
+| `random` | Text | Random predictions (sanity check) |
+| `majority` | Text | Always predict majority class |
+| `sentence_length` | Text | Classify by text length |
+| `sentence_transformers` | Text | Pretrained embeddings + classifier |
+| `random_direction` | Activation | Project onto random unit vector |
+| `pca` | Activation | Top principal components |
+| `layer_0` | Activation | Input embeddings only |
+| `perplexity` | Activation | Model's own token probabilities |
 
 ---
 
