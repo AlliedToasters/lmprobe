@@ -70,11 +70,14 @@ class LinearProbe:
     auto_alpha : float, default=0.01
         Group Lasso regularization strength for layers="auto".
         Higher values select fewer layers. Typical range: 0.001 to 0.1.
-    normalize_layers : bool, default=True
-        If True, apply per-layer standardization when using multiple layers.
-        This normalizes each layer's features to zero mean and unit variance,
-        compensating for differences in activation magnitude across layers.
-        Recommended for accurate layer importance comparison.
+    normalize_layers : bool | str, default=True
+        Per-layer feature standardization when using multiple layers.
+        Compensates for differences in activation magnitude across layers.
+        Options:
+        - True or "per_neuron": Each neuron gets its own mean/std (default)
+        - "per_layer": All neurons in a layer share one mean/std
+          (may work better with small sample sizes due to lower variance)
+        - False: No scaling
     fast_auto_top_k : int | None, default=None
         Number of layers to select when using layers="fast_auto".
         If None, defaults to selecting half the candidate layers.
@@ -129,7 +132,7 @@ class LinearProbe:
         batch_size: int = 8,
         auto_candidates: list[int] | list[float] | None = None,
         auto_alpha: float = 0.01,
-        normalize_layers: bool = True,
+        normalize_layers: bool | str = True,
         fast_auto_top_k: int | None = None,
     ):
         self.model = model
@@ -172,6 +175,25 @@ class LinearProbe:
     def _get_remote(self, remote: bool | None) -> bool:
         """Resolve remote parameter with method-level override."""
         return self.remote if remote is None else remote
+
+    def _get_scaling_strategy(self) -> str | None:
+        """Resolve normalize_layers to a scaling strategy string.
+
+        Returns
+        -------
+        str | None
+            "per_neuron", "per_layer", or None (no scaling).
+        """
+        if self.normalize_layers is False:
+            return None
+        if self.normalize_layers is True:
+            return "per_neuron"
+        if self.normalize_layers in ("per_neuron", "per_layer"):
+            return self.normalize_layers
+        raise ValueError(
+            f"Invalid normalize_layers value: {self.normalize_layers!r}. "
+            f"Expected True, False, 'per_neuron', or 'per_layer'."
+        )
 
     def _extract_and_pool(
         self,
@@ -298,11 +320,12 @@ class LinearProbe:
 
         # Apply per-layer normalization if enabled and using multiple layers
         n_layers = len(self._extractor.layer_indices)
-        if self.normalize_layers and n_layers > 1:
+        scaling_strategy = self._get_scaling_strategy()
+        if scaling_strategy is not None and n_layers > 1:
             from .scaling import PerLayerScaler
 
             hidden_dim_per_layer = X.shape[1] // n_layers
-            self.scaler_ = PerLayerScaler(n_layers, hidden_dim_per_layer)
+            self.scaler_ = PerLayerScaler(n_layers, hidden_dim_per_layer, scaling_strategy)
             X = self.scaler_.fit_transform(X)
 
         # Clone and fit classifier
@@ -329,6 +352,7 @@ class LinearProbe:
 
         from .cache import CachedExtractor
         from .classifiers import build_group_lasso_classifier
+        from .scaling import PerLayerScaler
 
         remote = self._get_remote(remote)
 
@@ -354,6 +378,16 @@ class LinearProbe:
         hidden_dim_total = X_candidates.shape[1]
         hidden_dim_per_layer = hidden_dim_total // n_candidate_layers
 
+        # Apply per-layer normalization if enabled (before Group Lasso)
+        scaling_strategy = self._get_scaling_strategy()
+        if scaling_strategy is not None and n_candidate_layers > 1:
+            candidate_scaler = PerLayerScaler(
+                n_candidate_layers, hidden_dim_per_layer, scaling_strategy
+            )
+            X_candidates_scaled = candidate_scaler.fit_transform(X_candidates)
+        else:
+            X_candidates_scaled = X_candidates
+
         # Phase 1: Train Group Lasso classifier
         group_lasso_clf = build_group_lasso_classifier(
             hidden_dim=hidden_dim_per_layer,
@@ -361,7 +395,7 @@ class LinearProbe:
             alpha=self.auto_alpha,
             random_state=self.random_state,
         )
-        group_lasso_clf.fit(X_candidates, labels_expanded)
+        group_lasso_clf.fit(X_candidates_scaled, labels_expanded)
 
         # Store candidate layers and their importances (group norms)
         self.candidate_layers_ = candidate_layers
@@ -389,8 +423,20 @@ class LinearProbe:
             start = idx * hidden_dim_per_layer
             end = (idx + 1) * hidden_dim_per_layer
             selected_columns.extend(range(start, end))
-        X_selected = X_candidates[:, selected_columns]
+        X_selected = X_candidates[:, selected_columns]  # Use unscaled for re-fit
         labels_final = labels_expanded
+
+        # Apply per-layer normalization to selected layers if enabled
+        n_selected = len(self.selected_layers_)
+        if scaling_strategy is not None and n_selected > 1:
+            self.scaler_ = PerLayerScaler(n_selected, hidden_dim_per_layer, scaling_strategy)
+            X_selected = self.scaler_.fit_transform(X_selected)
+        elif scaling_strategy is not None and n_selected == 1:
+            # Single layer: still normalize but store scaler
+            self.scaler_ = PerLayerScaler(1, hidden_dim_per_layer, scaling_strategy)
+            X_selected = self.scaler_.fit_transform(X_selected)
+        else:
+            self.scaler_ = None
 
         # Create extractor for selected layers (needed for inference later)
         selected_extractor = ActivationExtractor(
@@ -463,8 +509,9 @@ class LinearProbe:
         self.candidate_layers_ = list(candidate_layers)
 
         # Apply per-layer normalization if enabled
-        if self.normalize_layers and n_candidate_layers > 1:
-            scaler = PerLayerScaler(n_candidate_layers, hidden_dim_per_layer)
+        scaling_strategy = self._get_scaling_strategy()
+        if scaling_strategy is not None and n_candidate_layers > 1:
+            scaler = PerLayerScaler(n_candidate_layers, hidden_dim_per_layer, scaling_strategy)
             X_candidates_scaled = scaler.fit_transform(X_candidates)
         else:
             scaler = None
@@ -508,12 +555,12 @@ class LinearProbe:
 
         # Apply normalization to selected layers if enabled
         n_selected = len(self.selected_layers_)
-        if self.normalize_layers and n_selected > 1:
-            self.scaler_ = PerLayerScaler(n_selected, hidden_dim_per_layer)
+        if scaling_strategy is not None and n_selected > 1:
+            self.scaler_ = PerLayerScaler(n_selected, hidden_dim_per_layer, scaling_strategy)
             X_selected = self.scaler_.fit_transform(X_selected)
-        elif self.normalize_layers and n_selected == 1:
+        elif scaling_strategy is not None and n_selected == 1:
             # Single layer: still normalize but store scaler
-            self.scaler_ = PerLayerScaler(1, hidden_dim_per_layer)
+            self.scaler_ = PerLayerScaler(1, hidden_dim_per_layer, scaling_strategy)
             X_selected = self.scaler_.fit_transform(X_selected)
         else:
             self.scaler_ = None

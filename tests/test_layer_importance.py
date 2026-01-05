@@ -441,3 +441,231 @@ class TestNormalizeLayers:
 
         # They shouldn't be identical
         assert not np.allclose(coef_norm, coef_no_norm)
+
+
+class TestPerLayerStrategy:
+    """Tests for the 'per_layer' scaling strategy."""
+
+    def test_per_layer_strategy_normalization(self):
+        """per_layer strategy normalizes all neurons in a layer together."""
+        from lmprobe.scaling import PerLayerScaler
+
+        np.random.seed(42)
+        n_samples = 100
+        hidden_dim = 8
+        n_layers = 2
+
+        # Create data with different scales per layer
+        layer_0 = np.random.randn(n_samples, hidden_dim)
+        layer_1 = np.random.randn(n_samples, hidden_dim) * 5 + 10
+        X = np.hstack([layer_0, layer_1])
+
+        scaler = PerLayerScaler(n_layers=n_layers, hidden_dim=hidden_dim, strategy="per_layer")
+        X_scaled = scaler.fit_transform(X)
+
+        # After scaling, each layer should have ~zero mean and ~unit std
+        X_reshaped = X_scaled.reshape(n_samples, n_layers, hidden_dim)
+
+        # Check layer 0 (all values together)
+        layer_0_values = X_reshaped[:, 0, :].flatten()
+        assert np.abs(layer_0_values.mean()) < 0.1
+        assert np.abs(layer_0_values.std() - 1.0) < 0.1
+
+        # Check layer 1 (all values together)
+        layer_1_values = X_reshaped[:, 1, :].flatten()
+        assert np.abs(layer_1_values.mean()) < 0.1
+        assert np.abs(layer_1_values.std() - 1.0) < 0.1
+
+    def test_per_layer_has_fewer_parameters(self):
+        """per_layer strategy has fewer parameters than per_neuron."""
+        from lmprobe.scaling import PerLayerScaler
+
+        np.random.seed(42)
+        X = np.random.randn(50, 16)  # 2 layers x 8 hidden_dim
+
+        scaler_neuron = PerLayerScaler(n_layers=2, hidden_dim=8, strategy="per_neuron")
+        scaler_layer = PerLayerScaler(n_layers=2, hidden_dim=8, strategy="per_layer")
+
+        scaler_neuron.fit(X)
+        scaler_layer.fit(X)
+
+        # per_neuron: means_ shape (2, 8) = 16 parameters
+        assert scaler_neuron.means_.shape == (2, 8)
+        # per_layer: means_ shape (2,) = 2 parameters
+        assert scaler_layer.means_.shape == (2,)
+
+    def test_per_layer_inverse_transform(self):
+        """per_layer strategy inverse_transform recovers original data."""
+        from lmprobe.scaling import PerLayerScaler
+
+        np.random.seed(42)
+        X = np.random.randn(50, 16)
+
+        scaler = PerLayerScaler(n_layers=2, hidden_dim=8, strategy="per_layer")
+        X_scaled = scaler.fit_transform(X)
+        X_recovered = scaler.inverse_transform(X_scaled)
+
+        np.testing.assert_allclose(X, X_recovered, rtol=1e-10)
+
+    def test_per_layer_get_layer_stats(self):
+        """per_layer strategy returns correct stats."""
+        from lmprobe.scaling import PerLayerScaler
+
+        np.random.seed(42)
+        X = np.random.randn(50, 16)
+
+        scaler = PerLayerScaler(n_layers=2, hidden_dim=8, strategy="per_layer")
+        scaler.fit(X)
+        stats = scaler.get_layer_stats()
+
+        # per_layer should return 'means' and 'stds' keys
+        assert "means" in stats
+        assert "stds" in stats
+        assert stats["means"].shape == (2,)
+        assert stats["stds"].shape == (2,)
+
+    def test_invalid_strategy_raises(self):
+        """Invalid strategy raises ValueError."""
+        from lmprobe.scaling import PerLayerScaler
+
+        with pytest.raises(ValueError, match="Unknown strategy"):
+            PerLayerScaler(n_layers=2, hidden_dim=8, strategy="invalid")
+
+    def test_probe_with_per_layer_strategy(self, tiny_model):
+        """LinearProbe works with normalize_layers='per_layer'."""
+        probe = LinearProbe(
+            model=tiny_model,
+            layers=[-2, -1],
+            normalize_layers="per_layer",
+            pooling="last_token",
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        probe.fit(["positive"], ["negative"])
+
+        assert probe.scaler_ is not None
+        assert probe.scaler_.strategy == "per_layer"
+
+        # Can predict
+        predictions = probe.predict(["test"])
+        assert predictions.shape == (1,)
+
+    def test_probe_with_explicit_per_neuron(self, tiny_model):
+        """LinearProbe works with normalize_layers='per_neuron'."""
+        probe = LinearProbe(
+            model=tiny_model,
+            layers=[-2, -1],
+            normalize_layers="per_neuron",
+            pooling="last_token",
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        probe.fit(["positive"], ["negative"])
+
+        assert probe.scaler_ is not None
+        assert probe.scaler_.strategy == "per_neuron"
+
+    def test_invalid_normalize_layers_raises(self, tiny_model):
+        """Invalid normalize_layers value raises ValueError."""
+        probe = LinearProbe(
+            model=tiny_model,
+            layers=[-2, -1],
+            normalize_layers="invalid",
+            pooling="last_token",
+            device="cpu",
+            remote=False,
+        )
+
+        with pytest.raises(ValueError, match="Invalid normalize_layers"):
+            probe.fit(["positive"], ["negative"])
+
+
+class TestGroupLassoWithScaling:
+    """Tests for Group Lasso (auto) mode with layer scaling."""
+
+    def test_auto_layers_with_default_scaling(self, tiny_model):
+        """Group Lasso auto mode uses scaling by default."""
+        probe = LinearProbe(
+            model=tiny_model,
+            layers="auto",
+            auto_candidates=[-2, -1],
+            pooling="last_token",
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        probe.fit(["positive"], ["negative"])
+
+        # Scaler should be set
+        assert probe.scaler_ is not None
+        assert probe.scaler_.strategy == "per_neuron"
+
+    def test_auto_layers_with_per_layer_scaling(self, tiny_model):
+        """Group Lasso auto mode works with per_layer scaling."""
+        probe = LinearProbe(
+            model=tiny_model,
+            layers="auto",
+            auto_candidates=[-2, -1],
+            normalize_layers="per_layer",
+            pooling="last_token",
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        probe.fit(["positive"], ["negative"])
+
+        assert probe.scaler_ is not None
+        assert probe.scaler_.strategy == "per_layer"
+
+        # Can predict
+        predictions = probe.predict(["test"])
+        assert predictions.shape == (1,)
+
+    def test_auto_layers_without_scaling(self, tiny_model):
+        """Group Lasso auto mode works without scaling."""
+        probe = LinearProbe(
+            model=tiny_model,
+            layers="auto",
+            auto_candidates=[-2, -1],
+            normalize_layers=False,
+            pooling="last_token",
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        probe.fit(["positive"], ["negative"])
+
+        # Scaler should not be set
+        assert probe.scaler_ is None
+
+    def test_auto_layers_save_load_preserves_scaling(self, tiny_model, tmp_path):
+        """Save/load preserves scaling strategy for auto mode."""
+        probe = LinearProbe(
+            model=tiny_model,
+            layers="auto",
+            auto_candidates=[-2, -1],
+            normalize_layers="per_layer",
+            pooling="last_token",
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        probe.fit(["positive"], ["negative"])
+
+        pred_before = probe.predict(["test"])
+
+        # Save and load
+        save_path = tmp_path / "probe.pkl"
+        probe.save(str(save_path))
+        loaded = LinearProbe.load(str(save_path))
+
+        # Strategy should be preserved
+        assert loaded.normalize_layers == "per_layer"
+        assert loaded.scaler_ is not None
+        assert loaded.scaler_.strategy == "per_layer"
+
+        # Predictions should match
+        pred_after = loaded.predict(["test"])
+        np.testing.assert_array_equal(pred_before, pred_after)
