@@ -159,8 +159,9 @@ class LinearProbe:
         self._classifier_template = resolve_classifier(classifier, random_state)
 
         # Create extractor (lazy loads model)
+        # Pass remote flag so large models (e.g., 405B) don't download weights locally
         self._extractor = ActivationExtractor(
-            model, device, layers, batch_size, auto_candidates=auto_candidates
+            model, device, layers, batch_size, auto_candidates=auto_candidates, remote=remote
         )
         self._cached_extractor = CachedExtractor(self._extractor)
 

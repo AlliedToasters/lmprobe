@@ -22,7 +22,9 @@ if TYPE_CHECKING:
 _MODEL_CACHE: dict[tuple[str, str], LanguageModel] = {}
 
 
-def get_cached_model(model_name: str, device: str = "auto") -> LanguageModel:
+def get_cached_model(
+    model_name: str, device: str = "auto", remote: bool = False
+) -> LanguageModel:
     """Get a model from the cache, loading if necessary.
 
     This ensures the same model is shared across all ActivationExtractor
@@ -34,15 +36,19 @@ def get_cached_model(model_name: str, device: str = "auto") -> LanguageModel:
         HuggingFace model ID or local path.
     device : str
         Device specification.
+    remote : bool
+        If True, creates a lightweight model stub for remote execution only.
+        No model weights are downloaded.
 
     Returns
     -------
     LanguageModel
         The cached or newly loaded model.
     """
-    cache_key = (model_name, device)
+    # Include remote in cache key since remote stubs differ from local models
+    cache_key = (model_name, device, remote)
     if cache_key not in _MODEL_CACHE:
-        _MODEL_CACHE[cache_key] = load_model(model_name, device)
+        _MODEL_CACHE[cache_key] = load_model(model_name, device, remote=remote)
     return _MODEL_CACHE[cache_key]
 
 
@@ -283,6 +289,7 @@ def resolve_layers(
 def load_model(
     model_name: str,
     device: str = "auto",
+    remote: bool = False,
 ) -> LanguageModel:
     """Load a language model via nnsight.
 
@@ -292,24 +299,37 @@ def load_model(
         HuggingFace model ID or local path.
     device : str
         Device specification. "auto" uses device_map="auto".
+        Ignored when remote=True.
+    remote : bool
+        If True, creates a lightweight model stub for remote execution only.
+        No model weights are downloaded - only the tokenizer and config.
+        This is critical for large models like 405B that would otherwise
+        require hundreds of GB of memory.
 
     Returns
     -------
     LanguageModel
         The loaded nnsight model.
     """
-    if device == "auto":
-        device_map = "auto"
-    elif device == "cpu":
-        device_map = {"": "cpu"}
+    if remote:
+        # For remote execution, don't load weights locally.
+        # nnsight handles this by not specifying device_map.
+        # See: https://nnsight.net/notebooks/features/remote_execution/
+        model = LanguageModel(model_name)
     else:
-        device_map = {"": device}
+        # Local execution - load weights to specified device
+        if device == "auto":
+            device_map = "auto"
+        elif device == "cpu":
+            device_map = {"": "cpu"}
+        else:
+            device_map = {"": device}
 
-    model = LanguageModel(
-        model_name,
-        device_map=device_map,
-        dispatch=True,
-    )
+        model = LanguageModel(
+            model_name,
+            device_map=device_map,
+            dispatch=True,
+        )
     return model
 
 
@@ -493,6 +513,11 @@ class ActivationExtractor:
         Number of prompts to process at once. Smaller values use less memory.
     auto_candidates : list[int] | list[float] | None
         Candidate layers for layers="auto" mode.
+    remote : bool
+        If True, creates a lightweight model stub for remote execution only.
+        No model weights are downloaded - only the tokenizer and config.
+        This is critical for large models (e.g., 405B) that would otherwise
+        require hundreds of GB of memory to load locally.
     """
 
     def __init__(
@@ -502,12 +527,14 @@ class ActivationExtractor:
         layers: int | list[int] | str = "middle",
         batch_size: int = 8,
         auto_candidates: list[int] | list[float] | None = None,
+        remote: bool = False,
     ):
         self.model_name = model_name
         self.device = device
         self.layers_spec = layers
         self.batch_size = batch_size
         self.auto_candidates = auto_candidates
+        self.remote = remote
 
         # Lazy-loaded
         self._model: LanguageModel | None = None
@@ -519,9 +546,13 @@ class ActivationExtractor:
 
         Uses a global cache to share models across ActivationExtractor instances,
         preventing OOM from loading multiple copies of the same model.
+
+        For remote=True, only loads tokenizer and config (no weights).
         """
         if self._model is None:
-            self._model = get_cached_model(self.model_name, self.device)
+            self._model = get_cached_model(
+                self.model_name, self.device, remote=self.remote
+            )
         return self._model
 
     @property
