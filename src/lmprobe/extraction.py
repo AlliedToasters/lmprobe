@@ -22,7 +22,9 @@ if TYPE_CHECKING:
 _MODEL_CACHE: dict[tuple[str, str], LanguageModel] = {}
 
 
-def get_cached_model(model_name: str, device: str = "auto") -> LanguageModel:
+def get_cached_model(
+    model_name: str, device: str = "auto", remote: bool = False
+) -> LanguageModel:
     """Get a model from the cache, loading if necessary.
 
     This ensures the same model is shared across all ActivationExtractor
@@ -34,15 +36,19 @@ def get_cached_model(model_name: str, device: str = "auto") -> LanguageModel:
         HuggingFace model ID or local path.
     device : str
         Device specification.
+    remote : bool
+        If True, creates a lightweight model stub for remote execution only.
+        No model weights are downloaded.
 
     Returns
     -------
     LanguageModel
         The cached or newly loaded model.
     """
-    cache_key = (model_name, device)
+    # Include remote in cache key since remote stubs differ from local models
+    cache_key = (model_name, device, remote)
     if cache_key not in _MODEL_CACHE:
-        _MODEL_CACHE[cache_key] = load_model(model_name, device)
+        _MODEL_CACHE[cache_key] = load_model(model_name, device, remote=remote)
     return _MODEL_CACHE[cache_key]
 
 
@@ -75,21 +81,49 @@ def configure_remote() -> None:
     CONFIG.API.APIKEY = api_key
 
 
-def get_num_layers(model: LanguageModel) -> int:
-    """Get the number of transformer layers in a model.
+def get_num_layers_from_config(model_name: str) -> int:
+    """Get the number of transformer layers from model config (without loading weights).
+
+    This function only downloads the model's config.json (~1KB) instead of the
+    full model weights. This is critical for large models where loading weights
+    would consume hundreds of GB of memory.
 
     Parameters
     ----------
-    model : LanguageModel
-        The nnsight LanguageModel.
+    model_name : str
+        HuggingFace model ID or local path.
 
     Returns
     -------
     int
         Number of transformer layers.
+
+    Raises
+    ------
+    ValueError
+        If the config doesn't contain a recognized layer count field.
+
+    Examples
+    --------
+    >>> get_num_layers_from_config("meta-llama/Llama-3.1-8B-Instruct")
+    32
+    >>> get_num_layers_from_config("meta-llama/Llama-3.1-405B-Instruct")
+    126
     """
-    # For Llama-style models, layers are at model.model.layers
-    return len(model.model.layers)
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model_name)
+
+    # Different model architectures use different config field names
+    # Try common ones in order of prevalence
+    for attr in ("num_hidden_layers", "n_layer", "num_layers", "n_layers"):
+        if hasattr(config, attr):
+            return getattr(config, attr)
+
+    raise ValueError(
+        f"Could not determine layer count from config for {model_name}. "
+        f"Config has attributes: {list(config.to_dict().keys())}"
+    )
 
 
 def resolve_auto_candidates(
@@ -255,6 +289,7 @@ def resolve_layers(
 def load_model(
     model_name: str,
     device: str = "auto",
+    remote: bool = False,
 ) -> LanguageModel:
     """Load a language model via nnsight.
 
@@ -264,24 +299,37 @@ def load_model(
         HuggingFace model ID or local path.
     device : str
         Device specification. "auto" uses device_map="auto".
+        Ignored when remote=True.
+    remote : bool
+        If True, creates a lightweight model stub for remote execution only.
+        No model weights are downloaded - only the tokenizer and config.
+        This is critical for large models like 405B that would otherwise
+        require hundreds of GB of memory.
 
     Returns
     -------
     LanguageModel
         The loaded nnsight model.
     """
-    if device == "auto":
-        device_map = "auto"
-    elif device == "cpu":
-        device_map = {"": "cpu"}
+    if remote:
+        # For remote execution, don't load weights locally.
+        # nnsight handles this by not specifying device_map.
+        # See: https://nnsight.net/notebooks/features/remote_execution/
+        model = LanguageModel(model_name)
     else:
-        device_map = {"": device}
+        # Local execution - load weights to specified device
+        if device == "auto":
+            device_map = "auto"
+        elif device == "cpu":
+            device_map = {"": "cpu"}
+        else:
+            device_map = {"": device}
 
-    model = LanguageModel(
-        model_name,
-        device_map=device_map,
-        dispatch=True,
-    )
+        model = LanguageModel(
+            model_name,
+            device_map=device_map,
+            dispatch=True,
+        )
     return model
 
 
@@ -310,9 +358,6 @@ def _extract_batch(
         - activations: Shape (batch, seq_len, hidden_dim * num_layers)
         - attention_mask: Shape (batch, seq_len)
     """
-    # Storage for layer activations
-    layer_activations = []
-
     # Tokenize the prompts to get attention mask
     tokenized = model.tokenizer(
         prompts,
@@ -320,22 +365,39 @@ def _extract_batch(
         padding=True,
     )
 
-    with model.trace(tokenized, remote=remote) as tracer:
-        for layer_idx in layer_indices:
-            # For Llama-style models: model.model.layers[i].output is the hidden state
-            # Note: In nnsight, .output gives the full tensor, not a tuple
-            hidden_state = model.model.layers[layer_idx].output.save()
-            layer_activations.append(hidden_state)
+    # Use nnsight's tracer.cache() to collect multiple layer activations.
+    # This pattern works for both local and remote execution.
+    modules_to_cache = [model.model.layers[i] for i in layer_indices]
 
-    # After trace context, collect the actual tensor values
-    # nnsight returns tensors directly after .save() in local mode,
-    # or proxies with .value in remote mode
+    with model.trace(tokenized, remote=remote) as tracer:
+        cache = tracer.cache(modules=modules_to_cache).save()
+
+    # Collect tensors from the cache
+    # Cache structure differs slightly between local/remote:
+    # - Remote: cache[key] is a dict with 'output' key
+    # - Local: cache[key] is an Entry object with .output attribute
     activation_tensors = []
-    for act in layer_activations:
-        if hasattr(act, "value"):
-            activation_tensors.append(act.value)
+    for layer_idx in layer_indices:
+        key = f"model.model.layers.{layer_idx}"
+        entry = cache[key]
+
+        # Handle both dict (remote) and Entry object (local) formats
+        if hasattr(entry, "output"):
+            output = entry.output
         else:
-            activation_tensors.append(act)
+            output = entry["output"]
+
+        # Handle both tuple outputs (hidden_states, ...) and direct tensors
+        if isinstance(output, tuple):
+            tensor = output[0]
+        else:
+            tensor = output
+
+        # Handle proxy vs direct tensor
+        if hasattr(tensor, "value"):
+            tensor = tensor.value
+
+        activation_tensors.append(tensor)
 
     # Concatenate along hidden dimension
     # Result shape: (batch, seq_len, hidden_dim * num_layers)
@@ -451,6 +513,11 @@ class ActivationExtractor:
         Number of prompts to process at once. Smaller values use less memory.
     auto_candidates : list[int] | list[float] | None
         Candidate layers for layers="auto" mode.
+    remote : bool
+        If True, creates a lightweight model stub for remote execution only.
+        No model weights are downloaded - only the tokenizer and config.
+        This is critical for large models (e.g., 405B) that would otherwise
+        require hundreds of GB of memory to load locally.
     """
 
     def __init__(
@@ -460,12 +527,14 @@ class ActivationExtractor:
         layers: int | list[int] | str = "middle",
         batch_size: int = 8,
         auto_candidates: list[int] | list[float] | None = None,
+        remote: bool = False,
     ):
         self.model_name = model_name
         self.device = device
         self.layers_spec = layers
         self.batch_size = batch_size
         self.auto_candidates = auto_candidates
+        self.remote = remote
 
         # Lazy-loaded
         self._model: LanguageModel | None = None
@@ -477,16 +546,20 @@ class ActivationExtractor:
 
         Uses a global cache to share models across ActivationExtractor instances,
         preventing OOM from loading multiple copies of the same model.
+
+        For remote=True, only loads tokenizer and config (no weights).
         """
         if self._model is None:
-            self._model = get_cached_model(self.model_name, self.device)
+            self._model = get_cached_model(
+                self.model_name, self.device, remote=self.remote
+            )
         return self._model
 
     @property
     def layer_indices(self) -> list[int]:
         """Get resolved layer indices."""
         if self._layer_indices is None:
-            num_layers = get_num_layers(self.model)
+            num_layers = get_num_layers_from_config(self.model_name)
             self._layer_indices = resolve_layers(
                 self.layers_spec, num_layers, auto_candidates=self.auto_candidates
             )
