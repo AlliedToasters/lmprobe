@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lmprobe"
-version = "0.2.0"
+version = "0.3.0"
 description = "Train linear probes on language model activations for AI safety monitoring"
 readme = "README.md"
 license = "MIT"
@@ -52,6 +52,9 @@ auto = [
 plot = [
     "matplotlib>=3.5",
     "seaborn>=0.12",
+]
+embeddings = [
+    "sentence-transformers>=2.0",
 ]
 
 [project.urls]

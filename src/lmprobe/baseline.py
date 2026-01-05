@@ -37,6 +37,9 @@ class BaselineProbe:
         - "tfidf": TF-IDF weighted bag-of-words
         - "random": Random predictions (true chance baseline)
         - "majority": Always predict majority class
+        - "sentence_length": Use character/word count features
+        - "perplexity": Use model's own logprobs (requires model param)
+        - "sentence_transformers": Use off-the-shelf embeddings
     classifier : str | BaseEstimator, default="logistic_regression"
         Classification model. Same options as LinearProbe.
         Ignored for method="random" and method="majority".
@@ -47,6 +50,12 @@ class BaselineProbe:
     ngram_range : tuple[int, int], default=(1, 1)
         N-gram range for bow/tfidf. (1, 1) = unigrams only,
         (1, 2) = unigrams and bigrams.
+    model : str | None, default=None
+        HuggingFace model ID. Required for method="perplexity".
+    device : str, default="auto"
+        Device for model inference (for perplexity method).
+    remote : bool, default=False
+        Use nnsight remote execution (for perplexity method).
 
     Attributes
     ----------
@@ -65,7 +74,15 @@ class BaselineProbe:
     >>> print(f"TF-IDF baseline: {accuracy:.1%}")
     """
 
-    VALID_METHODS = ("bow", "tfidf", "random", "majority")
+    VALID_METHODS = (
+        "bow",
+        "tfidf",
+        "random",
+        "majority",
+        "sentence_length",
+        "perplexity",
+        "sentence_transformers",
+    )
 
     def __init__(
         self,
@@ -74,10 +91,18 @@ class BaselineProbe:
         random_state: int | None = None,
         max_features: int | None = 10000,
         ngram_range: tuple[int, int] = (1, 1),
+        model: str | None = None,
+        device: str = "auto",
+        remote: bool = False,
     ):
         if method not in self.VALID_METHODS:
             raise ValueError(
                 f"Unknown method: {method!r}. Valid options: {self.VALID_METHODS}"
+            )
+
+        if method == "perplexity" and model is None:
+            raise ValueError(
+                "method='perplexity' requires the 'model' parameter to be specified."
             )
 
         self.method = method
@@ -85,6 +110,9 @@ class BaselineProbe:
         self.random_state = random_state
         self.max_features = max_features
         self.ngram_range = ngram_range
+        self.model = model
+        self.device = device
+        self.remote = remote
 
         # Resolve classifier template
         if method in ("random", "majority"):
@@ -99,6 +127,7 @@ class BaselineProbe:
         self.classifier_: BaseEstimator | None = None
         self.classes_: np.ndarray | None = None
         self.vectorizer_: CountVectorizer | TfidfVectorizer | None = None
+        self._st_model = None  # Sentence transformer model (lazy loaded)
 
     def fit(
         self,
@@ -136,6 +165,12 @@ class BaselineProbe:
                 ngram_range=self.ngram_range,
             )
             X = self.vectorizer_.fit_transform(prompts)
+        elif self.method == "sentence_length":
+            X = self._extract_sentence_length_features(prompts)
+        elif self.method == "perplexity":
+            X = self._compute_perplexity(prompts)
+        elif self.method == "sentence_transformers":
+            X = self._transform_sentence_transformers(prompts, fit=True)
         else:
             # random/majority - features don't matter, just need shape
             X = np.zeros((len(prompts), 1))
@@ -220,6 +255,12 @@ class BaselineProbe:
         if self.method in ("bow", "tfidf"):
             X = self.vectorizer_.transform(prompts)
             return self._ensure_dense_if_needed(X)
+        elif self.method == "sentence_length":
+            return self._extract_sentence_length_features(prompts)
+        elif self.method == "perplexity":
+            return self._compute_perplexity(prompts)
+        elif self.method == "sentence_transformers":
+            return self._transform_sentence_transformers(prompts, fit=False)
         else:
             # random/majority
             return np.zeros((len(prompts), 1))
@@ -229,6 +270,111 @@ class BaselineProbe:
         if issparse(X) and isinstance(self._classifier_template, LinearDiscriminantAnalysis):
             return X.toarray()
         return X
+
+    def _extract_sentence_length_features(self, prompts: list[str]) -> np.ndarray:
+        """Extract sentence length features from prompts.
+
+        Features: character count, word count, average word length.
+        """
+        features = []
+        for prompt in prompts:
+            char_count = len(prompt)
+            word_count = len(prompt.split())
+            avg_word_len = char_count / max(word_count, 1)
+            features.append([char_count, word_count, avg_word_len])
+        return np.array(features)
+
+    def _compute_perplexity(self, prompts: list[str]) -> np.ndarray:
+        """Compute perplexity features for each prompt.
+
+        Uses the model's own logprobs to compute perplexity.
+        Features: mean perplexity, min perplexity, max perplexity.
+        """
+        import torch
+
+        from .extraction import configure_remote, get_cached_model
+
+        if self.remote:
+            configure_remote()
+
+        model = get_cached_model(self.model, self.device, remote=self.remote)
+
+        features = []
+        for prompt in prompts:
+            # Tokenize
+            inputs = model.tokenizer(prompt, return_tensors="pt")
+
+            # Forward pass to get logits using nnsight tracing
+            with model.trace(inputs, remote=self.remote) as tracer:
+                logits = model.lm_head.output.save()
+
+            # Unwrap proxy if needed
+            logits_val = logits.value if hasattr(logits, "value") else logits
+
+            # Compute per-token cross-entropy loss
+            # Shift logits and labels for next-token prediction
+            shift_logits = logits_val[..., :-1, :].contiguous()
+            shift_labels = inputs["input_ids"][..., 1:].contiguous()
+
+            # Move to same device
+            if shift_logits.device != shift_labels.device:
+                shift_labels = shift_labels.to(shift_logits.device)
+
+            loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
+            per_token_loss = loss_fn(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
+
+            # Compute perplexity statistics
+            mean_loss = per_token_loss.mean().item()
+            min_loss = per_token_loss.min().item()
+            max_loss = per_token_loss.max().item()
+
+            mean_ppl = float(np.exp(mean_loss))
+            min_ppl = float(np.exp(min_loss))
+            max_ppl = float(np.exp(max_loss))
+
+            features.append([mean_ppl, min_ppl, max_ppl])
+
+        return np.array(features)
+
+    def _check_sentence_transformers_installed(self) -> None:
+        """Check that sentence-transformers is installed."""
+        try:
+            import sentence_transformers  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers is required for method='sentence_transformers'. "
+                "Install it with: pip install lmprobe[embeddings]"
+            )
+
+    def _transform_sentence_transformers(
+        self, prompts: list[str], fit: bool = False
+    ) -> np.ndarray:
+        """Extract sentence-transformer embeddings.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            Text prompts to embed.
+        fit : bool
+            If True, load the sentence transformer model.
+
+        Returns
+        -------
+        np.ndarray
+            Embeddings with shape (n_prompts, embedding_dim).
+        """
+        self._check_sentence_transformers_installed()
+        from sentence_transformers import SentenceTransformer
+
+        if fit or self._st_model is None:
+            # Use a small, fast model by default
+            self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+        embeddings = self._st_model.encode(prompts, show_progress_bar=False)
+        return embeddings
 
     def _check_fitted(self) -> None:
         """Check if the baseline has been fitted."""

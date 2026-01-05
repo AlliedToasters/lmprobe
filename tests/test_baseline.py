@@ -244,3 +244,117 @@ class TestBaselineProbeReproducibility:
         pred2 = baseline2.predict(prompts)
 
         np.testing.assert_array_equal(pred1, pred2)
+
+
+class TestBaselineProbeSentenceLength:
+    """Test sentence_length baseline method."""
+
+    def test_sentence_length_fit_predict(self):
+        """Sentence length baseline can fit and predict."""
+        baseline = BaselineProbe(method="sentence_length", random_state=42)
+        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+        predictions = baseline.predict(TEST_PROMPTS)
+        assert predictions.shape == (2,)
+        assert set(predictions).issubset({0, 1})
+
+    def test_sentence_length_features(self):
+        """Sentence length extracts char/word count features."""
+        baseline = BaselineProbe(method="sentence_length", random_state=42)
+        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+        # Should be able to predict longer vs shorter sentences
+        predictions = baseline.predict(["Short", "This is a much longer sentence with many words"])
+        assert predictions.shape == (2,)
+
+    def test_sentence_length_predict_proba(self):
+        """Sentence length baseline supports predict_proba."""
+        baseline = BaselineProbe(method="sentence_length", random_state=42)
+        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+        proba = baseline.predict_proba(TEST_PROMPTS)
+        assert proba.shape == (2, 2)
+        np.testing.assert_allclose(proba.sum(axis=1), 1.0)
+
+
+class TestBaselineProbePerplexity:
+    """Test perplexity baseline method."""
+
+    def test_perplexity_requires_model(self):
+        """Perplexity method requires model parameter."""
+        with pytest.raises(ValueError, match="requires the 'model' parameter"):
+            BaselineProbe(method="perplexity")
+
+    def test_perplexity_fit_predict(self, tiny_model):
+        """Perplexity baseline can fit and predict."""
+        baseline = BaselineProbe(
+            method="perplexity",
+            model=tiny_model,
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+        predictions = baseline.predict(TEST_PROMPTS)
+        assert predictions.shape == (2,)
+        assert set(predictions).issubset({0, 1})
+
+    def test_perplexity_predict_proba(self, tiny_model):
+        """Perplexity baseline supports predict_proba."""
+        baseline = BaselineProbe(
+            method="perplexity",
+            model=tiny_model,
+            device="cpu",
+            remote=False,
+        )
+        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+        proba = baseline.predict_proba(TEST_PROMPTS)
+        assert proba.shape == (2, 2)
+        np.testing.assert_allclose(proba.sum(axis=1), 1.0)
+
+
+class TestBaselineProbeSentenceTransformers:
+    """Test sentence_transformers baseline method."""
+
+    def test_sentence_transformers_fit_predict(self):
+        """Sentence transformers baseline can fit and predict."""
+        pytest.importorskip("sentence_transformers")
+
+        baseline = BaselineProbe(
+            method="sentence_transformers",
+            random_state=42,
+        )
+        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+        predictions = baseline.predict(TEST_PROMPTS)
+        assert predictions.shape == (2,)
+        assert set(predictions).issubset({0, 1})
+
+    def test_sentence_transformers_predict_proba(self):
+        """Sentence transformers baseline supports predict_proba."""
+        pytest.importorskip("sentence_transformers")
+
+        baseline = BaselineProbe(
+            method="sentence_transformers",
+            random_state=42,
+        )
+        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+        proba = baseline.predict_proba(TEST_PROMPTS)
+        assert proba.shape == (2, 2)
+        np.testing.assert_allclose(proba.sum(axis=1), 1.0)
+
+    def test_sentence_transformers_missing_dependency(self, monkeypatch):
+        """Missing sentence-transformers raises helpful error."""
+        import sys
+
+        # Hide sentence_transformers if it's installed
+        monkeypatch.setitem(sys.modules, "sentence_transformers", None)
+
+        baseline = BaselineProbe(method="sentence_transformers")
+
+        # Should fail during fit when trying to import
+        with pytest.raises(ImportError, match="sentence-transformers is required"):
+            baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
