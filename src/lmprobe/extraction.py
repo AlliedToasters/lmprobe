@@ -410,6 +410,154 @@ def _extract_batch(
     return combined, attention_mask
 
 
+def _extract_batch_with_logits(
+    model: LanguageModel,
+    prompts: list[str],
+    layer_indices: list[int],
+    remote: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Extract activations AND logits for a single batch of prompts.
+
+    This function captures both layer activations and the lm_head output
+    in a single forward pass, enabling efficient computation of both
+    probe features and perplexity.
+
+    Parameters
+    ----------
+    model : LanguageModel
+        The nnsight model.
+    prompts : list[str]
+        List of text prompts (should be a small batch).
+    layer_indices : list[int]
+        List of layer indices to extract from (must be positive).
+    remote : bool
+        Whether to use remote execution.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        - activations: Shape (batch, seq_len, hidden_dim * num_layers)
+        - attention_mask: Shape (batch, seq_len)
+        - logits: Shape (batch, seq_len, vocab_size)
+    """
+    # Tokenize the prompts to get attention mask
+    tokenized = model.tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+    )
+
+    # Use nnsight's tracer.cache() to collect multiple layer activations
+    # AND capture logits in the same forward pass
+    modules_to_cache = [model.model.layers[i] for i in layer_indices]
+
+    with model.trace(tokenized, remote=remote) as tracer:
+        cache = tracer.cache(modules=modules_to_cache).save()
+        logits = model.lm_head.output.save()
+
+    # Collect tensors from the cache (same as _extract_batch)
+    activation_tensors = []
+    for layer_idx in layer_indices:
+        key = f"model.model.layers.{layer_idx}"
+        entry = cache[key]
+
+        # Handle both dict (remote) and Entry object (local) formats
+        if hasattr(entry, "output"):
+            output = entry.output
+        else:
+            output = entry["output"]
+
+        # Handle both tuple outputs (hidden_states, ...) and direct tensors
+        if isinstance(output, tuple):
+            tensor = output[0]
+        else:
+            tensor = output
+
+        # Handle proxy vs direct tensor
+        if hasattr(tensor, "value"):
+            tensor = tensor.value
+
+        activation_tensors.append(tensor)
+
+    # Concatenate along hidden dimension
+    combined = torch.cat(activation_tensors, dim=-1)
+
+    # Get attention mask from the tokenized input
+    attention_mask = tokenized["attention_mask"]
+
+    # Unwrap logits proxy if needed
+    logits_val = logits.value if hasattr(logits, "value") else logits
+
+    return combined, attention_mask, logits_val
+
+
+def compute_perplexity_from_logits(
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute perplexity features from logits.
+
+    Handles batched computation with proper masking for variable-length sequences.
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        Model logits, shape (batch, seq_len, vocab_size).
+    input_ids : torch.Tensor
+        Input token IDs, shape (batch, seq_len).
+    attention_mask : torch.Tensor
+        Attention mask, shape (batch, seq_len). 1 for real tokens, 0 for padding.
+
+    Returns
+    -------
+    torch.Tensor
+        Perplexity features, shape (batch, 3) - [mean_ppl, min_ppl, max_ppl] per prompt.
+    """
+    import numpy as np
+
+    # Shift logits and labels for next-token prediction
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = input_ids[..., 1:].contiguous()
+    shift_mask = attention_mask[..., 1:].contiguous()  # Mask for shifted positions
+
+    # Move to same device
+    if shift_logits.device != shift_labels.device:
+        shift_labels = shift_labels.to(shift_logits.device)
+        shift_mask = shift_mask.to(shift_logits.device)
+
+    # Compute per-token cross-entropy loss (no reduction)
+    batch_size, seq_len_minus_1, vocab_size = shift_logits.shape
+
+    loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
+    per_token_loss = loss_fn(
+        shift_logits.view(-1, vocab_size),
+        shift_labels.view(-1),
+    ).view(batch_size, seq_len_minus_1)
+
+    # Compute features per prompt
+    features = []
+    for i in range(batch_size):
+        valid_losses = per_token_loss[i][shift_mask[i] == 1]
+
+        if len(valid_losses) == 0:
+            # Edge case: empty sequence after shift
+            features.append([1.0, 1.0, 1.0])
+            continue
+
+        mean_loss = valid_losses.mean().item()
+        min_loss = valid_losses.min().item()
+        max_loss = valid_losses.max().item()
+
+        mean_ppl = float(np.exp(mean_loss))
+        min_ppl = float(np.exp(min_loss))
+        max_ppl = float(np.exp(max_loss))
+
+        features.append([mean_ppl, min_ppl, max_ppl])
+
+    return torch.tensor(features, dtype=torch.float32)
+
+
 def extract_activations(
     model: LanguageModel,
     prompts: list[str],

@@ -22,7 +22,7 @@ from .baseline import BaselineProbe
 from .battery import BaselineBattery, BaselineResult, BaselineResults
 from .probe import LinearProbe
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 __all__ = [
     "ActivationBaseline",
     "BaselineBattery",
@@ -31,7 +31,10 @@ __all__ = [
     "BaselineResults",
     "LinearProbe",
     "PerLayerScaler",
+    "UnifiedCache",
+    "WarmupStats",
     "clear_model_cache",
+    "enable_cache_logging",
     "plot_layer_importance",
     "plot_layer_importance_heatmap",
 ]
@@ -54,4 +57,12 @@ def __getattr__(name: str):
         from .extraction import clear_model_cache
 
         return clear_model_cache
+    if name == "enable_cache_logging":
+        from .cache import enable_cache_logging
+
+        return enable_cache_logging
+    if name in ("UnifiedCache", "WarmupStats"):
+        from .unified_cache import UnifiedCache, WarmupStats
+
+        return {"UnifiedCache": UnifiedCache, "WarmupStats": WarmupStats}[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

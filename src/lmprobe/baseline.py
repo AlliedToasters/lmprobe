@@ -291,27 +291,56 @@ class BaselineProbe:
         Uses the model's own logprobs to compute perplexity.
         Features: mean perplexity, min perplexity, max perplexity.
 
-        Results are cached to disk to avoid redundant NDIF calls.
+        Results are cached per-prompt to disk to avoid redundant NDIF calls
+        and enable cross-run reuse.
         """
         import torch
         from tqdm import tqdm
 
+        from .cache import (
+            is_prompt_perplexity_cached,
+            load_prompt_perplexity,
+            save_prompt_perplexity,
+        )
         from .extraction import configure_remote, get_cached_model
 
-        # Check cache first
-        cache_path = get_perplexity_cache_path(self.model, prompts)
-        cached = load_perplexity_cache(cache_path)
-        if cached is not None:
-            return cached.numpy()
+        # Check which prompts are already cached
+        cached_indices = []
+        uncached_prompts = []
+        uncached_indices = []
 
-        # Not cached - compute perplexity
+        for i, prompt in enumerate(prompts):
+            if is_prompt_perplexity_cached(self.model, prompt):
+                cached_indices.append(i)
+            else:
+                uncached_prompts.append(prompt)
+                uncached_indices.append(i)
+
+        # Initialize result array
+        features = np.zeros((len(prompts), 3), dtype=np.float32)
+
+        # Load cached prompts
+        for i in cached_indices:
+            ppl = load_prompt_perplexity(self.model, prompts[i])
+            features[i] = ppl.numpy()
+
+        # If all prompts are cached, return early
+        if not uncached_prompts:
+            return features
+
+        # Configure remote if needed
         if self.remote:
             configure_remote()
 
         model = get_cached_model(self.model, self.device, remote=self.remote)
 
-        features = []
-        for prompt in tqdm(prompts, desc="Computing perplexity", unit="prompt"):
+        # Compute perplexity for uncached prompts
+        for idx, prompt in tqdm(
+            zip(uncached_indices, uncached_prompts),
+            total=len(uncached_prompts),
+            desc="Computing perplexity",
+            unit="prompt",
+        ):
             # Tokenize
             inputs = model.tokenizer(prompt, return_tensors="pt")
 
@@ -346,13 +375,13 @@ class BaselineProbe:
             min_ppl = float(np.exp(min_loss))
             max_ppl = float(np.exp(max_loss))
 
-            features.append([mean_ppl, min_ppl, max_ppl])
+            # Save to per-prompt cache
+            ppl_tensor = torch.tensor([mean_ppl, min_ppl, max_ppl], dtype=torch.float32)
+            save_prompt_perplexity(self.model, prompt, ppl_tensor)
 
-        # Cache results
-        features_tensor = torch.tensor(features, dtype=torch.float32)
-        save_perplexity_cache(cache_path, features_tensor)
+            features[idx] = ppl_tensor.numpy()
 
-        return features_tensor.numpy()
+        return features
 
     def _check_sentence_transformers_installed(self) -> None:
         """Check that sentence-transformers is installed."""

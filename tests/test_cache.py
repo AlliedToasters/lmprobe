@@ -1,4 +1,4 @@
-"""Tests for per-layer activation caching."""
+"""Tests for per-prompt, per-layer activation caching."""
 
 import shutil
 
@@ -9,7 +9,10 @@ from lmprobe.cache import (
     clear_cache,
     get_cached_layers,
     get_extraction_cache_dir,
+    get_prompt_cache_dir,
+    get_prompt_cached_layers,
     invalidate_extraction_cache,
+    is_prompt_fully_cached,
     load_attention_mask,
     load_layer,
     save_attention_mask,
@@ -75,10 +78,10 @@ class TestCacheStorage:
 
 
 class TestCachedExtractor:
-    """Tests for CachedExtractor with per-layer caching."""
+    """Tests for CachedExtractor with per-prompt, per-layer caching."""
 
-    def test_caches_layers_individually(self, tiny_model, tmp_path, monkeypatch):
-        """First extraction caches each layer as a separate file."""
+    def test_caches_prompts_individually(self, tiny_model, tmp_path, monkeypatch):
+        """First extraction caches each prompt with its layers."""
         monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
 
         from lmprobe.cache import CachedExtractor
@@ -96,22 +99,23 @@ class TestCachedExtractor:
         prompts = ["hello world"]
         cached.extract(prompts, remote=False)
 
-        # Check cache directory structure
-        cache_dir = get_extraction_cache_dir(tiny_model, prompts)
-        cached_layers = get_cached_layers(cache_dir)
+        # Check per-prompt cache directory structure
+        cache_dir = get_prompt_cache_dir(tiny_model, prompts[0])
+        cached_layers = get_prompt_cached_layers(cache_dir)
         assert cached_layers == {0, 1}
 
         # Check attention mask exists
         assert (cache_dir / "attention_mask.pt").exists()
 
-    def test_partial_cache_hit(self, tiny_model, tmp_path, monkeypatch):
-        """Reuses cached layers and only extracts missing ones."""
+    def test_partial_layer_cache_hit(self, tiny_model, tmp_path, monkeypatch):
+        """Reuses cached layers for prompts and only extracts missing layers."""
         monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
 
         from lmprobe.cache import CachedExtractor
         from lmprobe.extraction import ActivationExtractor
 
-        prompts = ["test prompt"]
+        prompt = "test prompt"
+        prompts = [prompt]
 
         # tiny model has only 2 layers (0 and 1)
         # First extraction: layer [0] only
@@ -124,11 +128,12 @@ class TestCachedExtractor:
         cached1 = CachedExtractor(extractor1)
         acts1, mask1 = cached1.extract(prompts, remote=False)
 
-        # Verify layer 0 is cached
-        cache_dir = get_extraction_cache_dir(tiny_model, prompts)
-        assert get_cached_layers(cache_dir) == {0}
+        # Verify layer 0 is cached for this prompt
+        cache_dir = get_prompt_cache_dir(tiny_model, prompt)
+        assert get_prompt_cached_layers(cache_dir) == {0}
 
-        # Second extraction: layers [0, 1] - should reuse layer 0, extract layer 1
+        # Second extraction: layers [0, 1] - prompt needs layer 1 extracted
+        # (layer 0 is cached but [0,1] requires both, so prompt is not fully cached)
         extractor2 = ActivationExtractor(
             tiny_model,
             device="cpu",
@@ -138,15 +143,15 @@ class TestCachedExtractor:
         cached2 = CachedExtractor(extractor2)
         acts2, mask2 = cached2.extract(prompts, remote=False)
 
-        # Now both layers should be cached
-        assert get_cached_layers(cache_dir) == {0, 1}
+        # Now both layers should be cached for this prompt
+        assert get_prompt_cached_layers(cache_dir) == {0, 1}
 
         # Verify shapes are correct
         # acts2 should have 2 layers worth of hidden dims (double acts1)
         assert acts2.shape[-1] == acts1.shape[-1] * 2
 
     def test_full_cache_hit(self, tiny_model, tmp_path, monkeypatch):
-        """Full cache hit loads all layers without extraction."""
+        """Full cache hit loads all prompts without extraction."""
         monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
 
         from lmprobe.cache import CachedExtractor
@@ -178,7 +183,8 @@ class TestCachedExtractor:
         from lmprobe.cache import CachedExtractor
         from lmprobe.extraction import ActivationExtractor
 
-        prompts = ["invalidation test"]
+        prompt = "invalidation test"
+        prompts = [prompt]
 
         extractor = ActivationExtractor(
             tiny_model,
@@ -191,8 +197,8 @@ class TestCachedExtractor:
         # First extraction
         acts1, _ = cached.extract(prompts, remote=False)
 
-        # Get cache dir before invalidation
-        cache_dir = get_extraction_cache_dir(tiny_model, prompts)
+        # Get cache dir before invalidation (per-prompt)
+        cache_dir = get_prompt_cache_dir(tiny_model, prompt)
         assert cache_dir.exists()
 
         # Extract with invalidation
@@ -200,7 +206,7 @@ class TestCachedExtractor:
 
         # Cache should exist again
         assert cache_dir.exists()
-        assert get_cached_layers(cache_dir) == {0}
+        assert get_prompt_cached_layers(cache_dir) == {0}
 
     def test_different_prompts_different_cache(self, tiny_model, tmp_path, monkeypatch):
         """Different prompts use different cache directories."""
@@ -223,17 +229,45 @@ class TestCachedExtractor:
         cached.extract(prompts1, remote=False)
         cached.extract(prompts2, remote=False)
 
-        # Should have two different cache directories
-        cache_dir1 = get_extraction_cache_dir(tiny_model, prompts1)
-        cache_dir2 = get_extraction_cache_dir(tiny_model, prompts2)
+        # Should have two different per-prompt cache directories
+        cache_dir1 = get_prompt_cache_dir(tiny_model, prompts1[0])
+        cache_dir2 = get_prompt_cache_dir(tiny_model, prompts2[0])
 
         assert cache_dir1 != cache_dir2
         assert cache_dir1.exists()
         assert cache_dir2.exists()
 
+    def test_cross_request_cache_hit(self, tiny_model, tmp_path, monkeypatch):
+        """Prompts cached in one request are reused in another."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        from lmprobe.cache import CachedExtractor
+        from lmprobe.extraction import ActivationExtractor
+
+        extractor = ActivationExtractor(
+            tiny_model,
+            device="cpu",
+            layers=[0, 1],
+            batch_size=4,
+        )
+        cached = CachedExtractor(extractor)
+
+        # First request: prompts A, B
+        prompts1 = ["prompt A", "prompt B"]
+        cached.extract(prompts1, remote=False)
+
+        # Second request: prompts B, C - B should be cached!
+        prompts2 = ["prompt B", "prompt C"]
+        cached.extract(prompts2, remote=False)
+
+        # All three prompts should be cached
+        assert is_prompt_fully_cached(tiny_model, "prompt A", {0, 1})
+        assert is_prompt_fully_cached(tiny_model, "prompt B", {0, 1})
+        assert is_prompt_fully_cached(tiny_model, "prompt C", {0, 1})
+
 
 class TestLinearProbeWithCache:
-    """Integration tests for LinearProbe with per-layer caching."""
+    """Integration tests for LinearProbe with per-prompt caching."""
 
     def test_iterative_layer_experimentation(self, tiny_model, tmp_path, monkeypatch):
         """Simulates iterative experimentation with different layers."""
@@ -254,12 +288,12 @@ class TestLinearProbeWithCache:
         )
         probe1.fit(positive, negative)
 
-        # Cache should contain layer 0
-        all_prompts = positive + negative
-        cache_dir = get_extraction_cache_dir(tiny_model, all_prompts)
-        assert get_cached_layers(cache_dir) == {0}
+        # Cache should contain layer 0 for each prompt
+        for prompt in positive + negative:
+            cache_dir = get_prompt_cache_dir(tiny_model, prompt)
+            assert get_prompt_cached_layers(cache_dir) == {0}
 
-        # Experiment 2: layers [0, 1] - should reuse layer 0, extract layer 1
+        # Experiment 2: layers [0, 1] - prompts need layer 1 extracted
         probe2 = LinearProbe(
             model=tiny_model,
             layers=[0, 1],
@@ -272,5 +306,7 @@ class TestLinearProbeWithCache:
         assert probe1.classifier_ is not None
         assert probe2.classifier_ is not None
 
-        # Cache should now contain both layers
-        assert get_cached_layers(cache_dir) == {0, 1}
+        # Cache should now contain both layers for each prompt
+        for prompt in positive + negative:
+            cache_dir = get_prompt_cache_dir(tiny_model, prompt)
+            assert get_prompt_cached_layers(cache_dir) == {0, 1}
