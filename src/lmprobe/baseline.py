@@ -16,6 +16,7 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.dummy import DummyClassifier
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 
+from .cache import get_perplexity_cache_path, load_perplexity_cache, save_perplexity_cache
 from .classifiers import resolve_classifier
 
 if TYPE_CHECKING:
@@ -289,18 +290,28 @@ class BaselineProbe:
 
         Uses the model's own logprobs to compute perplexity.
         Features: mean perplexity, min perplexity, max perplexity.
+
+        Results are cached to disk to avoid redundant NDIF calls.
         """
         import torch
+        from tqdm import tqdm
 
         from .extraction import configure_remote, get_cached_model
 
+        # Check cache first
+        cache_path = get_perplexity_cache_path(self.model, prompts)
+        cached = load_perplexity_cache(cache_path)
+        if cached is not None:
+            return cached.numpy()
+
+        # Not cached - compute perplexity
         if self.remote:
             configure_remote()
 
         model = get_cached_model(self.model, self.device, remote=self.remote)
 
         features = []
-        for prompt in prompts:
+        for prompt in tqdm(prompts, desc="Computing perplexity", unit="prompt"):
             # Tokenize
             inputs = model.tokenizer(prompt, return_tensors="pt")
 
@@ -337,7 +348,11 @@ class BaselineProbe:
 
             features.append([mean_ppl, min_ppl, max_ppl])
 
-        return np.array(features)
+        # Cache results
+        features_tensor = torch.tensor(features, dtype=torch.float32)
+        save_perplexity_cache(cache_path, features_tensor)
+
+        return features_tensor.numpy()
 
     def _check_sentence_transformers_installed(self) -> None:
         """Check that sentence-transformers is installed."""

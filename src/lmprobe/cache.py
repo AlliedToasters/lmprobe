@@ -187,6 +187,59 @@ def invalidate_extraction_cache(cache_dir: Path) -> None:
         shutil.rmtree(cache_dir)
 
 
+def get_perplexity_cache_path(model_name: str, prompts: list[str]) -> Path:
+    """Get the cache file path for perplexity features.
+
+    Parameters
+    ----------
+    model_name : str
+        The model identifier.
+    prompts : list[str]
+        The prompts being processed.
+
+    Returns
+    -------
+    Path
+        Path to the perplexity cache file.
+    """
+    base = get_cache_dir()
+    model_hash = _hash_string(model_name)
+    prompts_hash = _hash_prompts(prompts)
+    return base / model_hash / f"perplexity_{prompts_hash}.pt"
+
+
+def load_perplexity_cache(cache_path: Path) -> torch.Tensor | None:
+    """Load cached perplexity features if they exist.
+
+    Parameters
+    ----------
+    cache_path : Path
+        Path to the perplexity cache file.
+
+    Returns
+    -------
+    torch.Tensor | None
+        Cached perplexity features with shape (n_prompts, 3), or None if not cached.
+    """
+    if cache_path.exists():
+        return torch.load(cache_path, weights_only=True)
+    return None
+
+
+def save_perplexity_cache(cache_path: Path, features: torch.Tensor) -> None:
+    """Save perplexity features to cache.
+
+    Parameters
+    ----------
+    cache_path : Path
+        Path to save the cache file.
+    features : torch.Tensor
+        Perplexity features with shape (n_prompts, 3).
+    """
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(features.cpu(), cache_path)
+
+
 def clear_cache() -> int:
     """Clear all cached activations.
 
