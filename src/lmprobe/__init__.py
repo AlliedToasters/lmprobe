@@ -22,7 +22,7 @@ from .baseline import BaselineProbe
 from .battery import BaselineBattery, BaselineResult, BaselineResults
 from .probe import LinearProbe
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = [
     "ActivationBaseline",
     "BaselineBattery",
