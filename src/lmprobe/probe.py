@@ -12,7 +12,11 @@ import numpy as np
 import torch
 from sklearn.base import clone
 
-from .cache import CachedExtractor
+from .cache import (
+    CachedExtractor,
+    is_prompt_pooled_cached,
+    load_prompt_pooled_activations,
+)
 from .classifiers import resolve_classifier
 from .extraction import ActivationExtractor
 from .pooling import (
@@ -196,6 +200,58 @@ class LinearProbe:
             f"Expected True, False, 'per_neuron', or 'per_layer'."
         )
 
+    def _try_load_from_pooled_cache(
+        self,
+        prompts: list[str],
+        pooling_strategy: str,
+    ) -> np.ndarray | None:
+        """Try to load pre-pooled activations from cache.
+
+        This checks if UnifiedCache (or similar) has already cached pooled
+        activations for all prompts. If so, we can skip both extraction AND
+        pooling, loading the final result directly.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            Prompts to check.
+        pooling_strategy : str
+            Pooling strategy (must match what was used during caching).
+
+        Returns
+        -------
+        np.ndarray | None
+            Pooled activations with shape (batch, hidden_dim) if all prompts
+            are in pooled cache. None if any prompt is missing.
+        """
+        # "all" pooling cannot use pre-pooled cache (needs full sequence)
+        if pooling_strategy == "all":
+            return None
+
+        layer_indices = self._extractor.layer_indices
+        required_layers = set(layer_indices)
+
+        # Check if ALL prompts have pooled cache
+        for prompt in prompts:
+            if not is_prompt_pooled_cached(
+                self.model, prompt, required_layers, pooling_strategy
+            ):
+                return None
+
+        # All prompts are in pooled cache - load directly!
+        all_activations = []
+        sorted_layers = sorted(layer_indices)
+        for prompt in prompts:
+            acts = load_prompt_pooled_activations(
+                self.model, prompt, sorted_layers, pooling_strategy
+            )
+            all_activations.append(acts)
+
+        # Concatenate along batch dimension
+        # Each acts has shape (1, n_layers * hidden_dim)
+        pooled = torch.cat(all_activations, dim=0)
+        return pooled.detach().cpu().float().numpy()
+
     def _extract_and_pool(
         self,
         prompts: list[str],
@@ -205,6 +261,10 @@ class LinearProbe:
     ) -> tuple[np.ndarray, torch.Tensor | None]:
         """Extract activations and apply pooling.
 
+        This method first checks if pre-pooled activations are available
+        in cache (e.g., from UnifiedCache with cache_pooled=True). If so,
+        it loads them directly, skipping both extraction and pooling.
+
         Returns
         -------
         tuple[np.ndarray, torch.Tensor | None]
@@ -213,7 +273,16 @@ class LinearProbe:
         """
         remote = self._get_remote(remote)
 
-        # Extract activations (with caching)
+        # Try to load from pooled cache first (skip extraction + pooling)
+        if not invalidate_cache:
+            pooled_from_cache = self._try_load_from_pooled_cache(
+                prompts, pooling_strategy
+            )
+            if pooled_from_cache is not None:
+                # Success! Return directly without extraction
+                return pooled_from_cache, None
+
+        # Fall back to extraction + pooling
         activations, attention_mask = self._cached_extractor.extract(
             prompts,
             remote=remote,
