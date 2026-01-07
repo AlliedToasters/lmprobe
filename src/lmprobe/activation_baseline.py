@@ -10,10 +10,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
+import torch
 from sklearn.base import clone
 from sklearn.decomposition import PCA
 
-from .cache import CachedExtractor
+from .cache import (
+    CachedExtractor,
+    is_prompt_pooled_cached,
+    load_prompt_pooled_activations,
+)
 from .classifiers import resolve_classifier
 from .extraction import ActivationExtractor
 from .pooling import get_pooling_fn
@@ -122,8 +127,55 @@ class ActivationBaseline:
         self.random_direction_: np.ndarray | None = None
         self.pca_: PCA | None = None
 
+    def _try_load_from_pooled_cache(
+        self, prompts: list[str]
+    ) -> np.ndarray | None:
+        """Try to load pre-pooled activations from cache.
+
+        Checks if UnifiedCache (or similar) has already cached pooled
+        activations for all prompts. If so, loads directly.
+
+        Returns
+        -------
+        np.ndarray | None
+            Pooled activations if all prompts are in cache, else None.
+        """
+        layer_indices = self._extractor.layer_indices
+        required_layers = set(layer_indices)
+
+        # Check if ALL prompts have pooled cache
+        for prompt in prompts:
+            if not is_prompt_pooled_cached(
+                self.model, prompt, required_layers, self.pooling
+            ):
+                return None
+
+        # All prompts are in pooled cache - load directly!
+        all_activations = []
+        sorted_layers = sorted(layer_indices)
+        for prompt in prompts:
+            acts = load_prompt_pooled_activations(
+                self.model, prompt, sorted_layers, self.pooling
+            )
+            all_activations.append(acts)
+
+        # Concatenate along batch dimension
+        pooled = torch.cat(all_activations, dim=0)
+        return pooled.detach().cpu().float().numpy()
+
     def _extract_and_pool(self, prompts: list[str]) -> np.ndarray:
-        """Extract and pool activations."""
+        """Extract and pool activations.
+
+        First checks if pre-pooled activations are available in cache
+        (e.g., from UnifiedCache with cache_pooled=True). If so, loads
+        them directly, skipping both extraction and pooling.
+        """
+        # Try to load from pooled cache first
+        pooled_from_cache = self._try_load_from_pooled_cache(prompts)
+        if pooled_from_cache is not None:
+            return pooled_from_cache
+
+        # Fall back to extraction + pooling
         activations, attention_mask = self._cached_extractor.extract(
             prompts, remote=self.remote
         )
