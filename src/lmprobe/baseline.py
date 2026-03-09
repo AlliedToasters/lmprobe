@@ -40,6 +40,8 @@ class BaselineProbe:
         - "sentence_length": Use character/word count features
         - "perplexity": Use model's own logprobs (requires model param)
         - "sentence_transformers": Use off-the-shelf embeddings
+        - "shuffled_labels": Sanity check — trains on shuffled labels using
+          features from base_method. Should get ~50% accuracy.
     classifier : str | BaseEstimator, default="logistic_regression"
         Classification model. Same options as LinearProbe.
         Ignored for method="random" and method="majority".
@@ -50,6 +52,9 @@ class BaselineProbe:
     ngram_range : tuple[int, int], default=(1, 1)
         N-gram range for bow/tfidf. (1, 1) = unigrams only,
         (1, 2) = unigrams and bigrams.
+    base_method : str, default="tfidf"
+        Feature extraction method to use when method="shuffled_labels".
+        Ignored for other methods.
     model : str | None, default=None
         HuggingFace model ID. Required for method="perplexity".
     device : str, default="auto"
@@ -82,6 +87,7 @@ class BaselineProbe:
         "sentence_length",
         "perplexity",
         "sentence_transformers",
+        "shuffled_labels",
     )
 
     def __init__(
@@ -91,6 +97,7 @@ class BaselineProbe:
         random_state: int | None = None,
         max_features: int | None = 10000,
         ngram_range: tuple[int, int] = (1, 1),
+        base_method: str = "tfidf",
         model: str | None = None,
         device: str = "auto",
         remote: bool = False,
@@ -105,11 +112,18 @@ class BaselineProbe:
                 "method='perplexity' requires the 'model' parameter to be specified."
             )
 
+        if method == "shuffled_labels" and base_method not in self.VALID_METHODS:
+            raise ValueError(
+                f"Unknown base_method: {base_method!r}. "
+                f"Valid options: {self.VALID_METHODS}"
+            )
+
         self.method = method
         self.classifier = classifier
         self.random_state = random_state
         self.max_features = max_features
         self.ngram_range = ngram_range
+        self.base_method = base_method
         self.model = model
         self.device = device
         self.remote = remote
@@ -152,28 +166,36 @@ class BaselineProbe:
         prompts = positive_prompts + negative_prompts
         labels = np.array([1] * len(positive_prompts) + [0] * len(negative_prompts))
 
+        # For shuffled_labels, use base_method for features
+        feature_method = self.base_method if self.method == "shuffled_labels" else self.method
+
         # Extract features based on method
-        if self.method == "bow":
+        if feature_method == "bow":
             self.vectorizer_ = CountVectorizer(
                 max_features=self.max_features,
                 ngram_range=self.ngram_range,
             )
             X = self.vectorizer_.fit_transform(prompts)
-        elif self.method == "tfidf":
+        elif feature_method == "tfidf":
             self.vectorizer_ = TfidfVectorizer(
                 max_features=self.max_features,
                 ngram_range=self.ngram_range,
             )
             X = self.vectorizer_.fit_transform(prompts)
-        elif self.method == "sentence_length":
+        elif feature_method == "sentence_length":
             X = self._extract_sentence_length_features(prompts)
-        elif self.method == "perplexity":
+        elif feature_method == "perplexity":
             X = self._compute_perplexity(prompts)
-        elif self.method == "sentence_transformers":
+        elif feature_method == "sentence_transformers":
             X = self._transform_sentence_transformers(prompts, fit=True)
         else:
             # random/majority - features don't matter, just need shape
             X = np.zeros((len(prompts), 1))
+
+        # Shuffle labels for sanity check baseline
+        if self.method == "shuffled_labels":
+            rng = np.random.RandomState(self.random_state)
+            labels = rng.permutation(labels)
 
         # Fit classifier
         self.classifier_ = clone(self._classifier_template)
@@ -252,14 +274,16 @@ class BaselineProbe:
 
     def _transform(self, prompts: list[str]) -> np.ndarray:
         """Transform prompts to feature matrix."""
-        if self.method in ("bow", "tfidf"):
+        feature_method = self.base_method if self.method == "shuffled_labels" else self.method
+
+        if feature_method in ("bow", "tfidf"):
             X = self.vectorizer_.transform(prompts)
             return self._ensure_dense_if_needed(X)
-        elif self.method == "sentence_length":
+        elif feature_method == "sentence_length":
             return self._extract_sentence_length_features(prompts)
-        elif self.method == "perplexity":
+        elif feature_method == "perplexity":
             return self._compute_perplexity(prompts)
-        elif self.method == "sentence_transformers":
+        elif feature_method == "sentence_transformers":
             return self._transform_sentence_transformers(prompts, fit=False)
         else:
             # random/majority
