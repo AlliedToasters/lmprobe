@@ -1,11 +1,9 @@
 """Tests for UnifiedCache - combined activation and perplexity extraction."""
 
 import shutil
-import time
 
 import numpy as np
 import pytest
-import torch
 
 from lmprobe.cache import (
     get_prompt_cache_dir,
@@ -354,7 +352,6 @@ class TestPooledCache:
 
     def test_pooled_vs_unpooled_cache_size(self, tiny_model, tmp_path, monkeypatch):
         """Pooled cache uses significantly less disk space than unpooled."""
-        import os
 
         monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
 
@@ -402,7 +399,8 @@ class TestPooledCache:
         # (exact ratio depends on seq_len, but should be at least 2x smaller)
         assert pooled_size < unpooled_size
         # For reference, print the ratio (helpful for debugging)
-        # print(f"Unpooled: {unpooled_size}, Pooled: {pooled_size}, Ratio: {unpooled_size/pooled_size:.1f}x")
+        # print(f"Unpooled: {unpooled_size}, Pooled: {pooled_size}, "
+        #       f"Ratio: {unpooled_size/pooled_size:.1f}x")
 
     def test_pooled_different_strategies(self, tiny_model, tmp_path, monkeypatch):
         """Different pooling strategies create separate cache entries."""

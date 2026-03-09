@@ -210,7 +210,7 @@ class ActivationBaseline:
         self,
         positive_prompts: list[str],
         negative_prompts: list[str],
-    ) -> "ActivationBaseline":
+    ) -> ActivationBaseline:
         """Fit the baseline on contrastive examples.
 
         Parameters

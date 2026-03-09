@@ -5,7 +5,6 @@ import pytest
 
 from lmprobe.activation_baseline import ActivationBaseline
 
-
 # Test data
 POSITIVE_PROMPTS = [
     "The dog barked loudly",

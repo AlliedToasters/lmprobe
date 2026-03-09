@@ -74,7 +74,7 @@ def configure_remote() -> None:
     """
     api_key = os.getenv("NNSIGHT_API_KEY")
     if not api_key:
-        raise EnvironmentError(
+        raise OSError(
             "NNSIGHT_API_KEY environment variable is required for remote execution. "
             "Set it with: export NNSIGHT_API_KEY='your-key-here'"
         )

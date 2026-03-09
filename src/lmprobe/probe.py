@@ -29,6 +29,8 @@ from .pooling import (
 if TYPE_CHECKING:
     from sklearn.base import BaseEstimator
 
+    from .scaling import PerLayerScaler
+
 
 class LinearProbe:
     """Train a linear probe on language model activations.
@@ -175,7 +177,7 @@ class LinearProbe:
         self.selected_layers_: list[int] | None = None
         self.candidate_layers_: list[int] | None = None
         self.layer_importances_: np.ndarray | None = None
-        self.scaler_: "PerLayerScaler | None" = None  # type: ignore[name-defined]
+        self.scaler_: PerLayerScaler | None = None
 
     def _get_remote(self, remote: bool | None) -> bool:
         """Resolve remote parameter with method-level override."""
@@ -312,7 +314,7 @@ class LinearProbe:
         negative_prompts: list[str] | np.ndarray | list[int] | None = None,
         remote: bool | None = None,
         invalidate_cache: bool = False,
-    ) -> "LinearProbe":
+    ) -> LinearProbe:
         """Fit the probe on training data.
 
         Supports two signatures:
@@ -413,7 +415,7 @@ class LinearProbe:
         labels: np.ndarray,
         remote: bool | None,
         invalidate_cache: bool,
-    ) -> "LinearProbe":
+    ) -> LinearProbe:
         """Fit with automatic layer selection via Group Lasso.
 
         This is a two-phase process:
@@ -536,7 +538,7 @@ class LinearProbe:
         labels: np.ndarray,
         remote: bool | None,
         invalidate_cache: bool,
-    ) -> "LinearProbe":
+    ) -> LinearProbe:
         """Fit with fast automatic layer selection via coefficient importance.
 
         This is a fast alternative to Group Lasso layer selection:
@@ -1040,7 +1042,7 @@ class LinearProbe:
             pickle.dump(state, f)
 
     @classmethod
-    def load(cls, path: str) -> "LinearProbe":
+    def load(cls, path: str) -> LinearProbe:
         """Load a fitted probe from disk.
 
         Parameters

@@ -2,13 +2,11 @@
 
 import numpy as np
 import pytest
-from sklearn.base import BaseEstimator
 
 from lmprobe import LinearProbe
 from lmprobe.classifiers import (
     BUILTIN_CLASSIFIERS,
     build_classifier,
-    resolve_classifier,
     validate_classifier,
 )
 

@@ -14,10 +14,9 @@ The "all" strategy returns per-token activations without reduction.
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 import torch
-
 
 # Strategies valid for training (must produce fixed-size output)
 TRAIN_POOLING_STRATEGIES = frozenset({
@@ -217,7 +216,8 @@ def reduce_scores(
         Shape (batch,) or (batch, n_classes)
     """
     if strategy not in SCORE_POOLING_STRATEGIES:
-        raise ValueError(f"reduce_scores only supports {SCORE_POOLING_STRATEGIES}, got {strategy!r}")
+        valid = SCORE_POOLING_STRATEGIES
+        raise ValueError(f"reduce_scores only supports {valid}, got {strategy!r}")
 
     # Handle masking for padded sequences
     if attention_mask is not None:

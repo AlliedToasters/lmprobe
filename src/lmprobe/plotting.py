@@ -110,7 +110,7 @@ def plot_layer_importance(
 
     # Create bar plot
     x_positions = np.arange(len(candidate_layers))
-    bars = ax.bar(x_positions, layer_importances, color=colors, edgecolor="white")
+    ax.bar(x_positions, layer_importances, color=colors, edgecolor="white")
 
     # Customize axes
     ax.set_xticks(x_positions)

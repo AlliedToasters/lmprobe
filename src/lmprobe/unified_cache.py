@@ -16,7 +16,6 @@ import torch
 from tqdm import tqdm
 
 from .cache import (
-    get_prompt_cache_dir,
     is_prompt_fully_cached,
     is_prompt_perplexity_cached,
     is_prompt_pooled_cached,
@@ -35,7 +34,7 @@ from .extraction import (
     get_num_layers_from_config,
     resolve_layers,
 )
-from .pooling import get_pooling_fn, TRAIN_POOLING_STRATEGIES
+from .pooling import TRAIN_POOLING_STRATEGIES, get_pooling_fn
 
 if TYPE_CHECKING:
     from nnsight import LanguageModel
@@ -65,7 +64,8 @@ class WarmupStats:
     def __repr__(self) -> str:
         return (
             f"WarmupStats(total={self.total_prompts}, "
-            f"activations={self.activations_cached} cached + {self.activations_extracted} extracted, "
+            f"activations={self.activations_cached} cached "
+            f"+ {self.activations_extracted} extracted, "
             f"perplexity={self.perplexity_cached} cached + {self.perplexity_extracted} extracted, "
             f"time={self.elapsed_seconds:.1f}s)"
         )

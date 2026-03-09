@@ -10,7 +10,6 @@ from lmprobe.battery import (
     BaselineResults,
 )
 
-
 # Test data
 POSITIVE_PROMPTS = [
     "The dog barked loudly",
@@ -125,8 +124,12 @@ class TestBaselineResults:
         from lmprobe import BaselineProbe
 
         results = BaselineResults(results=[
-            BaselineResult(name="bow", score=0.8, baseline=BaselineProbe(method="bow"), fit_time=0.1),
-            BaselineResult(name="tfidf", score=0.9, baseline=BaselineProbe(method="tfidf"), fit_time=0.2),
+            BaselineResult(
+                name="bow", score=0.8, baseline=BaselineProbe(method="bow"), fit_time=0.1,
+            ),
+            BaselineResult(
+                name="tfidf", score=0.9, baseline=BaselineProbe(method="tfidf"), fit_time=0.2,
+            ),
         ])
 
         summary = results.summary()

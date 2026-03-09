@@ -1,12 +1,9 @@
 """Tests for per-prompt, per-layer activation caching."""
 
-import shutil
 
-import pytest
 import torch
 
 from lmprobe.cache import (
-    clear_cache,
     get_cached_layers,
     get_extraction_cache_dir,
     get_prompt_cache_dir,
@@ -507,6 +504,7 @@ class TestUnifiedCacheLinearProbeIntegration:
 
         # Get activations via probe's internal method
         import torch
+
         from lmprobe.pooling import get_pooling_fn
 
         pooling_fn = get_pooling_fn(pooling)
@@ -789,6 +787,7 @@ class TestUnifiedCachePerplexityBaselineIntegration:
         monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
 
         import numpy as np
+
         from lmprobe import BaselineProbe, UnifiedCache
 
         prompts = ["Matching test prompt"]

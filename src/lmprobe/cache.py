@@ -58,7 +58,8 @@ def enable_cache_logging(level: int = logging.INFO) -> None:
 
 # Auto-enable logging if LMPROBE_CACHE_DEBUG environment variable is set
 if os.getenv("LMPROBE_CACHE_DEBUG"):
-    enable_cache_logging(logging.DEBUG if os.getenv("LMPROBE_CACHE_DEBUG") == "debug" else logging.INFO)
+    _level = logging.DEBUG if os.getenv("LMPROBE_CACHE_DEBUG") == "debug" else logging.INFO
+    enable_cache_logging(_level)
 
 
 def _format_layers(layers: set[int] | list[int], max_show: int = 10) -> str:
@@ -67,7 +68,9 @@ def _format_layers(layers: set[int] | list[int], max_show: int = 10) -> str:
     if len(sorted_layers) <= max_show:
         return str(sorted_layers)
     else:
-        return f"{sorted_layers[:max_show//2]}...{sorted_layers[-max_show//2:]} ({len(sorted_layers)} total)"
+        head = sorted_layers[:max_show // 2]
+        tail = sorted_layers[-max_show // 2:]
+        return f"{head}...{tail} ({len(sorted_layers)} total)"
 
 
 def get_cache_dir() -> Path:

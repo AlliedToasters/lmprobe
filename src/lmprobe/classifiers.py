@@ -204,7 +204,7 @@ class MassMeanClassifier:
         self.mean_positive_: np.ndarray | None = None
         self.mean_negative_: np.ndarray | None = None
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "MassMeanClassifier":
+    def fit(self, X: np.ndarray, y: np.ndarray) -> MassMeanClassifier:
         """Fit the Mass-Mean classifier.
 
         Parameters
@@ -335,7 +335,7 @@ class MassMeanClassifier:
         """
         return {}
 
-    def set_params(self, **params) -> "MassMeanClassifier":
+    def set_params(self, **params) -> MassMeanClassifier:
         """Set parameters for this estimator (sklearn compatibility).
 
         Parameters
@@ -432,7 +432,7 @@ class GroupLassoClassifier:
 
         return GeneralizedLinearEstimator(datafit, penalty, solver)
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "GroupLassoClassifier":
+    def fit(self, X: np.ndarray, y: np.ndarray) -> GroupLassoClassifier:
         """Fit the Group Lasso classifier.
 
         Parameters

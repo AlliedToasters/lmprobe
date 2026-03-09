@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import time
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -97,7 +98,8 @@ class BaselineResults:
         lines = ["Baseline Results:", "-" * 60]
         for r in sorted(self.results, key=lambda x: x.score, reverse=True):
             lines.append(
-                f"  {r.name:30s} {r.score:.4f}  (fit: {r.fit_time:.2f}s, predict: {r.predict_time:.2f}s)"
+                f"  {r.name:30s} {r.score:.4f}  "
+                f"(fit: {r.fit_time:.2f}s, predict: {r.predict_time:.2f}s)"
             )
         return "\n".join(lines)
 

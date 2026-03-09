@@ -78,6 +78,7 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["N803", "N806"]  # Allow uppercase X, X_train etc. (sklearn convention)
 
 [tool.black]
 line-length = 100

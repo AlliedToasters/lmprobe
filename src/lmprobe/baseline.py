@@ -16,7 +16,6 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.dummy import DummyClassifier
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 
-from .cache import get_perplexity_cache_path, load_perplexity_cache, save_perplexity_cache
 from .classifiers import resolve_classifier
 
 if TYPE_CHECKING:
@@ -134,7 +133,7 @@ class BaselineProbe:
         self,
         positive_prompts: list[str],
         negative_prompts: list[str],
-    ) -> "BaselineProbe":
+    ) -> BaselineProbe:
         """Fit the baseline on contrastive examples.
 
         Parameters
@@ -345,7 +344,7 @@ class BaselineProbe:
             inputs = model.tokenizer(prompt, return_tensors="pt")
 
             # Forward pass to get logits using nnsight tracing
-            with model.trace(inputs, remote=self.remote) as tracer:
+            with model.trace(inputs, remote=self.remote):
                 logits = model.lm_head.output.save()
 
             # Unwrap proxy if needed

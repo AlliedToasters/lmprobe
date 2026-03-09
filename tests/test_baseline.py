@@ -5,7 +5,6 @@ import pytest
 
 from lmprobe.baseline import BaselineProbe
 
-
 # Test data
 POSITIVE_PROMPTS = [
     "The dog barked loudly",

@@ -71,7 +71,7 @@ class PerLayerScaler:
         self.means_: np.ndarray | None = None
         self.stds_: np.ndarray | None = None
 
-    def fit(self, X: np.ndarray) -> "PerLayerScaler":
+    def fit(self, X: np.ndarray) -> PerLayerScaler:
         """Compute per-layer means and standard deviations.
 
         Parameters
