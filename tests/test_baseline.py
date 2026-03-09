@@ -357,3 +357,91 @@ class TestBaselineProbeSentenceTransformers:
         # Should fail during fit when trying to import
         with pytest.raises(ImportError, match="sentence-transformers is required"):
             baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+
+class TestBaselineProbeShuffledLabels:
+    """Test shuffled_labels sanity check baseline."""
+
+    def test_shuffled_labels_fit_predict(self):
+        """Shuffled labels baseline can fit and predict."""
+        baseline = BaselineProbe(
+            method="shuffled_labels",
+            base_method="tfidf",
+            random_state=42,
+        )
+        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+        predictions = baseline.predict(TEST_PROMPTS)
+        assert predictions.shape == (2,)
+        assert set(predictions).issubset({0, 1})
+
+    def test_shuffled_labels_predict_proba(self):
+        """Shuffled labels baseline supports predict_proba."""
+        baseline = BaselineProbe(
+            method="shuffled_labels",
+            base_method="tfidf",
+            random_state=42,
+        )
+        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+        proba = baseline.predict_proba(TEST_PROMPTS)
+        assert proba.shape == (2, 2)
+        np.testing.assert_allclose(proba.sum(axis=1), 1.0)
+
+    def test_shuffled_labels_low_accuracy(self):
+        """Shuffled labels should yield near-chance accuracy on average.
+
+        With shuffled labels, the probe shouldn't learn real signal.
+        Over multiple random seeds, mean accuracy should be near 0.5.
+        """
+        accuracies = []
+        for seed in range(20):
+            baseline = BaselineProbe(
+                method="shuffled_labels",
+                base_method="tfidf",
+                random_state=seed,
+            )
+            baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+            train_prompts = POSITIVE_PROMPTS + NEGATIVE_PROMPTS
+            train_labels = [1] * len(POSITIVE_PROMPTS) + [0] * len(NEGATIVE_PROMPTS)
+            accuracies.append(baseline.score(train_prompts, train_labels))
+
+        mean_acc = np.mean(accuracies)
+        # Should be near chance (0.5), not consistently high
+        assert mean_acc < 0.85, (
+            f"Shuffled labels baseline too accurate ({mean_acc:.2f}), "
+            "suggesting labels aren't properly shuffled"
+        )
+
+    def test_shuffled_labels_reproducible(self):
+        """Same random_state gives same shuffled results."""
+        b1 = BaselineProbe(method="shuffled_labels", random_state=42)
+        b2 = BaselineProbe(method="shuffled_labels", random_state=42)
+
+        b1.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+        b2.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+        pred1 = b1.predict(TEST_PROMPTS)
+        pred2 = b2.predict(TEST_PROMPTS)
+        np.testing.assert_array_equal(pred1, pred2)
+
+    def test_shuffled_labels_default_base_method(self):
+        """Default base_method is tfidf."""
+        baseline = BaselineProbe(method="shuffled_labels", random_state=42)
+        assert baseline.base_method == "tfidf"
+        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+        predictions = baseline.predict(TEST_PROMPTS)
+        assert predictions.shape == (2,)
+
+    def test_shuffled_labels_with_bow(self):
+        """Shuffled labels works with bow base_method."""
+        baseline = BaselineProbe(
+            method="shuffled_labels",
+            base_method="bow",
+            random_state=42,
+        )
+        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
+
+        predictions = baseline.predict(TEST_PROMPTS)
+        assert predictions.shape == (2,)
