@@ -58,9 +58,9 @@ embeddings = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/toast/lmprobe"
-Documentation = "https://github.com/toast/lmprobe#readme"
-Repository = "https://github.com/toast/lmprobe"
+Homepage = "https://github.com/AlliedToasters/lmprobe"
+Documentation = "https://github.com/AlliedToasters/lmprobe#readme"
+Repository = "https://github.com/AlliedToasters/lmprobe"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lmprobe"]
