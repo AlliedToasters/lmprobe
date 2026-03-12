@@ -408,9 +408,9 @@ def load_prompt_activations(
     if sf_path.exists():
         # Touch for LRU
         os.utime(sf_path)
-        keys_to_load = [_raw_layer_key(l) for l in layers] + [_ATTENTION_MASK_KEY]
+        keys_to_load = [_raw_layer_key(li) for li in layers] + [_ATTENTION_MASK_KEY]
         tensors = _load_sf_tensors(sf_path, keys_to_load)
-        layer_acts = [tensors[_raw_layer_key(l)] for l in layers]
+        layer_acts = [tensors[_raw_layer_key(li)] for li in layers]
         activations = torch.cat(layer_acts, dim=-1)
         return activations, tensors[_ATTENTION_MASK_KEY]
 
@@ -530,7 +530,7 @@ def load_prompt_pooled_activations(
     sf_path = get_prompt_cache_path(model_name, prompt)
     if sf_path.exists():
         os.utime(sf_path)
-        keys = [_pooled_layer_key(pooling, l) for l in layers]
+        keys = [_pooled_layer_key(pooling, li) for li in layers]
         tensors = _load_sf_tensors(sf_path, keys)
         return torch.cat([tensors[k] for k in keys], dim=-1)
 
@@ -636,9 +636,11 @@ class CacheInfo:
             for m in sorted(self.models, key=lambda x: x.size_bytes, reverse=True):
                 lines.append(repr(m))
         if self.oldest_mtime:
-            lines.append(f"Oldest entry: {time.strftime('%Y-%m-%d', time.localtime(self.oldest_mtime))}")
+            oldest = time.strftime("%Y-%m-%d", time.localtime(self.oldest_mtime))
+            lines.append(f"Oldest entry: {oldest}")
         if self.newest_mtime:
-            lines.append(f"Newest entry: {time.strftime('%Y-%m-%d', time.localtime(self.newest_mtime))}")
+            newest = time.strftime("%Y-%m-%d", time.localtime(self.newest_mtime))
+            lines.append(f"Newest entry: {newest}")
         return "\n".join(lines)
 
 

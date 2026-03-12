@@ -1,13 +1,10 @@
 """Tests for UnifiedCache - combined activation and perplexity extraction."""
 
-import shutil
-
 import numpy as np
 import pytest
 
 from lmprobe.cache import (
     get_prompt_cache_dir,
-    get_prompt_cached_layers,
     is_prompt_perplexity_cached,
     is_prompt_pooled_cached,
 )
@@ -72,7 +69,7 @@ class TestUnifiedCache:
         assert stats2.activations_extracted == 0
         assert stats2.perplexity_extracted == 0
 
-    def test_get_activations_returns_correct_shapes_unpooled(self, tiny_model, tmp_path, monkeypatch):
+    def test_get_activations_shapes_unpooled(self, tiny_model, tmp_path, monkeypatch):
         """get_activations with cache_pooled=False returns 3D tensor."""
         monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
 

@@ -6,10 +6,8 @@ import torch
 
 from lmprobe.cache import (
     CacheInfo,
-    ModelCacheInfo,
     _hash_string,
     cache_info,
-    clear_cache,
     get_cached_layers,
     get_extraction_cache_dir,
     get_prompt_cache_dir,
