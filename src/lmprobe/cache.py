@@ -287,7 +287,14 @@ def _load_sf_tensors(path: Path, keys: list[str]) -> dict[str, torch.Tensor]:
 
     result = {}
     with safe_open(str(path), framework="pt") as f:
+        available = set(f.keys())
         for k in keys:
+            if k not in available:
+                raise KeyError(
+                    f"Corrupted or incomplete cache file {path}: "
+                    f"missing key {k!r}. Available keys: {sorted(available)}. "
+                    f"Delete this file and re-run to rebuild the cache."
+                )
             result[k] = f.get_tensor(k)
     return result
 
@@ -804,13 +811,16 @@ def _maybe_evict() -> None:
     evicted_count = 0
 
     for path, size, _mtime in entries:
-        if total_size - evicted_size <= _CACHE_MAX_BYTES:
+        if total_size - evicted_size < _CACHE_MAX_BYTES:
             break
 
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except FileNotFoundError:
+            pass
         evicted_size += size
         evicted_count += 1
 
@@ -1080,11 +1090,11 @@ class CachedExtractor:
             if seq_len < max_seq_len:
                 pad_size = max_seq_len - seq_len
                 acts = torch.cat(
-                    [acts, torch.zeros(1, pad_size, hidden_dim, dtype=acts.dtype)],
+                    [acts, torch.zeros(acts.shape[0], pad_size, hidden_dim, dtype=acts.dtype)],
                     dim=1,
                 )
                 mask = torch.cat(
-                    [mask, torch.zeros(1, pad_size, dtype=mask.dtype)], dim=1
+                    [mask, torch.zeros(acts.shape[0], pad_size, dtype=mask.dtype)], dim=1
                 )
             padded_activations.append(acts)
             padded_masks.append(mask)

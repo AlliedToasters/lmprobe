@@ -2,6 +2,7 @@
 
 import os
 
+import pytest
 import torch
 
 from lmprobe.cache import (
@@ -217,15 +218,20 @@ class TestDiskFullError:
     """Tests for disk-full error handling (#44)."""
 
     def test_clear_error_message_on_disk_full(self, tmp_path, monkeypatch):
-        """Verify the error handling path exists (can't easily simulate disk full)."""
+        """Disk-full errors are wrapped with a helpful message."""
         monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
-        # Just verify save works normally (the error path wraps the save)
-        save_prompt_activations(
-            "test", "test", [0],
-            torch.randn(1, 3, 64),
-            torch.ones(1, 3, dtype=torch.long),
-        )
-        assert is_prompt_fully_cached("test", "test", {0})
+
+        def fake_save_file(*args, **kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr("safetensors.torch.save_file", fake_save_file)
+
+        with pytest.raises(OSError, match="Disk full"):
+            save_prompt_activations(
+                "test", "test", [0],
+                torch.randn(1, 3, 64),
+                torch.ones(1, 3, dtype=torch.long),
+            )
 
 
 class TestCacheDtype:
@@ -250,13 +256,23 @@ class TestCacheDtype:
             set_cache_dtype(None)
 
     def test_env_var_dtype(self, tmp_path, monkeypatch):
-        """LMPROBE_CACHE_DTYPE env var is respected at module level."""
-        # This tests the config mechanism; actual env var is read at import time
-        from lmprobe.cache import _DTYPE_MAP
+        """set_cache_dtype changes the active dtype and saves respect it."""
+        import lmprobe.cache as cache_mod
 
-        assert "float16" in _DTYPE_MAP
-        assert "bfloat16" in _DTYPE_MAP
-        assert "float32" in _DTYPE_MAP
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        set_cache_dtype("float16")
+        try:
+            assert cache_mod._CACHE_DTYPE == torch.float16
+
+            acts = torch.randn(1, 3, 64, dtype=torch.float32)
+            mask = torch.ones(1, 3, dtype=torch.long)
+            save_prompt_activations("test", "dtype-check", [0], acts, mask)
+
+            loaded_acts, _ = load_prompt_activations("test", "dtype-check", [0])
+            assert loaded_acts.dtype == torch.float16
+        finally:
+            set_cache_dtype(None)
 
 
 class TestCacheInfo:
@@ -345,9 +361,10 @@ class TestLRUEviction:
                 torch.ones(1, 10, dtype=torch.long),
             )
 
-            # Cache should now be under the limit
+            # Cache should now be near the limit (allow for the trigger prompt)
             info_after = cache_info()
-            assert info_after.total_size_bytes <= total_bytes
+            one_prompt_size = total_bytes / 5  # approximate size of one prompt
+            assert info_after.total_size_bytes <= half + one_prompt_size
         finally:
             set_cache_limit(None)
 
