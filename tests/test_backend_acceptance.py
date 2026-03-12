@@ -258,6 +258,29 @@ class TestDeviceConfiguration:
         device = next(backend.model.parameters()).device
         assert device.type == "cpu"
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available()
+        or not torch.cuda.get_device_capability()[0] >= 7,
+        reason="Compatible CUDA device not available",
+    )
+    def test_cuda_device(self, tiny_model):
+        backend = LocalBackend(tiny_model, device="cuda")
+        device = next(backend.model.parameters()).device
+        assert device.type == "cuda"
+        acts, mask = backend.extract_batch(["Hello"], [0])
+        assert acts.device.type == "cuda"
+
+    @pytest.mark.skipif(
+        not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
+        reason="MPS not available",
+    )
+    def test_mps_device(self, tiny_model):
+        backend = LocalBackend(tiny_model, device="mps")
+        device = next(backend.model.parameters()).device
+        assert device.type == "mps"
+        acts, mask = backend.extract_batch(["Hello"], [0])
+        assert acts.device.type == "mps"
+
 
 class TestDtypeConfiguration:
     """Verify dtype parameter works for LocalBackend."""
