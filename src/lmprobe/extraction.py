@@ -683,6 +683,7 @@ class ActivationExtractor:
         auto_candidates: list[int] | list[float] | None = None,
         remote: bool = False,
         backend: str = "nnsight",
+        dtype: torch.dtype | None = None,
     ):
         self.model_name = model_name
         self.device = device
@@ -695,7 +696,9 @@ class ActivationExtractor:
         # Create the backend
         from .backends import resolve_backend
 
-        self._backend = resolve_backend(backend, model_name, device, remote=remote)
+        self._backend = resolve_backend(
+            backend, model_name, device, remote=remote, dtype=dtype
+        )
 
         # Lazy-loaded
         self._model: LanguageModel | None = None

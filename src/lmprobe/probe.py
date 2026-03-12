@@ -31,6 +31,26 @@ if TYPE_CHECKING:
 
     from .scaling import PerLayerScaler
 
+_DTYPE_MAP = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def _resolve_dtype(dtype: str | None) -> torch.dtype | None:
+    """Resolve a dtype string to a torch.dtype, or None."""
+    if dtype is None:
+        return None
+    if isinstance(dtype, str):
+        if dtype not in _DTYPE_MAP:
+            raise ValueError(
+                f"Unknown dtype: {dtype!r}. "
+                f"Available: {list(_DTYPE_MAP.keys())}"
+            )
+        return _DTYPE_MAP[dtype]
+    return dtype
+
 
 class LinearProbe:
     """Train a linear probe on language model activations.
@@ -91,6 +111,9 @@ class LinearProbe:
         Extraction backend: "nnsight" (default) or "local".
         "local" uses HuggingFace transformers directly without nnsight,
         enabling use with models not supported by nnsight/NDIF.
+    dtype : str | None, default=None
+        Model dtype for local backend: "float32", "float16", or "bfloat16".
+        Defaults to "float32" if None. Ignored for nnsight backend.
 
     Attributes
     ----------
@@ -145,6 +168,7 @@ class LinearProbe:
         normalize_layers: bool | str = True,
         fast_auto_top_k: int | None = None,
         backend: str = "nnsight",
+        dtype: str | None = None,
     ):
         self.model = model
         self.layers = layers
@@ -161,6 +185,7 @@ class LinearProbe:
         self.normalize_layers = normalize_layers
         self.fast_auto_top_k = fast_auto_top_k
         self.backend = backend
+        self.dtype = dtype
 
         # Validate backend + remote compatibility
         if backend == "local" and remote:
@@ -179,9 +204,11 @@ class LinearProbe:
 
         # Create extractor (lazy loads model)
         # Pass remote flag so large models (e.g., 405B) don't download weights locally
+        _torch_dtype = _resolve_dtype(dtype)
         self._extractor = ActivationExtractor(
             model, device, layers, batch_size,
             auto_candidates=auto_candidates, remote=remote, backend=backend,
+            dtype=_torch_dtype,
         )
         self._cached_extractor = CachedExtractor(self._extractor)
 
@@ -1048,6 +1075,7 @@ class LinearProbe:
             "normalize_layers": self.normalize_layers,
             "fast_auto_top_k": self.fast_auto_top_k,
             "backend": self.backend,
+            "dtype": self.dtype,
             "classifier_": self.classifier_,
             "classes_": self.classes_,
             "selected_layers_": self.selected_layers_,
@@ -1103,6 +1131,7 @@ class LinearProbe:
             normalize_layers=state.get("normalize_layers", True),
             fast_auto_top_k=state.get("fast_auto_top_k"),
             backend=state.get("backend", "nnsight"),
+            dtype=state.get("dtype"),
         )
 
         # Restore original layers spec for reference
