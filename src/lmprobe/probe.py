@@ -373,6 +373,15 @@ class LinearProbe:
         self.layer_importances_: np.ndarray | None = None
         self.scaler_: PerLayerScaler | None = None
 
+        # Training data cache (for push_to_hub)
+        self._training_positive_: list[str] | None = None
+        self._training_negative_: list[str] | None = None
+        self._training_prompts_: list[str] | None = None
+        self._training_labels_: list[int] | None = None
+
+        # Evaluation results cache (for push_to_hub)
+        self._evaluation_results_: dict | None = None
+
     def _check_model(self) -> None:
         """Check that a model was provided (needed for prompt-based methods)."""
         if self.model is None:
@@ -589,12 +598,22 @@ class LinearProbe:
             # Standard mode: fit(prompts, labels)
             prompts = positive_prompts
             labels = np.asarray(negative_prompts)
+            # Cache for push_to_hub
+            self._training_prompts_ = list(positive_prompts)
+            self._training_labels_ = list(negative_prompts)
+            self._training_positive_ = None
+            self._training_negative_ = None
         else:
             # Contrastive mode: fit(positive_prompts, negative_prompts)
             prompts = list(positive_prompts) + list(negative_prompts)
             labels = np.array(
                 [1] * len(positive_prompts) + [0] * len(negative_prompts)
             )
+            # Cache for push_to_hub
+            self._training_positive_ = list(positive_prompts)
+            self._training_negative_ = list(negative_prompts)
+            self._training_prompts_ = None
+            self._training_labels_ = None
 
         # Check if auto layer selection is needed
         if self.layers == "auto":
@@ -1063,6 +1082,172 @@ class LinearProbe:
         predictions = self.predict(prompts, remote=remote)
         labels = np.asarray(labels)
         return float((predictions == labels).mean())
+
+    def evaluate(
+        self,
+        prompts: list[str],
+        labels: list[int] | np.ndarray,
+        remote: bool | None = None,
+    ) -> dict:
+        """Compute a standard set of evaluation metrics.
+
+        Computes accuracy, AUROC, F1, precision, and recall. Results are
+        cached on ``self._evaluation_results_`` for use by ``push_to_hub()``.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            Evaluation prompts (should NOT be training data).
+        labels : list[int] | np.ndarray
+            True labels.
+        remote : bool | None
+            Override the instance-level remote setting.
+
+        Returns
+        -------
+        dict
+            Metrics dict with keys: accuracy, auroc, f1, precision, recall,
+            n_eval, eval_hash.
+        """
+        from sklearn.metrics import (
+            accuracy_score,
+            f1_score,
+            precision_score,
+            recall_score,
+        )
+
+        self._check_fitted()
+        labels = np.asarray(labels)
+        predictions = self.predict(prompts, remote=remote)
+
+        results: dict = {
+            "accuracy": float(accuracy_score(labels, predictions)),
+            "f1": float(f1_score(labels, predictions, zero_division=0)),
+            "precision": float(precision_score(labels, predictions, zero_division=0)),
+            "recall": float(recall_score(labels, predictions, zero_division=0)),
+        }
+
+        # AUROC if predict_proba is available
+        if self.task == "classification" and hasattr(self.classifier_, "predict_proba"):
+            try:
+                from sklearn.metrics import roc_auc_score
+
+                probabilities = self.predict_proba(prompts, remote=remote)
+                if probabilities.ndim == 2 and probabilities.shape[1] == 2:
+                    results["auroc"] = float(roc_auc_score(labels, probabilities[:, 1]))
+                else:
+                    results["auroc"] = float(roc_auc_score(labels, probabilities))
+            except Exception:
+                pass
+
+        # Metadata
+        from .hub import _hash_prompts
+
+        label_strs = [str(val) for val in labels]
+        combined = list(prompts) + label_strs
+        results["n_eval"] = len(prompts)
+        results["eval_hash"] = _hash_prompts(combined)
+
+        self._evaluation_results_ = results
+        return results
+
+    def push_to_hub(
+        self,
+        repo_id: str,
+        description: str | None = None,
+        class_labels: dict[int, str] | None = None,
+        tags: list[str] | None = None,
+        metrics: dict[str, float] | None = None,
+        include_training_data: bool = True,
+        training_prompts: tuple[list[str], list[str]] | None = None,
+        private: bool = False,
+        license: str = "mit",
+        commit_message: str = "Upload lmprobe probe",
+    ) -> str:
+        """Push this fitted probe to the HuggingFace Hub.
+
+        Parameters
+        ----------
+        repo_id : str
+            HuggingFace Hub repository ID (e.g., "username/probe-name").
+        description : str | None
+            Human-readable description.
+        class_labels : dict[int, str] | None
+            Human-readable class labels.
+        tags : list[str] | None
+            Additional tags.
+        metrics : dict[str, float] | None
+            Evaluation metrics (overrides cached evaluate() results).
+        include_training_data : bool
+            Include training prompts in training_info.json.
+        training_prompts : tuple[list[str], list[str]] | None
+            (positive, negative) prompts if not cached from fit().
+        private : bool
+            Create a private repository.
+        license : str
+            License identifier.
+        commit_message : str
+            Git commit message for the upload.
+
+        Returns
+        -------
+        str
+            URL of the created/updated Hub repository.
+        """
+        from .hub import push_to_hub
+
+        return push_to_hub(
+            self,
+            repo_id=repo_id,
+            description=description,
+            class_labels=class_labels,
+            tags=tags,
+            metrics=metrics,
+            include_training_data=include_training_data,
+            training_prompts=training_prompts,
+            private=private,
+            license=license,
+            commit_message=commit_message,
+        )
+
+    @classmethod
+    def from_hub(
+        cls,
+        repo_id: str,
+        revision: str | None = None,
+        trust_classifier: bool = False,
+        load_model: bool = False,
+        device: str | None = None,
+    ) -> LinearProbe:
+        """Load a probe from the HuggingFace Hub.
+
+        Parameters
+        ----------
+        repo_id : str
+            HuggingFace Hub repository ID.
+        revision : str | None
+            Specific commit of the probe repo.
+        trust_classifier : bool
+            Must be True to load the classifier. Required for security.
+        load_model : bool
+            If True, download and initialize the base model.
+        device : str | None
+            Override device for inference.
+
+        Returns
+        -------
+        LinearProbe
+            The loaded probe.
+        """
+        from .hub import from_hub
+
+        return from_hub(
+            repo_id=repo_id,
+            revision=revision,
+            trust_classifier=trust_classifier,
+            load_model=load_model,
+            device=device,
+        )
 
     def plot_layer_importance(
         self,
