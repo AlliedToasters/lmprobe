@@ -345,7 +345,7 @@ class BaselineProbe:
         # Load cached prompts
         for i in cached_indices:
             ppl = load_prompt_perplexity(self.model, prompts[i])
-            features[i] = ppl.numpy()
+            features[i] = ppl.float().numpy()
 
         # If all prompts are cached, return early
         if not uncached_prompts:
@@ -402,7 +402,7 @@ class BaselineProbe:
             ppl_tensor = torch.tensor([mean_ppl, min_ppl, max_ppl], dtype=torch.float32)
             save_prompt_perplexity(self.model, prompt, ppl_tensor)
 
-            features[idx] = ppl_tensor.numpy()
+            features[idx] = ppl_tensor.float().numpy()
 
         return features
 
