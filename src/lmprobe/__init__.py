@@ -61,10 +61,15 @@ def set_max_threads(n: int) -> None:
         Maximum number of threads to use.
     """
     import os
+
     import torch
+
     torch.set_num_threads(n)
     torch.set_num_interop_threads(n)
-    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    for var in (
+        "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+    ):
         os.environ[var] = str(n)
 
 
