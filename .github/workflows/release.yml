@@ -17,6 +17,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Sync with latest main
+        run: git pull --rebase origin main
+
       - name: Bump patch version
         id: bump
         run: |
@@ -37,7 +40,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main
           git add pyproject.toml
           git commit -m "Bump version to ${{ steps.bump.outputs.version }}"
           git push
