@@ -307,8 +307,12 @@ class MassMeanClassifier:
         """
         scores = self.decision_function(X)
 
-        # Sigmoid to get P(y=1)
-        prob_positive = 1 / (1 + np.exp(-scores))
+        # Numerically stable sigmoid to get P(y=1)
+        prob_positive = np.empty_like(scores, dtype=np.float64)
+        pos = scores >= 0
+        neg = ~pos
+        prob_positive[pos] = 1 / (1 + np.exp(-scores[pos]))
+        prob_positive[neg] = np.exp(scores[neg]) / (1 + np.exp(scores[neg]))
         prob_negative = 1 - prob_positive
 
         return np.column_stack([prob_negative, prob_positive])
@@ -540,8 +544,12 @@ class GroupLassoClassifier:
         intercept = self.intercept_ if self.intercept_ is not None else 0
         scores = X @ self.coef_ + intercept
 
-        # Sigmoid to get P(y=1)
-        prob_positive = 1 / (1 + np.exp(-scores))
+        # Numerically stable sigmoid to get P(y=1)
+        prob_positive = np.empty_like(scores, dtype=np.float64)
+        pos = scores >= 0
+        neg = ~pos
+        prob_positive[pos] = 1 / (1 + np.exp(-scores[pos]))
+        prob_positive[neg] = np.exp(scores[neg]) / (1 + np.exp(scores[neg]))
         prob_negative = 1 - prob_positive
 
         return np.column_stack([prob_negative, prob_positive])
