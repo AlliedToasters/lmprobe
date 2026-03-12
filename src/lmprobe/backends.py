@@ -255,18 +255,27 @@ def _get_local_model(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        if device == "auto":
-            device_map = "auto"
-        elif device == "cpu":
-            device_map = {"": "cpu"}
-        else:
-            device_map = {"": device}
+        from transformers import AutoConfig
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map=device_map,
-            torch_dtype=dtype,
-        )
+        config = AutoConfig.from_pretrained(model_name)
+        if getattr(config, "quantization_config", None) is not None:
+            if config.quantization_config.get("linear_class") == "autobitlinear":
+                config.quantization_config["linear_class"] = "bitlinear"
+
+        if device == "auto":
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                config=config,
+                device_map="auto",
+                torch_dtype=dtype,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                config=config,
+                torch_dtype=dtype,
+            )
+            model = model.to(device)
         model.eval()
         _LOCAL_MODEL_CACHE[cache_key] = (model, tokenizer)
 

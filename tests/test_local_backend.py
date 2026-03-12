@@ -4,11 +4,19 @@ These tests verify that backend="local" works end-to-end with LinearProbe,
 producing the same shapes and behaviors as the nnsight backend.
 """
 
+from unittest.mock import patch
+
 import numpy as np
 import pytest
+import torch
 
 from lmprobe import LinearProbe
-from lmprobe.backends import LocalBackend, resolve_backend
+from lmprobe.backends import (
+    LocalBackend,
+    _get_local_model,
+    clear_local_model_cache,
+    resolve_backend,
+)
 
 POSITIVE_PROMPTS = [
     "Who wants to go for a walk?",
@@ -184,3 +192,101 @@ class TestLocalFitPredict:
                 remote=True,
                 backend="local",
             )
+
+
+class TestDeviceMapFix:
+    """Tests for issue #23: device_map should not be used for explicit devices."""
+
+    def test_cpu_loads_without_device_map(self, tiny_model):
+        """Loading with device='cpu' should not pass device_map to from_pretrained.
+
+        This verifies the fix for issue #23: explicit single-device cases
+        use .to(device) instead of device_map, avoiding the accelerate dependency.
+        """
+        clear_local_model_cache()
+
+        from transformers import AutoModelForCausalLM
+
+        original_from_pretrained = AutoModelForCausalLM.from_pretrained
+        captured_kwargs = {}
+
+        def capturing_from_pretrained(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return original_from_pretrained(*args, **kwargs)
+
+        try:
+            with patch.object(
+                AutoModelForCausalLM,
+                "from_pretrained",
+                side_effect=capturing_from_pretrained,
+            ):
+                model, tokenizer = _get_local_model(tiny_model, "cpu")
+
+            assert "device_map" not in captured_kwargs
+            assert next(model.parameters()).device == torch.device("cpu")
+        finally:
+            clear_local_model_cache()
+
+    def test_cpu_model_loads_and_extracts(self, tiny_model):
+        """End-to-end: model loaded with device='cpu' can extract activations."""
+        clear_local_model_cache()
+        backend = resolve_backend("local", tiny_model, "cpu")
+        acts, mask = backend.extract_batch(["Hello world"], [0])
+        assert acts.ndim == 3
+        assert next(backend.model.parameters()).device == torch.device("cpu")
+
+
+class TestBitNetConfigOverride:
+    """Tests for issue #25: BitNet autobitlinear config override."""
+
+    def test_autobitlinear_config_is_overridden(self):
+        """Verify that autobitlinear linear_class gets overridden to bitlinear."""
+        from transformers import AutoConfig
+
+        with patch.object(AutoConfig, "from_pretrained") as mock_config:
+            fake_config = type("FakeConfig", (), {
+                "quantization_config": {"linear_class": "autobitlinear"},
+            })()
+            mock_config.return_value = fake_config
+
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            with patch.object(AutoTokenizer, "from_pretrained"):
+                with patch.object(
+                    AutoModelForCausalLM, "from_pretrained"
+                ) as mock_model:
+                    mock_model.return_value = type("FakeModel", (), {
+                        "eval": lambda self: None,
+                        "to": lambda self, device: self,
+                    })()
+                    clear_local_model_cache()
+                    _get_local_model("fake-bitnet-model", "cpu")
+
+            assert fake_config.quantization_config["linear_class"] == "bitlinear"
+            clear_local_model_cache()
+
+    def test_non_bitnet_config_unchanged(self):
+        """Configs without autobitlinear should not be modified."""
+        from transformers import AutoConfig
+
+        with patch.object(AutoConfig, "from_pretrained") as mock_config:
+            fake_config = type("FakeConfig", (), {
+                "quantization_config": None,
+            })()
+            mock_config.return_value = fake_config
+
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            with patch.object(AutoTokenizer, "from_pretrained"):
+                with patch.object(
+                    AutoModelForCausalLM, "from_pretrained"
+                ) as mock_model:
+                    mock_model.return_value = type("FakeModel", (), {
+                        "eval": lambda self: None,
+                        "to": lambda self, device: self,
+                    })()
+                    clear_local_model_cache()
+                    _get_local_model("fake-normal-model", "cpu")
+
+            assert fake_config.quantization_config is None
+            clear_local_model_cache()
