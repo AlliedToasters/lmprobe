@@ -296,6 +296,91 @@ class TestRenderModelCard:
         assert "0.9800" in card
 
 
+    def test_model_card_uses_repo_id_in_usage(self, fitted_probe):
+        """Issue #57: usage example should show actual repo_id, not placeholder."""
+        from lmprobe.hub import _build_probe_config, _build_training_info, _render_model_card
+
+        config = _build_probe_config(fitted_probe)
+        config["probe"]["serialization_format"] = "skops"
+        info = _build_training_info(fitted_probe)
+        card = _render_model_card(
+            config, info, repo_id="latent-lab/my-probe"
+        )
+
+        assert 'from_hub("latent-lab/my-probe"' in card
+        assert "REPO_ID" not in card
+
+    def test_model_card_fallback_repo_id(self, fitted_probe):
+        """When repo_id is not provided, falls back to REPO_ID placeholder."""
+        from lmprobe.hub import _build_probe_config, _build_training_info, _render_model_card
+
+        config = _build_probe_config(fitted_probe)
+        config["probe"]["serialization_format"] = "skops"
+        info = _build_training_info(fitted_probe)
+        card = _render_model_card(config, info)
+
+        assert "REPO_ID" in card
+
+    def test_model_card_omits_limitations_by_default(self, fitted_probe):
+        """Issue #58: no placeholder limitations text when not provided."""
+        from lmprobe.hub import _build_probe_config, _build_training_info, _render_model_card
+
+        config = _build_probe_config(fitted_probe)
+        config["probe"]["serialization_format"] = "skops"
+        info = _build_training_info(fitted_probe)
+        card = _render_model_card(config, info)
+
+        assert "Limitations and Intended Use" not in card
+        assert "Please fill in" not in card
+
+    def test_model_card_with_limitations(self, fitted_probe):
+        """Issue #58: limitations text renders when provided."""
+        from lmprobe.hub import _build_probe_config, _build_training_info, _render_model_card
+
+        config = _build_probe_config(fitted_probe)
+        config["probe"]["serialization_format"] = "skops"
+        info = _build_training_info(fitted_probe)
+        card = _render_model_card(
+            config, info, limitations="Not suitable for production use."
+        )
+
+        assert "## Limitations and Intended Use" in card
+        assert "Not suitable for production use." in card
+
+    def test_model_card_compact_layers_for_named_spec(self, fitted_probe):
+        """Issue #59: named layer specs show compact format."""
+        from lmprobe.hub import _build_probe_config, _build_training_info, _render_model_card
+
+        config = _build_probe_config(fitted_probe)
+        config["probe"]["serialization_format"] = "skops"
+        # Simulate "all" spec with many layers
+        config["probe"]["layers_spec_original"] = "all"
+        config["probe"]["layers"] = list(range(30))
+        info = _build_training_info(fitted_probe)
+        card = _render_model_card(config, info)
+
+        assert "all (0\u201329, 30 layers)" in card
+        # Should NOT contain the full list
+        assert "[0, 1, 2, 3," not in card
+
+    def test_model_card_eval_hash(self, fitted_probe):
+        """Issue #61: eval hash and size shown in model card."""
+        from lmprobe.hub import _build_probe_config, _build_training_info, _render_model_card
+
+        config = _build_probe_config(fitted_probe)
+        config["probe"]["serialization_format"] = "skops"
+        metrics = {
+            "accuracy": 0.95,
+            "n_eval": 300,
+            "eval_hash": "sha256:abc123",
+        }
+        info = _build_training_info(fitted_probe, metrics=metrics)
+        card = _render_model_card(config, info)
+
+        assert "**Evaluation samples**: 300" in card
+        assert "**Evaluation hash**: `sha256:abc123`" in card
+
+
 class TestSerializationRoundtrip:
     """Test classifier serialization and deserialization."""
 
