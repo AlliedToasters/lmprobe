@@ -876,7 +876,7 @@ class LinearProbe:
                     self._inference_pooling,
                     attention_mask,
                 )
-                return reduced.numpy()
+                return reduced.float().numpy()
             else:
                 # Return per-token probabilities
                 return probs
@@ -1093,7 +1093,7 @@ class LinearProbe:
     def _to_numpy(X) -> np.ndarray:
         """Convert input to numpy array, handling torch tensors."""
         if isinstance(X, torch.Tensor):
-            return X.detach().cpu().numpy()
+            return X.detach().cpu().float().numpy()
         return np.asarray(X)
 
     def fit_from_activations(

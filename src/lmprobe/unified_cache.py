@@ -491,6 +491,6 @@ class UnifiedCache:
         features = []
         for prompt in prompts:
             ppl = load_prompt_perplexity(self.model_name, prompt)
-            features.append(ppl.numpy())
+            features.append(ppl.float().numpy())
 
         return np.array(features)
