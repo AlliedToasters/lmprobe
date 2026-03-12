@@ -510,6 +510,29 @@ class LinearProbe:
             # Return attention_mask for later use
             return pooled.detach().cpu().float().numpy(), attention_mask
 
+    def warmup(
+        self,
+        prompts: list[str],
+        remote: bool | None = None,
+    ) -> None:
+        """Extract and cache activations without training a classifier.
+
+        Use this to pre-populate the activation cache for a set of prompts.
+        This is useful when you want to separate the (expensive) activation
+        extraction step from the (cheap) classifier training step, or when
+        you plan to train multiple probes on the same prompts.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            Text prompts to extract and cache activations for.
+        remote : bool | None
+            Override the instance-level remote setting.
+        """
+        self._check_model()
+        use_remote = self._get_remote(remote)
+        self._cached_extractor.extract(prompts, remote=use_remote)
+
     def fit(
         self,
         positive_prompts: list[str],

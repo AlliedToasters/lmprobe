@@ -233,6 +233,49 @@ class TestUnifiedCache:
         assert stats2.activations_extracted == 1
 
 
+    def test_dtype_parameter_passed_to_backend(self, tiny_model, tmp_path, monkeypatch):
+        """dtype parameter is stored and passed through to resolve_backend."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            dtype="float32",
+        )
+
+        assert cache.dtype == "float32"
+
+        # Trigger backend creation and verify it works
+        prompts = ["dtype test prompt"]
+        stats = cache.warmup(prompts)
+        assert stats.activations_extracted == 1
+
+    def test_dtype_none_default(self, tiny_model):
+        """dtype defaults to None when not specified."""
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            device="cpu",
+        )
+        assert cache.dtype is None
+
+    def test_dtype_invalid_raises(self, tiny_model):
+        """Invalid dtype string raises ValueError on backend creation."""
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            device="cpu",
+            dtype="invalid_dtype",
+        )
+        import pytest
+        with pytest.raises(ValueError, match="Unknown dtype"):
+            # Access _resolved_backend to trigger dtype resolution
+            _ = cache._resolved_backend
+
+
 class TestWarmupStats:
     """Tests for WarmupStats dataclass."""
 
