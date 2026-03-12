@@ -20,7 +20,7 @@ Example
 from .activation_baseline import ActivationBaseline
 from .baseline import BaselineProbe
 from .battery import BaselineBattery, BaselineResult, BaselineResults
-from .probe import LinearProbe
+from .probe import LayerSweepResult, LinearProbe
 
 __version__ = "0.5.0"
 __all__ = [
@@ -29,6 +29,7 @@ __all__ = [
     "BaselineProbe",
     "BaselineResult",
     "BaselineResults",
+    "LayerSweepResult",
     "LinearProbe",
     "PerLayerScaler",
     "UnifiedCache",

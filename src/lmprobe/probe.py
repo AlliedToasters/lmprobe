@@ -6,6 +6,7 @@ This is the main user-facing class for lmprobe.
 from __future__ import annotations
 
 import pickle
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -50,6 +51,133 @@ def _resolve_dtype(dtype: str | None) -> torch.dtype | None:
             )
         return _DTYPE_MAP[dtype]
     return dtype
+
+
+@dataclass
+class LayerSweepResult:
+    """Results from a per-layer probe sweep.
+
+    Contains a fitted LinearProbe for each layer, with convenience methods
+    for scoring and finding the best layer.
+
+    Parameters
+    ----------
+    probes : dict[int, LinearProbe]
+        Mapping from layer index to fitted LinearProbe.
+
+    Examples
+    --------
+    >>> result = LinearProbe.sweep_layers(
+    ...     model="meta-llama/Llama-3.1-8B-Instruct",
+    ...     positive_prompts=pos,
+    ...     negative_prompts=neg,
+    ...     layers="all",
+    ... )
+    >>> scores = result.score(test_prompts, test_labels)
+    >>> print(f"Best layer: {result.best_layer(test_prompts, test_labels)}")
+    """
+
+    probes: dict[int, LinearProbe] = field(default_factory=dict)
+
+    @property
+    def layers(self) -> list[int]:
+        """Return sorted list of layer indices in this sweep."""
+        return sorted(self.probes.keys())
+
+    def __len__(self) -> int:
+        return len(self.probes)
+
+    def __getitem__(self, layer: int) -> LinearProbe:
+        """Get the probe for a specific layer."""
+        return self.probes[layer]
+
+    def score(
+        self,
+        test_prompts: list[str],
+        test_labels: list[int] | np.ndarray,
+    ) -> dict[int, float]:
+        """Score each layer's probe on test data.
+
+        Parameters
+        ----------
+        test_prompts : list[str]
+            Test prompts.
+        test_labels : list[int] | np.ndarray
+            True labels.
+
+        Returns
+        -------
+        dict[int, float]
+            Mapping from layer index to accuracy.
+        """
+        return {
+            layer: probe.score(test_prompts, test_labels)
+            for layer, probe in sorted(self.probes.items())
+        }
+
+    def best_layer(
+        self,
+        test_prompts: list[str],
+        test_labels: list[int] | np.ndarray,
+    ) -> int:
+        """Return the layer index with the highest accuracy.
+
+        Parameters
+        ----------
+        test_prompts : list[str]
+            Test prompts.
+        test_labels : list[int] | np.ndarray
+            True labels.
+
+        Returns
+        -------
+        int
+            Layer index with the best score.
+        """
+        scores = self.score(test_prompts, test_labels)
+        return max(scores, key=scores.get)
+
+    def predict(
+        self,
+        prompts: list[str],
+    ) -> dict[int, np.ndarray]:
+        """Predict with each layer's probe.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            Text prompts to classify.
+
+        Returns
+        -------
+        dict[int, np.ndarray]
+            Mapping from layer index to predictions array.
+        """
+        return {
+            layer: probe.predict(prompts)
+            for layer, probe in sorted(self.probes.items())
+        }
+
+    def predict_proba(
+        self,
+        prompts: list[str],
+    ) -> dict[int, np.ndarray]:
+        """Predict probabilities with each layer's probe.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            Text prompts to classify.
+
+        Returns
+        -------
+        dict[int, np.ndarray]
+            Mapping from layer index to probability arrays.
+        """
+        return {
+            layer: probe.predict_proba(prompts)
+            for layer, probe in sorted(self.probes.items())
+        }
 
 
 class LinearProbe:
@@ -1302,3 +1430,126 @@ class LinearProbe:
         probe.scaler_ = state.get("scaler_")
 
         return probe
+
+    @classmethod
+    def sweep_layers(
+        cls,
+        model: str,
+        positive_prompts: list[str],
+        negative_prompts: list[str],
+        layers: int | list[int] | str = "all",
+        pooling: str = "last_token",
+        classifier: str | BaseEstimator = "logistic_regression",
+        device: str = "auto",
+        remote: bool = False,
+        random_state: int | None = None,
+        batch_size: int = 8,
+        backend: str = "local",
+        dtype: str | None = None,
+        normalize_layers: bool | str = True,
+    ) -> LayerSweepResult:
+        """Train a probe at every layer and return per-layer results.
+
+        This method avoids the boilerplate of manually looping over layers.
+        It performs one warmup pass extracting all requested layers (single
+        forward pass through the model, cached), then trains an independent
+        single-layer probe for each layer using cached activations.
+
+        Parameters
+        ----------
+        model : str
+            HuggingFace model ID or local path.
+        positive_prompts : list[str]
+            Prompts for the positive class.
+        negative_prompts : list[str]
+            Prompts for the negative class.
+        layers : int | list[int] | str, default="all"
+            Which layers to sweep. Accepts same specifications as LinearProbe:
+            int, list[int], "all", "middle", "last".
+        pooling : str, default="last_token"
+            Token pooling strategy.
+        classifier : str | BaseEstimator, default="logistic_regression"
+            Classification model.
+        device : str, default="auto"
+            Device for model inference.
+        remote : bool, default=False
+            Use nnsight remote execution.
+        random_state : int | None, default=None
+            Random seed for reproducibility.
+        batch_size : int, default=8
+            Number of prompts per batch during extraction.
+        backend : str, default="local"
+            Extraction backend: "local" or "nnsight".
+        dtype : str | None, default=None
+            Model dtype for local backend.
+        normalize_layers : bool | str, default=True
+            Per-layer normalization (applied per single-layer probe).
+
+        Returns
+        -------
+        LayerSweepResult
+            Contains a fitted probe for each layer, with methods for
+            scoring and finding the best layer.
+
+        Examples
+        --------
+        >>> result = LinearProbe.sweep_layers(
+        ...     model="meta-llama/Llama-3.1-8B-Instruct",
+        ...     positive_prompts=pos,
+        ...     negative_prompts=neg,
+        ...     layers="all",
+        ... )
+        >>> scores = result.score(test_prompts, test_labels)
+        >>> best = result.best_layer(test_prompts, test_labels)
+        >>> print(f"Best layer: {best}, accuracy: {scores[best]:.3f}")
+        """
+        from .extraction import get_num_layers_from_config, resolve_layers
+
+        # Resolve which layers to sweep
+        num_layers = get_num_layers_from_config(model)
+        layer_indices = resolve_layers(layers, num_layers)
+
+        # Step 1: Warmup pass - extract ALL requested layers at once.
+        # This ensures a single forward pass through the model, with all
+        # layer activations cached to disk.
+        warmup_probe = cls(
+            model=model,
+            layers=layer_indices,
+            pooling=pooling,
+            classifier=classifier,
+            device=device,
+            remote=remote,
+            random_state=random_state,
+            batch_size=batch_size,
+            backend=backend,
+            dtype=dtype,
+            normalize_layers=False,  # No scaling needed for warmup
+        )
+
+        all_prompts = list(positive_prompts) + list(negative_prompts)
+        warmup_probe._cached_extractor.extract(
+            all_prompts,
+            remote=remote,
+        )
+
+        # Step 2: Train individual single-layer probes.
+        # Each probe will hit the cache (no model inference needed).
+        probes: dict[int, LinearProbe] = {}
+        for layer_idx in layer_indices:
+            probe = cls(
+                model=model,
+                layers=layer_idx,
+                pooling=pooling,
+                classifier=classifier,
+                device=device,
+                remote=remote,
+                random_state=random_state,
+                batch_size=batch_size,
+                backend=backend,
+                dtype=dtype,
+                normalize_layers=normalize_layers,
+            )
+            probe.fit(positive_prompts, negative_prompts, remote=remote)
+            probes[layer_idx] = probe
+
+        return LayerSweepResult(probes=probes)
