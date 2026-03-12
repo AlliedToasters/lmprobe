@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from .backends import resolve_backend
 from .cache import (
     is_prompt_fully_cached,
     is_prompt_perplexity_cached,
@@ -26,7 +27,6 @@ from .cache import (
     save_prompt_perplexity,
     save_prompt_pooled_activations,
 )
-from .backends import resolve_backend
 from .extraction import (
     compute_perplexity_from_logits,
     get_num_layers_from_config,

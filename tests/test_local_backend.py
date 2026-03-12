@@ -6,11 +6,9 @@ producing the same shapes and behaviors as the nnsight backend.
 
 import numpy as np
 import pytest
-import torch
 
 from lmprobe import LinearProbe
 from lmprobe.backends import LocalBackend, resolve_backend
-
 
 POSITIVE_PROMPTS = [
     "Who wants to go for a walk?",
