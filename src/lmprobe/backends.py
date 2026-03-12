@@ -173,7 +173,7 @@ class NnsightBackend(ExtractionBackend):
 
 # Global cache for locally-loaded HuggingFace models
 # Key: (model_name, device), Value: (model, tokenizer)
-_LOCAL_MODEL_CACHE: dict[tuple[str, str], tuple] = {}
+_LOCAL_MODEL_CACHE: dict[tuple, tuple] = {}
 
 
 def _get_decoder_layers(model) -> list:
@@ -228,7 +228,9 @@ def _get_decoder_layers(model) -> list:
     )
 
 
-def _get_local_model(model_name: str, device: str):
+def _get_local_model(
+    model_name: str, device: str, dtype: torch.dtype = torch.float32
+):
     """Load a HuggingFace model locally, with caching.
 
     Parameters
@@ -237,13 +239,15 @@ def _get_local_model(model_name: str, device: str):
         HuggingFace model ID or local path.
     device : str
         Device specification.
+    dtype : torch.dtype
+        Model dtype (e.g., torch.float32, torch.bfloat16).
 
     Returns
     -------
     tuple
         (model, tokenizer)
     """
-    cache_key = (model_name, device)
+    cache_key = (model_name, device, dtype)
     if cache_key not in _LOCAL_MODEL_CACHE:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -261,7 +265,7 @@ def _get_local_model(model_name: str, device: str):
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map=device_map,
-            torch_dtype=torch.float32,
+            torch_dtype=dtype,
         )
         model.eval()
         _LOCAL_MODEL_CACHE[cache_key] = (model, tokenizer)
@@ -287,17 +291,27 @@ class LocalBackend(ExtractionBackend):
         HuggingFace model ID or local path.
     device : str
         Device specification.
+    dtype : torch.dtype
+        Model dtype (e.g., torch.float32, torch.bfloat16).
     """
 
-    def __init__(self, model_name: str, device: str = "auto"):
+    def __init__(
+        self,
+        model_name: str,
+        device: str = "auto",
+        dtype: torch.dtype = torch.float32,
+    ):
         super().__init__(model_name, device)
+        self.dtype = dtype
         self._model = None
         self._tokenizer = None
 
     def _load(self):
         """Load model and tokenizer."""
         if self._model is None:
-            model, tokenizer = _get_local_model(self.model_name, self.device)
+            model, tokenizer = _get_local_model(
+                self.model_name, self.device, self.dtype
+            )
             self._model = model
             self._tokenizer = tokenizer
 
@@ -420,6 +434,7 @@ def resolve_backend(
     model_name: str,
     device: str = "auto",
     remote: bool = False,
+    dtype: torch.dtype | None = None,
 ) -> ExtractionBackend:
     """Create an ExtractionBackend from a string identifier.
 
@@ -433,6 +448,9 @@ def resolve_backend(
         Device specification.
     remote : bool
         Whether to use remote execution (only valid for nnsight backend).
+    dtype : torch.dtype or None
+        Model dtype for local backend (e.g., torch.float32, torch.bfloat16).
+        Defaults to torch.float32 if None. Ignored for nnsight backend.
 
     Returns
     -------
@@ -453,7 +471,8 @@ def resolve_backend(
                 "backend='local' does not support remote=True. "
                 "Use backend='nnsight' for remote execution."
             )
-        return LocalBackend(model_name, device)
+        local_dtype = dtype if dtype is not None else torch.float32
+        return LocalBackend(model_name, device, dtype=local_dtype)
     else:
         raise ValueError(
             f"Unknown backend: {backend!r}. Available backends: 'nnsight', 'local'."
