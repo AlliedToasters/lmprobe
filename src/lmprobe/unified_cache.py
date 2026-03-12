@@ -110,6 +110,9 @@ class UnifiedCache:
         - "mean": Mean of all non-padding tokens
     backend : str, default="local"
         Extraction backend: "local" (default) or "nnsight".
+    dtype : str or None, default=None
+        Model dtype as a string: "float32", "float16", or "bfloat16".
+        If None, defaults to float32 for local backend.
 
     Examples
     --------
@@ -135,6 +138,7 @@ class UnifiedCache:
         cache_pooled: bool = False,
         pooling: str = "last_token",
         backend: str = "local",
+        dtype: str | None = None,
     ):
         self.model_name = model
         self.layers_spec = layers
@@ -145,6 +149,7 @@ class UnifiedCache:
         self.cache_pooled = cache_pooled
         self.pooling = pooling
         self.backend_name = backend
+        self.dtype = dtype
 
         # Validate pooling strategy
         if cache_pooled and pooling not in TRAIN_POOLING_STRATEGIES:
@@ -167,10 +172,29 @@ class UnifiedCache:
     def _resolved_backend(self) -> ExtractionBackend:
         """Get the backend, creating if necessary."""
         if self._backend is None:
+            torch_dtype = self._resolve_dtype(self.dtype)
             self._backend = resolve_backend(
-                self.backend_name, self.model_name, self.device, remote=self.remote
+                self.backend_name, self.model_name, self.device,
+                remote=self.remote, dtype=torch_dtype,
             )
         return self._backend
+
+    @staticmethod
+    def _resolve_dtype(dtype: str | None) -> torch.dtype | None:
+        """Resolve a dtype string to a torch.dtype, or None."""
+        if dtype is None:
+            return None
+        _dtype_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        if dtype not in _dtype_map:
+            raise ValueError(
+                f"Unknown dtype: {dtype!r}. "
+                f"Available: {list(_dtype_map.keys())}"
+            )
+        return _dtype_map[dtype]
 
     @property
     def model(self):
