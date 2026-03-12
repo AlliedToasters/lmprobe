@@ -41,10 +41,9 @@ class TestUnifiedCache:
         assert stats.perplexity_cached == 0
         assert stats.elapsed_seconds > 0
 
-        # Check both are cached
+        # Check both are cached (default is now cache_pooled=True)
         for prompt in prompts:
-            cache_dir = get_prompt_cache_dir(tiny_model, prompt)
-            assert get_prompt_cached_layers(cache_dir) == {0, 1}
+            assert is_prompt_pooled_cached(tiny_model, prompt, {0, 1}, "last_token")
             assert is_prompt_perplexity_cached(tiny_model, prompt)
 
     def test_warmup_cache_hit(self, tiny_model, tmp_path, monkeypatch):
@@ -73,8 +72,30 @@ class TestUnifiedCache:
         assert stats2.activations_extracted == 0
         assert stats2.perplexity_extracted == 0
 
-    def test_get_activations_returns_correct_shapes(self, tiny_model, tmp_path, monkeypatch):
-        """get_activations returns tensor with correct shape."""
+    def test_get_activations_returns_correct_shapes_unpooled(self, tiny_model, tmp_path, monkeypatch):
+        """get_activations with cache_pooled=False returns 3D tensor."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0, 1],
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_pooled=False,
+        )
+
+        prompts = ["short", "a longer test prompt"]
+        activations, mask = cache.get_activations(prompts)
+
+        # Shape: (batch, seq_len, n_layers * hidden_dim)
+        assert activations.ndim == 3
+        assert activations.shape[0] == 2  # 2 prompts
+        assert mask.shape[0] == 2
+        assert mask.shape[1] == activations.shape[1]  # seq_len matches
+
+    def test_get_activations_returns_correct_shapes_pooled(self, tiny_model, tmp_path, monkeypatch):
+        """get_activations with default cache_pooled=True returns 2D tensor."""
         monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
 
         cache = UnifiedCache(
@@ -88,11 +109,10 @@ class TestUnifiedCache:
         prompts = ["short", "a longer test prompt"]
         activations, mask = cache.get_activations(prompts)
 
-        # Shape: (batch, seq_len, n_layers * hidden_dim)
-        assert activations.ndim == 3
-        assert activations.shape[0] == 2  # 2 prompts
-        assert mask.shape[0] == 2
-        assert mask.shape[1] == activations.shape[1]  # seq_len matches
+        # Shape: (batch, n_layers * hidden_dim) - pooled, no seq_len
+        assert activations.ndim == 2
+        assert activations.shape[0] == 2
+        assert mask is None
 
     def test_get_perplexity_returns_correct_shape(self, tiny_model, tmp_path, monkeypatch):
         """get_perplexity returns (n_prompts, 3) array."""
@@ -145,8 +165,8 @@ class TestUnifiedCache:
         )
         cache1.warmup([prompt])
 
-        # Verify activations cached but not perplexity
-        assert get_prompt_cached_layers(get_prompt_cache_dir(tiny_model, prompt)) == {0, 1}
+        # Verify activations cached (pooled, since default) but not perplexity
+        assert is_prompt_pooled_cached(tiny_model, prompt, {0, 1}, "last_token")
         assert not is_prompt_perplexity_cached(tiny_model, prompt)
 
         # Second: extract with perplexity enabled
@@ -181,8 +201,8 @@ class TestUnifiedCache:
         prompts = ["test all layers"]
         cache.warmup(prompts)
 
-        cache_dir = get_prompt_cache_dir(tiny_model, prompts[0])
-        assert get_prompt_cached_layers(cache_dir) == {0, 1}
+        # Default is pooled caching now
+        assert is_prompt_pooled_cached(tiny_model, prompts[0], {0, 1}, "last_token")
 
     def test_layers_last(self, tiny_model, tmp_path, monkeypatch):
         """layers='last' resolves to last layer only."""
@@ -401,6 +421,8 @@ class TestPooledCache:
         # Use a longer prompt to amplify the difference
         prompt = "This is a longer prompt that will have more tokens and show the disk savings"
 
+        from lmprobe.cache import get_prompt_cache_path, invalidate_extraction_cache
+
         # Extract with unpooled cache
         cache_unpooled = UnifiedCache(
             model=tiny_model,
@@ -412,14 +434,12 @@ class TestPooledCache:
         )
         cache_unpooled.warmup([prompt])
 
-        # Calculate unpooled size
-        unpooled_dir = get_prompt_cache_dir(tiny_model, prompt)
-        unpooled_size = sum(
-            f.stat().st_size for f in unpooled_dir.rglob("*.pt")
-        )
+        # Calculate unpooled size (safetensors file)
+        sf_path = get_prompt_cache_path(tiny_model, prompt)
+        unpooled_size = sf_path.stat().st_size
 
         # Clear and extract with pooled cache
-        shutil.rmtree(unpooled_dir)
+        invalidate_extraction_cache(get_prompt_cache_dir(tiny_model, prompt))
 
         cache_pooled = UnifiedCache(
             model=tiny_model,
@@ -433,17 +453,11 @@ class TestPooledCache:
         cache_pooled.warmup([prompt])
 
         # Calculate pooled size
-        pooled_dir = get_prompt_cache_dir(tiny_model, prompt)
-        pooled_size = sum(
-            f.stat().st_size for f in pooled_dir.rglob("*.pt")
-        )
+        sf_path_pooled = get_prompt_cache_path(tiny_model, prompt)
+        pooled_size = sf_path_pooled.stat().st_size
 
         # Pooled should be significantly smaller
-        # (exact ratio depends on seq_len, but should be at least 2x smaller)
         assert pooled_size < unpooled_size
-        # For reference, print the ratio (helpful for debugging)
-        # print(f"Unpooled: {unpooled_size}, Pooled: {pooled_size}, "
-        #       f"Ratio: {unpooled_size/pooled_size:.1f}x")
 
     def test_pooled_different_strategies(self, tiny_model, tmp_path, monkeypatch):
         """Different pooling strategies create separate cache entries."""
