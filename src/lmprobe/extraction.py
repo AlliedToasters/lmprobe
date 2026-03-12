@@ -341,11 +341,28 @@ def load_model(
         else:
             device_map = {"": device}
 
-        model = LM(
-            model_name,
-            device_map=device_map,
-            dispatch=True,
-        )
+        try:
+            model = LM(
+                model_name,
+                device_map=device_map,
+                dispatch=True,
+            )
+        except RuntimeError as e:
+            if "no kernel image" in str(e).lower() and device_map != {"": "cpu"}:
+                import warnings
+                warnings.warn(
+                    f"GPU detected but incompatible with PyTorch: {e}. "
+                    f"Falling back to CPU.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                model = LM(
+                    model_name,
+                    device_map={"": "cpu"},
+                    dispatch=True,
+                )
+            else:
+                raise
     return model
 
 

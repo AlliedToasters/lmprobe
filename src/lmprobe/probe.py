@@ -91,12 +91,40 @@ class LayerSweepResult:
         """Get the probe for a specific layer."""
         return self.probes[layer]
 
+    def _warmup_cache(self, prompts: list[str]) -> None:
+        """Extract all layers for prompts in a single forward pass.
+
+        This populates the per-prompt cache so that individual single-layer
+        probes can score without each triggering a separate forward pass.
+        """
+        if not self.probes:
+            return
+        # Pick any probe to access model/extractor config
+        any_probe = next(iter(self.probes.values()))
+        if any_probe._cached_extractor is None:
+            return
+        # Create a temporary extractor requesting ALL swept layers
+        all_layers = sorted(self.probes.keys())
+        warmup_extractor = ActivationExtractor(
+            model_name=any_probe.model,
+            device=any_probe.device,
+            layers=all_layers,
+            batch_size=any_probe.batch_size,
+            backend=any_probe.backend,
+            dtype=_resolve_dtype(any_probe.dtype),
+        )
+        warmup_cached = CachedExtractor(warmup_extractor)
+        warmup_cached.extract(prompts, remote=any_probe.remote)
+
     def score(
         self,
         test_prompts: list[str],
         test_labels: list[int] | np.ndarray,
     ) -> dict[int, float]:
         """Score each layer's probe on test data.
+
+        Performs a single warmup extraction pass for all layers, then
+        scores each probe from cache (no redundant forward passes).
 
         Parameters
         ----------
@@ -110,6 +138,7 @@ class LayerSweepResult:
         dict[int, float]
             Mapping from layer index to accuracy.
         """
+        self._warmup_cache(test_prompts)
         return {
             layer: probe.score(test_prompts, test_labels)
             for layer, probe in sorted(self.probes.items())
@@ -143,6 +172,9 @@ class LayerSweepResult:
     ) -> dict[int, np.ndarray]:
         """Predict with each layer's probe.
 
+        Performs a single warmup extraction pass for all layers, then
+        predicts from cache (no redundant forward passes).
+
         Parameters
         ----------
         prompts : list[str]
@@ -153,6 +185,7 @@ class LayerSweepResult:
         dict[int, np.ndarray]
             Mapping from layer index to predictions array.
         """
+        self._warmup_cache(prompts)
         return {
             layer: probe.predict(prompts)
             for layer, probe in sorted(self.probes.items())
@@ -164,6 +197,9 @@ class LayerSweepResult:
     ) -> dict[int, np.ndarray]:
         """Predict probabilities with each layer's probe.
 
+        Performs a single warmup extraction pass for all layers, then
+        predicts from cache (no redundant forward passes).
+
         Parameters
         ----------
         prompts : list[str]
@@ -174,6 +210,7 @@ class LayerSweepResult:
         dict[int, np.ndarray]
             Mapping from layer index to probability arrays.
         """
+        self._warmup_cache(prompts)
         return {
             layer: probe.predict_proba(prompts)
             for layer, probe in sorted(self.probes.items())
@@ -638,7 +675,7 @@ class LinearProbe:
             # Repeat labels for each token
             labels = np.repeat(labels, seq_len)
 
-        # Apply per-layer normalization if enabled and using multiple layers
+        # Apply per-layer normalization if enabled
         n_layers = len(self._extractor.layer_indices)
         scaling_strategy = self._get_scaling_strategy()
         if scaling_strategy is not None and n_layers > 1:
@@ -646,6 +683,13 @@ class LinearProbe:
 
             hidden_dim_per_layer = X.shape[1] // n_layers
             self.scaler_ = PerLayerScaler(n_layers, hidden_dim_per_layer, scaling_strategy)
+            X = self.scaler_.fit_transform(X)
+        elif n_layers == 1:
+            # Apply StandardScaler for single-layer probes to prevent
+            # convergence issues with unscaled activations (#40)
+            from sklearn.preprocessing import StandardScaler
+
+            self.scaler_ = StandardScaler()
             X = self.scaler_.fit_transform(X)
 
         # Clone and fit classifier

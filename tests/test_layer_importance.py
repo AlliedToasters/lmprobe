@@ -391,8 +391,10 @@ class TestNormalizeLayers:
 
         assert probe.scaler_ is None
 
-    def test_single_layer_no_scaler(self, tiny_model):
-        """No scaler for single-layer probes (nothing to normalize)."""
+    def test_single_layer_has_standard_scaler(self, tiny_model):
+        """Single-layer probes get StandardScaler to prevent convergence issues (#40)."""
+        from sklearn.preprocessing import StandardScaler
+
         probe = LinearProbe(
             model=tiny_model,
             layers=-1,  # Single layer
@@ -403,8 +405,8 @@ class TestNormalizeLayers:
         )
         probe.fit(["positive"], ["negative"])
 
-        # Single layer doesn't need per-layer normalization
-        assert probe.scaler_ is None
+        # Single layer gets StandardScaler (not PerLayerScaler)
+        assert isinstance(probe.scaler_, StandardScaler)
 
     def test_normalization_affects_predictions(self, tiny_model):
         """Normalization changes predictions (coefficients differ)."""
