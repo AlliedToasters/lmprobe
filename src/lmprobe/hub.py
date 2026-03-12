@@ -545,11 +545,11 @@ def push_to_hub(
     str
         URL of the created/updated Hub repository.
     """
+    # Check fitted before checking deps (better error message)
+    probe._check_fitted()
+
     _check_hub_deps()
     from huggingface_hub import HfApi
-
-    # Check fitted
-    probe._check_fitted()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)

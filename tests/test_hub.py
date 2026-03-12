@@ -12,6 +12,15 @@ from lmprobe import LinearProbe
 
 TEST_MODEL = "stas/tiny-random-llama-2"
 
+try:
+    import skops  # noqa: F401
+
+    HAS_SKOPS = True
+except ImportError:
+    HAS_SKOPS = False
+
+requires_skops = pytest.mark.skipif(not HAS_SKOPS, reason="skops not installed")
+
 
 @pytest.fixture
 def fitted_probe():
@@ -290,6 +299,7 @@ class TestRenderModelCard:
 class TestSerializationRoundtrip:
     """Test classifier serialization and deserialization."""
 
+    @requires_skops
     def test_skops_roundtrip(self, fitted_probe, tmp_path):
         from lmprobe.hub import _load_classifier, _serialize_classifier
 
@@ -301,6 +311,22 @@ class TestSerializationRoundtrip:
 
         # Verify predictions match
         # Create some test data
+        rng = np.random.RandomState(42)
+        X = rng.randn(5, fitted_probe.classifier_.coef_.shape[1])
+        original_preds = fitted_probe.classifier_.predict(X)
+        loaded_preds = loaded.predict(X)
+        np.testing.assert_array_equal(original_preds, loaded_preds)
+
+    def test_serialize_roundtrip(self, fitted_probe, tmp_path):
+        """Test serialization roundtrip with whatever format is available."""
+        from lmprobe.hub import _load_classifier, _serialize_classifier
+
+        fmt = _serialize_classifier(fitted_probe.classifier_, tmp_path / "classifier")
+        assert fmt in ("skops", "joblib")
+
+        loaded = _load_classifier(tmp_path, fmt, trust_classifier=True)
+        assert type(loaded).__name__ == type(fitted_probe.classifier_).__name__
+
         rng = np.random.RandomState(42)
         X = rng.randn(5, fitted_probe.classifier_.coef_.shape[1])
         original_preds = fitted_probe.classifier_.predict(X)
