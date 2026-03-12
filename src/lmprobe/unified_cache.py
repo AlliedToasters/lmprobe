@@ -108,8 +108,8 @@ class UnifiedCache:
         - "last_token": Use the last non-padding token (default)
         - "first_token": Use the first token
         - "mean": Mean of all non-padding tokens
-    backend : str, default="nnsight"
-        Extraction backend: "nnsight" (default) or "local".
+    backend : str, default="local"
+        Extraction backend: "local" (default) or "nnsight".
 
     Examples
     --------
@@ -134,7 +134,7 @@ class UnifiedCache:
         batch_size: int = 8,
         cache_pooled: bool = False,
         pooling: str = "last_token",
-        backend: str = "nnsight",
+        backend: str = "local",
     ):
         self.model_name = model
         self.layers_spec = layers
