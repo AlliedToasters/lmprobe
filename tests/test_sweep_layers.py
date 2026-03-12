@@ -1,6 +1,5 @@
 """Tests for LinearProbe.sweep_layers() per-layer probe sweep."""
 
-import numpy as np
 import pytest
 
 from lmprobe import LayerSweepResult, LinearProbe
