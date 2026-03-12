@@ -35,6 +35,12 @@ BUILTIN_CLASSIFIERS = frozenset({
     "lda",
 })
 
+# Classifiers that only work with classification tasks
+CLASSIFICATION_CLASSIFIERS = BUILTIN_CLASSIFIERS - {"ridge_regression"}
+
+# Classifiers that only work with regression tasks
+REGRESSION_CLASSIFIERS = frozenset({"ridge_regression"})
+
 
 def build_classifier(name: str, random_state: int | None = None) -> BaseEstimator:
     """Build a classifier by name with the given random_state.

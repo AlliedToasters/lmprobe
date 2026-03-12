@@ -6,6 +6,7 @@ import pytest
 from lmprobe import LinearProbe
 from lmprobe.classifiers import (
     BUILTIN_CLASSIFIERS,
+    CLASSIFICATION_CLASSIFIERS,
     build_classifier,
     validate_classifier,
 )
@@ -283,7 +284,7 @@ class TestPerTokenPredictWithoutProba:
 class TestAllClassifiersPredict:
     """Parametrized tests to ensure all classifiers work with predict()."""
 
-    @pytest.mark.parametrize("classifier", list(BUILTIN_CLASSIFIERS))
+    @pytest.mark.parametrize("classifier", list(CLASSIFICATION_CLASSIFIERS))
     def test_predict_works_for_all_builtin_classifiers(self, tiny_model, classifier):
         """Every builtin classifier works with predict()."""
         probe = LinearProbe(
@@ -311,7 +312,7 @@ class TestAllClassifiersPredict:
         assert predictions.shape == (1,)
         assert predictions[0] in [0, 1]
 
-    @pytest.mark.parametrize("classifier", list(BUILTIN_CLASSIFIERS))
+    @pytest.mark.parametrize("classifier", list(CLASSIFICATION_CLASSIFIERS))
     def test_score_works_for_all_builtin_classifiers(self, tiny_model, classifier):
         """Every builtin classifier works with score()."""
         probe = LinearProbe(
