@@ -58,6 +58,8 @@ class ActivationBaseline:
         Number of PCA components (for method="pca").
     batch_size : int, default=8
         Batch size for activation extraction.
+    backend : str, default="nnsight"
+        Extraction backend: "nnsight" (default) or "local".
 
     Attributes
     ----------
@@ -95,6 +97,7 @@ class ActivationBaseline:
         random_state: int | None = None,
         n_components: int = 10,
         batch_size: int = 8,
+        backend: str = "nnsight",
     ):
         if method not in self.VALID_METHODS:
             raise ValueError(
@@ -111,12 +114,13 @@ class ActivationBaseline:
         self.random_state = random_state
         self.n_components = n_components
         self.batch_size = batch_size
+        self.backend = backend
 
         # For layer_0 method, always use layer 0
         actual_layers = 0 if method == "layer_0" else layers
 
         self._extractor = ActivationExtractor(
-            model, device, actual_layers, batch_size, remote=remote
+            model, device, actual_layers, batch_size, remote=remote, backend=backend
         )
         self._cached_extractor = CachedExtractor(self._extractor)
         self._classifier_template = resolve_classifier(classifier, random_state)

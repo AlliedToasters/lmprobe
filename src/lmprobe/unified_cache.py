@@ -26,18 +26,16 @@ from .cache import (
     save_prompt_perplexity,
     save_prompt_pooled_activations,
 )
+from .backends import resolve_backend
 from .extraction import (
-    _extract_batch_with_logits,
     compute_perplexity_from_logits,
-    configure_remote,
-    get_cached_model,
     get_num_layers_from_config,
     resolve_layers,
 )
 from .pooling import TRAIN_POOLING_STRATEGIES, get_pooling_fn
 
 if TYPE_CHECKING:
-    from nnsight import LanguageModel
+    from .backends import ExtractionBackend
 
 
 logger = logging.getLogger(__name__)
@@ -110,6 +108,8 @@ class UnifiedCache:
         - "last_token": Use the last non-padding token (default)
         - "first_token": Use the first token
         - "mean": Mean of all non-padding tokens
+    backend : str, default="nnsight"
+        Extraction backend: "nnsight" (default) or "local".
 
     Examples
     --------
@@ -134,6 +134,7 @@ class UnifiedCache:
         batch_size: int = 8,
         cache_pooled: bool = False,
         pooling: str = "last_token",
+        backend: str = "nnsight",
     ):
         self.model_name = model
         self.layers_spec = layers
@@ -143,6 +144,7 @@ class UnifiedCache:
         self.batch_size = batch_size
         self.cache_pooled = cache_pooled
         self.pooling = pooling
+        self.backend_name = backend
 
         # Validate pooling strategy
         if cache_pooled and pooling not in TRAIN_POOLING_STRATEGIES:
@@ -156,19 +158,24 @@ class UnifiedCache:
                 "Use 'last_token', 'first_token', or 'mean'."
             )
 
-        # Lazy-loaded
-        self._model: LanguageModel | None = None
+        # Create backend (lazy-loads model)
+        self._backend: ExtractionBackend | None = None
         self._layer_indices: list[int] | None = None
         self._pooling_fn = get_pooling_fn(pooling) if cache_pooled else None
 
     @property
-    def model(self) -> LanguageModel:
-        """Get the loaded model, loading if necessary."""
-        if self._model is None:
-            self._model = get_cached_model(
-                self.model_name, self.device, remote=self.remote
+    def _resolved_backend(self) -> ExtractionBackend:
+        """Get the backend, creating if necessary."""
+        if self._backend is None:
+            self._backend = resolve_backend(
+                self.backend_name, self.model_name, self.device, remote=self.remote
             )
-        return self._model
+        return self._backend
+
+    @property
+    def model(self):
+        """Get the loaded model, loading if necessary."""
+        return self._resolved_backend.model
 
     @property
     def layer_indices(self) -> list[int]:
@@ -243,7 +250,9 @@ class UnifiedCache:
         start_time = time.time()
         remote = self.remote if remote is None else remote
 
-        if remote:
+        if remote and self.backend_name == "nnsight":
+            from .extraction import configure_remote
+
             configure_remote()
 
         layer_indices = sorted(self.layer_indices)
@@ -278,7 +287,7 @@ class UnifiedCache:
             )
 
         if need_unified_list:
-            model = self.model
+            backend = self._resolved_backend
             num_batches = (len(need_unified_list) + self.batch_size - 1) // self.batch_size
 
             logger.info(
@@ -298,14 +307,16 @@ class UnifiedCache:
                     ]
 
                     # Single forward pass captures both activations and logits
-                    batch_acts, batch_mask, batch_logits = _extract_batch_with_logits(
-                        model, batch_prompts, layer_indices, remote=remote
+                    batch_acts, batch_mask, batch_logits = (
+                        backend.extract_batch_with_logits(
+                            batch_prompts, layer_indices, remote=remote
+                        )
                     )
 
                     # Compute perplexity features from logits
                     if self.compute_perplexity:
                         # Get input_ids for perplexity computation
-                        tokenized = model.tokenizer(
+                        tokenized = backend.tokenizer(
                             batch_prompts,
                             return_tensors="pt",
                             padding=True,

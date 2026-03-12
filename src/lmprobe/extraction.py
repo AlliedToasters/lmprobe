@@ -649,6 +649,8 @@ class ActivationExtractor:
     """Manages model loading and activation extraction.
 
     This class caches the loaded model to avoid reloading on every call.
+    It delegates to an ExtractionBackend for actual model loading and
+    activation extraction.
 
     Parameters
     ----------
@@ -667,6 +669,9 @@ class ActivationExtractor:
         No model weights are downloaded - only the tokenizer and config.
         This is critical for large models (e.g., 405B) that would otherwise
         require hundreds of GB of memory to load locally.
+    backend : str
+        Extraction backend to use: "nnsight" (default) or "local".
+        "local" uses HuggingFace transformers directly without nnsight.
     """
 
     def __init__(
@@ -677,6 +682,7 @@ class ActivationExtractor:
         batch_size: int = 8,
         auto_candidates: list[int] | list[float] | None = None,
         remote: bool = False,
+        backend: str = "nnsight",
     ):
         self.model_name = model_name
         self.device = device
@@ -684,6 +690,12 @@ class ActivationExtractor:
         self.batch_size = batch_size
         self.auto_candidates = auto_candidates
         self.remote = remote
+        self.backend_name = backend
+
+        # Create the backend
+        from .backends import resolve_backend
+
+        self._backend = resolve_backend(backend, model_name, device, remote=remote)
 
         # Lazy-loaded
         self._model: LanguageModel | None = None
@@ -698,11 +710,12 @@ class ActivationExtractor:
 
         For remote=True, only loads tokenizer and config (no weights).
         """
-        if self._model is None:
-            self._model = get_cached_model(
-                self.model_name, self.device, remote=self.remote
-            )
-        return self._model
+        return self._backend.model
+
+    @property
+    def tokenizer(self):
+        """Get the model's tokenizer."""
+        return self._backend.tokenizer
 
     @property
     def layer_indices(self) -> list[int]:
@@ -718,6 +731,60 @@ class ActivationExtractor:
     def num_layers(self) -> int:
         """Number of layers being extracted."""
         return len(self.layer_indices)
+
+    def extract_batch(
+        self,
+        prompts: list[str],
+        layer_indices: list[int],
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract activations for a single batch of prompts.
+
+        Delegates to the configured backend.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            List of text prompts.
+        layer_indices : list[int]
+            Layer indices to extract from.
+        **kwargs
+            Backend-specific parameters (e.g., remote for NnsightBackend).
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            (activations, attention_mask)
+        """
+        return self._backend.extract_batch(prompts, layer_indices, **kwargs)
+
+    def extract_batch_with_logits(
+        self,
+        prompts: list[str],
+        layer_indices: list[int],
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract activations AND logits for a single batch of prompts.
+
+        Delegates to the configured backend.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            List of text prompts.
+        layer_indices : list[int]
+            Layer indices to extract from.
+        **kwargs
+            Backend-specific parameters.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            (activations, attention_mask, logits)
+        """
+        return self._backend.extract_batch_with_logits(
+            prompts, layer_indices, **kwargs
+        )
 
     def extract(
         self,
