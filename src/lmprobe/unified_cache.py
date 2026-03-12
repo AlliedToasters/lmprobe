@@ -95,10 +95,13 @@ class UnifiedCache:
         Use nnsight remote execution (requires NNSIGHT_API_KEY).
     batch_size : int, default=8
         Number of prompts to process at once.
-    cache_pooled : bool, default=False
-        If True, apply pooling BEFORE caching and store only the pooled
-        activations. This reduces disk usage by ~100x (storing only
-        (1, hidden_dim) per layer instead of (1, seq_len, hidden_dim)).
+    cache_pooled : bool, default=True
+        If True (default), apply pooling BEFORE caching and store only
+        the pooled activations. This reduces disk usage by ~100x (storing
+        only (1, hidden_dim) per layer instead of (1, seq_len, hidden_dim)).
+
+        Set to False only if you need to re-pool cached activations with
+        different strategies.
 
         WARNING: When cache_pooled=True, you must use the same pooling
         strategy for all operations. The cached data cannot be re-pooled
@@ -135,7 +138,7 @@ class UnifiedCache:
         device: str = "auto",
         remote: bool = False,
         batch_size: int = 8,
-        cache_pooled: bool = False,
+        cache_pooled: bool = True,
         pooling: str = "last_token",
         backend: str = "local",
         dtype: str | None = None,

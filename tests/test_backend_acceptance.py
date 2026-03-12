@@ -133,8 +133,8 @@ class TestCachingIsBackendAgnostic:
             backend="local", random_state=42,
         )
         probe.fit(["positive"], ["negative"])
-        # Cache should have files
-        cache_files = list(tmp_path.rglob("*.pt"))
+        # Cache should have files (safetensors v2 or legacy .pt)
+        cache_files = list(tmp_path.rglob("*.safetensors")) + list(tmp_path.rglob("*.pt"))
         assert len(cache_files) > 0
 
     def test_nnsight_caching(self, tiny_model, tmp_path, monkeypatch):
@@ -144,7 +144,7 @@ class TestCachingIsBackendAgnostic:
             backend="nnsight", random_state=42,
         )
         probe.fit(["positive"], ["negative"])
-        cache_files = list(tmp_path.rglob("*.pt"))
+        cache_files = list(tmp_path.rglob("*.safetensors")) + list(tmp_path.rglob("*.pt"))
         assert len(cache_files) > 0
 
 
