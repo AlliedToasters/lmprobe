@@ -344,12 +344,40 @@ def _build_training_info(
     return info
 
 
+def _format_layers(probe_cfg: dict) -> str:
+    """Format layers for display in the model card.
+
+    Uses the original spec (e.g., "all", "middle") when available,
+    with resolved count. Falls back to the raw list for short lists.
+    """
+    layers = probe_cfg.get("layers")
+    spec = probe_cfg.get("layers_spec_original")
+
+    # If the original spec is a named string like "all", "middle", "fast_auto"
+    if isinstance(spec, str) and layers is not None and isinstance(layers, list):
+        first = min(layers)
+        last = max(layers)
+        n = len(layers)
+        return f"{spec} ({first}\u2013{last}, {n} layers)"
+
+    # Short list or single layer — just show it directly
+    if isinstance(layers, list) and len(layers) > 10:
+        first = min(layers)
+        last = max(layers)
+        n = len(layers)
+        return f"[{first}\u2013{last}] ({n} layers)"
+
+    return str(layers)
+
+
 def _render_model_card(
     config: dict,
     training_info: dict,
+    repo_id: str | None = None,
     description: str | None = None,
     tags: list[str] | None = None,
     license: str = "mit",
+    limitations: str | None = None,
 ) -> str:
     """Generate a HuggingFace model card README.md.
 
@@ -359,12 +387,16 @@ def _render_model_card(
         probe_config.json contents.
     training_info : dict
         training_info.json contents.
+    repo_id : str | None
+        Repository ID for the usage example.
     description : str | None
         Human-readable description of what the probe detects.
     tags : list[str] | None
         Additional tags for discoverability.
     license : str
         License identifier.
+    limitations : str | None
+        Limitations and intended use text. If None, the section is omitted.
 
     Returns
     -------
@@ -428,7 +460,8 @@ def _render_model_card(
     body_lines.append("```python")
     body_lines.append("from lmprobe import LinearProbe")
     body_lines.append("")
-    body_lines.append('probe = LinearProbe.from_hub("REPO_ID", trust_classifier=True)')
+    usage_repo = repo_id if repo_id else "REPO_ID"
+    body_lines.append(f'probe = LinearProbe.from_hub("{usage_repo}", trust_classifier=True)')
     body_lines.append('predictions = probe.predict(["your text here"])')
     body_lines.append("```")
     body_lines.append("")
@@ -440,7 +473,7 @@ def _render_model_card(
     body_lines.append(f"- **Base model**: `{base_model}`")
     if config["base_model"].get("revision"):
         body_lines.append(f"- **Model revision**: `{config['base_model']['revision']}`")
-    body_lines.append(f"- **Layers**: {probe_cfg['layers']}")
+    body_lines.append(f"- **Layers**: {_format_layers(probe_cfg)}")
     body_lines.append(f"- **Pooling**: {probe_cfg['pooling']}")
     body_lines.append(f"- **Classifier**: {probe_cfg['classifier_type']}")
     body_lines.append(f"- **Task**: {probe_cfg['task']}")
@@ -480,6 +513,20 @@ def _render_model_card(
             body_lines.append(f"- **Negative hash**: `{training_data['negative_hash']}`")
         body_lines.append("")
 
+    # Evaluation data hash (issue #61)
+    if evaluation:
+        eval_hash = evaluation.get("eval_hash")
+        eval_size = evaluation.get("eval_set_size")
+        if eval_hash or eval_size:
+            if not training_data:
+                body_lines.append("## Evaluation Data")
+                body_lines.append("")
+            if eval_size:
+                body_lines.append(f"- **Evaluation samples**: {eval_size}")
+            if eval_hash:
+                body_lines.append(f"- **Evaluation hash**: `{eval_hash}`")
+            body_lines.append("")
+
     # Reproducibility
     env = training_info.get("training_environment", {})
     body_lines.append("## Reproducibility")
@@ -491,11 +538,12 @@ def _render_model_card(
     body_lines.append(f"- **transformers**: {env.get('transformers_version', 'unknown')}")
     body_lines.append("")
 
-    # Limitations
-    body_lines.append("## Limitations and Intended Use")
-    body_lines.append("")
-    body_lines.append("*Please fill in limitations and intended use for this probe.*")
-    body_lines.append("")
+    # Limitations (only if provided)
+    if limitations:
+        body_lines.append("## Limitations and Intended Use")
+        body_lines.append("")
+        body_lines.append(limitations)
+        body_lines.append("")
 
     return "\n".join(yaml_lines) + "\n".join(body_lines) + "\n"
 
@@ -512,6 +560,7 @@ def push_to_hub(
     private: bool = False,
     license: str = "mit",
     commit_message: str = "Upload lmprobe probe",
+    limitations: str | None = None,
 ) -> str:
     """Push a fitted probe to the HuggingFace Hub.
 
@@ -539,6 +588,9 @@ def push_to_hub(
         License identifier.
     commit_message : str
         Git commit message for the upload.
+    limitations : str | None
+        Limitations and intended use text for the model card.
+        If None, the section is omitted.
 
     Returns
     -------
@@ -583,9 +635,11 @@ def push_to_hub(
         # Render model card
         card = _render_model_card(
             config, training_info,
+            repo_id=repo_id,
             description=description,
             tags=tags,
             license=license,
+            limitations=limitations,
         )
         with open(tmpdir / "README.md", "w") as f:
             f.write(card)

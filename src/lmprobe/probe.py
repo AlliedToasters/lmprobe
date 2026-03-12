@@ -1207,6 +1207,7 @@ class LinearProbe:
         private: bool = False,
         license: str = "mit",
         commit_message: str = "Upload lmprobe probe",
+        limitations: str | None = None,
     ) -> str:
         """Push this fitted probe to the HuggingFace Hub.
 
@@ -1232,6 +1233,9 @@ class LinearProbe:
             License identifier.
         commit_message : str
             Git commit message for the upload.
+        limitations : str | None
+            Limitations and intended use text for the model card.
+            If None, the section is omitted.
 
         Returns
         -------
@@ -1252,6 +1256,7 @@ class LinearProbe:
             private=private,
             license=license,
             commit_message=commit_message,
+            limitations=limitations,
         )
 
     @classmethod
