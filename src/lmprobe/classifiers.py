@@ -13,6 +13,7 @@ import numpy as np
 from sklearn.linear_model import (
     LogisticRegression,
     LogisticRegressionCV,
+    Ridge,
     RidgeClassifier,
     SGDClassifier,
 )
@@ -27,6 +28,7 @@ BUILTIN_CLASSIFIERS = frozenset({
     "logistic_regression",
     "logistic_regression_cv",
     "ridge",
+    "ridge_regression",
     "svm",
     "sgd",
     "mass_mean",
@@ -44,6 +46,7 @@ def build_classifier(name: str, random_state: int | None = None) -> BaseEstimato
         - "logistic_regression": L2-regularized logistic regression (default)
         - "logistic_regression_cv": Logistic regression with CV-tuned regularization
         - "ridge": Ridge classifier (fast, no probabilities)
+        - "ridge_regression": Ridge regression for regression tasks
         - "svm": Linear SVM with Platt scaling for probabilities
         - "sgd": SGD classifier (scalable to large datasets)
         - "mass_mean": Mass-Mean Probing (difference-in-means direction)
@@ -75,6 +78,8 @@ def build_classifier(name: str, random_state: int | None = None) -> BaseEstimato
         )
     elif name == "ridge":
         return RidgeClassifier(random_state=random_state)
+    elif name == "ridge_regression":
+        return Ridge(alpha=1.0)
     elif name == "svm":
         return SVC(
             kernel="linear",
