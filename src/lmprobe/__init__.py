@@ -32,6 +32,7 @@ __all__ = [
     "LayerSweepResult",
     "LinearProbe",
     "PerLayerScaler",
+    "ProbeCard",
     "UnifiedCache",
     "WarmupStats",
     "clear_model_cache",
@@ -66,4 +67,8 @@ def __getattr__(name: str):
         from .unified_cache import UnifiedCache, WarmupStats
 
         return {"UnifiedCache": UnifiedCache, "WarmupStats": WarmupStats}[name]
+    if name == "ProbeCard":
+        from .hub import ProbeCard
+
+        return ProbeCard
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

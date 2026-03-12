@@ -61,6 +61,10 @@ plot = [
 embeddings = [
     "sentence-transformers>=2.0",
 ]
+hub = [
+    "huggingface_hub>=0.20",
+    "skops>=0.9",
+]
 
 [project.urls]
 Homepage = "https://github.com/AlliedToasters/lmprobe"
