@@ -57,8 +57,9 @@ class LinearProbe:
 
     Parameters
     ----------
-    model : str
-        HuggingFace model ID or local path.
+    model : str | None
+        HuggingFace model ID or local path. Optional when using
+        *_from_activations() methods only.
     layers : int | list[int] | str, default="middle"
         Which layers to extract activations from:
         - int: Single layer (negative indexing supported)
@@ -78,6 +79,9 @@ class LinearProbe:
         Additional options: "max", "min" (score-level pooling)
     classifier : str | BaseEstimator, default="logistic_regression"
         Classification model. Either a string name or sklearn estimator.
+    task : str, default="classification"
+        Task type: "classification" or "regression".
+        When "regression", defaults to Ridge regression and disables predict_proba.
     device : str, default="auto"
         Device for model inference: "auto", "cpu", "cuda:0", etc.
     remote : bool, default=False
@@ -153,12 +157,13 @@ class LinearProbe:
 
     def __init__(
         self,
-        model: str,
+        model: str | None = None,
         layers: int | list[int] | str = "middle",
         pooling: str = "last_token",
         train_pooling: str | None = None,
         inference_pooling: str | None = None,
         classifier: str | BaseEstimator = "logistic_regression",
+        task: str = "classification",
         device: str = "auto",
         remote: bool = False,
         random_state: int | None = None,
@@ -176,6 +181,7 @@ class LinearProbe:
         self.train_pooling = train_pooling
         self.inference_pooling = inference_pooling
         self.classifier = classifier
+        self.task = task
         self.device = device
         self.remote = remote
         self.random_state = random_state
@@ -187,6 +193,12 @@ class LinearProbe:
         self.backend = backend
         self.dtype = dtype
 
+        # Validate task
+        if task not in ("classification", "regression"):
+            raise ValueError(
+                f"Unknown task: {task!r}. Expected 'classification' or 'regression'."
+            )
+
         # Validate backend + remote compatibility
         if backend == "local" and remote:
             raise ValueError(
@@ -194,23 +206,36 @@ class LinearProbe:
                 "Use backend='nnsight' for remote execution."
             )
 
-        # Resolve pooling strategies
-        self._train_pooling, self._inference_pooling = resolve_pooling(
-            pooling, train_pooling, inference_pooling
-        )
+        # Resolve pooling strategies (only needed if model is provided)
+        if model is not None:
+            self._train_pooling, self._inference_pooling = resolve_pooling(
+                pooling, train_pooling, inference_pooling
+            )
+        else:
+            self._train_pooling = None
+            self._inference_pooling = None
 
-        # Resolve classifier
-        self._classifier_template = resolve_classifier(classifier, random_state)
+        # Resolve classifier (use regression default if task="regression" and no custom classifier)
+        if task == "regression" and classifier == "logistic_regression":
+            # Default regression classifier
+            self._classifier_template = resolve_classifier(
+                "ridge_regression", random_state
+            )
+        else:
+            self._classifier_template = resolve_classifier(classifier, random_state)
 
-        # Create extractor (lazy loads model)
-        # Pass remote flag so large models (e.g., 405B) don't download weights locally
-        _torch_dtype = _resolve_dtype(dtype)
-        self._extractor = ActivationExtractor(
-            model, device, layers, batch_size,
-            auto_candidates=auto_candidates, remote=remote, backend=backend,
-            dtype=_torch_dtype,
-        )
-        self._cached_extractor = CachedExtractor(self._extractor)
+        # Create extractor (lazy loads model) only if model is provided
+        if model is not None:
+            _torch_dtype = _resolve_dtype(dtype)
+            self._extractor = ActivationExtractor(
+                model, device, layers, batch_size,
+                auto_candidates=auto_candidates, remote=remote, backend=backend,
+                dtype=_torch_dtype,
+            )
+            self._cached_extractor = CachedExtractor(self._extractor)
+        else:
+            self._extractor = None
+            self._cached_extractor = None
 
         # Fitted state (set after fit())
         self.classifier_: BaseEstimator | None = None
@@ -219,6 +244,14 @@ class LinearProbe:
         self.candidate_layers_: list[int] | None = None
         self.layer_importances_: np.ndarray | None = None
         self.scaler_: PerLayerScaler | None = None
+
+    def _check_model(self) -> None:
+        """Check that a model was provided (needed for prompt-based methods)."""
+        if self.model is None:
+            raise ValueError(
+                "No model specified. Either pass model= to LinearProbe() "
+                "or use the *_from_activations() methods instead."
+            )
 
     def _get_remote(self, remote: bool | None) -> bool:
         """Resolve remote parameter with method-level override."""
@@ -389,6 +422,8 @@ class LinearProbe:
         After fitting with layers="auto", check probe.selected_layers_ to see
         which layers were chosen.
         """
+        self._check_model()
+
         # Determine if contrastive or standard mode
         if negative_prompts is None:
             raise ValueError(
@@ -800,6 +835,11 @@ class LinearProbe:
         """
         self._check_fitted()
 
+        if self.task == "regression":
+            raise ValueError(
+                "predict_proba is not available for regression tasks."
+            )
+
         # Extract activations
         X, attention_mask = self._extract_and_pool(
             prompts,
@@ -1049,6 +1089,120 @@ class LinearProbe:
 
         return importances
 
+    @staticmethod
+    def _to_numpy(X) -> np.ndarray:
+        """Convert input to numpy array, handling torch tensors."""
+        if isinstance(X, torch.Tensor):
+            return X.detach().cpu().numpy()
+        return np.asarray(X)
+
+    def fit_from_activations(
+        self,
+        X,
+        y,
+    ) -> LinearProbe:
+        """Fit the probe from pre-computed activation tensors.
+
+        Skips all extraction and pooling logic, going straight to
+        classifier fitting.
+
+        Parameters
+        ----------
+        X : np.ndarray | torch.Tensor
+            Pre-computed activations, shape (n_samples, n_features).
+        y : np.ndarray | torch.Tensor
+            Labels. int for classification, float for regression.
+
+        Returns
+        -------
+        LinearProbe
+            Self, for method chaining.
+        """
+        X = self._to_numpy(X)
+        y = self._to_numpy(y)
+
+        # Clone and fit classifier
+        self.classifier_ = clone(self._classifier_template)
+        self.classifier_.fit(X, y)
+
+        # Set classes_ for classification, None for regression
+        if self.task == "classification":
+            if hasattr(self.classifier_, "classes_"):
+                self.classes_ = self.classifier_.classes_
+            else:
+                self.classes_ = np.unique(y)
+        else:
+            self.classes_ = None
+
+        return self
+
+    def predict_from_activations(self, X) -> np.ndarray:
+        """Predict from pre-computed activation tensors.
+
+        Parameters
+        ----------
+        X : np.ndarray | torch.Tensor
+            Pre-computed activations, shape (n_samples, n_features).
+
+        Returns
+        -------
+        np.ndarray
+            Predictions, shape (n_samples,).
+        """
+        self._check_fitted()
+        X = self._to_numpy(X)
+        return self.classifier_.predict(X)
+
+    def predict_proba_from_activations(self, X) -> np.ndarray:
+        """Predict probabilities from pre-computed activation tensors.
+
+        Only available for classification tasks.
+
+        Parameters
+        ----------
+        X : np.ndarray | torch.Tensor
+            Pre-computed activations, shape (n_samples, n_features).
+
+        Returns
+        -------
+        np.ndarray
+            Class probabilities, shape (n_samples, n_classes).
+
+        Raises
+        ------
+        ValueError
+            If task is regression.
+        """
+        self._check_fitted()
+        if self.task == "regression":
+            raise ValueError(
+                "predict_proba is not available for regression tasks."
+            )
+        X = self._to_numpy(X)
+        return self.classifier_.predict_proba(X)
+
+    def score_from_activations(self, X, y) -> float:
+        """Score the probe on pre-computed activation tensors.
+
+        Returns accuracy for classification, R-squared for regression.
+
+        Parameters
+        ----------
+        X : np.ndarray | torch.Tensor
+            Pre-computed activations, shape (n_samples, n_features).
+        y : np.ndarray | torch.Tensor
+            True labels/values.
+
+        Returns
+        -------
+        float
+            Accuracy (classification) or R-squared (regression).
+        """
+        self._check_fitted()
+        X = self._to_numpy(X)
+        y = self._to_numpy(y)
+        return self.classifier_.score(X, y)
+
     def save(self, path: str) -> None:
         """Save the fitted probe to disk.
 
@@ -1066,6 +1220,7 @@ class LinearProbe:
             "train_pooling": self.train_pooling,
             "inference_pooling": self.inference_pooling,
             "classifier": self.classifier,
+            "task": self.task,
             "device": self.device,
             "remote": self.remote,
             "random_state": self.random_state,
@@ -1122,6 +1277,7 @@ class LinearProbe:
             train_pooling=state["train_pooling"],
             inference_pooling=state["inference_pooling"],
             classifier=state["classifier"],
+            task=state.get("task", "classification"),
             device=state["device"],
             remote=state["remote"],
             random_state=state["random_state"],
