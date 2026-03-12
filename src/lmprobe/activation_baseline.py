@@ -58,8 +58,8 @@ class ActivationBaseline:
         Number of PCA components (for method="pca").
     batch_size : int, default=8
         Batch size for activation extraction.
-    backend : str, default="nnsight"
-        Extraction backend: "nnsight" (default) or "local".
+    backend : str, default="local"
+        Extraction backend: "local" (default) or "nnsight".
 
     Attributes
     ----------
@@ -97,7 +97,7 @@ class ActivationBaseline:
         random_state: int | None = None,
         n_components: int = 10,
         batch_size: int = 8,
-        backend: str = "nnsight",
+        backend: str = "local",
     ):
         if method not in self.VALID_METHODS:
             raise ValueError(

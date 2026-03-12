@@ -111,7 +111,7 @@ class LinearProbe:
     fast_auto_top_k : int | None, default=None
         Number of layers to select when using layers="fast_auto".
         If None, defaults to selecting half the candidate layers.
-    backend : str, default="nnsight"
+    backend : str, default="local"
         Extraction backend: "nnsight" (default) or "local".
         "local" uses HuggingFace transformers directly without nnsight,
         enabling use with models not supported by nnsight/NDIF.
@@ -172,7 +172,7 @@ class LinearProbe:
         auto_alpha: float = 0.01,
         normalize_layers: bool | str = True,
         fast_auto_top_k: int | None = None,
-        backend: str = "nnsight",
+        backend: str = "local",
         dtype: str | None = None,
     ):
         self.model = model
@@ -1286,7 +1286,7 @@ class LinearProbe:
             auto_alpha=state.get("auto_alpha", 0.01),
             normalize_layers=state.get("normalize_layers", True),
             fast_auto_top_k=state.get("fast_auto_top_k"),
-            backend=state.get("backend", "nnsight"),
+            backend=state.get("backend", "local"),
             dtype=state.get("dtype"),
         )
 

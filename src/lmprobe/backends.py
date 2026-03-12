@@ -473,6 +473,13 @@ def resolve_backend(
         are specified (e.g., local + remote).
     """
     if backend == "nnsight":
+        try:
+            import nnsight  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "nnsight is required for backend='nnsight'. "
+                "Install with: pip install lmprobe[nnsight]"
+            ) from None
         return NnsightBackend(model_name, device, remote=remote)
     elif backend == "local":
         if remote:

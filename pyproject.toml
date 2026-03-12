@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lmprobe"
-version = "0.4.9"
+version = "0.5.0"
 description = "Train linear probes on language model activations for AI safety monitoring"
 readme = "README.md"
 license = "MIT"
@@ -31,7 +31,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "nnsight>=0.3",
     "torch>=2.0",
     "transformers>=4.30",
     "scikit-learn>=1.0",
@@ -40,6 +39,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+nnsight = [
+    "nnsight>=0.3",
+]
+remote = [
+    "nnsight>=0.3",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",

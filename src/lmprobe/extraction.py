@@ -10,16 +10,27 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
-from nnsight import CONFIG, LanguageModel
 from tqdm import tqdm
 
 if TYPE_CHECKING:
-    pass
+    from nnsight import LanguageModel
+
+
+def _require_nnsight():
+    """Import and return the nnsight module, raising a clear error if not installed."""
+    try:
+        import nnsight
+    except ImportError:
+        raise ImportError(
+            "nnsight is required for this operation. "
+            "Install it with: pip install lmprobe[nnsight]"
+        ) from None
+    return nnsight
 
 
 # Global model cache to avoid loading the same model multiple times
 # Key: (model_name, device), Value: LanguageModel
-_MODEL_CACHE: dict[tuple[str, str], LanguageModel] = {}
+_MODEL_CACHE: dict = {}
 
 
 def get_cached_model(
@@ -78,7 +89,8 @@ def configure_remote() -> None:
             "NNSIGHT_API_KEY environment variable is required for remote execution. "
             "Set it with: export NNSIGHT_API_KEY='your-key-here'"
         )
-    CONFIG.API.APIKEY = api_key
+    nnsight = _require_nnsight()
+    nnsight.CONFIG.API.APIKEY = api_key
 
 
 def get_num_layers_from_config(model_name: str) -> int:
@@ -311,12 +323,15 @@ def load_model(
     LanguageModel
         The loaded nnsight model.
     """
+    nnsight = _require_nnsight()
+    LM = nnsight.LanguageModel
+
     if remote:
         # For remote execution, don't load weights locally.
         # dispatch=False prevents loading model weights - only tokenizer is loaded.
         # This is critical for large models (405B) that would OOM locally.
         # See: https://nnsight.net/notebooks/features/remote_execution/
-        model = LanguageModel(model_name, dispatch=False)
+        model = LM(model_name, dispatch=False)
     else:
         # Local execution - load weights to specified device
         if device == "auto":
@@ -326,7 +341,7 @@ def load_model(
         else:
             device_map = {"": device}
 
-        model = LanguageModel(
+        model = LM(
             model_name,
             device_map=device_map,
             dispatch=True,
@@ -670,7 +685,7 @@ class ActivationExtractor:
         This is critical for large models (e.g., 405B) that would otherwise
         require hundreds of GB of memory to load locally.
     backend : str
-        Extraction backend to use: "nnsight" (default) or "local".
+        Extraction backend to use: "local" (default) or "nnsight".
         "local" uses HuggingFace transformers directly without nnsight.
     """
 
@@ -682,7 +697,7 @@ class ActivationExtractor:
         batch_size: int = 8,
         auto_candidates: list[int] | list[float] | None = None,
         remote: bool = False,
-        backend: str = "nnsight",
+        backend: str = "local",
         dtype: torch.dtype | None = None,
     ):
         self.model_name = model_name

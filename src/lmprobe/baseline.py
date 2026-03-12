@@ -325,7 +325,9 @@ class BaselineProbe:
             load_prompt_perplexity,
             save_prompt_perplexity,
         )
-        from .extraction import configure_remote, get_cached_model
+        from .extraction import _require_nnsight, configure_remote, get_cached_model
+
+        _require_nnsight()
 
         # Check which prompts are already cached
         cached_indices = []
