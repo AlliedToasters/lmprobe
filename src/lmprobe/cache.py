@@ -740,16 +740,15 @@ class CachedExtractor:
             (batch, seq_len, n_layers * hidden_dim) with layers concatenated
             in sorted order.
         """
-        from .extraction import _extract_batch, configure_remote
-
         model_name = self.extractor.model_name
         layer_indices = sorted(self.extractor.layer_indices)
         required_layers = set(layer_indices)
         batch_size = self.extractor.batch_size
 
-        # Validate API key early if using remote mode
-        # This ensures we fail fast if the key is missing, even with full cache hits
+        # For nnsight backend, validate API key early if using remote mode
         if remote:
+            from .extraction import configure_remote
+
             configure_remote()
 
         logger.info(
@@ -787,7 +786,6 @@ class CachedExtractor:
 
         # Extract missing prompts in batches, saving after each batch
         if missing_prompts:
-            model = self.extractor.model
             num_batches = (n_missing + batch_size - 1) // batch_size
 
             logger.info(
@@ -806,9 +804,9 @@ class CachedExtractor:
                 ):
                     batch_prompts = missing_prompts[batch_idx : batch_idx + batch_size]
 
-                    # Extract this batch
-                    batch_acts, batch_mask = _extract_batch(
-                        model, batch_prompts, layer_indices, remote=remote
+                    # Delegate to extractor (which delegates to backend)
+                    batch_acts, batch_mask = self.extractor.extract_batch(
+                        batch_prompts, layer_indices, remote=remote
                     )
 
                     # Save each prompt in the batch immediately

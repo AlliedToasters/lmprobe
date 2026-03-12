@@ -87,6 +87,10 @@ class LinearProbe:
     fast_auto_top_k : int | None, default=None
         Number of layers to select when using layers="fast_auto".
         If None, defaults to selecting half the candidate layers.
+    backend : str, default="nnsight"
+        Extraction backend: "nnsight" (default) or "local".
+        "local" uses HuggingFace transformers directly without nnsight,
+        enabling use with models not supported by nnsight/NDIF.
 
     Attributes
     ----------
@@ -140,6 +144,7 @@ class LinearProbe:
         auto_alpha: float = 0.01,
         normalize_layers: bool | str = True,
         fast_auto_top_k: int | None = None,
+        backend: str = "nnsight",
     ):
         self.model = model
         self.layers = layers
@@ -155,6 +160,14 @@ class LinearProbe:
         self.auto_alpha = auto_alpha
         self.normalize_layers = normalize_layers
         self.fast_auto_top_k = fast_auto_top_k
+        self.backend = backend
+
+        # Validate backend + remote compatibility
+        if backend == "local" and remote:
+            raise ValueError(
+                "backend='local' does not support remote=True. "
+                "Use backend='nnsight' for remote execution."
+            )
 
         # Resolve pooling strategies
         self._train_pooling, self._inference_pooling = resolve_pooling(
@@ -167,7 +180,8 @@ class LinearProbe:
         # Create extractor (lazy loads model)
         # Pass remote flag so large models (e.g., 405B) don't download weights locally
         self._extractor = ActivationExtractor(
-            model, device, layers, batch_size, auto_candidates=auto_candidates, remote=remote
+            model, device, layers, batch_size,
+            auto_candidates=auto_candidates, remote=remote, backend=backend,
         )
         self._cached_extractor = CachedExtractor(self._extractor)
 
@@ -518,6 +532,7 @@ class LinearProbe:
             self.device,
             self.selected_layers_,
             self.batch_size,
+            backend=self.backend,
         )
         selected_cached_extractor = CachedExtractor(selected_extractor)
 
@@ -645,6 +660,7 @@ class LinearProbe:
             self.device,
             self.selected_layers_,
             self.batch_size,
+            backend=self.backend,
         )
         selected_cached_extractor = CachedExtractor(selected_extractor)
 
@@ -1031,6 +1047,7 @@ class LinearProbe:
             "auto_alpha": self.auto_alpha,
             "normalize_layers": self.normalize_layers,
             "fast_auto_top_k": self.fast_auto_top_k,
+            "backend": self.backend,
             "classifier_": self.classifier_,
             "classes_": self.classes_,
             "selected_layers_": self.selected_layers_,
@@ -1085,6 +1102,7 @@ class LinearProbe:
             auto_alpha=state.get("auto_alpha", 0.01),
             normalize_layers=state.get("normalize_layers", True),
             fast_auto_top_k=state.get("fast_auto_top_k"),
+            backend=state.get("backend", "nnsight"),
         )
 
         # Restore original layers spec for reference
