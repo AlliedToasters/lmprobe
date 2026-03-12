@@ -982,6 +982,9 @@ class CachedExtractor:
         required_layers = set(layer_indices)
         batch_size = self.extractor.batch_size
 
+        # Ensure model name is persisted for cache_info() (#54)
+        _register_model(model_name)
+
         if remote:
             from .extraction import configure_remote
 
