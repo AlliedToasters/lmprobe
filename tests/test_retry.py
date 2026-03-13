@@ -1,6 +1,5 @@
 """Tests for retry logic used in remote extraction."""
 
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
