@@ -76,6 +76,7 @@ class TestRemoteExecution:
             model=remote_model,
             layers=-1,
             remote=True,
+            backend="nnsight",
             random_state=42,
         )
 
@@ -92,6 +93,7 @@ class TestRemoteExecution:
             model=remote_model,
             layers=-1,
             remote=True,
+            backend="nnsight",
             random_state=42,
         )
 
@@ -108,6 +110,7 @@ class TestRemoteExecution:
             model=remote_model,
             layers=[0, 15, 31],  # First, middle, last layers of 32-layer model
             remote=True,
+            backend="nnsight",
             random_state=42,
         )
 
@@ -132,6 +135,7 @@ class TestRemoteExecution:
             model=large_remote_model,
             layers="middle",
             remote=True,
+            backend="nnsight",
             random_state=42,
         )
 
@@ -149,6 +153,7 @@ class TestRemoteExecution:
             model=remote_model,
             layers=-1,
             remote=True,
+            backend="nnsight",
             random_state=42,
         )
 
@@ -177,6 +182,7 @@ class TestRemoteErrorHandling:
             model=remote_model,
             layers=-1,
             remote=True,
+            backend="nnsight",
         )
 
         with pytest.raises(EnvironmentError, match="NNSIGHT_API_KEY"):

@@ -371,6 +371,104 @@ def load_model(
     return model
 
 
+def _build_remote_extract_fn(layer_indices: list[int], with_logits: bool = False):
+    """Build a trace function for remote nnsight execution.
+
+    nnsight's remote tracing serializes the source code inside the
+    ``with model.trace()`` block. Two limitations prevent using the
+    same code path as local execution:
+
+    1. ``tracer.cache()`` returns a ``CacheDict`` whose ``__getattr__``
+       causes a ``RecursionError`` during ``torch.load`` deserialization
+       (nnsight issue #501).
+    2. nnsight's ``push()`` mechanism only injects simple variable
+       assignments back into the calling scope — loops and container
+       mutations are silently dropped.
+
+    To work around both issues we dynamically generate a real ``.py``
+    file containing one ``output.save()`` statement per layer (and
+    optionally a logits save). The file is importable so that
+    ``inspect.getsourcelines`` succeeds during nnsight's code capture.
+
+    Parameters
+    ----------
+    layer_indices : list[int]
+        Positive layer indices to extract.
+    with_logits : bool
+        If True, also save the lm_head logits output.
+
+    Returns
+    -------
+    callable
+        A function ``(model, tokenized) -> tuple[list[Tensor], Tensor|None]``
+        that runs the trace and returns (layer_outputs, logits_or_none).
+    """
+    import importlib.util
+    import tempfile
+
+    var_names = [f"_l{i}" for i in layer_indices]
+    save_lines = "\n".join(
+        f"        {v} = model.model.layers[{i}].output.save()"
+        for v, i in zip(var_names, layer_indices)
+    )
+    logits_line = (
+        "        _logits = model.lm_head.output.save()" if with_logits else ""
+    )
+
+    return_layers = f"[{', '.join(var_names)}]"
+    return_logits = "_logits" if with_logits else "None"
+
+    code = (
+        "def extract(model, tokenized):\n"
+        "    with model.trace(tokenized, remote=True, scan=False) as tracer:\n"
+        f"{save_lines}\n"
+        f"{logits_line}\n"
+        f"    return ({return_layers}, {return_logits})\n"
+    )
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", prefix="_lmprobe_remote_", delete=False
+    )
+    tmp.write(code)
+    tmp.flush()
+    tmp_path = tmp.name
+    tmp.close()
+
+    spec = importlib.util.spec_from_file_location("_lmprobe_remote", tmp_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # Wrap the function to clean up the temp file after execution.
+    # The file must exist when nnsight calls inspect.getsourcelines()
+    # during model.trace(), so we can only delete it after the trace
+    # (i.e., after the wrapper returns).
+    _extract_fn = mod.extract
+
+    def _wrapper(model, tokenized):
+        try:
+            return _extract_fn(model, tokenized)
+        finally:
+            try:
+                import os as _os
+
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    return _wrapper
+
+
+def _unwrap_layer_outputs(raw_outputs: list) -> list[torch.Tensor]:
+    """Unwrap proxy / tuple layer outputs into plain tensors."""
+    tensors = []
+    for raw in raw_outputs:
+        val = raw.value if hasattr(raw, "value") else raw
+        if isinstance(val, tuple):
+            val = val[0]
+        tensors.append(val)
+    return tensors
+
+
 def _extract_batch(
     model: LanguageModel,
     prompts: list[str],
@@ -396,52 +494,47 @@ def _extract_batch(
         - activations: Shape (batch, seq_len, hidden_dim * num_layers)
         - attention_mask: Shape (batch, seq_len)
     """
-    # Tokenize the prompts to get attention mask
     tokenized = model.tokenizer(
         prompts,
         return_tensors="pt",
         padding=True,
     )
 
-    # Use nnsight's tracer.cache() to collect multiple layer activations.
-    # This pattern works for both local and remote execution.
-    modules_to_cache = [model.model.layers[i] for i in layer_indices]
+    if remote:
+        # Remote: use individual output.save() calls to avoid CacheDict
+        # pickling issue (nnsight #501). See _build_remote_extract_fn
+        # docstring for details.
+        fn = _build_remote_extract_fn(layer_indices, with_logits=False)
+        layer_outputs, _ = fn(model, tokenized)
+        activation_tensors = _unwrap_layer_outputs(layer_outputs)
+    else:
+        # Local: tracer.cache() works fine without serialization.
+        modules_to_cache = [model.model.layers[i] for i in layer_indices]
 
-    with model.trace(tokenized, remote=remote) as tracer:
-        cache = tracer.cache(modules=modules_to_cache).save()
+        with model.trace(tokenized, remote=False) as tracer:
+            cache = tracer.cache(modules=modules_to_cache).save()
 
-    # Collect tensors from the cache
-    # Cache structure differs slightly between local/remote:
-    # - Remote: cache[key] is a dict with 'output' key
-    # - Local: cache[key] is an Entry object with .output attribute
-    activation_tensors = []
-    for layer_idx in layer_indices:
-        key = f"model.model.layers.{layer_idx}"
-        entry = cache[key]
+        activation_tensors = []
+        for layer_idx in layer_indices:
+            key = f"model.model.layers.{layer_idx}"
+            entry = cache[key]
 
-        # Handle both dict (remote) and Entry object (local) formats
-        if hasattr(entry, "output"):
-            output = entry.output
-        else:
-            output = entry["output"]
+            if hasattr(entry, "output"):
+                output = entry.output
+            else:
+                output = entry["output"]
 
-        # Handle both tuple outputs (hidden_states, ...) and direct tensors
-        if isinstance(output, tuple):
-            tensor = output[0]
-        else:
-            tensor = output
+            if isinstance(output, tuple):
+                tensor = output[0]
+            else:
+                tensor = output
 
-        # Handle proxy vs direct tensor
-        if hasattr(tensor, "value"):
-            tensor = tensor.value
+            if hasattr(tensor, "value"):
+                tensor = tensor.value
 
-        activation_tensors.append(tensor)
+            activation_tensors.append(tensor)
 
-    # Concatenate along hidden dimension
-    # Result shape: (batch, seq_len, hidden_dim * num_layers)
     combined = torch.cat(activation_tensors, dim=-1)
-
-    # Get attention mask from the tokenized input
     attention_mask = tokenized["attention_mask"]
 
     return combined, attention_mask
@@ -477,53 +570,50 @@ def _extract_batch_with_logits(
         - attention_mask: Shape (batch, seq_len)
         - logits: Shape (batch, seq_len, vocab_size)
     """
-    # Tokenize the prompts to get attention mask
     tokenized = model.tokenizer(
         prompts,
         return_tensors="pt",
         padding=True,
     )
 
-    # Use nnsight's tracer.cache() to collect multiple layer activations
-    # AND capture logits in the same forward pass
-    modules_to_cache = [model.model.layers[i] for i in layer_indices]
+    if remote:
+        fn = _build_remote_extract_fn(layer_indices, with_logits=True)
+        layer_outputs, logits_proxy = fn(model, tokenized)
+        activation_tensors = _unwrap_layer_outputs(layer_outputs)
+        logits_val = (
+            logits_proxy.value if hasattr(logits_proxy, "value") else logits_proxy
+        )
+    else:
+        modules_to_cache = [model.model.layers[i] for i in layer_indices]
 
-    with model.trace(tokenized, remote=remote) as tracer:
-        cache = tracer.cache(modules=modules_to_cache).save()
-        logits = model.lm_head.output.save()
+        with model.trace(tokenized, remote=False) as tracer:
+            cache = tracer.cache(modules=modules_to_cache).save()
+            logits = model.lm_head.output.save()
 
-    # Collect tensors from the cache (same as _extract_batch)
-    activation_tensors = []
-    for layer_idx in layer_indices:
-        key = f"model.model.layers.{layer_idx}"
-        entry = cache[key]
+        activation_tensors = []
+        for layer_idx in layer_indices:
+            key = f"model.model.layers.{layer_idx}"
+            entry = cache[key]
 
-        # Handle both dict (remote) and Entry object (local) formats
-        if hasattr(entry, "output"):
-            output = entry.output
-        else:
-            output = entry["output"]
+            if hasattr(entry, "output"):
+                output = entry.output
+            else:
+                output = entry["output"]
 
-        # Handle both tuple outputs (hidden_states, ...) and direct tensors
-        if isinstance(output, tuple):
-            tensor = output[0]
-        else:
-            tensor = output
+            if isinstance(output, tuple):
+                tensor = output[0]
+            else:
+                tensor = output
 
-        # Handle proxy vs direct tensor
-        if hasattr(tensor, "value"):
-            tensor = tensor.value
+            if hasattr(tensor, "value"):
+                tensor = tensor.value
 
-        activation_tensors.append(tensor)
+            activation_tensors.append(tensor)
 
-    # Concatenate along hidden dimension
+        logits_val = logits.value if hasattr(logits, "value") else logits
+
     combined = torch.cat(activation_tensors, dim=-1)
-
-    # Get attention mask from the tokenized input
     attention_mask = tokenized["attention_mask"]
-
-    # Unwrap logits proxy if needed
-    logits_val = logits.value if hasattr(logits, "value") else logits
 
     return combined, attention_mask, logits_val
 
