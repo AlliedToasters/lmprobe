@@ -46,11 +46,15 @@ nnsight = [
 remote = [
     "nnsight>=0.6,<0.6.2",
 ]
+s3 = [
+    "boto3>=1.26",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "ruff>=0.1",
     "black>=23.0",
+    "moto[s3]>=5.0",
 ]
 auto = [
     "skglm>=0.3",
