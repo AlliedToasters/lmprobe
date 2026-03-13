@@ -333,6 +333,11 @@ def load_model(
         # See: https://nnsight.net/notebooks/features/remote_execution/
         model = LM(model_name, dispatch=False)
     else:
+        # Fast-fail on CUDA compute capability mismatch
+        from lmprobe._device_utils import check_cuda_compatibility
+
+        check_cuda_compatibility(device)
+
         # Local execution - load weights to specified device
         if device == "auto":
             device_map = "auto"
