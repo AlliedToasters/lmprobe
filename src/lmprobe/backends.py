@@ -249,6 +249,10 @@ def _get_local_model(
     """
     cache_key = (model_name, device, dtype)
     if cache_key not in _LOCAL_MODEL_CACHE:
+        from lmprobe._device_utils import check_cuda_compatibility
+
+        check_cuda_compatibility(device)
+
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(model_name)
