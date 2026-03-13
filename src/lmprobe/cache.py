@@ -1365,6 +1365,7 @@ class CachedExtractor:
         prompts: list[str],
         remote: bool = False,
         invalidate_cache: bool = False,
+        max_retries: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract activations, using per-prompt cache when available."""
         model_name = self.extractor.model_name
@@ -1424,6 +1425,7 @@ class CachedExtractor:
             )
 
         # Extract missing prompts in batches
+        failed_count = 0
         if missing_prompts:
             num_batches = (n_missing + batch_size - 1) // batch_size
             logger.info(
@@ -1432,6 +1434,16 @@ class CachedExtractor:
             )
 
             from tqdm import tqdm
+
+            # Resolve retry count: only retry for remote extraction
+            effective_retries = max_retries if max_retries is not None else (3 if remote else 0)
+            if not remote:
+                effective_retries = 0  # never retry local — would hide real errors
+
+            if effective_retries > 0:
+                from .retry import retry_with_backoff
+
+            failed_count = 0
 
             with torch.no_grad():
                 for batch_idx in tqdm(
@@ -1443,9 +1455,31 @@ class CachedExtractor:
                     batch_prompts = missing_prompts[
                         batch_idx : batch_idx + batch_size
                     ]
-                    batch_acts, batch_mask = self.extractor.extract_batch(
-                        batch_prompts, layer_indices, remote=remote
-                    )
+                    batch_num = batch_idx // batch_size + 1
+
+                    try:
+                        if effective_retries > 0:
+                            batch_acts, batch_mask = retry_with_backoff(
+                                lambda bp=batch_prompts: self.extractor.extract_batch(
+                                    bp, layer_indices, remote=remote
+                                ),
+                                max_retries=effective_retries,
+                                context=f"batch {batch_num}/{num_batches}",
+                            )
+                        else:
+                            batch_acts, batch_mask = self.extractor.extract_batch(
+                                batch_prompts, layer_indices, remote=remote
+                            )
+                    except Exception:
+                        if remote and effective_retries > 0:
+                            # Skip this batch — partial progress is saved
+                            failed_count += len(batch_prompts)
+                            logger.error(
+                                f"[CACHE] Skipping batch {batch_num}/{num_batches} "
+                                f"({len(batch_prompts)} prompts) after {effective_retries} retries"
+                            )
+                            continue
+                        raise
 
                     # Save each prompt immediately
                     for j, prompt in enumerate(batch_prompts):
@@ -1457,11 +1491,29 @@ class CachedExtractor:
                             batch_mask[j : j + 1],
                         )
 
-            logger.info(
-                f"[CACHE] Extraction complete - all {n_missing} prompts cached"
-            )
+            if failed_count > 0:
+                logger.warning(
+                    f"[CACHE] Extraction partially complete - {failed_count}/{n_missing} "
+                    f"prompts failed and were skipped"
+                )
+            else:
+                logger.info(
+                    f"[CACHE] Extraction complete - all {n_missing} prompts cached"
+                )
         else:
             logger.info("[CACHE] 100% cache hit - no model inference needed!")
+
+        # If some batches were skipped, raise with a helpful message
+        if failed_count > 0:
+            cached_now = sum(
+                1 for p in prompts
+                if is_prompt_fully_cached(model_name, p, set(layer_indices))
+            )
+            raise RuntimeError(
+                f"Remote extraction incomplete: {failed_count} prompts failed after retries. "
+                f"{cached_now}/{len(prompts)} prompts are now cached. "
+                f"Re-run to retry the remaining prompts (cached results will be reused)."
+            )
 
         # Load all prompts from cache in original order
         all_activations = []

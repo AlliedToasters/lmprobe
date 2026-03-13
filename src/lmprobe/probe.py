@@ -339,6 +339,7 @@ class LinearProbe:
         fast_auto_top_k: int | None = None,
         backend: str = "local",
         dtype: str | None = None,
+        max_retries: int | None = None,
     ):
         self.model = model
         self.layers = layers
@@ -357,6 +358,7 @@ class LinearProbe:
         self.fast_auto_top_k = fast_auto_top_k
         self.backend = backend
         self.dtype = dtype
+        self.max_retries = max_retries
 
         # Validate task
         if task not in ("classification", "regression"):
@@ -508,6 +510,7 @@ class LinearProbe:
         pooling_strategy: str,
         remote: bool | None = None,
         invalidate_cache: bool = False,
+        max_retries: int | None = None,
     ) -> tuple[np.ndarray, torch.Tensor | None]:
         """Extract activations and apply pooling.
 
@@ -533,10 +536,12 @@ class LinearProbe:
                 return pooled_from_cache, None
 
         # Fall back to extraction + pooling
+        effective_retries = max_retries if max_retries is not None else self.max_retries
         activations, attention_mask = self._cached_extractor.extract(
             prompts,
             remote=remote,
             invalidate_cache=invalidate_cache,
+            max_retries=effective_retries,
         )
 
         # Get pooling function
@@ -560,6 +565,7 @@ class LinearProbe:
         self,
         prompts: list[str],
         remote: bool | None = None,
+        max_retries: int | None = None,
     ) -> None:
         """Extract and cache activations without training a classifier.
 
@@ -574,10 +580,16 @@ class LinearProbe:
             Text prompts to extract and cache activations for.
         remote : bool | None
             Override the instance-level remote setting.
+        max_retries : int | None
+            Override the instance-level max_retries setting.
+            Only applies to remote extraction.
         """
         self._check_model()
         use_remote = self._get_remote(remote)
-        self._cached_extractor.extract(prompts, remote=use_remote)
+        effective_retries = max_retries if max_retries is not None else self.max_retries
+        self._cached_extractor.extract(
+            prompts, remote=use_remote, max_retries=effective_retries
+        )
 
     def fit(
         self,
@@ -585,6 +597,7 @@ class LinearProbe:
         negative_prompts: list[str] | np.ndarray | list[int] | None = None,
         remote: bool | None = None,
         invalidate_cache: bool = False,
+        max_retries: int | None = None,
     ) -> LinearProbe:
         """Fit the probe on training data.
 
@@ -604,6 +617,9 @@ class LinearProbe:
             Override the instance-level remote setting.
         invalidate_cache : bool
             If True, ignore cached activations and re-extract.
+        max_retries : int | None
+            Override the instance-level max_retries setting.
+            Only applies to remote extraction.
 
         Returns
         -------
@@ -664,6 +680,7 @@ class LinearProbe:
             self._train_pooling,
             remote=remote,
             invalidate_cache=invalidate_cache,
+            max_retries=max_retries,
         )
 
         # Handle "all" pooling for training (expand to per-token examples)
