@@ -12,7 +12,7 @@ Keys in safetensors file:
     pooled_{strategy}_layer_{i}      Pooled: (1, hidden_dim)
     perplexity                       Features: (3,)
 
-Legacy format v1 (read-only, for backward compat):
+Legacy format v1 (read-only, for backward compat, local backend only):
     {model_hash}/{prompt_hash}/
       layer_{i}.pt
       attention_mask.pt
@@ -20,12 +20,13 @@ Legacy format v1 (read-only, for backward compat):
       perplexity.pt
 
 Features:
+    - Pluggable cache backends (local filesystem, S3)
     - Disk-full error handling (#44)
     - Pool-then-cache default (#45, applied in UnifiedCache)
     - float16 cache storage (#46) via LMPROBE_CACHE_DTYPE
     - Single safetensors file per prompt (#47)
     - cache_info() reporting (#48)
-    - LRU eviction (#49) via LMPROBE_CACHE_MAX_GB
+    - LRU eviction (#49) via LMPROBE_CACHE_MAX_GB (local backend only)
 """
 
 from __future__ import annotations
@@ -39,6 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
+
+from .cache_backends import CacheBackend, LocalCacheBackend
 
 # =============================================================================
 # Logging
@@ -142,6 +145,84 @@ def set_cache_dtype(dtype: str | None = None) -> None:
 
 
 # =============================================================================
+# Backend management
+# =============================================================================
+
+_backend: CacheBackend | None = None
+
+
+def _parse_backend_uri(uri: str) -> CacheBackend:
+    """Parse a backend URI string into a CacheBackend instance.
+
+    Supported schemes:
+    - ``s3://bucket/prefix`` → S3CacheBackend
+    - Local filesystem path → LocalCacheBackend
+    """
+    if uri.startswith("s3://"):
+        from .cache_backends import S3CacheBackend
+
+        # Parse s3://bucket/prefix
+        rest = uri[5:]  # strip "s3://"
+        parts = rest.split("/", 1)
+        bucket = parts[0]
+        prefix = parts[1] if len(parts) > 1 else ""
+        return S3CacheBackend(bucket=bucket, prefix=prefix)
+    elif uri.startswith("gs://") or uri.startswith("gcs://"):
+        raise ValueError(
+            f"Unsupported cache backend URI scheme: {uri!r}. "
+            "Only 's3://' and local filesystem paths are supported."
+        )
+    else:
+        # Treat as local filesystem path
+        return LocalCacheBackend(Path(uri))
+
+
+def get_backend() -> CacheBackend:
+    """Get the active cache backend, initializing from env vars if needed."""
+    global _backend
+    if _backend is not None:
+        return _backend
+
+    # Check LMPROBE_CACHE_BACKEND env var first
+    env_backend = os.getenv("LMPROBE_CACHE_BACKEND")
+    if env_backend:
+        _backend = _parse_backend_uri(env_backend)
+        return _backend
+
+    # Default: local filesystem backend using LMPROBE_CACHE_DIR
+    _backend = LocalCacheBackend(get_cache_dir())
+    return _backend
+
+
+def set_cache_backend(backend: CacheBackend | str | None) -> None:
+    """Set the cache storage backend.
+
+    Parameters
+    ----------
+    backend : CacheBackend | str | None
+        - A CacheBackend instance
+        - A URI string (e.g. "s3://bucket/prefix" or "/path/to/cache")
+        - None to reset to default (lazy re-initialization)
+    """
+    global _backend
+    if backend is None:
+        _backend = None
+    elif isinstance(backend, str):
+        _backend = _parse_backend_uri(backend)
+    elif isinstance(backend, CacheBackend):
+        _backend = backend
+    else:
+        raise TypeError(
+            f"Expected CacheBackend, str, or None, got {type(backend).__name__}"
+        )
+
+
+def _is_local_backend() -> bool:
+    """Check if the current backend is a local filesystem backend."""
+    return isinstance(get_backend(), LocalCacheBackend)
+
+
+# =============================================================================
 # Helpers
 # =============================================================================
 
@@ -218,6 +299,24 @@ def _parse_pooled_layer_keys(keys: set[str] | list[str], pooling: str) -> set[in
 
 
 # =============================================================================
+# Backend key helpers
+# =============================================================================
+
+
+def _prompt_cache_key(model_name: str, prompt: str) -> str:
+    """Get the backend key for a prompt's safetensors file."""
+    model_hash = _hash_string(model_name)
+    prompt_hash = _hash_string(prompt)
+    return f"{model_hash}/{prompt_hash}.safetensors"
+
+
+def _model_name_key(model_name: str) -> str:
+    """Get the backend key for the model name text file."""
+    model_hash = _hash_string(model_name)
+    return f"{model_hash}/_model_name.txt"
+
+
+# =============================================================================
 # Safe I/O (#44 disk-full handling, #46 dtype, #47 safetensors)
 # =============================================================================
 
@@ -230,6 +329,121 @@ def _prepare_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return t
 
 
+def _save_tensors_to_backend(key: str, tensors: dict[str, torch.Tensor]) -> None:
+    """Save tensors to the backend as safetensors bytes."""
+    from safetensors.torch import save
+
+    if _CACHE_MAX_BYTES == -1:
+        return  # Caching disabled
+
+    backend = get_backend()
+    data = save(tensors)
+
+    try:
+        backend.write_bytes(key, data)
+    except OSError as e:
+        err = str(e)
+        if "No space left" in err or "iostream error" in err or "enforce fail" in err:
+            raise OSError(
+                f"Disk full: could not write cache entry {key}. "
+                f"Free up disk space or set LMPROBE_CACHE_MAX_GB to limit cache size."
+            ) from e
+        raise
+
+    # Run LRU eviction after successful write (local backend only)
+    _maybe_evict()
+
+
+def _load_tensors_from_backend(
+    key: str, tensor_keys: list[str] | None = None
+) -> dict[str, torch.Tensor]:
+    """Load tensors from the backend.
+
+    For LocalCacheBackend, uses safe_open for memory-mapped selective loading.
+    For other backends, loads the full file from bytes.
+    """
+    backend = get_backend()
+
+    if isinstance(backend, LocalCacheBackend):
+        # Use safe_open for memory-mapped access on local files
+        from safetensors import safe_open
+
+        path = str(backend._path(key))
+        result = {}
+        with safe_open(path, framework="pt") as f:
+            available = set(f.keys())
+            if tensor_keys is None:
+                for k in available:
+                    result[k] = f.get_tensor(k)
+            else:
+                for k in tensor_keys:
+                    if k not in available:
+                        raise KeyError(
+                            f"Corrupted or incomplete cache entry {key}: "
+                            f"missing key {k!r}. Available keys: {sorted(available)}. "
+                            f"Delete this entry and re-run to rebuild the cache."
+                        )
+                    result[k] = f.get_tensor(k)
+        return result
+    else:
+        # Load full bytes for non-local backends
+        from safetensors.torch import load
+
+        data = backend.read_bytes(key)
+        all_tensors = load(data)
+        if tensor_keys is None:
+            return all_tensors
+        result = {}
+        for k in tensor_keys:
+            if k not in all_tensors:
+                raise KeyError(
+                    f"Corrupted or incomplete cache entry {key}: "
+                    f"missing key {k!r}. Available keys: {sorted(all_tensors.keys())}. "
+                    f"Delete this entry and re-run to rebuild the cache."
+                )
+            result[k] = all_tensors[k]
+        return result
+
+
+def _get_tensor_keys_from_backend(key: str) -> set[str]:
+    """Get tensor key names from a backend entry without loading data."""
+    backend = get_backend()
+
+    if isinstance(backend, LocalCacheBackend):
+        from safetensors import safe_open
+
+        path = str(backend._path(key))
+        with safe_open(path, framework="pt") as f:
+            return set(f.keys())
+    else:
+        from safetensors.torch import load
+
+        data = backend.read_bytes(key)
+        return set(load(data).keys())
+
+
+def _merge_save_backend(key: str, new_tensors: dict[str, torch.Tensor]) -> None:
+    """Load existing entry, merge with new tensors, and save."""
+    backend = get_backend()
+
+    if isinstance(backend, LocalCacheBackend):
+        # For local backend, use the original _merge_save path which
+        # provides atomic writes via temp file + rename
+        path = backend._path(key)
+        existing = _load_sf_all(path) if path.exists() else {}
+        existing.update(new_tensors)
+        _safe_save_file(existing, path)
+    else:
+        # For non-local backends (S3 etc.), use bytes-level I/O
+        if backend.exists(key):
+            existing = _load_tensors_from_backend(key)
+        else:
+            existing = {}
+        existing.update(new_tensors)
+        _save_tensors_to_backend(key, existing)
+
+
+# Keep legacy functions for backward compatibility (used by tests and v1 paths)
 def _safe_save_file(tensors: dict[str, torch.Tensor], path: Path) -> None:
     """Atomically save tensors to safetensors with disk-full error handling (#44).
 
@@ -340,13 +554,10 @@ def get_prompt_cache_path(model_name: str, prompt: str) -> Path:
 
 def _register_model(model_name: str) -> None:
     """Record model hash -> name mapping for cache_info()."""
-    base = get_cache_dir()
-    model_hash = _hash_string(model_name)
-    model_dir = base / model_hash
-    model_dir.mkdir(parents=True, exist_ok=True)
-    name_file = model_dir / "_model_name.txt"
-    if not name_file.exists():
-        name_file.write_text(model_name)
+    backend = get_backend()
+    key = _model_name_key(model_name)
+    if not backend.exists(key):
+        backend.write_text(key, model_name)
 
 
 def _read_model_name(model_dir: Path) -> str | None:
@@ -367,13 +578,28 @@ def get_prompt_cached_layers(cache_dir: Path) -> set[int]:
 
     Checks v2 safetensors format first, then v1 .pt format.
     """
-    # v2: check safetensors file (sibling of the directory path)
-    sf_path = cache_dir.with_suffix(".safetensors")
-    if sf_path.exists():
-        keys = _load_sf_keys(sf_path)
-        return _parse_raw_layer_keys(keys)
+    backend = get_backend()
 
-    # v1: check .pt files in directory
+    # v2: check via backend
+    # Derive the key from the cache_dir path
+    sf_path = cache_dir.with_suffix(".safetensors")
+    if isinstance(backend, LocalCacheBackend):
+        # For local backend, check if safetensors file exists via Path
+        if sf_path.exists():
+            keys = _load_sf_keys(sf_path)
+            return _parse_raw_layer_keys(keys)
+    else:
+        # For non-local, compute key from model/prompt hashes
+        try:
+            rel = sf_path.relative_to(get_cache_dir())
+            key = str(rel)
+            if backend.exists(key):
+                tensor_keys = _get_tensor_keys_from_backend(key)
+                return _parse_raw_layer_keys(tensor_keys)
+        except ValueError:
+            pass
+
+    # v1: check .pt files in directory (local only)
     if not cache_dir.exists():
         return set()
     cached = set()
@@ -389,19 +615,24 @@ def is_prompt_fully_cached(
     model_name: str, prompt: str, required_layers: set[int]
 ) -> bool:
     """Check if a prompt has all required raw layers cached."""
-    # v2
-    sf_path = get_prompt_cache_path(model_name, prompt)
-    if sf_path.exists():
-        keys = _load_sf_keys(sf_path)
-        cached = _parse_raw_layer_keys(keys)
-        has_mask = _ATTENTION_MASK_KEY in keys
+    backend = get_backend()
+    key = _prompt_cache_key(model_name, prompt)
+
+    # v2: check via backend
+    if backend.exists(key):
+        tensor_keys = _get_tensor_keys_from_backend(key)
+        cached = _parse_raw_layer_keys(tensor_keys)
+        has_mask = _ATTENTION_MASK_KEY in tensor_keys
         return required_layers.issubset(cached) and has_mask
 
-    # v1
-    cache_dir = get_prompt_cache_dir(model_name, prompt)
-    cached = get_prompt_cached_layers(cache_dir)
-    has_mask = (cache_dir / "attention_mask.pt").exists()
-    return required_layers.issubset(cached) and has_mask
+    # v1 fallback (local only)
+    if isinstance(backend, LocalCacheBackend):
+        cache_dir = get_prompt_cache_dir(model_name, prompt)
+        cached = get_prompt_cached_layers(cache_dir)
+        has_mask = (cache_dir / "attention_mask.pt").exists()
+        return required_layers.issubset(cached) and has_mask
+
+    return False
 
 
 def load_prompt_activations(
@@ -411,25 +642,30 @@ def load_prompt_activations(
 
     Returns (activations, attention_mask). Checks v2 then v1.
     """
-    sf_path = get_prompt_cache_path(model_name, prompt)
-    if sf_path.exists():
+    backend = get_backend()
+    key = _prompt_cache_key(model_name, prompt)
+
+    if backend.exists(key):
         # Touch for LRU
-        os.utime(sf_path)
+        backend.touch(key)
         keys_to_load = [_raw_layer_key(li) for li in layers] + [_ATTENTION_MASK_KEY]
-        tensors = _load_sf_tensors(sf_path, keys_to_load)
+        tensors = _load_tensors_from_backend(key, keys_to_load)
         layer_acts = [tensors[_raw_layer_key(li)] for li in layers]
         activations = torch.cat(layer_acts, dim=-1)
         return activations, tensors[_ATTENTION_MASK_KEY]
 
-    # v1 fallback
-    cache_dir = get_prompt_cache_dir(model_name, prompt)
-    layer_acts = []
-    for layer in layers:
-        acts = torch.load(cache_dir / f"layer_{layer}.pt", weights_only=True)
-        layer_acts.append(acts)
-    activations = torch.cat(layer_acts, dim=-1)
-    mask = torch.load(cache_dir / "attention_mask.pt", weights_only=True)
-    return activations, mask
+    # v1 fallback (local only)
+    if isinstance(backend, LocalCacheBackend):
+        cache_dir = get_prompt_cache_dir(model_name, prompt)
+        layer_acts = []
+        for layer in layers:
+            acts = torch.load(cache_dir / f"layer_{layer}.pt", weights_only=True)
+            layer_acts.append(acts)
+        activations = torch.cat(layer_acts, dim=-1)
+        mask = torch.load(cache_dir / "attention_mask.pt", weights_only=True)
+        return activations, mask
+
+    raise FileNotFoundError(f"No cached activations found for prompt: {prompt!r}")
 
 
 def save_prompt_activations(
@@ -441,7 +677,7 @@ def save_prompt_activations(
 ) -> None:
     """Save raw activations for a single prompt (v2 safetensors format)."""
     _register_model(model_name)
-    sf_path = get_prompt_cache_path(model_name, prompt)
+    key = _prompt_cache_key(model_name, prompt)
 
     n_layers = len(layers)
     hidden_dim = activations.shape[-1] // n_layers
@@ -453,33 +689,50 @@ def save_prompt_activations(
         new_tensors[_raw_layer_key(layer)] = _prepare_tensor(activations[..., start:end])
     new_tensors[_ATTENTION_MASK_KEY] = attention_mask.detach().cpu().contiguous()
 
-    _merge_save(sf_path, new_tensors)
+    _merge_save_backend(key, new_tensors)
 
-    # Clean up v1 directory if it exists (migrate on write)
-    old_dir = get_prompt_cache_dir(model_name, prompt)
-    if old_dir.is_dir():
-        shutil.rmtree(old_dir)
+    # Clean up v1 directory if it exists (migrate on write, local only)
+    if isinstance(get_backend(), LocalCacheBackend):
+        old_dir = get_prompt_cache_dir(model_name, prompt)
+        if old_dir.is_dir():
+            shutil.rmtree(old_dir)
 
 
 def is_prompt_perplexity_cached(model_name: str, prompt: str) -> bool:
     """Check if perplexity features are cached for a prompt."""
-    sf_path = get_prompt_cache_path(model_name, prompt)
-    if sf_path.exists():
-        return _PERPLEXITY_KEY in _load_sf_keys(sf_path)
-    # v1
-    cache_dir = get_prompt_cache_dir(model_name, prompt)
-    return (cache_dir / "perplexity.pt").exists()
+    backend = get_backend()
+    key = _prompt_cache_key(model_name, prompt)
+
+    if backend.exists(key):
+        tensor_keys = _get_tensor_keys_from_backend(key)
+        return _PERPLEXITY_KEY in tensor_keys
+
+    # v1 (local only)
+    if isinstance(backend, LocalCacheBackend):
+        cache_dir = get_prompt_cache_dir(model_name, prompt)
+        return (cache_dir / "perplexity.pt").exists()
+
+    return False
 
 
 def load_prompt_perplexity(model_name: str, prompt: str) -> torch.Tensor:
     """Load cached perplexity features (3,) for a single prompt."""
-    sf_path = get_prompt_cache_path(model_name, prompt)
-    if sf_path.exists():
-        os.utime(sf_path)
-        return _load_sf_tensor(sf_path, _PERPLEXITY_KEY)
-    # v1
-    cache_dir = get_prompt_cache_dir(model_name, prompt)
-    return torch.load(cache_dir / "perplexity.pt", weights_only=True)
+    backend = get_backend()
+    key = _prompt_cache_key(model_name, prompt)
+
+    if backend.exists(key):
+        backend.touch(key)
+        tensors = _load_tensors_from_backend(key, [_PERPLEXITY_KEY])
+        return tensors[_PERPLEXITY_KEY]
+
+    # v1 (local only)
+    if isinstance(backend, LocalCacheBackend):
+        cache_dir = get_prompt_cache_dir(model_name, prompt)
+        return torch.load(cache_dir / "perplexity.pt", weights_only=True)
+
+    raise FileNotFoundError(
+        f"No cached perplexity found for prompt: {prompt!r}"
+    )
 
 
 def save_prompt_perplexity(
@@ -487,9 +740,9 @@ def save_prompt_perplexity(
 ) -> None:
     """Save perplexity features for a single prompt."""
     _register_model(model_name)
-    sf_path = get_prompt_cache_path(model_name, prompt)
+    key = _prompt_cache_key(model_name, prompt)
     new_tensors = {_PERPLEXITY_KEY: _prepare_tensor(perplexity_features)}
-    _merge_save(sf_path, new_tensors)
+    _merge_save_backend(key, new_tensors)
 
 
 # =============================================================================
@@ -509,46 +762,58 @@ def is_prompt_pooled_cached(
     pooling: str,
 ) -> bool:
     """Check if pooled activations are cached for a prompt."""
+    backend = get_backend()
+    key = _prompt_cache_key(model_name, prompt)
+
     # v2
-    sf_path = get_prompt_cache_path(model_name, prompt)
-    if sf_path.exists():
-        keys = _load_sf_keys(sf_path)
-        cached = _parse_pooled_layer_keys(keys, pooling)
+    if backend.exists(key):
+        tensor_keys = _get_tensor_keys_from_backend(key)
+        cached = _parse_pooled_layer_keys(tensor_keys, pooling)
         return required_layers.issubset(cached)
 
-    # v1
-    cache_dir = get_prompt_cache_dir(model_name, prompt)
-    pooled_dir = cache_dir / get_pooled_cache_key(pooling)
-    if not pooled_dir.exists():
-        return False
-    cached = set()
-    for f in pooled_dir.glob("layer_*.pt"):
-        try:
-            cached.add(int(f.stem.split("_")[1]))
-        except (IndexError, ValueError):
-            continue
-    return required_layers.issubset(cached)
+    # v1 (local only)
+    if isinstance(backend, LocalCacheBackend):
+        cache_dir = get_prompt_cache_dir(model_name, prompt)
+        pooled_dir = cache_dir / get_pooled_cache_key(pooling)
+        if not pooled_dir.exists():
+            return False
+        cached = set()
+        for f in pooled_dir.glob("layer_*.pt"):
+            try:
+                cached.add(int(f.stem.split("_")[1]))
+            except (IndexError, ValueError):
+                continue
+        return required_layers.issubset(cached)
+
+    return False
 
 
 def load_prompt_pooled_activations(
     model_name: str, prompt: str, layers: list[int], pooling: str
 ) -> torch.Tensor:
     """Load pooled activations for a single prompt. Shape: (1, n_layers * hidden_dim)."""
-    sf_path = get_prompt_cache_path(model_name, prompt)
-    if sf_path.exists():
-        os.utime(sf_path)
-        keys = [_pooled_layer_key(pooling, li) for li in layers]
-        tensors = _load_sf_tensors(sf_path, keys)
-        return torch.cat([tensors[k] for k in keys], dim=-1)
+    backend = get_backend()
+    key = _prompt_cache_key(model_name, prompt)
 
-    # v1
-    cache_dir = get_prompt_cache_dir(model_name, prompt)
-    pooled_dir = cache_dir / get_pooled_cache_key(pooling)
-    layer_acts = []
-    for layer in layers:
-        acts = torch.load(pooled_dir / f"layer_{layer}.pt", weights_only=True)
-        layer_acts.append(acts)
-    return torch.cat(layer_acts, dim=-1)
+    if backend.exists(key):
+        backend.touch(key)
+        tensor_keys = [_pooled_layer_key(pooling, li) for li in layers]
+        tensors = _load_tensors_from_backend(key, tensor_keys)
+        return torch.cat([tensors[k] for k in tensor_keys], dim=-1)
+
+    # v1 (local only)
+    if isinstance(backend, LocalCacheBackend):
+        cache_dir = get_prompt_cache_dir(model_name, prompt)
+        pooled_dir = cache_dir / get_pooled_cache_key(pooling)
+        layer_acts = []
+        for layer in layers:
+            acts = torch.load(pooled_dir / f"layer_{layer}.pt", weights_only=True)
+            layer_acts.append(acts)
+        return torch.cat(layer_acts, dim=-1)
+
+    raise FileNotFoundError(
+        f"No cached pooled activations found for prompt: {prompt!r}"
+    )
 
 
 def save_prompt_pooled_activations(
@@ -560,7 +825,7 @@ def save_prompt_pooled_activations(
 ) -> None:
     """Save pooled activations for a single prompt (v2 safetensors)."""
     _register_model(model_name)
-    sf_path = get_prompt_cache_path(model_name, prompt)
+    key = _prompt_cache_key(model_name, prompt)
 
     n_layers = len(layers)
     hidden_dim = pooled_activations.shape[-1] // n_layers
@@ -573,13 +838,14 @@ def save_prompt_pooled_activations(
             pooled_activations[..., start:end]
         )
 
-    _merge_save(sf_path, new_tensors)
+    _merge_save_backend(key, new_tensors)
 
-    # Clean up v1 pooled directory if exists
-    old_dir = get_prompt_cache_dir(model_name, prompt)
-    pooled_dir = old_dir / get_pooled_cache_key(pooling)
-    if pooled_dir.is_dir():
-        shutil.rmtree(pooled_dir)
+    # Clean up v1 pooled directory if exists (local only)
+    if isinstance(get_backend(), LocalCacheBackend):
+        old_dir = get_prompt_cache_dir(model_name, prompt)
+        pooled_dir = old_dir / get_pooled_cache_key(pooling)
+        if pooled_dir.is_dir():
+            shutil.rmtree(pooled_dir)
 
 
 # =============================================================================
@@ -617,7 +883,7 @@ class ModelCacheInfo:
 class CacheInfo:
     """Cache usage report."""
 
-    cache_dir: Path
+    cache_dir: Path | str
     total_size_bytes: int
     models: list[ModelCacheInfo] = field(default_factory=list)
     oldest_mtime: float | None = None
@@ -664,7 +930,17 @@ def cache_info(model: str | None = None) -> CacheInfo:
     CacheInfo
         Structured cache usage report.
     """
-    base = get_cache_dir()
+    backend = get_backend()
+
+    if isinstance(backend, LocalCacheBackend):
+        return _cache_info_local(backend, model)
+    else:
+        return _cache_info_backend(backend, model)
+
+
+def _cache_info_local(backend: LocalCacheBackend, model: str | None = None) -> CacheInfo:
+    """Cache info implementation for local filesystem backend."""
+    base = backend.base_dir
     total_size = 0
     models = []
     oldest_mtime = None
@@ -758,8 +1034,98 @@ def cache_info(model: str | None = None) -> CacheInfo:
     )
 
 
+def _cache_info_backend(backend: CacheBackend, model: str | None = None) -> CacheInfo:
+    """Cache info implementation for non-local backends (e.g. S3)."""
+    from safetensors.torch import load
+
+    target_hash = _hash_string(model) if model else None
+    entries = backend.collect_entries()
+
+    # Group entries by model hash
+    model_entries: dict[str, list[tuple[str, int, float]]] = {}
+    for entry_key, size, mtime in entries:
+        parts = entry_key.split("/")
+        if len(parts) < 2:
+            continue
+        model_hash = parts[0]
+        if target_hash and model_hash != target_hash:
+            continue
+        model_entries.setdefault(model_hash, []).append((entry_key, size, mtime))
+
+    total_size = 0
+    models = []
+    oldest_mtime = None
+    newest_mtime = None
+
+    for model_hash, m_entries in sorted(model_entries.items()):
+        # Try to read model name
+        name_key = f"{model_hash}/_model_name.txt"
+        model_name = None
+        if backend.exists(name_key):
+            model_name = backend.read_text(name_key).strip()
+
+        model_size = 0
+        num_prompts = 0
+        all_layers: set[int] = set()
+        has_pooled = False
+        has_perplexity = False
+
+        for entry_key, size, mtime in m_entries:
+            model_size += size
+            num_prompts += 1
+
+            if oldest_mtime is None or mtime < oldest_mtime:
+                oldest_mtime = mtime
+            if newest_mtime is None or mtime > newest_mtime:
+                newest_mtime = mtime
+
+            # Try to read tensor keys
+            if entry_key.endswith(".safetensors"):
+                try:
+                    data = backend.read_bytes(entry_key)
+                    tensor_keys = set(load(data).keys())
+                    all_layers |= _parse_raw_layer_keys(tensor_keys)
+                    if any(k.startswith("pooled_") for k in tensor_keys):
+                        has_pooled = True
+                    if _PERPLEXITY_KEY in tensor_keys:
+                        has_perplexity = True
+                except Exception:
+                    pass
+
+        if num_prompts > 0 or model_size > 0:
+            total_size += model_size
+            models.append(
+                ModelCacheInfo(
+                    model_name=model_name,
+                    model_hash=model_hash,
+                    size_bytes=model_size,
+                    num_prompts=num_prompts,
+                    num_layers=len(all_layers),
+                    has_pooled=has_pooled,
+                    has_perplexity=has_perplexity,
+                )
+            )
+
+    # Determine cache_dir label
+    from .cache_backends import S3CacheBackend
+
+    if isinstance(backend, S3CacheBackend):
+        cache_dir_label = f"s3://{backend.bucket}/{backend.prefix}"
+    else:
+        cache_dir_label = str(getattr(backend, "base_dir", "unknown"))
+
+    return CacheInfo(
+        cache_dir=cache_dir_label,
+        total_size_bytes=total_size,
+        models=models,
+        oldest_mtime=oldest_mtime,
+        newest_mtime=newest_mtime,
+        cache_limit_bytes=None,  # No eviction on non-local backends
+    )
+
+
 # =============================================================================
-# LRU Eviction (#49)
+# LRU Eviction (#49) — local backend only
 # =============================================================================
 
 
@@ -794,8 +1160,16 @@ def _collect_cache_entries() -> list[tuple[Path, int, float]]:
 
 
 def _maybe_evict() -> None:
-    """Evict least-recently-used cache entries if over the size limit."""
+    """Evict least-recently-used cache entries if over the size limit.
+
+    This is a no-op on non-local backends (S3 etc.) — S3 is designed
+    for accumulating large datasets, not ephemeral caching.
+    """
     if _CACHE_MAX_BYTES is None or _CACHE_MAX_BYTES <= 0:
+        return
+
+    # Only evict on local backends
+    if not _is_local_backend():
         return
 
     entries = _collect_cache_entries()
@@ -916,19 +1290,35 @@ def clear_cache() -> int:
 
     Returns the number of cache entries deleted.
     """
-    cache_dir = get_cache_dir()
-    count = 0
-    for model_dir in cache_dir.iterdir():
-        if not model_dir.is_dir():
-            continue
-        # Count v2 safetensors files
-        count += sum(1 for _ in model_dir.glob("*.safetensors"))
-        # Count v1 directories
-        count += sum(
-            1 for d in model_dir.iterdir() if d.is_dir() and not d.name.startswith("_")
-        )
-        shutil.rmtree(model_dir)
-    return count
+    backend = get_backend()
+
+    if isinstance(backend, LocalCacheBackend):
+        cache_dir = backend.base_dir
+        count = 0
+        for model_dir in cache_dir.iterdir():
+            if not model_dir.is_dir():
+                continue
+            # Count v2 safetensors files
+            count += sum(1 for _ in model_dir.glob("*.safetensors"))
+            # Count v1 directories
+            count += sum(
+                1 for d in model_dir.iterdir() if d.is_dir() and not d.name.startswith("_")
+            )
+            shutil.rmtree(model_dir)
+        return count
+    else:
+        # Non-local backend: list all entries and delete by model hash
+        entries = backend.collect_entries()
+        model_hashes = set()
+        for entry_key, _, _ in entries:
+            parts = entry_key.split("/")
+            if parts:
+                model_hashes.add(parts[0])
+
+        count = 0
+        for model_hash in model_hashes:
+            count += backend.delete_tree(f"{model_hash}/")
+        return count
 
 
 def compute_cache_key(
@@ -998,15 +1388,16 @@ class CachedExtractor:
         # Handle cache invalidation
         if invalidate_cache:
             logger.info("[CACHE] Cache invalidation requested")
+            backend = get_backend()
             for prompt in prompts:
-                # Delete v2 file
-                sf_path = get_prompt_cache_path(model_name, prompt)
-                if sf_path.exists():
-                    sf_path.unlink()
-                # Delete v1 directory
-                cache_dir = get_prompt_cache_dir(model_name, prompt)
-                if cache_dir.exists():
-                    shutil.rmtree(cache_dir)
+                key = _prompt_cache_key(model_name, prompt)
+                if backend.exists(key):
+                    backend.delete(key)
+                # Delete v1 directory (local only)
+                if isinstance(backend, LocalCacheBackend):
+                    cache_dir = get_prompt_cache_dir(model_name, prompt)
+                    if cache_dir.exists():
+                        shutil.rmtree(cache_dir)
 
         # Check which prompts need extraction
         cached_prompts = []

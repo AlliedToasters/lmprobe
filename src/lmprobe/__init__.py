@@ -46,6 +46,7 @@ __all__ = [
     "enable_cache_logging",
     "plot_layer_importance",
     "plot_layer_importance_heatmap",
+    "set_cache_backend",
     "set_cache_dtype",
     "set_cache_limit",
     "set_max_threads",
@@ -94,11 +95,15 @@ def __getattr__(name: str):
         from .cache import enable_cache_logging
 
         return enable_cache_logging
-    if name in ("cache_info", "CacheInfo", "ModelCacheInfo", "set_cache_limit", "set_cache_dtype"):
+    if name in (
+        "cache_info", "CacheInfo", "ModelCacheInfo",
+        "set_cache_backend", "set_cache_limit", "set_cache_dtype",
+    ):
         from .cache import (
             CacheInfo,
             ModelCacheInfo,
             cache_info,
+            set_cache_backend,
             set_cache_dtype,
             set_cache_limit,
         )
@@ -107,6 +112,7 @@ def __getattr__(name: str):
             "cache_info": cache_info,
             "CacheInfo": CacheInfo,
             "ModelCacheInfo": ModelCacheInfo,
+            "set_cache_backend": set_cache_backend,
             "set_cache_limit": set_cache_limit,
             "set_cache_dtype": set_cache_dtype,
         }[name]

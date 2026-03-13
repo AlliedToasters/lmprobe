@@ -16,3 +16,18 @@ def tiny_model():
     that the pipeline works end-to-end, but predictions are meaningless.
     """
     return TEST_MODEL
+
+
+@pytest.fixture(autouse=True)
+def _reset_cache_backend():
+    """Reset the cache backend global between tests.
+
+    This ensures that tests using LMPROBE_CACHE_DIR via monkeypatch
+    get a fresh LocalCacheBackend pointing to the correct directory.
+    """
+    import lmprobe.cache as cache_mod
+
+    old = cache_mod._backend
+    cache_mod._backend = None
+    yield
+    cache_mod._backend = old
