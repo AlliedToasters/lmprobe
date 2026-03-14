@@ -1,5 +1,7 @@
 """Tests for UnifiedCache - combined activation and perplexity extraction."""
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -491,6 +493,99 @@ class TestPooledCache:
         # Both should now be cached separately
         assert is_prompt_pooled_cached(tiny_model, prompt, {0}, "last_token")
         assert is_prompt_pooled_cached(tiny_model, prompt, {0}, "mean")
+
+    def test_partial_cache_warns_missing_layers(self, tiny_model, tmp_path, monkeypatch):
+        """Warns when cache exists for prompts but requested layers are missing."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        prompt = "layer sweep test prompt"
+
+        # First: cache layer 0 only
+        cache_layer0 = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_pooled=True,
+            pooling="last_token",
+        )
+        cache_layer0.warmup([prompt])
+        assert is_prompt_pooled_cached(tiny_model, prompt, {0}, "last_token")
+
+        # Second: request layer 1 — cache file exists but layer 1 is missing
+        cache_layer1 = UnifiedCache(
+            model=tiny_model,
+            layers=[1],
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_pooled=True,
+            pooling="last_token",
+        )
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            cache_layer1.warmup([prompt])
+
+            # Should have emitted exactly one warning about missing layers
+            layer_warnings = [
+                x for x in w if "missing layer" in str(x.message).lower()
+            ]
+            assert len(layer_warnings) == 1
+            msg = str(layer_warnings[0].message)
+            assert "1" in msg  # missing layer 1
+            assert "warmup" in msg.lower()  # suggests warmup()
+
+    def test_no_warning_when_fully_cached(self, tiny_model, tmp_path, monkeypatch):
+        """No warning when all requested layers are cached."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        prompt = "fully cached test"
+
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0, 1],
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_pooled=True,
+            pooling="last_token",
+        )
+        cache.warmup([prompt])
+
+        # Request same layers again — should NOT warn
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            cache.warmup([prompt])
+
+            layer_warnings = [
+                x for x in w if "missing layer" in str(x.message).lower()
+            ]
+            assert len(layer_warnings) == 0
+
+    def test_no_warning_when_no_cache_exists(self, tiny_model, tmp_path, monkeypatch):
+        """No warning when there's no cache file at all (first extraction)."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_pooled=True,
+            pooling="last_token",
+        )
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            cache.warmup(["brand new prompt"])
+
+            layer_warnings = [
+                x for x in w if "missing layer" in str(x.message).lower()
+            ]
+            assert len(layer_warnings) == 0
 
     def test_pooled_invalid_pooling_raises(self, tiny_model):
         """cache_pooled=True with pooling='all' raises error."""
