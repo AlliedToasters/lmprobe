@@ -1,4 +1,4 @@
-"""LinearProbe: Train linear classifiers on language model activations.
+"""Probe: Train classifiers on language model activations.
 
 This is the main user-facing class for lmprobe.
 """
@@ -99,17 +99,17 @@ def _resolve_dtype(dtype: str | None) -> torch.dtype | None:
 class LayerSweepResult:
     """Results from a per-layer probe sweep.
 
-    Contains a fitted LinearProbe for each layer, with convenience methods
+    Contains a fitted Probe for each layer, with convenience methods
     for scoring and finding the best layer.
 
     Parameters
     ----------
-    probes : dict[int, LinearProbe]
-        Mapping from layer index to fitted LinearProbe.
+    probes : dict[int, Probe]
+        Mapping from layer index to fitted Probe.
 
     Examples
     --------
-    >>> result = LinearProbe.sweep_layers(
+    >>> result = Probe.sweep_layers(
     ...     model="meta-llama/Llama-3.1-8B-Instruct",
     ...     positive_prompts=pos,
     ...     negative_prompts=neg,
@@ -119,7 +119,7 @@ class LayerSweepResult:
     >>> print(f"Best layer: {result.best_layer(test_prompts, test_labels)}")
     """
 
-    probes: dict[int, LinearProbe] = field(default_factory=dict)
+    probes: dict[int, Probe] = field(default_factory=dict)
 
     @property
     def layers(self) -> list[int]:
@@ -129,7 +129,7 @@ class LayerSweepResult:
     def __len__(self) -> int:
         return len(self.probes)
 
-    def __getitem__(self, layer: int) -> LinearProbe:
+    def __getitem__(self, layer: int) -> Probe:
         """Get the probe for a specific layer."""
         return self.probes[layer]
 
@@ -259,7 +259,7 @@ class LayerSweepResult:
         }
 
 
-class LinearProbe:
+class Probe:
     """Train a linear probe on language model activations.
 
     Parameters
@@ -365,7 +365,7 @@ class LinearProbe:
 
     Examples
     --------
-    >>> probe = LinearProbe(
+    >>> probe = Probe(
     ...     model="meta-llama/Llama-3.1-8B-Instruct",
     ...     layers=16,
     ...     pooling="last_token",
@@ -376,7 +376,7 @@ class LinearProbe:
     >>> predictions = probe.predict(test_prompts)
 
     >>> # Automatic layer selection
-    >>> probe = LinearProbe(
+    >>> probe = Probe(
     ...     model="meta-llama/Llama-3.1-8B-Instruct",
     ...     layers="auto",
     ...     auto_candidates=[0.25, 0.5, 0.75],
@@ -510,7 +510,7 @@ class LinearProbe:
         """Check that a model was provided (needed for prompt-based methods)."""
         if self.model is None:
             raise ValueError(
-                "No model specified. Either pass model= to LinearProbe() "
+                "No model specified. Either pass model= to Probe() "
                 "or use the *_from_activations() methods instead."
             )
 
@@ -792,7 +792,7 @@ class LinearProbe:
         remote: bool | None = None,
         invalidate_cache: bool = False,
         max_retries: int | None = None,
-    ) -> LinearProbe:
+    ) -> Probe:
         """Fit the probe on training data.
 
         Supports two signatures:
@@ -817,7 +817,7 @@ class LinearProbe:
 
         Returns
         -------
-        LinearProbe
+        Probe
             Self, for method chaining.
 
         Notes
@@ -936,7 +936,7 @@ class LinearProbe:
         labels: np.ndarray,
         remote: bool | None,
         invalidate_cache: bool,
-    ) -> LinearProbe:
+    ) -> Probe:
         """Fit with automatic layer selection via Group Lasso.
 
         This is a two-phase process:
@@ -1060,7 +1060,7 @@ class LinearProbe:
         labels: np.ndarray,
         remote: bool | None,
         invalidate_cache: bool,
-    ) -> LinearProbe:
+    ) -> Probe:
         """Fit with fast automatic layer selection via coefficient importance.
 
         This is a fast alternative to Group Lasso layer selection:
@@ -1187,7 +1187,7 @@ class LinearProbe:
         positive_prompts: list[str],
         negative_prompts: list[str],
         remote: bool | None,
-    ) -> LinearProbe:
+    ) -> Probe:
         """Fit using sweep mode: train an independent probe per layer.
 
         Resolves the sweep spec to layer indices, delegates to sweep_layers(),
@@ -1249,7 +1249,7 @@ class LinearProbe:
         """Check that the probe has been fitted."""
         if self.classifier_ is None:
             raise RuntimeError(
-                "LinearProbe has not been fitted. Call fit() first."
+                "Probe has not been fitted. Call fit() first."
             )
 
     def predict(
@@ -1639,7 +1639,7 @@ class LinearProbe:
         trust_classifier: bool = False,
         load_model: bool = False,
         device: str | None = None,
-    ) -> LinearProbe:
+    ) -> Probe:
         """Load a probe from the HuggingFace Hub.
 
         Parameters
@@ -1657,7 +1657,7 @@ class LinearProbe:
 
         Returns
         -------
-        LinearProbe
+        Probe
             The loaded probe.
         """
         from .hub import from_hub
@@ -1716,7 +1716,7 @@ class LinearProbe:
 
         Examples
         --------
-        >>> probe = LinearProbe(model="...", layers="auto")
+        >>> probe = Probe(model="...", layers="auto")
         >>> probe.fit(positive_prompts, negative_prompts)
         >>> fig, ax = probe.plot_layer_importance()
         >>> fig.savefig("layer_importance.png")
@@ -1783,7 +1783,7 @@ class LinearProbe:
 
         Examples
         --------
-        >>> probe = LinearProbe(model="...", layers=[8, 16, 24])
+        >>> probe = Probe(model="...", layers=[8, 16, 24])
         >>> probe.fit(positive_prompts, negative_prompts)
         >>> importance = probe.compute_layer_importance()
         >>> print(f"Layer {probe.candidate_layers_[importance.argmax()]} is most important")
@@ -1857,7 +1857,7 @@ class LinearProbe:
         self,
         X,
         y,
-    ) -> LinearProbe:
+    ) -> Probe:
         """Fit the probe from pre-computed activation tensors.
 
         Skips all extraction and pooling logic, going straight to
@@ -1872,7 +1872,7 @@ class LinearProbe:
 
         Returns
         -------
-        LinearProbe
+        Probe
             Self, for method chaining.
         """
         X = self._to_numpy(X)
@@ -2015,7 +2015,7 @@ class LinearProbe:
             pickle.dump(state, f)
 
     @classmethod
-    def load(cls, path: str) -> LinearProbe:
+    def load(cls, path: str) -> Probe:
         """Load a fitted probe from disk.
 
         Parameters
@@ -2025,7 +2025,7 @@ class LinearProbe:
 
         Returns
         -------
-        LinearProbe
+        Probe
             The loaded probe.
         """
         with open(path, "rb") as f:
@@ -2117,7 +2117,7 @@ class LinearProbe:
         negative_prompts : list[str]
             Prompts for the negative class.
         layers : int | list[int] | str, default="all"
-            Which layers to sweep. Accepts same specifications as LinearProbe:
+            Which layers to sweep. Accepts same specifications as Probe:
             int, list[int], "all", "middle", "last".
         pooling : str, default="last_token"
             Token pooling strategy.
@@ -2146,7 +2146,7 @@ class LinearProbe:
 
         Examples
         --------
-        >>> result = LinearProbe.sweep_layers(
+        >>> result = Probe.sweep_layers(
         ...     model="meta-llama/Llama-3.1-8B-Instruct",
         ...     positive_prompts=pos,
         ...     negative_prompts=neg,
@@ -2188,7 +2188,7 @@ class LinearProbe:
 
         # Step 2: Train individual single-layer probes.
         # Each probe will hit the cache (no model inference needed).
-        probes: dict[int, LinearProbe] = {}
+        probes: dict[int, Probe] = {}
         for layer_idx in layer_indices:
             probe = cls(
                 model=model,
@@ -2210,3 +2210,7 @@ class LinearProbe:
             probes[layer_idx] = probe
 
         return LayerSweepResult(probes=probes)
+
+
+# Backwards-compatible alias
+LinearProbe = Probe
