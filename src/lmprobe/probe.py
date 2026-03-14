@@ -588,7 +588,8 @@ class LinearProbe:
         use_remote = self._get_remote(remote)
         effective_retries = max_retries if max_retries is not None else self.max_retries
         self._cached_extractor.extract(
-            prompts, remote=use_remote, max_retries=effective_retries
+            prompts, remote=use_remote, max_retries=effective_retries,
+            cache_only=True,
         )
 
     def fit(
