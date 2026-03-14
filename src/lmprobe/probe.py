@@ -32,6 +32,48 @@ if TYPE_CHECKING:
 
     from .scaling import PerLayerScaler
 
+def _parse_sweep_spec(spec: str) -> tuple[bool, int | list[int] | str]:
+    """Parse a sweep layer specification.
+
+    Parameters
+    ----------
+    spec : str
+        One of: "sweep", "sweep:10", "sweep:55-65"
+
+    Returns
+    -------
+    tuple[bool, int | list[int] | str]
+        (is_sweep, resolved_layers) where resolved_layers is the layer
+        spec to pass to sweep_layers. "sweep" -> "all",
+        "sweep:10" -> step size, "sweep:55-65" -> range.
+    """
+    if not isinstance(spec, str) or not spec.startswith("sweep"):
+        return False, spec
+
+    if spec == "sweep":
+        return True, "all"
+
+    # Must be "sweep:..." format
+    if not spec.startswith("sweep:"):
+        return False, spec
+
+    suffix = spec[len("sweep:"):]
+
+    if "-" in suffix:
+        # Range: "sweep:55-65"
+        parts = suffix.split("-")
+        if len(parts) != 2:
+            raise ValueError(
+                f"Invalid sweep range: {spec!r}. Expected 'sweep:START-END'."
+            )
+        start, end = int(parts[0]), int(parts[1])
+        return True, list(range(start, end + 1))
+
+    # Step size: "sweep:10"
+    step = int(suffix)
+    return True, step
+
+
 _DTYPE_MAP = {
     "float32": torch.float32,
     "float16": torch.float16,
@@ -234,6 +276,9 @@ class LinearProbe:
         - "all": All layers
         - "auto": Automatic layer selection via Group Lasso
         - "fast_auto": Fast automatic layer selection via coefficient importance
+        - "sweep": Train independent probe per layer (memory-safe)
+        - "sweep:N": Sweep every Nth layer (coarse sweep)
+        - "sweep:START-END": Sweep a range of layers (fine sweep)
     pooling : str, default="last_token"
         Token pooling strategy for both training and inference.
         Options: "last_token", "first_token", "mean", "all"
@@ -283,6 +328,21 @@ class LinearProbe:
     dtype : str | None, default=None
         Model dtype for local backend: "float32", "float16", or "bfloat16".
         Defaults to "float32" if None. Ignored for nnsight backend.
+    classifier_kwargs : dict | None, default=None
+        Additional keyword arguments passed to the sklearn classifier constructor.
+        Overrides defaults for built-in classifiers. Example:
+        ``{"C": 0.01, "solver": "liblinear", "max_iter": 5000}``
+        for logistic regression.
+    preprocessing : str | list[str] | None, default=None
+        Preprocessing pipeline applied after layer scaling but before the
+        classifier. Steps are separated by ``"+"`` when given as a string:
+        - ``"standard"``: StandardScaler
+        - ``"pca"`` or ``"pca:N"``: PCA with N components
+        - ``"standard+pca"``: StandardScaler then PCA
+        Use ``pca_components`` to set N when using ``"pca"`` without ``:N``.
+    pca_components : int | None, default=None
+        Number of PCA components when ``preprocessing`` includes ``"pca"``
+        without an explicit component count.
 
     Attributes
     ----------
@@ -340,6 +400,9 @@ class LinearProbe:
         backend: str = "local",
         dtype: str | None = None,
         max_retries: int | None = None,
+        classifier_kwargs: dict | None = None,
+        preprocessing: str | list[str] | None = None,
+        pca_components: int | None = None,
     ):
         self.model = model
         self.layers = layers
@@ -359,6 +422,12 @@ class LinearProbe:
         self.backend = backend
         self.dtype = dtype
         self.max_retries = max_retries
+        self.classifier_kwargs = classifier_kwargs
+        self.preprocessing = preprocessing
+        self.pca_components = pca_components
+
+        # Detect sweep mode before other validations
+        self._sweep_mode, self._sweep_layers_spec = _parse_sweep_spec(layers)
 
         # Validate task
         if task not in ("classification", "regression"):
@@ -386,13 +455,18 @@ class LinearProbe:
         if task == "regression" and classifier == "logistic_regression":
             # Default regression classifier
             self._classifier_template = resolve_classifier(
-                "ridge_regression", random_state
+                "ridge_regression", random_state,
+                classifier_kwargs=classifier_kwargs,
             )
         else:
-            self._classifier_template = resolve_classifier(classifier, random_state)
+            self._classifier_template = resolve_classifier(
+                classifier, random_state,
+                classifier_kwargs=classifier_kwargs,
+            )
 
         # Create extractor (lazy loads model) only if model is provided
-        if model is not None:
+        # Skip for sweep mode — sweep creates its own extractors
+        if model is not None and not self._sweep_mode:
             _torch_dtype = _resolve_dtype(dtype)
             self._extractor = ActivationExtractor(
                 model, device, layers, batch_size,
@@ -411,6 +485,8 @@ class LinearProbe:
         self.candidate_layers_: list[int] | None = None
         self.layer_importances_: np.ndarray | None = None
         self.scaler_: PerLayerScaler | None = None
+        self.preprocessing_pipeline_: object | None = None
+        self.sweep_result_: LayerSweepResult | None = None
 
         # Training data cache (for push_to_hub)
         self._training_positive_: list[str] | None = None
@@ -451,6 +527,55 @@ class LinearProbe:
             f"Invalid normalize_layers value: {self.normalize_layers!r}. "
             f"Expected True, False, 'per_neuron', or 'per_layer'."
         )
+
+    def _build_preprocessing_pipeline(self):
+        """Build a sklearn Pipeline from the preprocessing specification.
+
+        Returns
+        -------
+        sklearn.pipeline.Pipeline | None
+            A fitted preprocessing pipeline, or None if no preprocessing.
+        """
+        from sklearn.decomposition import PCA
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        spec = self.preprocessing
+        if spec is None:
+            return None
+
+        # Normalize to list of step strings
+        if isinstance(spec, str):
+            steps_spec = [s.strip() for s in spec.split("+")]
+        else:
+            steps_spec = list(spec)
+
+        steps = []
+        for s in steps_spec:
+            if s == "standard_scaler" or s == "standard":
+                steps.append(("scaler", StandardScaler()))
+            elif s.startswith("pca"):
+                # "pca", "pca:200"
+                if ":" in s:
+                    n = int(s.split(":")[1])
+                else:
+                    n = self.pca_components
+                if n is None:
+                    raise ValueError(
+                        "PCA requested but no component count specified. "
+                        "Use preprocessing='standard+pca:200' or set pca_components=200."
+                    )
+                steps.append(("pca", PCA(n_components=n)))
+            else:
+                raise ValueError(
+                    f"Unknown preprocessing step: {s!r}. "
+                    f"Available: 'standard', 'standard_scaler', 'pca', 'pca:<N>'."
+                )
+
+        if not steps:
+            return None
+
+        return Pipeline(steps)
 
     def _try_load_from_pooled_cache(
         self,
@@ -669,6 +794,12 @@ class LinearProbe:
             self._training_prompts_ = None
             self._training_labels_ = None
 
+        # Check if sweep mode
+        if self._sweep_mode:
+            return self._fit_sweep(
+                positive_prompts, negative_prompts, remote,
+            )
+
         # Check if auto layer selection is needed
         if self.layers == "auto":
             return self._fit_auto_layers(prompts, labels, remote, invalidate_cache)
@@ -709,6 +840,11 @@ class LinearProbe:
 
             self.scaler_ = StandardScaler()
             X = self.scaler_.fit_transform(X)
+
+        # Apply user-specified preprocessing (StandardScaler, PCA, etc.)
+        self.preprocessing_pipeline_ = self._build_preprocessing_pipeline()
+        if self.preprocessing_pipeline_ is not None:
+            X = self.preprocessing_pipeline_.fit_transform(X)
 
         # Clone and fit classifier
         self.classifier_ = clone(self._classifier_template)
@@ -969,6 +1105,69 @@ class LinearProbe:
 
         return self
 
+    def _fit_sweep(
+        self,
+        positive_prompts: list[str],
+        negative_prompts: list[str],
+        remote: bool | None,
+    ) -> LinearProbe:
+        """Fit using sweep mode: train an independent probe per layer.
+
+        Resolves the sweep spec to layer indices, delegates to sweep_layers(),
+        and sets the best layer's probe as the active classifier.
+        """
+        from .extraction import get_num_layers_from_config, resolve_layers
+
+        self._check_model()
+
+        num_layers = get_num_layers_from_config(self.model)
+        spec = self._sweep_layers_spec
+
+        if isinstance(spec, int):
+            # Step size: "sweep:10" → every 10th layer
+            sweep_layers_list = list(range(0, num_layers, spec))
+        elif isinstance(spec, list):
+            # Explicit layer list (from range parse)
+            sweep_layers_list = [idx for idx in spec if 0 <= idx < num_layers]
+        elif isinstance(spec, str):
+            # "all", "middle", etc.
+            sweep_layers_list = resolve_layers(spec, num_layers)
+        else:
+            sweep_layers_list = resolve_layers("all", num_layers)
+
+        # Delegate to sweep_layers classmethod
+        self.sweep_result_ = type(self).sweep_layers(
+            model=self.model,
+            positive_prompts=positive_prompts,
+            negative_prompts=negative_prompts,
+            layers=sweep_layers_list,
+            pooling=self.pooling,
+            classifier=self.classifier,
+            device=self.device,
+            remote=self._get_remote(remote),
+            random_state=self.random_state,
+            batch_size=self.batch_size,
+            backend=self.backend,
+            dtype=self.dtype,
+            normalize_layers=self.normalize_layers,
+            classifier_kwargs=self.classifier_kwargs,
+            preprocessing=self.preprocessing,
+            pca_components=self.pca_components,
+        )
+
+        # Use the first layer's probe as a default active probe
+        # (user can pick the best after evaluate())
+        first_layer = self.sweep_result_.layers[0]
+        best_probe = self.sweep_result_[first_layer]
+        self.classifier_ = best_probe.classifier_
+        self.classes_ = best_probe.classes_
+        self.scaler_ = best_probe.scaler_
+        self.preprocessing_pipeline_ = best_probe.preprocessing_pipeline_
+        self._extractor = best_probe._extractor
+        self._cached_extractor = best_probe._cached_extractor
+
+        return self
+
     def _check_fitted(self) -> None:
         """Check that the probe has been fitted."""
         if self.classifier_ is None:
@@ -1029,6 +1228,9 @@ class LinearProbe:
                 # Apply scaling if fitted
                 if self.scaler_ is not None:
                     X_flat = self.scaler_.transform(X_flat)
+                # Apply preprocessing if fitted
+                if self.preprocessing_pipeline_ is not None:
+                    X_flat = self.preprocessing_pipeline_.transform(X_flat)
 
                 preds_flat = self.classifier_.predict(X_flat)
                 preds = preds_flat.reshape(batch_size, seq_len)
@@ -1042,6 +1244,9 @@ class LinearProbe:
                 # Apply scaling if fitted
                 if self.scaler_ is not None:
                     X = self.scaler_.transform(X)
+                # Apply preprocessing if fitted
+                if self.preprocessing_pipeline_ is not None:
+                    X = self.preprocessing_pipeline_.transform(X)
                 return self.classifier_.predict(X)
 
     def predict_proba(
@@ -1092,6 +1297,9 @@ class LinearProbe:
             # Apply scaling if fitted
             if self.scaler_ is not None:
                 X_flat = self.scaler_.transform(X_flat)
+            # Apply preprocessing if fitted
+            if self.preprocessing_pipeline_ is not None:
+                X_flat = self.preprocessing_pipeline_.transform(X_flat)
 
             # Classify all tokens
             probs_flat = self.classifier_.predict_proba(X_flat)
@@ -1117,6 +1325,9 @@ class LinearProbe:
             # Apply scaling if fitted
             if self.scaler_ is not None:
                 X = self.scaler_.transform(X)
+            # Apply preprocessing if fitted
+            if self.preprocessing_pipeline_ is not None:
+                X = self.preprocessing_pipeline_.transform(X)
             return self.classifier_.predict_proba(X)
 
     def score(
@@ -1180,6 +1391,52 @@ class LinearProbe:
 
         self._check_fitted()
         labels = np.asarray(labels)
+
+        # Sweep mode: evaluate each layer and return per-layer + summary
+        if self.sweep_result_ is not None:
+            layer_results = {}
+            scores = self.sweep_result_.score(prompts, labels)
+            for layer_idx, probe in sorted(self.sweep_result_.probes.items()):
+                layer_preds = probe.predict(prompts, remote=remote)
+                layer_metrics: dict = {
+                    "accuracy": float(accuracy_score(labels, layer_preds)),
+                    "f1": float(f1_score(labels, layer_preds, zero_division=0)),
+                    "precision": float(precision_score(labels, layer_preds, zero_division=0)),
+                    "recall": float(recall_score(labels, layer_preds, zero_division=0)),
+                }
+                if hasattr(probe.classifier_, "predict_proba"):
+                    try:
+                        from sklearn.metrics import roc_auc_score
+
+                        proba = probe.predict_proba(prompts, remote=remote)
+                        if proba.ndim == 2 and proba.shape[1] == 2:
+                            layer_metrics["auroc"] = float(roc_auc_score(labels, proba[:, 1]))
+                        else:
+                            layer_metrics["auroc"] = float(roc_auc_score(labels, proba))
+                    except Exception:
+                        pass
+                layer_results[layer_idx] = layer_metrics
+
+            best_layer = max(scores, key=scores.get)
+            results: dict = {
+                "layer_results": layer_results,
+                "best_layer": best_layer,
+                "best_accuracy": scores[best_layer],
+                **layer_results[best_layer],  # top-level metrics from best layer
+            }
+
+            # Update this probe to use the best layer's probe
+            best_probe = self.sweep_result_[best_layer]
+            self.classifier_ = best_probe.classifier_
+            self.classes_ = best_probe.classes_
+            self.scaler_ = best_probe.scaler_
+            self.preprocessing_pipeline_ = best_probe.preprocessing_pipeline_
+            self._extractor = best_probe._extractor
+            self._cached_extractor = best_probe._cached_extractor
+
+            self._evaluation_results_ = results
+            return results
+
         predictions = self.predict(prompts, remote=remote)
 
         results: dict = {
@@ -1722,6 +1979,9 @@ class LinearProbe:
         backend: str = "local",
         dtype: str | None = None,
         normalize_layers: bool | str = True,
+        classifier_kwargs: dict | None = None,
+        preprocessing: str | list[str] | None = None,
+        pca_components: int | None = None,
     ) -> LayerSweepResult:
         """Train a probe at every layer and return per-layer results.
 
@@ -1799,6 +2059,7 @@ class LinearProbe:
             backend=backend,
             dtype=dtype,
             normalize_layers=False,  # No scaling needed for warmup
+            classifier_kwargs=classifier_kwargs,
         )
 
         all_prompts = list(positive_prompts) + list(negative_prompts)
@@ -1823,6 +2084,9 @@ class LinearProbe:
                 backend=backend,
                 dtype=dtype,
                 normalize_layers=normalize_layers,
+                classifier_kwargs=classifier_kwargs,
+                preprocessing=preprocessing,
+                pca_components=pca_components,
             )
             probe.fit(positive_prompts, negative_prompts, remote=remote)
             probes[layer_idx] = probe

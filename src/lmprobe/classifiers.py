@@ -42,7 +42,11 @@ CLASSIFICATION_CLASSIFIERS = BUILTIN_CLASSIFIERS - {"ridge_regression"}
 REGRESSION_CLASSIFIERS = frozenset({"ridge_regression"})
 
 
-def build_classifier(name: str, random_state: int | None = None) -> BaseEstimator:
+def build_classifier(
+    name: str,
+    random_state: int | None = None,
+    classifier_kwargs: dict | None = None,
+) -> BaseEstimator:
     """Build a classifier by name with the given random_state.
 
     Parameters
@@ -59,6 +63,10 @@ def build_classifier(name: str, random_state: int | None = None) -> BaseEstimato
         - "lda": Linear Discriminant Analysis (covariance-corrected mass mean)
     random_state : int | None
         Random seed for reproducibility. Propagated from LinearProbe.
+    classifier_kwargs : dict | None
+        Additional keyword arguments passed to the sklearn classifier constructor.
+        These override the defaults (e.g., ``{"C": 0.01, "solver": "liblinear"}``
+        for logistic regression).
 
     Returns
     -------
@@ -70,39 +78,38 @@ def build_classifier(name: str, random_state: int | None = None) -> BaseEstimato
     ValueError
         If the classifier name is not recognized.
     """
+    extra = classifier_kwargs or {}
+
     if name == "logistic_regression":
-        return LogisticRegression(
-            max_iter=1000,
-            solver="lbfgs",
-            random_state=random_state,
-        )
+        defaults = dict(max_iter=1000, solver="lbfgs", random_state=random_state)
+        defaults.update(extra)
+        return LogisticRegression(**defaults)
     elif name == "logistic_regression_cv":
-        return LogisticRegressionCV(
-            cv=5,
-            max_iter=1000,
-            random_state=random_state,
-        )
+        defaults = dict(cv=5, max_iter=1000, random_state=random_state)
+        defaults.update(extra)
+        return LogisticRegressionCV(**defaults)
     elif name == "ridge":
-        return RidgeClassifier(random_state=random_state)
+        defaults = dict(random_state=random_state)
+        defaults.update(extra)
+        return RidgeClassifier(**defaults)
     elif name == "ridge_regression":
-        return Ridge(alpha=1.0)
+        defaults = dict(alpha=1.0)
+        defaults.update(extra)
+        return Ridge(**defaults)
     elif name == "svm":
-        return SVC(
-            kernel="linear",
-            probability=True,
-            random_state=random_state,
-        )
+        defaults = dict(kernel="linear", probability=True, random_state=random_state)
+        defaults.update(extra)
+        return SVC(**defaults)
     elif name == "sgd":
-        return SGDClassifier(
-            loss="log_loss",
-            random_state=random_state,
-        )
+        defaults = dict(loss="log_loss", random_state=random_state)
+        defaults.update(extra)
+        return SGDClassifier(**defaults)
     elif name == "mass_mean":
         return MassMeanClassifier()
     elif name == "lda":
         from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
-        return LinearDiscriminantAnalysis()
+        return LinearDiscriminantAnalysis(**extra)
     else:
         raise ValueError(
             f"Unknown classifier: {name!r}. "
@@ -148,6 +155,7 @@ def validate_classifier(clf: BaseEstimator) -> None:
 def resolve_classifier(
     classifier: str | BaseEstimator,
     random_state: int | None = None,
+    classifier_kwargs: dict | None = None,
 ) -> BaseEstimator:
     """Resolve a classifier specification to an estimator instance.
 
@@ -159,6 +167,9 @@ def resolve_classifier(
     random_state : int | None
         Random seed. Only used for built-in classifiers (strings).
         Custom estimators must set their own random_state.
+    classifier_kwargs : dict | None
+        Additional keyword arguments for built-in classifiers.
+        Ignored when a custom estimator instance is provided.
 
     Returns
     -------
@@ -166,7 +177,10 @@ def resolve_classifier(
         The resolved classifier instance.
     """
     if isinstance(classifier, str):
-        clf = build_classifier(classifier, random_state=random_state)
+        clf = build_classifier(
+            classifier, random_state=random_state,
+            classifier_kwargs=classifier_kwargs,
+        )
     else:
         clf = classifier
 
