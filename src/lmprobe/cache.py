@@ -1366,7 +1366,8 @@ class CachedExtractor:
         remote: bool = False,
         invalidate_cache: bool = False,
         max_retries: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache_only: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Extract activations, using per-prompt cache when available."""
         model_name = self.extractor.model_name
         layer_indices = sorted(self.extractor.layer_indices)
@@ -1514,6 +1515,14 @@ class CachedExtractor:
                 f"{cached_now}/{len(prompts)} prompts are now cached. "
                 f"Re-run to retry the remaining prompts (cached results will be reused)."
             )
+
+        # If cache_only, skip matrix assembly (used by warmup())
+        if cache_only:
+            logger.info(
+                f"[CACHE] cache_only=True — skipping matrix assembly "
+                f"({n_cached} cached + {n_missing} extracted)"
+            )
+            return None
 
         # Load all prompts from cache in original order
         all_activations = []
