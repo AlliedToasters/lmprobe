@@ -343,6 +343,12 @@ class LinearProbe:
     pca_components : int | None, default=None
         Number of PCA components when ``preprocessing`` includes ``"pca"``
         without an explicit component count.
+    mass_mean_augment : bool, default=False
+        If True, compute the mass-mean direction (mean_positive - mean_negative)
+        on the original activations (before preprocessing), project all samples
+        onto this direction to get a 1D feature, and append it to the
+        (optionally PCA-reduced) features before fitting the classifier.
+        This augmentation is also applied during inference.
 
     Attributes
     ----------
@@ -403,6 +409,7 @@ class LinearProbe:
         classifier_kwargs: dict | None = None,
         preprocessing: str | list[str] | None = None,
         pca_components: int | None = None,
+        mass_mean_augment: bool = False,
     ):
         self.model = model
         self.layers = layers
@@ -425,6 +432,7 @@ class LinearProbe:
         self.classifier_kwargs = classifier_kwargs
         self.preprocessing = preprocessing
         self.pca_components = pca_components
+        self.mass_mean_augment = mass_mean_augment
 
         # Detect sweep mode before other validations
         self._sweep_mode, self._sweep_layers_spec = _parse_sweep_spec(layers)
@@ -486,6 +494,7 @@ class LinearProbe:
         self.layer_importances_: np.ndarray | None = None
         self.scaler_: PerLayerScaler | None = None
         self.preprocessing_pipeline_: object | None = None
+        self._mass_mean_direction_: np.ndarray | None = None
         self.sweep_result_: LayerSweepResult | None = None
 
         # Training data cache (for push_to_hub)
@@ -576,6 +585,65 @@ class LinearProbe:
             return None
 
         return Pipeline(steps)
+
+    def _compute_mass_mean_direction(
+        self,
+        X: np.ndarray,
+        labels: np.ndarray,
+    ) -> None:
+        """Compute and store the mass-mean direction from training data.
+
+        The direction is computed as the difference between the mean of
+        positive samples and the mean of negative samples, then normalized
+        to a unit vector. This is computed on the original (pre-preprocessing)
+        activations.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Training activations, shape (n_samples, n_features).
+        labels : np.ndarray
+            Binary labels (0 or 1).
+        """
+        positive_mask = labels == 1
+        negative_mask = labels == 0
+        mean_pos = X[positive_mask].mean(axis=0)
+        mean_neg = X[negative_mask].mean(axis=0)
+        direction = mean_pos - mean_neg
+        norm = np.linalg.norm(direction)
+        if norm > 0:
+            direction = direction / norm
+        self._mass_mean_direction_ = direction
+
+    def _augment_mass_mean(
+        self,
+        X_preprocessed: np.ndarray,
+        X_original: np.ndarray,
+    ) -> np.ndarray:
+        """Project samples onto the mass-mean direction and append to features.
+
+        The projection is computed on the original (pre-preprocessing)
+        activations using the stored mass-mean direction, producing a 1D
+        feature that is appended to the (possibly PCA-reduced) features.
+
+        Parameters
+        ----------
+        X_preprocessed : np.ndarray
+            Post-preprocessing activations, shape (n_samples, n_features).
+        X_original : np.ndarray
+            Pre-preprocessing activations, shape (n_samples, n_original_features).
+            Must match the dimensionality of the stored mass-mean direction.
+
+        Returns
+        -------
+        np.ndarray
+            Augmented activations with one extra column,
+            shape (n_samples, n_features + 1).
+        """
+        if self._mass_mean_direction_ is None:
+            return X_preprocessed
+        projection = X_original @ self._mass_mean_direction_
+        return np.column_stack([X_preprocessed, projection])
 
     def _try_load_from_pooled_cache(
         self,
@@ -841,10 +909,19 @@ class LinearProbe:
             self.scaler_ = StandardScaler()
             X = self.scaler_.fit_transform(X)
 
+        # Save pre-preprocessing activations for mass-mean augmentation
+        if self.mass_mean_augment:
+            X_pre_preprocessing = X.copy()
+            self._compute_mass_mean_direction(X_pre_preprocessing, labels)
+
         # Apply user-specified preprocessing (StandardScaler, PCA, etc.)
         self.preprocessing_pipeline_ = self._build_preprocessing_pipeline()
         if self.preprocessing_pipeline_ is not None:
             X = self.preprocessing_pipeline_.fit_transform(X)
+
+        # Apply mass-mean augmentation if enabled
+        if self.mass_mean_augment:
+            X = self._augment_mass_mean(X, X_pre_preprocessing)
 
         # Clone and fit classifier
         self.classifier_ = clone(self._classifier_template)
@@ -1228,9 +1305,14 @@ class LinearProbe:
                 # Apply scaling if fitted
                 if self.scaler_ is not None:
                     X_flat = self.scaler_.transform(X_flat)
+                # Save pre-preprocessing copy for mass-mean augmentation
+                X_flat_pre = X_flat.copy() if self._mass_mean_direction_ is not None else None
                 # Apply preprocessing if fitted
                 if self.preprocessing_pipeline_ is not None:
                     X_flat = self.preprocessing_pipeline_.transform(X_flat)
+                # Apply mass-mean augmentation if fitted
+                if self._mass_mean_direction_ is not None:
+                    X_flat = self._augment_mass_mean(X_flat, X_flat_pre)
 
                 preds_flat = self.classifier_.predict(X_flat)
                 preds = preds_flat.reshape(batch_size, seq_len)
@@ -1244,9 +1326,14 @@ class LinearProbe:
                 # Apply scaling if fitted
                 if self.scaler_ is not None:
                     X = self.scaler_.transform(X)
+                # Save pre-preprocessing copy for mass-mean augmentation
+                X_pre = X.copy() if self._mass_mean_direction_ is not None else None
                 # Apply preprocessing if fitted
                 if self.preprocessing_pipeline_ is not None:
                     X = self.preprocessing_pipeline_.transform(X)
+                # Apply mass-mean augmentation if fitted
+                if self._mass_mean_direction_ is not None:
+                    X = self._augment_mass_mean(X, X_pre)
                 return self.classifier_.predict(X)
 
     def predict_proba(
@@ -1297,9 +1384,14 @@ class LinearProbe:
             # Apply scaling if fitted
             if self.scaler_ is not None:
                 X_flat = self.scaler_.transform(X_flat)
+            # Save pre-preprocessing copy for mass-mean augmentation
+            X_flat_pre = X_flat.copy() if self._mass_mean_direction_ is not None else None
             # Apply preprocessing if fitted
             if self.preprocessing_pipeline_ is not None:
                 X_flat = self.preprocessing_pipeline_.transform(X_flat)
+            # Apply mass-mean augmentation if fitted
+            if self._mass_mean_direction_ is not None:
+                X_flat = self._augment_mass_mean(X_flat, X_flat_pre)
 
             # Classify all tokens
             probs_flat = self.classifier_.predict_proba(X_flat)
@@ -1325,9 +1417,14 @@ class LinearProbe:
             # Apply scaling if fitted
             if self.scaler_ is not None:
                 X = self.scaler_.transform(X)
+            # Save pre-preprocessing copy for mass-mean augmentation
+            X_pre = X.copy() if self._mass_mean_direction_ is not None else None
             # Apply preprocessing if fitted
             if self.preprocessing_pipeline_ is not None:
                 X = self.preprocessing_pipeline_.transform(X)
+            # Apply mass-mean augmentation if fitted
+            if self._mass_mean_direction_ is not None:
+                X = self._augment_mass_mean(X, X_pre)
             return self.classifier_.predict_proba(X)
 
     def score(
@@ -1781,6 +1878,11 @@ class LinearProbe:
         X = self._to_numpy(X)
         y = self._to_numpy(y)
 
+        # Apply mass-mean augmentation if enabled
+        if self.mass_mean_augment:
+            self._compute_mass_mean_direction(X, y)
+            X = self._augment_mass_mean(X, X)
+
         # Clone and fit classifier
         self.classifier_ = clone(self._classifier_template)
         self.classifier_.fit(X, y)
@@ -1811,6 +1913,8 @@ class LinearProbe:
         """
         self._check_fitted()
         X = self._to_numpy(X)
+        if self._mass_mean_direction_ is not None:
+            X = self._augment_mass_mean(X, X)
         return self.classifier_.predict(X)
 
     def predict_proba_from_activations(self, X) -> np.ndarray:
@@ -1839,6 +1943,8 @@ class LinearProbe:
                 "predict_proba is not available for regression tasks."
             )
         X = self._to_numpy(X)
+        if self._mass_mean_direction_ is not None:
+            X = self._augment_mass_mean(X, X)
         return self.classifier_.predict_proba(X)
 
     def score_from_activations(self, X, y) -> float:
@@ -1861,6 +1967,8 @@ class LinearProbe:
         self._check_fitted()
         X = self._to_numpy(X)
         y = self._to_numpy(y)
+        if self._mass_mean_direction_ is not None:
+            X = self._augment_mass_mean(X, X)
         return self.classifier_.score(X, y)
 
     def save(self, path: str) -> None:
@@ -1897,6 +2005,11 @@ class LinearProbe:
             "candidate_layers_": self.candidate_layers_,
             "layer_importances_": self.layer_importances_,
             "scaler_": self.scaler_,
+            "mass_mean_augment": self.mass_mean_augment,
+            "_mass_mean_direction_": self._mass_mean_direction_,
+            "preprocessing": self.preprocessing,
+            "pca_components": self.pca_components,
+            "preprocessing_pipeline_": self.preprocessing_pipeline_,
         }
         with open(path, "wb") as f:
             pickle.dump(state, f)
@@ -1948,6 +2061,9 @@ class LinearProbe:
             fast_auto_top_k=state.get("fast_auto_top_k"),
             backend=state.get("backend", "local"),
             dtype=state.get("dtype"),
+            mass_mean_augment=state.get("mass_mean_augment", False),
+            preprocessing=state.get("preprocessing"),
+            pca_components=state.get("pca_components"),
         )
 
         # Restore original layers spec for reference
@@ -1960,6 +2076,8 @@ class LinearProbe:
         probe.candidate_layers_ = state.get("candidate_layers_")
         probe.layer_importances_ = state.get("layer_importances_")
         probe.scaler_ = state.get("scaler_")
+        probe._mass_mean_direction_ = state.get("_mass_mean_direction_")
+        probe.preprocessing_pipeline_ = state.get("preprocessing_pipeline_")
 
         return probe
 

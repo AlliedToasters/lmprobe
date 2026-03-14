@@ -33,6 +33,7 @@ BUILTIN_CLASSIFIERS = frozenset({
     "sgd",
     "mass_mean",
     "lda",
+    "ensemble",
 })
 
 # Classifiers that only work with classification tasks
@@ -106,6 +107,13 @@ def build_classifier(
         return SGDClassifier(**defaults)
     elif name == "mass_mean":
         return MassMeanClassifier()
+    elif name == "ensemble":
+        c_values = extra.pop("C_values", None)
+        return EnsembleClassifier(
+            C_values=c_values,
+            random_state=random_state,
+            **extra,
+        )
     elif name == "lda":
         from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
@@ -228,6 +236,7 @@ class MassMeanClassifier:
         self.classes_: np.ndarray | None = None
         self.mean_positive_: np.ndarray | None = None
         self.mean_negative_: np.ndarray | None = None
+        self._calibrator: LogisticRegression | None = None
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> MassMeanClassifier:
         """Fit the Mass-Mean classifier.
@@ -269,6 +278,13 @@ class MassMeanClassifier:
         proj_negative = np.dot(self.mean_negative_, self.coef_)
         self.intercept_ = -(proj_positive + proj_negative) / 2
 
+        # Platt scaling: fit a logistic regression on the 1D decision scores
+        # to produce calibrated probabilities. This fixes AUROC without
+        # changing predict() behavior (which still uses the raw threshold).
+        scores = self.decision_function(X)
+        self._calibrator = LogisticRegression(max_iter=1000, solver="lbfgs")
+        self._calibrator.fit(scores.reshape(-1, 1), y)
+
         return self
 
     def decision_function(self, X: np.ndarray) -> np.ndarray:
@@ -307,7 +323,11 @@ class MassMeanClassifier:
         return (scores > 0).astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Predict class probabilities using sigmoid of decision scores.
+        """Predict class probabilities using Platt-scaled decision scores.
+
+        Uses a logistic regression fitted on the 1D decision scores during
+        ``fit()`` to produce calibrated probabilities (Platt scaling). This
+        yields better-ranked probabilities (higher AUROC) than raw sigmoid.
 
         Parameters
         ----------
@@ -321,7 +341,10 @@ class MassMeanClassifier:
         """
         scores = self.decision_function(X)
 
-        # Numerically stable sigmoid to get P(y=1)
+        if self._calibrator is not None:
+            return self._calibrator.predict_proba(scores.reshape(-1, 1))
+
+        # Fallback: numerically stable sigmoid (should not normally be reached)
         prob_positive = np.empty_like(scores, dtype=np.float64)
         pos = scores >= 0
         neg = ~pos
@@ -376,6 +399,156 @@ class MassMeanClassifier:
         -------
         self
         """
+        return self
+
+
+class EnsembleClassifier:
+    """Ensemble classifier that averages predictions across regularization strengths.
+
+    Trains multiple logistic regression models at different C values and
+    averages their predicted probabilities for more robust predictions.
+
+    Parameters
+    ----------
+    C_values : list[float] | None
+        Regularization strengths. Defaults to [0.01, 0.1, 0.5, 1.0, 5.0].
+    solver : str
+        Solver for LogisticRegression. Default "lbfgs".
+    max_iter : int
+        Maximum iterations per model. Default 1000.
+    random_state : int | None
+        Random seed for reproducibility.
+
+    Attributes
+    ----------
+    classes_ : np.ndarray
+        Class labels [0, 1].
+    estimators_ : list[LogisticRegression]
+        Fitted logistic regression models.
+    coef_ : np.ndarray
+        Averaged coefficients across all models.
+    intercept_ : np.ndarray
+        Averaged intercepts across all models.
+    """
+
+    _DEFAULT_C_VALUES = [0.01, 0.1, 0.5, 1.0, 5.0]
+
+    def __init__(
+        self,
+        C_values: list[float] | None = None,
+        solver: str = "lbfgs",
+        max_iter: int = 1000,
+        random_state: int | None = None,
+        **kwargs,
+    ):
+        self.C_values = C_values if C_values is not None else self._DEFAULT_C_VALUES
+        self.solver = solver
+        self.max_iter = max_iter
+        self.random_state = random_state
+        self._extra_kwargs = kwargs
+
+        self.classes_: np.ndarray | None = None
+        self.estimators_: list[LogisticRegression] | None = None
+        self.coef_: np.ndarray | None = None
+        self.intercept_: np.ndarray | None = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> EnsembleClassifier:
+        """Fit one LogisticRegression per C value.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix, shape (n_samples, n_features).
+        y : np.ndarray
+            Labels, shape (n_samples,).
+
+        Returns
+        -------
+        self
+        """
+        self.estimators_ = []
+        for c_val in self.C_values:
+            lr = LogisticRegression(
+                C=c_val,
+                solver=self.solver,
+                max_iter=self.max_iter,
+                random_state=self.random_state,
+                **self._extra_kwargs,
+            )
+            lr.fit(X, y)
+            self.estimators_.append(lr)
+
+        self.classes_ = self.estimators_[0].classes_
+        self.coef_ = np.mean([e.coef_ for e in self.estimators_], axis=0)
+        self.intercept_ = np.mean([e.intercept_ for e in self.estimators_], axis=0)
+
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Average predicted probabilities across all models.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix, shape (n_samples, n_features).
+
+        Returns
+        -------
+        np.ndarray
+            Averaged class probabilities, shape (n_samples, n_classes).
+        """
+        if self.estimators_ is None:
+            raise RuntimeError("Classifier has not been fitted. Call fit() first.")
+
+        probas = np.array([e.predict_proba(X) for e in self.estimators_])
+        return probas.mean(axis=0)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict by thresholding averaged probabilities at 0.5.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix, shape (n_samples, n_features).
+
+        Returns
+        -------
+        np.ndarray
+            Predicted labels, shape (n_samples,).
+        """
+        proba = self.predict_proba(X)
+        return self.classes_[np.argmax(proba, axis=1)]
+
+    def score(self, X: np.ndarray, y: np.ndarray) -> float:
+        """Compute accuracy.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Feature matrix.
+        y : np.ndarray
+            True labels.
+
+        Returns
+        -------
+        float
+            Accuracy.
+        """
+        return float((self.predict(X) == y).mean())
+
+    def get_params(self, deep: bool = True) -> dict:
+        """Get parameters for this estimator (sklearn compatibility)."""
+        return {
+            "C_values": self.C_values,
+            "solver": self.solver,
+            "max_iter": self.max_iter,
+            "random_state": self.random_state,
+        }
+
+    def set_params(self, **params) -> EnsembleClassifier:
+        """Set parameters for this estimator (sklearn compatibility)."""
+        for key, value in params.items():
+            setattr(self, key, value)
         return self
 
 
