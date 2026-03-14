@@ -537,6 +537,17 @@ class Probe:
             f"Expected True, False, 'per_neuron', or 'per_layer'."
         )
 
+    def _preprocessing_includes_standard(self) -> bool:
+        """Check if preprocessing spec includes StandardScaler."""
+        spec = self.preprocessing
+        if spec is None:
+            return False
+        if isinstance(spec, str):
+            steps = [s.strip() for s in spec.split("+")]
+        else:
+            steps = list(spec)
+        return any(s in ("standard", "standard_scaler") for s in steps)
+
     def _build_preprocessing_pipeline(self):
         """Build a sklearn Pipeline from the preprocessing specification.
 
@@ -921,9 +932,23 @@ class Probe:
             # Repeat labels for each token
             labels = np.repeat(labels, seq_len)
 
-        # Apply per-layer normalization if enabled
+        # Auto-disable normalize_layers when preprocessing includes StandardScaler
         n_layers = len(self._extractor.layer_indices)
         scaling_strategy = self._get_scaling_strategy()
+        if scaling_strategy is not None and self._preprocessing_includes_standard():
+            import warnings
+
+            warnings.warn(
+                "normalize_layers auto-disabled because preprocessing includes "
+                "StandardScaler. The double normalization is redundant and can "
+                "slightly hurt accuracy. Set normalize_layers=False to silence "
+                "this warning.",
+                UserWarning,
+                stacklevel=2,
+            )
+            scaling_strategy = None
+
+        # Apply per-layer normalization if enabled
         if scaling_strategy is not None and n_layers > 1:
             from .scaling import PerLayerScaler
 
