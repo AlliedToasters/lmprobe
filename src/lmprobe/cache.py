@@ -611,6 +611,25 @@ def get_prompt_cached_layers(cache_dir: Path) -> set[int]:
     return cached
 
 
+def get_prompt_cached_raw_layers(
+    model_name: str, prompt: str
+) -> set[int] | None:
+    """Return the set of raw layer indices cached for a prompt, or None if no cache exists."""
+    backend = get_backend()
+    key = _prompt_cache_key(model_name, prompt)
+
+    if backend.exists(key):
+        tensor_keys = _get_tensor_keys_from_backend(key)
+        return _parse_raw_layer_keys(tensor_keys)
+
+    if isinstance(backend, LocalCacheBackend):
+        cache_dir = get_prompt_cache_dir(model_name, prompt)
+        if cache_dir.exists():
+            return get_prompt_cached_layers(cache_dir)
+
+    return None
+
+
 def is_prompt_fully_cached(
     model_name: str, prompt: str, required_layers: set[int]
 ) -> bool:
@@ -755,6 +774,34 @@ def get_pooled_cache_key(pooling: str) -> str:
     return f"pooled_{pooling}"
 
 
+def get_prompt_cached_pooled_layers(
+    model_name: str,
+    prompt: str,
+    pooling: str,
+) -> set[int] | None:
+    """Return the set of pooled layer indices cached for a prompt, or None if no cache exists."""
+    backend = get_backend()
+    key = _prompt_cache_key(model_name, prompt)
+
+    if backend.exists(key):
+        tensor_keys = _get_tensor_keys_from_backend(key)
+        return _parse_pooled_layer_keys(tensor_keys, pooling)
+
+    if isinstance(backend, LocalCacheBackend):
+        cache_dir = get_prompt_cache_dir(model_name, prompt)
+        pooled_dir = cache_dir / get_pooled_cache_key(pooling)
+        if pooled_dir.exists():
+            cached = set()
+            for f in pooled_dir.glob("layer_*.pt"):
+                try:
+                    cached.add(int(f.stem.split("_")[1]))
+                except (IndexError, ValueError):
+                    continue
+            return cached
+
+    return None
+
+
 def is_prompt_pooled_cached(
     model_name: str,
     prompt: str,
@@ -762,29 +809,9 @@ def is_prompt_pooled_cached(
     pooling: str,
 ) -> bool:
     """Check if pooled activations are cached for a prompt."""
-    backend = get_backend()
-    key = _prompt_cache_key(model_name, prompt)
-
-    # v2
-    if backend.exists(key):
-        tensor_keys = _get_tensor_keys_from_backend(key)
-        cached = _parse_pooled_layer_keys(tensor_keys, pooling)
+    cached = get_prompt_cached_pooled_layers(model_name, prompt, pooling)
+    if cached is not None:
         return required_layers.issubset(cached)
-
-    # v1 (local only)
-    if isinstance(backend, LocalCacheBackend):
-        cache_dir = get_prompt_cache_dir(model_name, prompt)
-        pooled_dir = cache_dir / get_pooled_cache_key(pooling)
-        if not pooled_dir.exists():
-            return False
-        cached = set()
-        for f in pooled_dir.glob("layer_*.pt"):
-            try:
-                cached.add(int(f.stem.split("_")[1]))
-            except (IndexError, ValueError):
-                continue
-        return required_layers.issubset(cached)
-
     return False
 
 

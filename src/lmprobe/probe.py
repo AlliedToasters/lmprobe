@@ -537,6 +537,17 @@ class Probe:
             f"Expected True, False, 'per_neuron', or 'per_layer'."
         )
 
+    def _preprocessing_includes_standard(self) -> bool:
+        """Check if preprocessing spec includes StandardScaler."""
+        spec = self.preprocessing
+        if spec is None:
+            return False
+        if isinstance(spec, str):
+            steps = [s.strip() for s in spec.split("+")]
+        else:
+            steps = list(spec)
+        return any(s in ("standard", "standard_scaler") for s in steps)
+
     def _build_preprocessing_pipeline(self):
         """Build a sklearn Pipeline from the preprocessing specification.
 
@@ -704,6 +715,7 @@ class Probe:
         remote: bool | None = None,
         invalidate_cache: bool = False,
         max_retries: int | None = None,
+        batch_size: int | None = None,
     ) -> tuple[np.ndarray, torch.Tensor | None]:
         """Extract activations and apply pooling.
 
@@ -730,12 +742,21 @@ class Probe:
 
         # Fall back to extraction + pooling
         effective_retries = max_retries if max_retries is not None else self.max_retries
-        activations, attention_mask = self._cached_extractor.extract(
-            prompts,
-            remote=remote,
-            invalidate_cache=invalidate_cache,
-            max_retries=effective_retries,
-        )
+
+        # Temporarily override batch_size if provided
+        if batch_size is not None:
+            original_batch_size = self._extractor.batch_size
+            self._extractor.batch_size = batch_size
+        try:
+            activations, attention_mask = self._cached_extractor.extract(
+                prompts,
+                remote=remote,
+                invalidate_cache=invalidate_cache,
+                max_retries=effective_retries,
+            )
+        finally:
+            if batch_size is not None:
+                self._extractor.batch_size = original_batch_size
 
         # Get pooling function
         pool_fn = get_pooling_fn(pooling_strategy)
@@ -759,6 +780,7 @@ class Probe:
         prompts: list[str],
         remote: bool | None = None,
         max_retries: int | None = None,
+        batch_size: int | None = None,
     ) -> None:
         """Extract and cache activations without training a classifier.
 
@@ -776,14 +798,26 @@ class Probe:
         max_retries : int | None
             Override the instance-level max_retries setting.
             Only applies to remote extraction.
+        batch_size : int | None
+            Override the instance-level batch_size for this call.
+            Smaller values reduce memory usage; larger values may
+            improve throughput on GPU.
         """
         self._check_model()
         use_remote = self._get_remote(remote)
         effective_retries = max_retries if max_retries is not None else self.max_retries
-        self._cached_extractor.extract(
-            prompts, remote=use_remote, max_retries=effective_retries,
-            cache_only=True,
-        )
+
+        if batch_size is not None:
+            original_batch_size = self._extractor.batch_size
+            self._extractor.batch_size = batch_size
+        try:
+            self._cached_extractor.extract(
+                prompts, remote=use_remote, max_retries=effective_retries,
+                cache_only=True,
+            )
+        finally:
+            if batch_size is not None:
+                self._extractor.batch_size = original_batch_size
 
     def fit(
         self,
@@ -792,6 +826,7 @@ class Probe:
         remote: bool | None = None,
         invalidate_cache: bool = False,
         max_retries: int | None = None,
+        batch_size: int | None = None,
     ) -> Probe:
         """Fit the probe on training data.
 
@@ -814,6 +849,10 @@ class Probe:
         max_retries : int | None
             Override the instance-level max_retries setting.
             Only applies to remote extraction.
+        batch_size : int | None
+            Override the instance-level batch_size for this call.
+            Smaller values reduce memory usage; larger values may
+            improve throughput on GPU.
 
         Returns
         -------
@@ -881,6 +920,7 @@ class Probe:
             remote=remote,
             invalidate_cache=invalidate_cache,
             max_retries=max_retries,
+            batch_size=batch_size,
         )
 
         # Handle "all" pooling for training (expand to per-token examples)
@@ -892,9 +932,23 @@ class Probe:
             # Repeat labels for each token
             labels = np.repeat(labels, seq_len)
 
-        # Apply per-layer normalization if enabled
+        # Auto-disable normalize_layers when preprocessing includes StandardScaler
         n_layers = len(self._extractor.layer_indices)
         scaling_strategy = self._get_scaling_strategy()
+        if scaling_strategy is not None and self._preprocessing_includes_standard():
+            import warnings
+
+            warnings.warn(
+                "normalize_layers auto-disabled because preprocessing includes "
+                "StandardScaler. The double normalization is redundant and can "
+                "slightly hurt accuracy. Set normalize_layers=False to silence "
+                "this warning.",
+                UserWarning,
+                stacklevel=2,
+            )
+            scaling_strategy = None
+
+        # Apply per-layer normalization if enabled
         if scaling_strategy is not None and n_layers > 1:
             from .scaling import PerLayerScaler
 
@@ -1256,6 +1310,7 @@ class Probe:
         self,
         prompts: list[str],
         remote: bool | None = None,
+        batch_size: int | None = None,
     ) -> np.ndarray:
         """Predict class labels for prompts.
 
@@ -1265,6 +1320,8 @@ class Probe:
             Text prompts to classify.
         remote : bool | None
             Override the instance-level remote setting.
+        batch_size : int | None
+            Override the instance-level batch_size for this call.
 
         Returns
         -------
@@ -1277,7 +1334,7 @@ class Probe:
         has_proba = hasattr(self.classifier_, "predict_proba")
 
         if has_proba:
-            probs = self.predict_proba(prompts, remote=remote)
+            probs = self.predict_proba(prompts, remote=remote, batch_size=batch_size)
 
             # Handle different output shapes
             if probs.ndim == 1:
@@ -1295,6 +1352,7 @@ class Probe:
                 prompts,
                 self._inference_pooling,
                 remote=remote,
+                batch_size=batch_size,
             )
 
             if X.ndim == 3:
@@ -1340,6 +1398,7 @@ class Probe:
         self,
         prompts: list[str],
         remote: bool | None = None,
+        batch_size: int | None = None,
     ) -> np.ndarray:
         """Predict class probabilities for prompts.
 
@@ -1349,6 +1408,8 @@ class Probe:
             Text prompts to classify.
         remote : bool | None
             Override the instance-level remote setting.
+        batch_size : int | None
+            Override the instance-level batch_size for this call.
 
         Returns
         -------
@@ -1369,6 +1430,7 @@ class Probe:
             prompts,
             self._inference_pooling,
             remote=remote,
+            batch_size=batch_size,
         )
 
         # Check for score-level pooling
@@ -1432,6 +1494,7 @@ class Probe:
         prompts: list[str],
         labels: list[int] | np.ndarray,
         remote: bool | None = None,
+        batch_size: int | None = None,
     ) -> float:
         """Compute accuracy on test data.
 
@@ -1443,13 +1506,15 @@ class Probe:
             True labels.
         remote : bool | None
             Override the instance-level remote setting.
+        batch_size : int | None
+            Override the instance-level batch_size for this call.
 
         Returns
         -------
         float
             Classification accuracy.
         """
-        predictions = self.predict(prompts, remote=remote)
+        predictions = self.predict(prompts, remote=remote, batch_size=batch_size)
         labels = np.asarray(labels)
         return float((predictions == labels).mean())
 

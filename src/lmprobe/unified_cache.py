@@ -17,6 +17,8 @@ from tqdm import tqdm
 
 from .backends import resolve_backend
 from .cache import (
+    get_prompt_cached_pooled_layers,
+    get_prompt_cached_raw_layers,
     is_prompt_fully_cached,
     is_prompt_perplexity_cached,
     is_prompt_pooled_cached,
@@ -227,6 +229,8 @@ class UnifiedCache:
 
         need_activations = []
         need_perplexity = []
+        partial_cache_count = 0
+        partial_cache_found_layers: set[int] | None = None
 
         for prompt in prompts:
             # Check appropriate cache based on cache_pooled setting
@@ -247,8 +251,35 @@ class UnifiedCache:
 
             if not act_cached:
                 need_activations.append(prompt)
+                # Check if cache file exists but is missing requested layers
+                if self.cache_pooled:
+                    cached_layers = get_prompt_cached_pooled_layers(
+                        self.model_name, prompt, self.pooling
+                    )
+                else:
+                    cached_layers = get_prompt_cached_raw_layers(
+                        self.model_name, prompt
+                    )
+                if cached_layers is not None and len(cached_layers) > 0:
+                    partial_cache_count += 1
+                    if partial_cache_found_layers is None:
+                        partial_cache_found_layers = cached_layers
+
             if not ppl_cached:
                 need_perplexity.append(prompt)
+
+        if partial_cache_count > 0:
+            missing = sorted(required_layers - (partial_cache_found_layers or set()))
+            found = sorted(partial_cache_found_layers or set())
+            import warnings
+
+            warnings.warn(
+                f"Cache exists for {partial_cache_count} prompt(s) but missing "
+                f"layer(s) {missing} (found layers {found}). "
+                f"A new forward pass is required. To avoid redundant forward passes, "
+                f"use probe.warmup(prompts) to cache all layers at once before fitting.",
+                stacklevel=2,
+            )
 
         return need_activations, need_perplexity
 

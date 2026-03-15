@@ -73,3 +73,49 @@ def test_warmup_returns_none(tiny_model):
 
     result = probe.warmup(["Hello world"])
     assert result is None
+
+
+def test_warmup_batch_size_override(tiny_model):
+    """warmup() accepts batch_size override and restores original after."""
+    probe = LinearProbe(
+        model=tiny_model,
+        layers=-1,
+        pooling="last_token",
+        device="cpu",
+        remote=False,
+        random_state=42,
+        batch_size=8,
+    )
+
+    # Should not raise, and should use batch_size=1
+    probe.warmup(["Hello world", "Another prompt"], batch_size=1)
+
+    # Original batch_size should be restored
+    assert probe._extractor.batch_size == 8
+
+
+def test_fit_batch_size_override(tiny_model):
+    """fit() accepts batch_size override and restores original after."""
+    probe = LinearProbe(
+        model=tiny_model,
+        layers=-1,
+        pooling="last_token",
+        device="cpu",
+        remote=False,
+        random_state=42,
+        batch_size=8,
+    )
+
+    probe.fit(
+        ["Walk the dog!", "Fetch!"],
+        ["Purring cat.", "Meow."],
+        batch_size=2,
+    )
+
+    # Original batch_size should be restored
+    assert probe._extractor.batch_size == 8
+
+    # Predict with batch_size override
+    predictions = probe.predict(["test input"], batch_size=1)
+    assert predictions.shape == (1,)
+    assert probe._extractor.batch_size == 8

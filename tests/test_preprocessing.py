@@ -136,6 +136,71 @@ class TestPreprocessing:
             )
             probe.fit(["good"], ["bad"])
 
+    def test_normalize_layers_auto_disabled_with_standard(self, tiny_model):
+        """normalize_layers auto-disables when preprocessing includes StandardScaler."""
+        import warnings
+
+        probe = LinearProbe(
+            model=tiny_model,
+            layers=-1,
+            preprocessing="standard",
+            normalize_layers=True,
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            probe.fit(["good", "great"], ["bad", "terrible"])
+
+        redundancy_warnings = [
+            x for x in w if "normalize_layers" in str(x.message)
+        ]
+        assert len(redundancy_warnings) == 1
+        assert "auto-disabled" in str(redundancy_warnings[0].message)
+
+    def test_normalize_layers_false_no_warning_with_standard(self, tiny_model):
+        """No warning when normalize_layers=False and preprocessing includes standard."""
+        import warnings
+
+        probe = LinearProbe(
+            model=tiny_model,
+            layers=-1,
+            preprocessing="standard",
+            normalize_layers=False,
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            probe.fit(["good", "great"], ["bad", "terrible"])
+
+        redundancy_warnings = [
+            x for x in w if "normalize_layers" in str(x.message)
+        ]
+        assert len(redundancy_warnings) == 0
+
+    def test_normalize_layers_not_disabled_without_standard(self, tiny_model):
+        """normalize_layers stays enabled when preprocessing doesn't include standard."""
+        probe = LinearProbe(
+            model=tiny_model,
+            layers=-1,
+            preprocessing="pca:4",
+            normalize_layers=True,
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        probe.fit(
+            ["good", "great", "nice", "wonderful", "excellent"],
+            ["bad", "terrible", "awful", "horrible", "dreadful"],
+        )
+        # No auto-disable — scaler_ should exist for single-layer case
+        assert hasattr(probe, "scaler_")
+
     def test_score_with_preprocessing(self, tiny_model):
         """score() works correctly with preprocessing."""
         probe = LinearProbe(
