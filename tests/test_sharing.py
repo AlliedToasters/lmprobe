@@ -8,17 +8,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-_has_pyarrow = pytest.importorskip is not None  # always True, but we need:
-try:
-    import pyarrow  # noqa: F401
-    _has_pyarrow = True
-except ImportError:
-    _has_pyarrow = False
-
-requires_pyarrow = pytest.mark.skipif(
-    not _has_pyarrow, reason="pyarrow not installed"
-)
-
 import lmprobe.cache as cache_mod
 from lmprobe.cache import (
     CachedPromptInfo,
@@ -40,6 +29,16 @@ from lmprobe.sharing import (
     load_activation_dataset,
     pull_dataset,
     push_dataset,
+)
+
+_has_pyarrow = True
+try:
+    import pyarrow  # noqa: F401
+except ImportError:
+    _has_pyarrow = False
+
+requires_pyarrow = pytest.mark.skipif(
+    not _has_pyarrow, reason="pyarrow not installed"
 )
 
 TEST_MODEL = "stas/tiny-random-llama-2"
