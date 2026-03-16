@@ -8,6 +8,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+_has_pyarrow = pytest.importorskip is not None  # always True, but we need:
+try:
+    import pyarrow  # noqa: F401
+    _has_pyarrow = True
+except ImportError:
+    _has_pyarrow = False
+
+requires_pyarrow = pytest.mark.skipif(
+    not _has_pyarrow, reason="pyarrow not installed"
+)
+
 import lmprobe.cache as cache_mod
 from lmprobe.cache import (
     CachedPromptInfo,
@@ -355,6 +366,7 @@ class TestConsolidateAndShard:
             assert "row_offset" in pm
 
 
+@requires_pyarrow
 class TestParquetIndex:
     def test_write_and_read(self, tmp_path):
         import pyarrow.parquet as pq
@@ -507,6 +519,7 @@ class TestBuildReadme:
         assert "Test dataset" in readme
 
 
+@requires_pyarrow
 class TestPushDataset:
     @patch("lmprobe.sharing._check_hub_deps")
     @patch("lmprobe.sharing._check_pyarrow")
@@ -677,6 +690,7 @@ class TestLoadActivationDataset:
                 load_activation_dataset("user/test")
 
 
+@requires_pyarrow
 class TestPullDataset:
     def _setup_remote_files(self, tmp_path):
         """Create remote files in the new format."""
@@ -771,6 +785,7 @@ class TestPullDataset:
         assert count == 2
 
 
+@requires_pyarrow
 class TestRoundtrip:
     """Push from cache -> pull into fresh cache -> verify data matches."""
 
