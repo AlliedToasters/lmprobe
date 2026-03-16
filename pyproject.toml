@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lmprobe"
-version = "0.7.3"
+version = "0.7.4"
 description = "Train probes on language model activations for AI safety monitoring"
 readme = "README.md"
 license = "MIT"
