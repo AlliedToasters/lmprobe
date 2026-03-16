@@ -7,10 +7,11 @@ import pytest
 
 from lmprobe.cache import (
     get_prompt_cache_dir,
+    is_prompt_logits_cached,
     is_prompt_perplexity_cached,
     is_prompt_pooled_cached,
 )
-from lmprobe.unified_cache import UnifiedCache, WarmupStats
+from lmprobe.unified_cache import CachedLogits, UnifiedCache, WarmupStats
 
 
 class TestUnifiedCache:
@@ -624,3 +625,156 @@ class TestPooledCache:
         assert activations.ndim == 2  # Pooled
         assert mask is None
         assert ppl.shape == (1, 3)
+
+
+class TestCachedLogits:
+    """Tests for cache_logits feature."""
+
+    def test_cache_logits_full(self, tiny_model, tmp_path, monkeypatch):
+        """Full logits cached and retrieved with correct shape."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_logits=True,
+            logit_positions="all",
+        )
+
+        prompts = ["hello world", "test prompt"]
+        stats = cache.warmup(prompts)
+
+        assert stats.logits_extracted == 2
+        assert stats.logits_cached == 0
+
+        result = cache.get_logits(prompts)
+        assert isinstance(result, CachedLogits)
+        assert result.values.ndim == 3  # (batch, seq_len, vocab_size)
+        assert result.values.shape[0] == 2
+        assert result.indices is None
+        assert result.top_k is None
+        assert result.positions == "all"
+
+    def test_cache_logits_top_k(self, tiny_model, tmp_path, monkeypatch):
+        """Top-K values + indices cached with correct shape."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        K = 10
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_logits=True,
+            logit_top_k=K,
+            logit_positions="last",
+        )
+
+        prompts = ["top k test"]
+        cache.warmup(prompts)
+
+        result = cache.get_logits(prompts)
+        assert result.values.shape == (1, 1, K)  # (batch, 1 position, K)
+        assert result.indices is not None
+        assert result.indices.shape == (1, 1, K)
+        assert result.indices.dtype == np.int32 or str(result.indices.dtype) == "torch.int32"
+        assert result.top_k == K
+
+    def test_cache_logits_last_position(self, tiny_model, tmp_path, monkeypatch):
+        """positions='last' stores only 1 position per prompt."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_logits=True,
+            logit_positions="last",
+        )
+
+        prompts = ["a longer prompt with several tokens for testing"]
+        cache.warmup(prompts)
+
+        result = cache.get_logits(prompts)
+        # Should have only 1 position (last token)
+        assert result.values.shape[1] == 1
+        assert result.positions == "last"
+
+    def test_cache_logits_idempotent(self, tiny_model, tmp_path, monkeypatch):
+        """Second warmup is all cache hits for logits."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_logits=True,
+            logit_positions="last",
+        )
+
+        prompts = ["idempotent logit test"]
+
+        stats1 = cache.warmup(prompts)
+        assert stats1.logits_extracted == 1
+        assert stats1.logits_cached == 0
+
+        stats2 = cache.warmup(prompts)
+        assert stats2.logits_cached == 1
+        assert stats2.logits_extracted == 0
+
+    def test_cache_logits_default_off(self, tiny_model, tmp_path, monkeypatch):
+        """Default cache_logits=False; get_logits() raises ValueError."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+        )
+
+        with pytest.raises(ValueError, match="cache_logits=False"):
+            cache.get_logits(["test"])
+
+    def test_cache_logits_with_perplexity(self, tiny_model, tmp_path, monkeypatch):
+        """Both logits and perplexity work together from same forward pass."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            compute_perplexity=True,
+            device="cpu",
+            remote=False,
+            cache_logits=True,
+            logit_positions="last",
+        )
+
+        prompts = ["combined test prompt"]
+        stats = cache.warmup(prompts)
+
+        assert stats.activations_extracted == 1
+        assert stats.perplexity_extracted == 1
+        assert stats.logits_extracted == 1
+
+        # Both should load from cache
+        ppl = cache.get_perplexity(prompts)
+        logits = cache.get_logits(prompts)
+
+        assert ppl.shape == (1, 3)
+        assert logits.values.ndim == 3
+        assert logits.values.shape[0] == 1
+
+        # Verify cache is populated
+        for prompt in prompts:
+            assert is_prompt_perplexity_cached(tiny_model, prompt)
+            assert is_prompt_logits_cached(tiny_model, prompt)

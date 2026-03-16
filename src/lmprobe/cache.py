@@ -271,6 +271,9 @@ def _pooled_layer_key(pooling: str, layer: int) -> str:
 
 _ATTENTION_MASK_KEY = "attention_mask"
 _PERPLEXITY_KEY = "perplexity"
+_LOGITS_KEY = "logits"
+_LOGITS_TOP_K_VALUES_KEY = "logits_top_k_values"
+_LOGITS_TOP_K_INDICES_KEY = "logits_top_k_indices"
 
 
 def _parse_raw_layer_keys(keys: set[str] | list[str]) -> set[int]:
@@ -762,6 +765,135 @@ def save_prompt_perplexity(
     key = _prompt_cache_key(model_name, prompt)
     new_tensors = {_PERPLEXITY_KEY: _prepare_tensor(perplexity_features)}
     _merge_save_backend(key, new_tensors)
+
+
+# =============================================================================
+# Logit Cache Functions
+# =============================================================================
+
+
+def is_prompt_logits_cached(
+    model_name: str, prompt: str, top_k: int | None = None
+) -> bool:
+    """Check if logits are cached for a prompt.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    prompt : str
+        The prompt text.
+    top_k : int | None
+        If None, checks for full logits. If int, checks for top-k logits.
+    """
+    backend = get_backend()
+    key = _prompt_cache_key(model_name, prompt)
+
+    if backend.exists(key):
+        tensor_keys = _get_tensor_keys_from_backend(key)
+        if top_k is not None:
+            return (
+                _LOGITS_TOP_K_VALUES_KEY in tensor_keys
+                and _LOGITS_TOP_K_INDICES_KEY in tensor_keys
+            )
+        return _LOGITS_KEY in tensor_keys
+
+    return False
+
+
+def save_prompt_logits(
+    model_name: str,
+    prompt: str,
+    logits: torch.Tensor,
+    attention_mask: torch.Tensor,
+    top_k: int | None = None,
+    positions: str = "last",
+) -> None:
+    """Save logits for a single prompt.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    prompt : str
+        The prompt text.
+    logits : torch.Tensor
+        Raw logits with shape (1, seq_len, vocab_size).
+    attention_mask : torch.Tensor
+        Attention mask with shape (1, seq_len).
+    top_k : int | None
+        If set, store only top-k values and indices instead of full logits.
+    positions : str
+        Which token positions to store: "last" (default) or "all".
+    """
+    _register_model(model_name)
+    key = _prompt_cache_key(model_name, prompt)
+
+    # Select positions
+    if positions == "last":
+        # Find last non-padding position
+        mask = attention_mask[0]  # (seq_len,)
+        last_pos = mask.sum().long().item() - 1
+        selected_logits = logits[:, last_pos : last_pos + 1, :]  # (1, 1, vocab_size)
+    elif positions == "all":
+        selected_logits = logits  # (1, seq_len, vocab_size)
+    else:
+        raise ValueError(
+            f"Invalid positions: {positions!r}. Must be 'last' or 'all'."
+        )
+
+    if top_k is not None:
+        # Store only top-k values and indices
+        values, indices = torch.topk(selected_logits, top_k, dim=-1)
+        new_tensors = {
+            _LOGITS_TOP_K_VALUES_KEY: _prepare_tensor(values),
+            _LOGITS_TOP_K_INDICES_KEY: _prepare_tensor(indices.to(torch.int32)),
+        }
+    else:
+        new_tensors = {_LOGITS_KEY: _prepare_tensor(selected_logits)}
+
+    _merge_save_backend(key, new_tensors)
+
+
+def load_prompt_logits(
+    model_name: str, prompt: str, top_k: int | None = None
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Load cached logits for a single prompt.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    prompt : str
+        The prompt text.
+    top_k : int | None
+        If None, loads full logits. If int, loads top-k values and indices.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor | None]
+        If top_k is None: (logits, None) where logits has shape (1, positions, vocab_size).
+        If top_k is set: (values, indices) where values has shape (1, positions, K)
+        and indices has shape (1, positions, K) with dtype int32.
+    """
+    backend = get_backend()
+    key = _prompt_cache_key(model_name, prompt)
+
+    if not backend.exists(key):
+        raise FileNotFoundError(
+            f"No cached logits found for prompt: {prompt!r}"
+        )
+
+    backend.touch(key)
+
+    if top_k is not None:
+        tensors = _load_tensors_from_backend(
+            key, [_LOGITS_TOP_K_VALUES_KEY, _LOGITS_TOP_K_INDICES_KEY]
+        )
+        return tensors[_LOGITS_TOP_K_VALUES_KEY], tensors[_LOGITS_TOP_K_INDICES_KEY]
+    else:
+        tensors = _load_tensors_from_backend(key, [_LOGITS_KEY])
+        return tensors[_LOGITS_KEY], None
 
 
 # =============================================================================

@@ -34,6 +34,7 @@ __all__ = [
     "BaselineResult",
     "BaselineResults",
     "CacheInfo",
+    "CachedLogits",
     "LayerSweepResult",
     "LinearProbe",
     "Probe",
@@ -117,10 +118,14 @@ def __getattr__(name: str):
             "set_cache_limit": set_cache_limit,
             "set_cache_dtype": set_cache_dtype,
         }[name]
-    if name in ("UnifiedCache", "WarmupStats"):
-        from .unified_cache import UnifiedCache, WarmupStats
+    if name in ("UnifiedCache", "WarmupStats", "CachedLogits"):
+        from .unified_cache import CachedLogits, UnifiedCache, WarmupStats
 
-        return {"UnifiedCache": UnifiedCache, "WarmupStats": WarmupStats}[name]
+        return {
+            "UnifiedCache": UnifiedCache,
+            "WarmupStats": WarmupStats,
+            "CachedLogits": CachedLogits,
+        }[name]
     if name == "ProbeCard":
         from .hub import ProbeCard
 
