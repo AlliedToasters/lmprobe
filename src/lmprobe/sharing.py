@@ -40,8 +40,10 @@ import torch
 from .cache import (
     CachedPromptInfo,
     discover_cached,
+    load_prompt_activations,
     load_prompt_logits,
     load_prompt_pooled_activations,
+    save_prompt_activations,
     save_prompt_pooled_activations,
 )
 
@@ -358,9 +360,72 @@ def _load_logits_for_prompt(
     }
 
 
+def _load_hidden_raw_for_prompt(
+    model_name: str,
+    prompt: str,
+    layers: list[int],
+) -> tuple[dict[str, torch.Tensor], int]:
+    """Load raw (full-sequence) hidden states for a prompt.
+
+    Returns
+    -------
+    tensors : dict[str, Tensor]
+        ``{"hidden.layer_0": (num_tokens, dim), ...}``
+    num_tokens : int
+        Number of non-padding tokens.
+    """
+    # load_prompt_activations returns (1, seq_len, hidden_dim*n_layers), mask
+    activations, mask = load_prompt_activations(model_name, prompt, layers)
+    # mask: (1, seq_len)  activations: (1, seq_len, hidden_dim * n_layers)
+    n_layers = len(layers)
+    total_dim = activations.shape[-1]
+    hidden_dim = total_dim // n_layers
+
+    # Remove batch dim and mask out padding
+    act = activations.squeeze(0)  # (seq_len, total_dim)
+    m = mask.squeeze(0).bool()  # (seq_len,)
+    act = act[m]  # (num_tokens, total_dim)
+    num_tokens = act.shape[0]
+
+    result = {}
+    for i, layer in enumerate(layers):
+        start = i * hidden_dim
+        end = (i + 1) * hidden_dim
+        result[f"hidden.layer_{layer}"] = act[:, start:end]  # (num_tokens, dim)
+
+    return result, num_tokens
+
+
 # =============================================================================
 # Consolidation engine
 # =============================================================================
+
+
+def _compute_shard_boundaries_variable(
+    per_prompt_bytes: list[int],
+    shard_max_bytes: int,
+) -> list[int]:
+    """Compute shard boundaries for variable-size prompts.
+
+    Returns a list of prompt counts per shard (same format as
+    ``_compute_shard_boundaries``).
+    """
+    boundaries: list[int] = []
+    current_bytes = 0
+    current_count = 0
+
+    for pb in per_prompt_bytes:
+        if current_count > 0 and current_bytes + pb > shard_max_bytes:
+            boundaries.append(current_count)
+            current_bytes = 0
+            current_count = 0
+        current_bytes += pb
+        current_count += 1
+
+    if current_count > 0:
+        boundaries.append(current_count)
+
+    return boundaries
 
 
 def _compute_shard_boundaries(
@@ -393,6 +458,7 @@ def _consolidate_and_shard(
     labels: list[int | str | None] | None,
     shard_max_bytes: int,
     repo_id: str,
+    metadata: list[dict] | None = None,
 ) -> tuple[Path, dict, list[dict]]:
     """Consolidate cached tensors into sharded safetensors files.
 
@@ -419,31 +485,48 @@ def _consolidate_and_shard(
     has_logits = tensor_types["has_logits"]
     logits_top_k = tensor_types["logits_top_k"]
 
+    # Auto-detect: if raw_layers available, store full-sequence
+    raw_layers = tensor_types.get("raw_layers", [])
+    use_raw = bool(raw_layers)
+
     # Determine which pooling strategy and layers we have
     # For hidden_layers, we co-locate all layers from the first available
     # pooling strategy
     hidden_strategy = None
     hidden_layers: list[int] = []
-    if pooled:
+    if not use_raw and pooled:
         hidden_strategy = next(iter(pooled))
         hidden_layers = pooled[hidden_strategy]
+    elif use_raw:
+        hidden_layers = raw_layers
 
     # --- Phase 1: Load all prompts, build metadata ---
     from tqdm import tqdm
 
     prompt_data: list[dict] = []  # per-prompt loaded tensors
     prompt_metadata: list[dict] = []
+    per_prompt_tokens: list[int] = []  # only used when use_raw
     skipped_count = 0
 
     for idx in tqdm(kept_indices, desc="Loading from cache", unit="prompt"):
         prompt = prompts[idx]
         label = labels[idx] if labels is not None else None
+        extra_meta: dict[str, Any] = {}
+        if metadata is not None:
+            extra_meta = dict(metadata[idx])
 
         try:
             loaded: dict[str, torch.Tensor] = {}
 
-            # Hidden layers (pooled, co-located)
-            if hidden_strategy and hidden_layers:
+            if use_raw and hidden_layers:
+                # Full-sequence path
+                layer_tensors, num_tok = _load_hidden_raw_for_prompt(
+                    model_name, prompt, hidden_layers,
+                )
+                loaded.update(layer_tensors)
+                per_prompt_tokens.append(num_tok)
+            elif hidden_strategy and hidden_layers:
+                # Pooled path (existing)
                 layer_tensors = _load_hidden_for_prompt(
                     model_name, prompt, hidden_layers, hidden_strategy,
                 )
@@ -471,6 +554,7 @@ def _consolidate_and_shard(
             "text": prompt,
             "label": label,
             "num_tokens": num_tokens,
+            **extra_meta,
         })
 
     if skipped_count > 0:
@@ -491,42 +575,58 @@ def _consolidate_and_shard(
     perm = _shuffle_indices(n, seed)
     prompt_data = [prompt_data[i] for i in perm]
     prompt_metadata = [prompt_metadata[i] for i in perm]
+    if per_prompt_tokens:
+        per_prompt_tokens = [per_prompt_tokens[i] for i in perm]
 
     # --- Phase 3: Compute shard boundaries ---
-    # Based on the largest tensor type's row_bytes
     hidden_dim = 0
     if hidden_layers and prompt_data:
         sample_key = f"hidden.layer_{hidden_layers[0]}"
         if sample_key in prompt_data[0]:
             hidden_dim = prompt_data[0][sample_key].shape[-1]
 
-    hidden_row_bytes = len(hidden_layers) * hidden_dim * 4  # float32
     logits_row_bytes = 0
     if has_logits and logits_top_k is not None:
         # values (float32) + indices (int64)
         logits_row_bytes = logits_top_k * 4 + logits_top_k * 8
 
-    max_row_bytes = max(hidden_row_bytes, logits_row_bytes, 1)
-    shard_boundaries = _compute_shard_boundaries(
-        n, max_row_bytes, shard_max_bytes,
-    )
+    if use_raw:
+        # Variable-size rows: bytes depend on per-prompt token count
+        per_prompt_bytes = [
+            tok * hidden_dim * 4 * len(hidden_layers)
+            for tok in per_prompt_tokens
+        ]
+        shard_boundaries = _compute_shard_boundaries_variable(
+            per_prompt_bytes, shard_max_bytes,
+        )
+    else:
+        hidden_row_bytes = len(hidden_layers) * hidden_dim * 4  # float32
+        max_row_bytes = max(hidden_row_bytes, logits_row_bytes, 1)
+        shard_boundaries = _compute_shard_boundaries(
+            n, max_row_bytes, shard_max_bytes,
+        )
 
     # --- Phase 4: Write safetensors shards ---
     tensor_descriptors: dict[str, dict] = {}
     offset = 0
 
-    # Assign shard_index and row_offset to each prompt
+    # Assign shard_index and row_offset / token_offset to each prompt
     for shard_idx, shard_size in enumerate(shard_boundaries):
+        token_offset_acc = 0  # cumulative token offset within shard (raw mode)
         for local_row in range(shard_size):
             global_row = offset + local_row
             if global_row < len(prompt_metadata):
                 prompt_metadata[global_row]["shard_index"] = shard_idx
-                prompt_metadata[global_row]["row_offset"] = local_row
+                if use_raw:
+                    prompt_metadata[global_row]["token_offset"] = token_offset_acc
+                    token_offset_acc += per_prompt_tokens[global_row]
+                else:
+                    prompt_metadata[global_row]["row_offset"] = local_row
 
         shard_prompts = prompt_data[offset : offset + shard_size]
 
         # Write hidden_layers shard
-        if hidden_layers and hidden_strategy:
+        if hidden_layers and (hidden_strategy or use_raw):
             shard_tensors = {}
             for layer in hidden_layers:
                 key = f"hidden.layer_{layer}"
@@ -561,26 +661,38 @@ def _consolidate_and_shard(
         offset += shard_size
 
     # Build tensor descriptors for lmprobe_info.json
-    if hidden_layers and hidden_strategy:
+    if hidden_layers and (hidden_strategy or use_raw):
         hidden_shards = []
         off = 0
         for si, sz in enumerate(shard_boundaries):
             actual = min(sz, n - off)
-            hidden_shards.append({
+            shard_desc: dict[str, Any] = {
                 "file": f"tensors/hidden_layers_{si:03d}.safetensors",
                 "num_prompts": actual,
-            })
+            }
+            if use_raw:
+                # Total tokens in this shard
+                shard_desc["num_tokens"] = sum(
+                    per_prompt_tokens[off : off + actual]
+                )
+            hidden_shards.append(shard_desc)
             off += actual
 
-        tensor_descriptors["hidden_layers"] = {
+        hidden_desc: dict[str, Any] = {
             "type": "hidden",
             "layers": hidden_layers,
             "dim": hidden_dim,
             "dtype": "float32",
-            "pooling": hidden_strategy,
-            "row_bytes": hidden_row_bytes,
             "shards": hidden_shards,
         }
+        if use_raw:
+            hidden_desc["storage"] = "full_sequence"
+        else:
+            hidden_desc["storage"] = "pooled"
+            hidden_desc["pooling"] = hidden_strategy
+            hidden_desc["row_bytes"] = len(hidden_layers) * hidden_dim * 4
+
+        tensor_descriptors["hidden_layers"] = hidden_desc
 
     if has_logits and logits_top_k is not None:
         logits_shards = []
@@ -614,7 +726,12 @@ def _write_parquet_index(
     tmpdir: Path,
     prompt_metadata: list[dict],
 ) -> None:
-    """Write the Parquet index from prompt metadata."""
+    """Write the Parquet index from prompt metadata.
+
+    Fixed columns: text, label, num_tokens, shard_index, row_offset (or
+    token_offset for full-sequence storage).  Any additional keys in
+    prompt_metadata are written as extra columns with auto-inferred types.
+    """
     _check_pyarrow()
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -634,14 +751,38 @@ def _write_parquet_index(
             type=pa.string(),
         )
 
-    table = pa.table({
+    columns: dict[str, pa.Array] = {
         "text": pa.array(texts, type=pa.string()),
         "label": label_array,
         "num_tokens": pa.array(num_tokens, type=pa.int32()),
         "shard_index": pa.array(shard_indices, type=pa.int32()),
         "row_offset": pa.array(row_offsets, type=pa.int32()),
-    })
+    }
 
+    # Detect extra keys beyond the fixed set
+    fixed_keys = {"text", "label", "num_tokens", "shard_index", "row_offset"}
+    if prompt_metadata:
+        extra_keys = sorted(
+            set(prompt_metadata[0].keys()) - fixed_keys
+        )
+        for ek in extra_keys:
+            values = [p.get(ek) for p in prompt_metadata]
+            # Infer pyarrow type from first non-None value
+            sample = next((v for v in values if v is not None), None)
+            if sample is None:
+                pa_type = pa.string()
+            elif isinstance(sample, int):
+                pa_type = pa.int32()
+            elif isinstance(sample, float):
+                pa_type = pa.float64()
+            else:
+                pa_type = pa.string()
+                values = [
+                    str(v) if v is not None else None for v in values
+                ]
+            columns[ek] = pa.array(values, type=pa_type)
+
+    table = pa.table(columns)
     pq.write_table(table, str(tmpdir / PARQUET_PATH))
 
 
@@ -867,6 +1008,7 @@ def push_dataset(
     prompts: list[str],
     *,
     labels: list[int | str | None] | None = None,
+    metadata: list[dict] | None = None,
     tensors: list[str] | None = None,
     shard_max_bytes: int = DEFAULT_SHARD_BYTES,
     private: bool = False,
@@ -888,6 +1030,10 @@ def push_dataset(
         Prompts to push (must have cached activations).
     labels : list[int | str | None] | None
         Per-prompt labels, positionally aligned with *prompts*.
+    metadata : list[dict] | None
+        Per-prompt metadata dicts, positionally aligned with *prompts*.
+        All dicts must have the same keys.  Values appear as extra columns
+        in the Parquet index.
     tensors : list[str] | None
         Filter: only push these tensor types (``["hidden_layers"]``,
         ``["logits_topk"]``).  None pushes all available types.
@@ -918,6 +1064,21 @@ def push_dataset(
         raise ValueError(
             f"labels length ({len(labels)}) != prompts length ({len(prompts)})"
         )
+
+    if metadata is not None:
+        if len(metadata) != len(prompts):
+            raise ValueError(
+                f"metadata length ({len(metadata)}) != "
+                f"prompts length ({len(prompts)})"
+            )
+        if metadata:
+            ref_keys = set(metadata[0].keys())
+            for i, m in enumerate(metadata[1:], 1):
+                if set(m.keys()) != ref_keys:
+                    raise ValueError(
+                        f"metadata[{i}] has keys {sorted(m.keys())}, "
+                        f"expected {sorted(ref_keys)}"
+                    )
 
     # Step 1: Discover cache state
     logger.info(
@@ -962,6 +1123,7 @@ def push_dataset(
         labels=labels,
         shard_max_bytes=shard_max_bytes,
         repo_id=repo_id,
+        metadata=metadata,
     )
 
     # Step 5: Write Parquet index
@@ -1158,17 +1320,63 @@ def pull_dataset(
                 sf_keys = list(f.keys())
                 tensors_data = {k: f.get_tensor(k) for k in sf_keys}
 
+            storage = t_info.get("storage", "pooled")
+
             for pi in tqdm(
                 shard_prompts,
                 desc=f"Unpacking {t_type} shard {shard_idx}",
                 unit="prompt",
                 leave=False,
             ):
-                row_offset = index["row_offset"][pi]
                 prompt_text = index["text"][pi]
 
-                if t_type == "hidden_layers":
-                    # Each key is "hidden.layer_N" — save as pooled
+                if t_type == "hidden_layers" and storage == "full_sequence":
+                    # Full-sequence: use token_offset + num_tokens
+                    tok_off = index["token_offset"][pi]
+                    num_tok = index["num_tokens"][pi]
+                    hidden_dim = t_info.get("dim", 0)
+
+                    # Reconstruct raw format: concat layers on dim=-1
+                    layer_slices = []
+                    for sf_key in sf_keys:
+                        match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
+                        if not match:
+                            continue
+                        layer = int(match.group(1))
+                        # (num_tok, hidden_dim)
+                        chunk = tensors_data[sf_key][tok_off : tok_off + num_tok]
+                        layer_slices.append((layer, chunk))
+
+                    layer_slices.sort(key=lambda x: x[0])
+                    sorted_layers = [ls[0] for ls in layer_slices]
+                    # Concat on dim=-1: (num_tok, hidden_dim * n_layers)
+                    raw_act = torch.cat(
+                        [ls[1] for ls in layer_slices], dim=-1
+                    )
+                    # Unsqueeze batch: (1, num_tok, total_dim)
+                    raw_act = raw_act.unsqueeze(0)
+                    mask = torch.ones(1, num_tok, dtype=torch.long)
+
+                    # Save raw activations
+                    save_prompt_activations(
+                        model_name, prompt_text,
+                        sorted_layers, raw_act, mask,
+                    )
+
+                    # Also save pooled (last token) for probe convenience
+                    for layer_idx, layer_num in enumerate(sorted_layers):
+                        start = layer_idx * hidden_dim
+                        end = (layer_idx + 1) * hidden_dim
+                        # Last token of this layer
+                        last_tok = raw_act[0, -1, start:end].unsqueeze(0)
+                        save_prompt_pooled_activations(
+                            model_name, prompt_text,
+                            [layer_num], last_tok, "last_token",
+                        )
+
+                elif t_type == "hidden_layers":
+                    # Pooled storage (existing path)
+                    row_offset = index["row_offset"][pi]
                     pooling = t_info.get("pooling", "last_token")
                     for sf_key in sf_keys:
                         m = re.match(r"^hidden\.layer_(\d+)$", sf_key)
@@ -1184,6 +1392,7 @@ def pull_dataset(
                         )
 
                 elif t_type == "logits_topk":
+                    row_offset = index["row_offset"][pi]
                     v_row = tensors_data["logits_topk.values"][
                         row_offset : row_offset + 1
                     ]

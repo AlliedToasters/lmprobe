@@ -12,7 +12,9 @@ import lmprobe.cache as cache_mod
 from lmprobe.cache import (
     CachedPromptInfo,
     discover_cached,
+    load_prompt_activations,
     load_prompt_pooled_activations,
+    save_prompt_activations,
     save_prompt_pooled_activations,
 )
 from lmprobe.sharing import (
@@ -21,6 +23,7 @@ from lmprobe.sharing import (
     PARQUET_PATH,
     _build_lmprobe_info,
     _build_readme,
+    _compute_shard_boundaries_variable,
     _compute_tensor_intersection,
     _consolidate_and_shard,
     _discover_prompts,
@@ -68,6 +71,31 @@ def populated_cache(cache_dir):
                 TEST_MODEL, prompt, [layer], pooled, "last_token"
             )
     return prompts
+
+
+@pytest.fixture
+def populated_raw_cache(cache_dir):
+    """Populate cache with raw (full-sequence) activations.
+
+    Variable seq_lens: 3, 5, 4 tokens.
+    """
+    prompts = [
+        "Who wants to go for a walk?",
+        "Fetch the ball!",
+        "Purring and scratching",
+    ]
+    seq_lens = [3, 5, 4]
+    layers = [0, 1]
+    original_raw = {}
+
+    for prompt, sl in zip(prompts, seq_lens):
+        # activations: (1, seq_len, hidden_dim * n_layers)
+        act = torch.randn(1, sl, HIDDEN_DIM * len(layers))
+        mask = torch.ones(1, sl, dtype=torch.long)
+        save_prompt_activations(TEST_MODEL, prompt, layers, act, mask)
+        original_raw[prompt] = (act, mask, sl)
+
+    return prompts, seq_lens, layers, original_raw
 
 
 class TestComputeTensorIntersection:
@@ -1066,3 +1094,465 @@ class TestRoundtrip:
 
             layer_0 = f.get_tensor("hidden.layer_0")
             assert layer_0.shape == (2, HIDDEN_DIM)
+
+
+# =============================================================================
+# Metadata tests
+# =============================================================================
+
+
+class TestConsolidationWithMetadata:
+    def test_extra_keys_in_prompt_metadata(self, populated_cache):
+        """Extra metadata keys appear in prompt_metadata dicts."""
+        tensor_types = {
+            "raw_layers": [],
+            "pooled": {"last_token": [0]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        meta = [
+            {"statement_id": "s0", "category": "cities"},
+            {"statement_id": "s1", "category": "cities"},
+            {"statement_id": "s2", "category": "animals"},
+        ]
+        _, _, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/test",
+            metadata=meta,
+        )
+        # All prompts should have the extra keys (order may be shuffled)
+        for pm in prompt_metadata:
+            assert "statement_id" in pm
+            assert "category" in pm
+        # All original values should be present
+        ids = {pm["statement_id"] for pm in prompt_metadata}
+        assert ids == {"s0", "s1", "s2"}
+
+
+@requires_pyarrow
+class TestExtraMetadataColumns:
+    def test_extra_columns_in_parquet(self, tmp_path):
+        """Extra metadata keys become extra Parquet columns."""
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir()
+        prompt_metadata = [
+            {"text": "hello", "label": 1, "num_tokens": 3,
+             "shard_index": 0, "row_offset": 0,
+             "statement_id": "s0", "score": 0.95},
+            {"text": "world", "label": 0, "num_tokens": 4,
+             "shard_index": 0, "row_offset": 1,
+             "statement_id": "s1", "score": 0.42},
+        ]
+        _write_parquet_index(tmp_path, prompt_metadata)
+
+        table = pq.read_table(str(tmp_path / PARQUET_PATH))
+        assert "statement_id" in table.column_names
+        assert "score" in table.column_names
+        assert table.column("statement_id").to_pylist() == ["s0", "s1"]
+        assert table.column("score").to_pylist() == [
+            pytest.approx(0.95), pytest.approx(0.42),
+        ]
+
+    def test_token_offset_column(self, tmp_path):
+        """token_offset from full-sequence storage appears as extra column."""
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir()
+        prompt_metadata = [
+            {"text": "a", "label": 1, "num_tokens": 3,
+             "shard_index": 0, "row_offset": 0, "token_offset": 0},
+            {"text": "b", "label": 0, "num_tokens": 5,
+             "shard_index": 0, "row_offset": 0, "token_offset": 3},
+        ]
+        _write_parquet_index(tmp_path, prompt_metadata)
+
+        table = pq.read_table(str(tmp_path / PARQUET_PATH))
+        assert "token_offset" in table.column_names
+        assert table.column("token_offset").to_pylist() == [0, 3]
+
+
+@requires_pyarrow
+class TestPushMetadataValidation:
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_metadata_length_mismatch(
+        self, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        with pytest.raises(ValueError, match="metadata length"):
+            push_dataset(
+                repo_id="user/test",
+                model_name=TEST_MODEL,
+                prompts=populated_cache,
+                metadata=[{"a": 1}],  # length 1, prompts length 3
+            )
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_metadata_inconsistent_keys(
+        self, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        with pytest.raises(ValueError, match="metadata"):
+            push_dataset(
+                repo_id="user/test",
+                model_name=TEST_MODEL,
+                prompts=populated_cache,
+                metadata=[
+                    {"a": 1},
+                    {"a": 2},
+                    {"b": 3},  # different keys
+                ],
+            )
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_push_with_metadata_end_to_end(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+        uploaded_files = {}
+
+        def capture_upload(repo_id, folder_path, **kwargs):
+            folder = Path(folder_path)
+            for f in folder.rglob("*"):
+                if f.is_file():
+                    rel = f.relative_to(folder)
+                    if f.suffix == ".json":
+                        uploaded_files[str(rel)] = json.loads(f.read_text())
+                    elif f.suffix == ".parquet":
+                        uploaded_files[str(rel)] = f.read_bytes()
+                    else:
+                        uploaded_files[str(rel)] = f.read_bytes()
+
+        mock_api.upload_folder.side_effect = capture_upload
+
+        meta = [
+            {"statement_id": "s0", "category": "cities"},
+            {"statement_id": "s1", "category": "cities"},
+            {"statement_id": "s2", "category": "animals"},
+        ]
+
+        push_dataset(
+            repo_id="user/meta-test",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            metadata=meta,
+            exist_ok=True,
+        )
+
+        # Verify Parquet has extra columns
+        import io
+
+        import pyarrow.parquet as pq
+        parquet_bytes = uploaded_files[PARQUET_PATH]
+        table = pq.read_table(io.BytesIO(parquet_bytes))
+        assert "statement_id" in table.column_names
+        assert "category" in table.column_names
+
+
+# =============================================================================
+# Full-sequence activation tests
+# =============================================================================
+
+
+class TestComputeShardBoundariesVariable:
+    def test_single_shard(self):
+        boundaries = _compute_shard_boundaries_variable(
+            [100, 200, 300], shard_max_bytes=1000
+        )
+        assert boundaries == [3]
+
+    def test_multiple_shards(self):
+        boundaries = _compute_shard_boundaries_variable(
+            [100, 200, 300, 400], shard_max_bytes=350
+        )
+        # 100+200=300 fits, +300 would be 600 > 350 → split
+        assert len(boundaries) >= 2
+        assert sum(boundaries) == 4
+
+    def test_each_prompt_own_shard(self):
+        boundaries = _compute_shard_boundaries_variable(
+            [100, 100, 100], shard_max_bytes=1
+        )
+        # Each prompt exceeds limit alone, so each goes in its own shard
+        assert boundaries == [1, 1, 1]
+
+
+class TestConsolidateRawActivations:
+    def test_full_sequence_storage_flag(self, populated_raw_cache):
+        """Consolidation with raw layers sets storage='full_sequence'."""
+        prompts, seq_lens, layers, _ = populated_raw_cache
+        tensor_types = {
+            "raw_layers": layers,
+            "pooled": {},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/raw-test",
+        )
+
+        desc = tensor_descriptors["hidden_layers"]
+        assert desc["storage"] == "full_sequence"
+        assert "pooling" not in desc
+        assert "row_bytes" not in desc
+
+        # Total tokens across shard should match sum of seq_lens
+        total_shard_tokens = sum(
+            s["num_tokens"] for s in desc["shards"]
+        )
+        assert total_shard_tokens == sum(seq_lens)
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_full_sequence_tensor_shape(self, populated_raw_cache):
+        """Shard tensor dim-0 is total_tokens, not num_prompts."""
+        from safetensors import safe_open
+
+        prompts, seq_lens, layers, _ = populated_raw_cache
+        tensor_types = {
+            "raw_layers": layers,
+            "pooled": {},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        tmpdir, tensor_descriptors, _ = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/raw-test",
+        )
+
+        shard_file = tmpdir / tensor_descriptors["hidden_layers"]["shards"][0]["file"]
+        with safe_open(str(shard_file), framework="pt") as f:
+            layer_0 = f.get_tensor("hidden.layer_0")
+            # Total tokens = 3 + 5 + 4 = 12 (may be shuffled but total same)
+            assert layer_0.shape == (sum(seq_lens), HIDDEN_DIM)
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_token_offset_in_metadata(self, populated_raw_cache):
+        """prompt_metadata has token_offset instead of row_offset for raw."""
+        prompts, seq_lens, layers, _ = populated_raw_cache
+        tensor_types = {
+            "raw_layers": layers,
+            "pooled": {},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        _, _, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/raw-test",
+        )
+
+        for pm in prompt_metadata:
+            assert "token_offset" in pm
+            assert "shard_index" in pm
+
+
+@requires_pyarrow
+class TestFullSequenceRoundtrip:
+    """Push raw activations, pull into fresh cache, verify raw + pooled."""
+
+    def test_push_pull_roundtrip_raw(self, tmp_path, monkeypatch):
+        # --- Phase 1: populate source cache with raw activations ---
+        src_cache = tmp_path / "src_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(src_cache))
+        cache_mod._backend = None
+
+        prompts = ["alpha", "beta", "gamma"]
+        seq_lens = [3, 5, 4]
+        layers = [0, 1]
+        original_raw = {}
+
+        for prompt, sl in zip(prompts, seq_lens):
+            act = torch.randn(1, sl, HIDDEN_DIM * len(layers))
+            mask = torch.ones(1, sl, dtype=torch.long)
+            save_prompt_activations(TEST_MODEL, prompt, layers, act, mask)
+            original_raw[prompt] = (act, mask, sl)
+
+        # --- Phase 2: push ---
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+        mock_api = MagicMock()
+
+        def capture_upload(repo_id, folder_path, **kwargs):
+            for f in Path(folder_path).rglob("*"):
+                if f.is_file():
+                    rel = f.relative_to(folder_path)
+                    dest = remote_dir / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(f), str(dest))
+
+        mock_api.upload_folder.side_effect = capture_upload
+
+        with (
+            patch("lmprobe.sharing._check_hub_deps"),
+            patch("huggingface_hub.HfApi", return_value=mock_api),
+        ):
+            push_dataset(
+                repo_id="user/raw-roundtrip",
+                model_name=TEST_MODEL,
+                prompts=prompts,
+                labels=[1, 1, 0],
+                exist_ok=True,
+            )
+
+        # Verify storage type in info
+        with open(remote_dir / INFO_FILENAME) as f:
+            info = json.load(f)
+        assert info["tensors"]["hidden_layers"]["storage"] == "full_sequence"
+
+        # --- Phase 3: pull into fresh cache ---
+        dst_cache = tmp_path / "dst_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(dst_cache))
+        cache_mod._backend = None
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with (
+            patch("lmprobe.sharing._check_hub_deps"),
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=mock_download,
+            ),
+        ):
+            count = pull_dataset("user/raw-roundtrip")
+
+        assert count == 3
+
+        # --- Phase 4: verify pulled data ---
+        for prompt in prompts:
+            cached = discover_cached(TEST_MODEL, prompt)
+            assert cached is not None
+
+            # Raw activations should be saved
+            pulled_act, pulled_mask = load_prompt_activations(
+                TEST_MODEL, prompt, layers,
+            )
+            orig_act, orig_mask, sl = original_raw[prompt]
+
+            assert pulled_act.shape == orig_act.shape
+            assert torch.allclose(pulled_act, orig_act, atol=1e-5)
+
+            # Pooled (last_token) should also be saved
+            pooled = load_prompt_pooled_activations(
+                TEST_MODEL, prompt, [0], "last_token",
+            )
+            assert pooled.shape == (1, HIDDEN_DIM)
+
+    def test_push_load_roundtrip_raw(self, tmp_path, monkeypatch):
+        """Push raw -> load_activation_dataset returns correct shapes."""
+        src_cache = tmp_path / "src_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(src_cache))
+        cache_mod._backend = None
+
+        prompts = ["alpha", "beta"]
+        seq_lens = [3, 5]
+        layers = [0, 1]
+
+        for prompt, sl in zip(prompts, seq_lens):
+            act = torch.randn(1, sl, HIDDEN_DIM * len(layers))
+            mask = torch.ones(1, sl, dtype=torch.long)
+            save_prompt_activations(TEST_MODEL, prompt, layers, act, mask)
+
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+        mock_api = MagicMock()
+
+        def capture_upload(repo_id, folder_path, **kwargs):
+            for f in Path(folder_path).rglob("*"):
+                if f.is_file():
+                    rel = f.relative_to(folder_path)
+                    dest = remote_dir / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(f), str(dest))
+
+        mock_api.upload_folder.side_effect = capture_upload
+
+        with (
+            patch("lmprobe.sharing._check_hub_deps"),
+            patch("huggingface_hub.HfApi", return_value=mock_api),
+        ):
+            push_dataset(
+                repo_id="user/raw-load",
+                model_name=TEST_MODEL,
+                prompts=prompts,
+                exist_ok=True,
+            )
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with (
+            patch("lmprobe.sharing._check_hub_deps"),
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=mock_download,
+            ),
+        ):
+            result, info = load_activation_dataset("user/raw-load")
+
+        # Total tokens = 3 + 5 = 8
+        assert result["hidden.layer_0"].shape == (sum(seq_lens), HIDDEN_DIM)
+        assert result["hidden.layer_1"].shape == (sum(seq_lens), HIDDEN_DIM)
+
+
+class TestPooledStorageUnchanged:
+    """Existing pooled tests still pass — auto-detect falls back to pooled."""
+
+    def test_pooled_storage_flag(self, populated_cache):
+        tensor_types = {
+            "raw_layers": [],
+            "pooled": {"last_token": [0, 1]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/pooled-test",
+        )
+
+        desc = tensor_descriptors["hidden_layers"]
+        assert desc["storage"] == "pooled"
+        assert desc["pooling"] == "last_token"
+        assert "row_bytes" in desc
+
+        # row_offset should be in metadata, not token_offset
+        for pm in prompt_metadata:
+            assert "row_offset" in pm
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
