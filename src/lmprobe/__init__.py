@@ -35,6 +35,7 @@ __all__ = [
     "BaselineResults",
     "CacheInfo",
     "CachedLogits",
+    "CachedPromptInfo",
     "LayerSweepResult",
     "LinearProbe",
     "Probe",
@@ -45,9 +46,13 @@ __all__ = [
     "WarmupStats",
     "cache_info",
     "clear_model_cache",
+    "discover_cached",
     "enable_cache_logging",
+    "load_activation_dataset",
     "plot_layer_importance",
     "plot_layer_importance_heatmap",
+    "pull_dataset",
+    "push_dataset",
     "set_cache_backend",
     "set_cache_dtype",
     "set_cache_limit",
@@ -130,4 +135,23 @@ def __getattr__(name: str):
         from .hub import ProbeCard
 
         return ProbeCard
+    if name in ("CachedPromptInfo", "discover_cached"):
+        from .cache import CachedPromptInfo, discover_cached
+
+        return {
+            "CachedPromptInfo": CachedPromptInfo,
+            "discover_cached": discover_cached,
+        }[name]
+    if name in ("push_dataset", "pull_dataset", "load_activation_dataset"):
+        from .sharing import (
+            load_activation_dataset,
+            pull_dataset,
+            push_dataset,
+        )
+
+        return {
+            "push_dataset": push_dataset,
+            "pull_dataset": pull_dataset,
+            "load_activation_dataset": load_activation_dataset,
+        }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
