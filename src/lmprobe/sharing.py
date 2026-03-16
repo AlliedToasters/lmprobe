@@ -617,11 +617,10 @@ def _consolidate_and_shard(
             global_row = offset + local_row
             if global_row < len(prompt_metadata):
                 prompt_metadata[global_row]["shard_index"] = shard_idx
+                prompt_metadata[global_row]["row_offset"] = local_row
                 if use_raw:
                     prompt_metadata[global_row]["token_offset"] = token_offset_acc
                     token_offset_acc += per_prompt_tokens[global_row]
-                else:
-                    prompt_metadata[global_row]["row_offset"] = local_row
 
         shard_prompts = prompt_data[offset : offset + shard_size]
 
@@ -759,8 +758,14 @@ def _write_parquet_index(
         "row_offset": pa.array(row_offsets, type=pa.int32()),
     }
 
-    # Detect extra keys beyond the fixed set
-    fixed_keys = {"text", "label", "num_tokens", "shard_index", "row_offset"}
+    # token_offset is a fixed column (int64 for large shards) when present
+    fixed_keys = {
+        "text", "label", "num_tokens", "shard_index", "row_offset",
+        "token_offset",
+    }
+    if any("token_offset" in p for p in prompt_metadata):
+        token_offsets = [p.get("token_offset", 0) for p in prompt_metadata]
+        columns["token_offset"] = pa.array(token_offsets, type=pa.int64())
     if prompt_metadata:
         extra_keys = sorted(
             set(prompt_metadata[0].keys()) - fixed_keys
@@ -893,13 +898,29 @@ def _build_readme(
     desc_section = f"\n{description}\n" if description else ""
     model_url = f"https://huggingface.co/{model_name}"
 
-    # Find example shard
+    # Find example shard and detect storage mode
     example_shard = "tensors/hidden_layers_000.safetensors"
+    is_full_sequence = False
     for info in tensor_descriptors.values():
         shards = info.get("shards", [])
         if shards:
             example_shard = shards[0]["file"]
+        if info.get("storage") == "full_sequence":
+            is_full_sequence = True
+        if shards:
             break
+
+    if is_full_sequence:
+        standalone_slice_example = (
+            'tok_off, num_tok = row["token_offset"], row["num_tokens"]\n'
+            "# Slice full-sequence activations for this prompt\n"
+            'prompt_acts = layer_0[tok_off : tok_off + num_tok]  '
+            "# (num_tokens, hidden_dim)"
+        )
+    else:
+        standalone_slice_example = (
+            'shard_idx, row_offset = row["shard_index"], row["row_offset"]'
+        )
 
     yaml_header = f"""---
 tags:
@@ -962,15 +983,14 @@ with open("{INFO_FILENAME}") as f:
 print(list(info["tensors"].keys()))  # e.g. ["hidden_layers", "logits_topk"]
 
 # 3. Load a shard — layers are co-located, use safetensors partial read
-#    for single-layer access.  Per-layer row size = dim * sizeof(dtype).
-#    row_bytes in the descriptor is for ALL co-located layers combined.
+#    for single-layer access.
 with safe_open("{example_shard}", framework="pt") as f:
     print(f.keys())  # e.g. ["hidden.layer_0", "hidden.layer_1"]
-    layer_0 = f.get_tensor("hidden.layer_0")  # (N_shard, hidden_dim)
+    layer_0 = f.get_tensor("hidden.layer_0")
 
 # 4. Map prompt index -> shard row
 row = index.iloc[42]
-shard_idx, row_offset = row["shard_index"], row["row_offset"]
+{standalone_slice_example}
 ```
 
 ## Load with HF Datasets

@@ -15,6 +15,7 @@ from lmprobe.cache import (
     load_prompt_activations,
     load_prompt_pooled_activations,
     save_prompt_activations,
+    save_prompt_logits,
     save_prompt_pooled_activations,
 )
 from lmprobe.sharing import (
@@ -529,7 +530,7 @@ class TestBuildReadme:
         assert "Load without lmprobe" in readme
         assert "pyarrow.parquet" in readme
         assert "safe_open" in readme
-        assert "row_bytes" in readme
+        assert "row_offset" in readme
         assert "load_dataset" in readme
 
     def test_readme_description(self):
@@ -1523,6 +1524,108 @@ class TestFullSequenceRoundtrip:
         # Total tokens = 3 + 5 = 8
         assert result["hidden.layer_0"].shape == (sum(seq_lens), HIDDEN_DIM)
         assert result["hidden.layer_1"].shape == (sum(seq_lens), HIDDEN_DIM)
+
+
+@requires_pyarrow
+class TestFullSequenceWithLogits:
+    """Test combining full-sequence hidden layers + logits_topk."""
+
+    def test_push_pull_raw_with_logits(self, tmp_path, monkeypatch):
+        """Push raw hidden + logits, pull, verify both are correct."""
+        src_cache = tmp_path / "src_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(src_cache))
+        cache_mod._backend = None
+
+        prompts = ["alpha", "beta", "gamma"]
+        seq_lens = [3, 5, 4]
+        layers = [0, 1]
+        top_k = 10
+        vocab_size = 50
+
+        original_raw = {}
+
+        for prompt, sl in zip(prompts, seq_lens):
+            # Save raw activations
+            act = torch.randn(1, sl, HIDDEN_DIM * len(layers))
+            mask = torch.ones(1, sl, dtype=torch.long)
+            save_prompt_activations(TEST_MODEL, prompt, layers, act, mask)
+            original_raw[prompt] = act
+
+            # Save top-k logits
+            logits = torch.randn(1, sl, vocab_size)
+            save_prompt_logits(
+                TEST_MODEL, prompt, logits, mask,
+                top_k=top_k, positions="last",
+            )
+
+        # Push
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+        mock_api = MagicMock()
+
+        def capture_upload(repo_id, folder_path, **kwargs):
+            for f in Path(folder_path).rglob("*"):
+                if f.is_file():
+                    rel = f.relative_to(folder_path)
+                    dest = remote_dir / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(f), str(dest))
+
+        mock_api.upload_folder.side_effect = capture_upload
+
+        with (
+            patch("lmprobe.sharing._check_hub_deps"),
+            patch("huggingface_hub.HfApi", return_value=mock_api),
+        ):
+            push_dataset(
+                repo_id="user/raw-logits",
+                model_name=TEST_MODEL,
+                prompts=prompts,
+                labels=[1, 1, 0],
+                exist_ok=True,
+            )
+
+        # Verify both tensor types in info
+        with open(remote_dir / INFO_FILENAME) as f:
+            info = json.load(f)
+        assert "hidden_layers" in info["tensors"]
+        assert "logits_topk" in info["tensors"]
+        assert info["tensors"]["hidden_layers"]["storage"] == "full_sequence"
+
+        # Verify Parquet has both row_offset and token_offset
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(str(remote_dir / PARQUET_PATH))
+        assert "row_offset" in table.column_names
+        assert "token_offset" in table.column_names
+
+        # Pull into fresh cache
+        dst_cache = tmp_path / "dst_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(dst_cache))
+        cache_mod._backend = None
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with (
+            patch("lmprobe.sharing._check_hub_deps"),
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=mock_download,
+            ),
+        ):
+            count = pull_dataset("user/raw-logits")
+
+        assert count == 3
+
+        # Verify raw activations roundtrip
+        for prompt in prompts:
+            pulled_act, pulled_mask = load_prompt_activations(
+                TEST_MODEL, prompt, layers,
+            )
+            orig_act = original_raw[prompt]
+            assert pulled_act.shape == orig_act.shape
+            assert torch.allclose(pulled_act, orig_act, atol=1e-5)
 
 
 class TestPooledStorageUnchanged:
