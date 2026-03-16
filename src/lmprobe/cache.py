@@ -301,6 +301,153 @@ def _parse_pooled_layer_keys(keys: set[str] | list[str], pooling: str) -> set[in
     return result
 
 
+def _parse_all_pooled_keys(keys: set[str] | list[str]) -> dict[str, list[int]]:
+    """Extract all pooling strategies and their layer indices from safetensors keys.
+
+    Returns a dict mapping pooling strategy name to sorted list of layer indices.
+    Parses keys matching ``pooled_{strategy}_layer_{i}``.
+    """
+    import re
+
+    pattern = re.compile(r"^pooled_(.+)_layer_(\d+)$")
+    result: dict[str, set[int]] = {}
+    for k in keys:
+        m = pattern.match(k)
+        if m:
+            strategy = m.group(1)
+            layer_idx = int(m.group(2))
+            result.setdefault(strategy, set()).add(layer_idx)
+    return {s: sorted(layers) for s, layers in result.items()}
+
+
+# =============================================================================
+# Public cache introspection API
+# =============================================================================
+
+
+@dataclass
+class CachedPromptInfo:
+    """What's cached for a single prompt.
+
+    Returned by :func:`discover_cached` to describe the available
+    tensors without loading any data.
+    """
+
+    raw_layers: list[int]
+    pooled: dict[str, list[int]]
+    has_logits: bool
+    logits_top_k: int | None
+    has_perplexity: bool
+    num_tokens: int | None
+
+
+def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
+    """Introspect what's cached for a model+prompt combination.
+
+    Returns None if nothing is cached. Otherwise returns a
+    :class:`CachedPromptInfo` describing available layers, pooling
+    strategies, logits, etc.
+
+    This is the public API for cache introspection — ``bucket.py``
+    and other modules should use this rather than parsing internal
+    cache key names.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    prompt : str
+        The prompt text.
+
+    Returns
+    -------
+    CachedPromptInfo | None
+        Description of cached tensors, or None if nothing is cached.
+    """
+    backend = get_backend()
+    key = _prompt_cache_key(model_name, prompt)
+
+    if not backend.exists(key):
+        # v1 fallback: check for legacy directory (local only)
+        if isinstance(backend, LocalCacheBackend):
+            cache_dir = get_prompt_cache_dir(model_name, prompt)
+            if not cache_dir.exists():
+                return None
+            # v1 has limited info — just raw layers and maybe perplexity
+            raw_layers = sorted(get_prompt_cached_layers(cache_dir))
+            if not raw_layers:
+                return None
+            has_perplexity = (cache_dir / "perplexity.pt").exists()
+            # Check for v1 pooled dirs
+            pooled: dict[str, list[int]] = {}
+            for d in cache_dir.iterdir():
+                if d.is_dir() and d.name.startswith("pooled_"):
+                    strategy = d.name[len("pooled_"):]
+                    layers = sorted(
+                        int(f.stem.split("_")[1])
+                        for f in d.glob("layer_*.pt")
+                    )
+                    if layers:
+                        pooled[strategy] = layers
+            # Try to get num_tokens from attention_mask
+            num_tokens = None
+            mask_path = cache_dir / "attention_mask.pt"
+            if mask_path.exists():
+                try:
+                    mask = torch.load(mask_path, weights_only=True)
+                    num_tokens = int(mask.sum().item())
+                except Exception:
+                    pass
+            return CachedPromptInfo(
+                raw_layers=raw_layers,
+                pooled=pooled,
+                has_logits=False,
+                logits_top_k=None,
+                has_perplexity=has_perplexity,
+                num_tokens=num_tokens,
+            )
+        return None
+
+    # v2: parse safetensors keys
+    tensor_keys = _get_tensor_keys_from_backend(key)
+
+    raw_layers = sorted(_parse_raw_layer_keys(tensor_keys))
+    pooled = _parse_all_pooled_keys(tensor_keys)
+    has_logits = _LOGITS_KEY in tensor_keys
+    has_topk = (
+        _LOGITS_TOP_K_VALUES_KEY in tensor_keys
+        and _LOGITS_TOP_K_INDICES_KEY in tensor_keys
+    )
+    has_perplexity = _PERPLEXITY_KEY in tensor_keys
+
+    # Determine top-k value by loading the shape of the topk values tensor
+    logits_top_k = None
+    if has_topk:
+        try:
+            tensors = _load_tensors_from_backend(key, [_LOGITS_TOP_K_VALUES_KEY])
+            logits_top_k = tensors[_LOGITS_TOP_K_VALUES_KEY].shape[-1]
+        except Exception:
+            pass
+
+    # Get num_tokens from attention_mask
+    num_tokens = None
+    if _ATTENTION_MASK_KEY in tensor_keys:
+        try:
+            tensors = _load_tensors_from_backend(key, [_ATTENTION_MASK_KEY])
+            num_tokens = int(tensors[_ATTENTION_MASK_KEY].sum().item())
+        except Exception:
+            pass
+
+    return CachedPromptInfo(
+        raw_layers=raw_layers,
+        pooled=pooled,
+        has_logits=has_logits,
+        logits_top_k=logits_top_k,
+        has_perplexity=has_perplexity,
+        num_tokens=num_tokens,
+    )
+
+
 # =============================================================================
 # Backend key helpers
 # =============================================================================
