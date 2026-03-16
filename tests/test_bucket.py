@@ -8,13 +8,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from lmprobe.cache import (
-    CachedPromptInfo,
-    discover_cached,
-    save_prompt_activations,
-    save_prompt_pooled_activations,
-    save_prompt_logits,
-)
 from lmprobe.bucket import (
     FORMAT_VERSION,
     _build_dataset_info,
@@ -23,9 +16,15 @@ from lmprobe.bucket import (
     _consolidate_and_shard,
     _discover_prompts,
     _filter_tensor_types,
-    push_to_bucket,
-    pull_from_bucket,
     load_from_bucket,
+    pull_from_bucket,
+    push_to_bucket,
+)
+from lmprobe.cache import (
+    CachedPromptInfo,
+    discover_cached,
+    save_prompt_activations,
+    save_prompt_pooled_activations,
 )
 
 TEST_MODEL = "stas/tiny-random-llama-2"
@@ -272,9 +271,6 @@ class TestConsolidateAndShard:
         )
         assert manifest_prompts[0]["label"] == 1
         assert manifest_prompts[2]["label"] == 0
-
-        # Clean up
-        parent = Path(manifest_prompts[0]["text"]).parent if manifest_prompts else None
 
     def test_consolidation_with_pooled(self, populated_cache):
         tensor_types = {

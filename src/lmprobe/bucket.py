@@ -787,9 +787,11 @@ def _build_readme(
 
     desc_section = f"\n{description}\n" if description else ""
 
+    model_url = f"https://huggingface.co/{model_name}"
     readme = f"""# {model_name} — Activation Dataset
 
-Cached activations extracted from [`{model_name}`](https://huggingface.co/{model_name}) (revision `{revision}`).
+Cached activations extracted from [`{model_name}`]({model_url})
+(revision `{revision}`).
 {desc_section}
 ## Contents
 

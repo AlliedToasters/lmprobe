@@ -1,15 +1,15 @@
 """Tests for discover_cached() — the public cache introspection API."""
 
-import torch
 import pytest
+import torch
 
 from lmprobe.cache import (
     CachedPromptInfo,
     discover_cached,
     save_prompt_activations,
-    save_prompt_pooled_activations,
     save_prompt_logits,
     save_prompt_perplexity,
+    save_prompt_pooled_activations,
 )
 
 TEST_MODEL = "stas/tiny-random-llama-2"
