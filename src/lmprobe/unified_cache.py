@@ -31,6 +31,7 @@ from .cache import (
     save_prompt_logits,
     save_prompt_perplexity,
     save_prompt_pooled_activations,
+    save_prompt_topk_logits,
 )
 from .extraction import (
     compute_perplexity_from_logits,
@@ -424,6 +425,18 @@ class UnifiedCache:
                 f"{num_batches} batches"
             )
 
+            # Determine if we can use server-side top-k for logits.
+            # All three conditions must hold:
+            # 1. remote=True
+            # 2. logit_top_k is set
+            # 3. compute_perplexity=False (full logits not needed)
+            effective_top_k = (
+                self.logit_top_k
+                if (remote and self.logit_top_k is not None
+                    and not self.compute_perplexity)
+                else None
+            )
+
             with torch.no_grad():
                 for batch_idx in tqdm(
                     range(0, len(need_unified_list), self.batch_size),
@@ -436,9 +449,11 @@ class UnifiedCache:
                     ]
 
                     # Single forward pass captures both activations and logits
-                    batch_acts, batch_mask, batch_logits = (
+                    batch_acts, batch_mask, batch_logits, batch_logits_indices = (
                         backend.extract_batch_with_logits(
-                            batch_prompts, layer_indices, remote=remote
+                            batch_prompts, layer_indices,
+                            remote=remote,
+                            logit_top_k=effective_top_k,
                         )
                     )
 
@@ -495,14 +510,27 @@ class UnifiedCache:
 
                         # Save logits if needed
                         if self.cache_logits and prompt in need_logits_set:
-                            save_prompt_logits(
-                                self.model_name,
-                                prompt,
-                                batch_logits[j : j + 1],
-                                batch_mask[j : j + 1],
-                                self.logit_top_k,
-                                self.logit_positions,
-                            )
+                            if batch_logits_indices is not None:
+                                # Pre-compressed from server-side top-k:
+                                # save values+indices directly, skip local topk
+                                save_prompt_topk_logits(
+                                    self.model_name,
+                                    prompt,
+                                    batch_logits[j : j + 1],
+                                    batch_logits_indices[j : j + 1],
+                                    batch_mask[j : j + 1],
+                                    self.logit_positions,
+                                )
+                            else:
+                                # Full logits: existing path applies local topk
+                                save_prompt_logits(
+                                    self.model_name,
+                                    prompt,
+                                    batch_logits[j : j + 1],
+                                    batch_mask[j : j + 1],
+                                    self.logit_top_k,
+                                    self.logit_positions,
+                                )
                             logits_extracted += 1
 
         elapsed = time.time() - start_time

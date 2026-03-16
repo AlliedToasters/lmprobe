@@ -371,7 +371,11 @@ def load_model(
     return model
 
 
-def _build_remote_extract_fn(layer_indices: list[int], with_logits: bool = False):
+def _build_remote_extract_fn(
+    layer_indices: list[int],
+    with_logits: bool = False,
+    logit_top_k: int | None = None,
+):
     """Build a trace function for remote nnsight execution.
 
     nnsight's remote tracing serializes the source code inside the
@@ -396,12 +400,18 @@ def _build_remote_extract_fn(layer_indices: list[int], with_logits: bool = False
         Positive layer indices to extract.
     with_logits : bool
         If True, also save the lm_head logits output.
+    logit_top_k : int | None
+        If set and with_logits is True, perform server-side top-k on
+        logits so only compressed tensors are transferred. The trace
+        will return ``(values, indices)`` instead of full logits.
 
     Returns
     -------
     callable
-        A function ``(model, tokenized) -> tuple[list[Tensor], Tensor|None]``
-        that runs the trace and returns (layer_outputs, logits_or_none).
+        A function ``(model, tokenized) -> tuple[list[Tensor], ...]``
+        that runs the trace and returns layer outputs plus logits info.
+        When logit_top_k is set: ``(layers, (topk_values, topk_indices))``
+        Otherwise: ``(layers, logits_or_none)``
     """
     import importlib.util
     import tempfile
@@ -411,12 +421,24 @@ def _build_remote_extract_fn(layer_indices: list[int], with_logits: bool = False
         f"        {v} = model.model.layers[{i}].output.save()"
         for v, i in zip(var_names, layer_indices)
     )
-    logits_line = (
-        "        _logits = model.lm_head.output.save()" if with_logits else ""
-    )
+
+    if with_logits and logit_top_k is not None:
+        # Server-side top-k: compute topk inside the trace
+        logits_line = (
+            "        _raw_logits = model.lm_head.output\n"
+            f"        _logits_vals, _logits_idxs = _raw_logits.topk({logit_top_k}, dim=-1)\n"
+            "        _logits_vals = _logits_vals.save()\n"
+            "        _logits_idxs = _logits_idxs.save()"
+        )
+        return_logits = "(_logits_vals, _logits_idxs)"
+    elif with_logits:
+        logits_line = "        _logits = model.lm_head.output.save()"
+        return_logits = "_logits"
+    else:
+        logits_line = ""
+        return_logits = "None"
 
     return_layers = f"[{', '.join(var_names)}]"
-    return_logits = "_logits" if with_logits else "None"
 
     code = (
         "def extract(model, tokenized):\n"
@@ -545,7 +567,8 @@ def _extract_batch_with_logits(
     prompts: list[str],
     layer_indices: list[int],
     remote: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    logit_top_k: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Extract activations AND logits for a single batch of prompts.
 
     This function captures both layer activations and the lm_head output
@@ -562,13 +585,21 @@ def _extract_batch_with_logits(
         List of layer indices to extract from (must be positive).
     remote : bool
         Whether to use remote execution.
+    logit_top_k : int | None
+        If set and remote=True, perform server-side top-k on logits
+        so only compressed tensors are transferred over the network.
+        When active, the third return value contains top-k values and
+        the fourth contains top-k indices. Ignored when remote=False.
 
     Returns
     -------
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
         - activations: Shape (batch, seq_len, hidden_dim * num_layers)
         - attention_mask: Shape (batch, seq_len)
-        - logits: Shape (batch, seq_len, vocab_size)
+        - logits: Shape (batch, seq_len, vocab_size) when logit_top_k is None,
+          or (batch, seq_len, K) top-k values when logit_top_k is set
+        - logits_indices: None when logit_top_k is None, or
+          (batch, seq_len, K) top-k indices when logit_top_k is set
     """
     tokenized = model.tokenizer(
         prompts,
@@ -576,13 +607,31 @@ def _extract_batch_with_logits(
         padding=True,
     )
 
+    logits_indices = None
+
     if remote:
-        fn = _build_remote_extract_fn(layer_indices, with_logits=True)
+        # Only pass logit_top_k to the remote trace builder
+        fn = _build_remote_extract_fn(
+            layer_indices, with_logits=True, logit_top_k=logit_top_k
+        )
         layer_outputs, logits_proxy = fn(model, tokenized)
         activation_tensors = _unwrap_layer_outputs(layer_outputs)
-        logits_val = (
-            logits_proxy.value if hasattr(logits_proxy, "value") else logits_proxy
-        )
+
+        if logit_top_k is not None:
+            # logits_proxy is a (values, indices) tuple from server-side topk
+            vals_proxy, idxs_proxy = logits_proxy
+            logits_val = (
+                vals_proxy.value if hasattr(vals_proxy, "value") else vals_proxy
+            )
+            logits_indices = (
+                idxs_proxy.value if hasattr(idxs_proxy, "value") else idxs_proxy
+            )
+        else:
+            logits_val = (
+                logits_proxy.value
+                if hasattr(logits_proxy, "value")
+                else logits_proxy
+            )
     else:
         modules_to_cache = [model.model.layers[i] for i in layer_indices]
 
@@ -615,7 +664,7 @@ def _extract_batch_with_logits(
     combined = torch.cat(activation_tensors, dim=-1)
     attention_mask = tokenized["attention_mask"]
 
-    return combined, attention_mask, logits_val
+    return combined, attention_mask, logits_val, logits_indices
 
 
 def compute_perplexity_from_logits(
@@ -893,7 +942,7 @@ class ActivationExtractor:
         prompts: list[str],
         layer_indices: list[int],
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Extract activations AND logits for a single batch of prompts.
 
         Delegates to the configured backend.
@@ -905,12 +954,12 @@ class ActivationExtractor:
         layer_indices : list[int]
             Layer indices to extract from.
         **kwargs
-            Backend-specific parameters.
+            Backend-specific parameters (e.g., logit_top_k).
 
         Returns
         -------
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-            (activations, attention_mask, logits)
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
+            (activations, attention_mask, logits, logits_indices)
         """
         return self._backend.extract_batch_with_logits(
             prompts, layer_indices, **kwargs

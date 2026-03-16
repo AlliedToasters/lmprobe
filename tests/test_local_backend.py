@@ -73,12 +73,13 @@ class TestLocalBackend:
 
     def test_extract_batch_with_logits(self, tiny_model):
         backend = resolve_backend("local", tiny_model, "cpu")
-        acts, mask, logits = backend.extract_batch_with_logits(
+        acts, mask, logits, logits_indices = backend.extract_batch_with_logits(
             ["Hello world"], [0]
         )
         assert acts.ndim == 3
         assert logits.ndim == 3  # (batch, seq_len, vocab_size)
         assert logits.shape[0] == 1
+        assert logits_indices is None
 
     def test_tokenizer_property(self, tiny_model):
         backend = resolve_backend("local", tiny_model, "cpu")

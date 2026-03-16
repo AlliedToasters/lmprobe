@@ -778,3 +778,61 @@ class TestCachedLogits:
         for prompt in prompts:
             assert is_prompt_perplexity_cached(tiny_model, prompt)
             assert is_prompt_logits_cached(tiny_model, prompt)
+
+
+class TestServerSideTopK:
+    """Tests for server-side top-k logits optimization."""
+
+    def test_effective_topk_only_when_remote_and_no_perplexity(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """effective_top_k is None when compute_perplexity=True, even with logit_top_k set."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        # With perplexity enabled: should use full logits path (local topk)
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            compute_perplexity=True,
+            device="cpu",
+            remote=False,
+            cache_logits=True,
+            logit_top_k=10,
+            logit_positions="last",
+        )
+
+        prompts = ["topk perplexity fallback test"]
+        stats = cache.warmup(prompts)
+
+        # Should still work — perplexity computed from full logits
+        assert stats.perplexity_extracted == 1
+        assert stats.logits_extracted == 1
+
+        # Logits should be cached as top-k (applied locally)
+        result = cache.get_logits(prompts)
+        assert result.values.shape[-1] == 10
+        assert result.indices is not None
+
+    def test_local_topk_still_works(self, tiny_model, tmp_path, monkeypatch):
+        """Local backend with logit_top_k still applies topk locally."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        K = 5
+        cache = UnifiedCache(
+            model=tiny_model,
+            layers=[0],
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_logits=True,
+            logit_top_k=K,
+            logit_positions="last",
+        )
+
+        prompts = ["local topk test"]
+        cache.warmup(prompts)
+
+        result = cache.get_logits(prompts)
+        assert result.values.shape == (1, 1, K)
+        assert result.indices is not None
+        assert result.indices.shape == (1, 1, K)
