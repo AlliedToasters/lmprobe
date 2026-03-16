@@ -1002,6 +1002,61 @@ def save_prompt_logits(
     _merge_save_backend(key, new_tensors)
 
 
+def save_prompt_topk_logits(
+    model_name: str,
+    prompt: str,
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    attention_mask: torch.Tensor,
+    positions: str = "last",
+) -> None:
+    """Save pre-compressed top-k logits for a single prompt.
+
+    Unlike ``save_prompt_logits`` which receives full-vocab logits and
+    applies ``torch.topk`` locally, this function receives values and
+    indices that were already compressed server-side (e.g., inside an
+    nnsight remote trace). It still performs position selection (e.g.,
+    last token) but skips the ``topk`` call.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    prompt : str
+        The prompt text.
+    values : torch.Tensor
+        Top-k logit values with shape (1, seq_len, K).
+    indices : torch.Tensor
+        Top-k token indices with shape (1, seq_len, K).
+    attention_mask : torch.Tensor
+        Attention mask with shape (1, seq_len).
+    positions : str
+        Which token positions to store: "last" (default) or "all".
+    """
+    _register_model(model_name)
+    key = _prompt_cache_key(model_name, prompt)
+
+    # Select positions
+    if positions == "last":
+        mask = attention_mask[0]  # (seq_len,)
+        last_pos = mask.sum().long().item() - 1
+        selected_values = values[:, last_pos : last_pos + 1, :]  # (1, 1, K)
+        selected_indices = indices[:, last_pos : last_pos + 1, :]  # (1, 1, K)
+    elif positions == "all":
+        selected_values = values
+        selected_indices = indices
+    else:
+        raise ValueError(
+            f"Invalid positions: {positions!r}. Must be 'last' or 'all'."
+        )
+
+    new_tensors = {
+        _LOGITS_TOP_K_VALUES_KEY: _prepare_tensor(selected_values),
+        _LOGITS_TOP_K_INDICES_KEY: _prepare_tensor(selected_indices.to(torch.int32)),
+    }
+    _merge_save_backend(key, new_tensors)
+
+
 def load_prompt_logits(
     model_name: str, prompt: str, top_k: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor | None]:

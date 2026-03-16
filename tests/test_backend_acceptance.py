@@ -200,8 +200,9 @@ class TestLocalBackendHooks:
 
     def test_logits_extraction(self, tiny_model):
         backend = LocalBackend(tiny_model, device="cpu")
-        acts, mask, logits = backend.extract_batch_with_logits(["Hello"], [0])
+        acts, mask, logits, logits_indices = backend.extract_batch_with_logits(["Hello"], [0])
         assert logits.ndim == 3  # (batch, seq_len, vocab_size)
+        assert logits_indices is None
 
     def test_full_pipeline_local(self, tiny_model):
         """Full fit/predict/score pipeline with local backend."""

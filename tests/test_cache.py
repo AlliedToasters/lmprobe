@@ -16,15 +16,18 @@ from lmprobe.cache import (
     get_prompt_cached_layers,
     invalidate_extraction_cache,
     is_prompt_fully_cached,
+    is_prompt_logits_cached,
     is_prompt_pooled_cached,
     load_attention_mask,
     load_layer,
     load_prompt_activations,
+    load_prompt_logits,
     load_prompt_pooled_activations,
     save_attention_mask,
     save_layer,
     save_prompt_activations,
     save_prompt_pooled_activations,
+    save_prompt_topk_logits,
     set_cache_dtype,
     set_cache_limit,
 )
@@ -772,3 +775,63 @@ class TestUnifiedCachePerplexityBaselineIntegration:
         ppl_from_baseline = baseline._compute_perplexity(prompts)
 
         assert np.allclose(ppl_from_cache, ppl_from_baseline, atol=1e-5)
+
+
+class TestSavePromptTopkLogits:
+    """Tests for save_prompt_topk_logits (pre-compressed top-k)."""
+
+    def test_save_and_load_topk_logits(self, tmp_path, monkeypatch):
+        """Pre-compressed top-k logits round-trip correctly."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        model_name = "test-model"
+        prompt = "test topk logits save"
+        K = 5
+        seq_len = 10
+
+        values = torch.randn(1, seq_len, K)
+        indices = torch.randint(0, 1000, (1, seq_len, K))
+        attention_mask = torch.ones(1, seq_len, dtype=torch.long)
+
+        save_prompt_topk_logits(
+            model_name, prompt, values, indices, attention_mask,
+            positions="all",
+        )
+
+        assert is_prompt_logits_cached(model_name, prompt, top_k=K)
+
+        loaded_values, loaded_indices = load_prompt_logits(
+            model_name, prompt, top_k=K
+        )
+        assert loaded_values.shape == (1, seq_len, K)
+        assert loaded_indices.shape == (1, seq_len, K)
+        assert torch.allclose(loaded_values, values, atol=1e-4)
+        assert (loaded_indices == indices.to(torch.int32)).all()
+
+    def test_save_topk_logits_last_position(self, tmp_path, monkeypatch):
+        """Position selection works on pre-compressed top-k logits."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        model_name = "test-model"
+        prompt = "test topk last position"
+        K = 3
+        seq_len = 8
+
+        values = torch.randn(1, seq_len, K)
+        indices = torch.randint(0, 500, (1, seq_len, K))
+        # 6 real tokens, 2 padding
+        attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
+
+        save_prompt_topk_logits(
+            model_name, prompt, values, indices, attention_mask,
+            positions="last",
+        )
+
+        loaded_values, loaded_indices = load_prompt_logits(
+            model_name, prompt, top_k=K
+        )
+        # Should have only 1 position (last non-padding = index 5)
+        assert loaded_values.shape == (1, 1, K)
+        assert loaded_indices.shape == (1, 1, K)
+        # Values should match position 5 of the original
+        assert torch.allclose(loaded_values[0, 0], values[0, 5], atol=1e-4)

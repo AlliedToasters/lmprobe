@@ -68,7 +68,7 @@ class ExtractionBackend(ABC):
         prompts: list[str],
         layer_indices: list[int],
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Extract activations AND logits for a batch of prompts.
 
         Parameters
@@ -78,14 +78,18 @@ class ExtractionBackend(ABC):
         layer_indices : list[int]
             Layer indices to extract from (positive integers).
         **kwargs
-            Backend-specific parameters.
+            Backend-specific parameters. Notable:
+            - logit_top_k (int | None): When set and remote=True (nnsight
+              backend), perform server-side top-k on logits. The fourth
+              return element will contain the top-k indices.
 
         Returns
         -------
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
             - activations: Shape (batch, seq_len, hidden_dim * num_layers)
             - attention_mask: Shape (batch, seq_len)
-            - logits: Shape (batch, seq_len, vocab_size)
+            - logits: Shape (batch, seq_len, vocab_size) or (batch, seq_len, K)
+            - logits_indices: None or (batch, seq_len, K) int64 indices
         """
 
     @property
@@ -162,12 +166,14 @@ class NnsightBackend(ExtractionBackend):
         prompts: list[str],
         layer_indices: list[int],
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         from .extraction import _extract_batch_with_logits
 
         remote = kwargs.get("remote", self.remote)
+        logit_top_k = kwargs.get("logit_top_k")
         return _extract_batch_with_logits(
-            self.model, prompts, layer_indices, remote=remote
+            self.model, prompts, layer_indices, remote=remote,
+            logit_top_k=logit_top_k,
         )
 
 
@@ -396,7 +402,7 @@ class LocalBackend(ExtractionBackend):
         prompts: list[str],
         layer_indices: list[int],
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         model = self.model
         tokenizer = self.tokenizer
         decoder_layers = _get_decoder_layers(model)
@@ -439,7 +445,7 @@ class LocalBackend(ExtractionBackend):
         combined = torch.cat(activation_tensors, dim=-1)
         logits = outputs.logits.detach().cpu()
 
-        return combined, tokenized["attention_mask"], logits
+        return combined, tokenized["attention_mask"], logits, None
 
 
 def resolve_backend(
