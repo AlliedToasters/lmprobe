@@ -396,17 +396,18 @@ def _consolidate_and_shard(
             loaded: dict[str, torch.Tensor] = {}
 
             # Raw layers (loaded per-layer individually)
+            # load_prompt_activations returns (1, seq_len, hidden_dim).
+            # For v1, we only support pooled raw layers (seq_len == 1).
+            # Variable-length unpooled push requires offset-based
+            # concatenation — see GitHub issue for v2 plans.
             mask: torch.Tensor | None = None
             if raw_layers:
-                # load_prompt_activations concatenates layers — we need per-layer
-                # Load each layer individually from cache
                 for layer in raw_layers:
                     acts, mask = load_prompt_activations(
                         model_name, prompt, [layer]
                     )
-                    # acts shape: (1, seq_len, hidden_dim)
+                    # acts: (1, seq_len, hidden_dim)
                     loaded[f"hidden.layer_{layer}"] = acts
-                # Store mask from last load for num_tokens
                 if mask is not None:
                     loaded["_mask"] = mask
 
@@ -416,7 +417,7 @@ def _consolidate_and_shard(
                     pooled_act = load_prompt_pooled_activations(
                         model_name, prompt, [layer], strategy
                     )
-                    # pooled_act shape: (1, hidden_dim)
+                    # pooled_act: (1, hidden_dim)
                     loaded[f"pooled.{strategy}.layer_{layer}"] = pooled_act
 
             # Logits (topk)
@@ -428,39 +429,33 @@ def _consolidate_and_shard(
                 if logit_idxs is not None:
                     loaded["logits_topk.indices"] = logit_idxs
 
-        except (FileNotFoundError, KeyError, Exception) as e:
+        except (FileNotFoundError, KeyError, OSError) as e:
             skipped_count += 1
             logger.debug(
                 f"[BUCKET] Skipping prompt index {idx}: {e}"
             )
             continue
 
-        # Determine num_tokens
+        # Determine num_tokens from attention mask
         num_tokens = None
         if "_mask" in loaded:
             num_tokens = int(loaded["_mask"].sum().item())
-        elif raw_layers and f"hidden.layer_{raw_layers[0]}" in loaded:
-            # Unpooled: seq_len from tensor shape
-            num_tokens = loaded[f"hidden.layer_{raw_layers[0]}"].shape[1]
 
-        # Determine pooling for raw layers
-        # If shape is (1, seq_len, hidden_dim) it's unpooled
-        # If shape is (1, hidden_dim) it's pooled (shouldn't happen for raw layers)
-        is_pooled_raw = False
-        if raw_layers:
-            t = loaded[f"hidden.layer_{raw_layers[0]}"]
-            is_pooled_raw = t.dim() == 2 or (t.dim() == 3 and t.shape[1] == 1)
-
-        # Accumulate into shards
+        # Raw layer tensors: reshape to (1, hidden_dim) for stacking.
+        # If the cached activations are unpooled (seq_len > 1), reject
+        # with a clear error — v1 only supports pooled/single-token raw.
         for layer in raw_layers:
             key = f"hidden.layer_{layer}"
             tensor = loaded[key]
-            if is_pooled_raw:
-                # (1, hidden_dim) or (1, 1, hidden_dim) -> (1, hidden_dim)
-                tensor = tensor.reshape(1, -1)
-            else:
-                # (1, seq_len, hidden_dim) — keep as-is for unpooled
-                pass
+            if tensor.dim() == 3 and tensor.shape[1] > 1:
+                raise ValueError(
+                    f"Unpooled raw activations (seq_len={tensor.shape[1]}) "
+                    f"for layer {layer} are not supported in push v1. "
+                    f"Use pooled activations or push pooled layers instead. "
+                    f"See: https://github.com/AlliedToasters/lmprobe/issues"
+                )
+            # (1, 1, hidden_dim) or (1, hidden_dim) -> (1, hidden_dim)
+            tensor = tensor.reshape(1, -1)
             type_accumulators[key].append(tensor.detach().cpu())
             type_current_bytes[key] += tensor.nelement() * tensor.element_size()
             type_current_prompts[key] += 1
@@ -515,19 +510,17 @@ def _consolidate_and_shard(
             "have been extracted."
         )
 
-    # Now write all accumulated tensors as shards
+    # Now write all accumulated tensors as shards.
+    # v1 only handles pooled (2D) tensors — each prompt is one row.
     def _write_shards(
         manifest_key: str,
         sf_key: str,
         accum: list[torch.Tensor],
         shard_max: int,
     ) -> list[dict]:
-        """Stack accumulated tensors and write shards. Returns shard descriptors."""
+        """Stack accumulated (1, dim) tensors and write shards."""
         if not accum:
             return []
-
-        # Determine if pooled (2D) or unpooled (3D)
-        is_pooled = accum[0].dim() <= 2
 
         shards = []
         current_tensors: list[torch.Tensor] = []
@@ -537,25 +530,17 @@ def _consolidate_and_shard(
 
         for tensor in accum:
             t_bytes = tensor.nelement() * tensor.element_size()
-            # Start new shard if adding this tensor would exceed limit
-            # (unless current shard is empty — single prompt > limit gets its own shard)
             if current_tensors and current_bytes + t_bytes > shard_max:
-                # Write current shard
-                fname = f"{manifest_key.replace('.', '_')}_{shard_idx:03d}.safetensors"
-                if is_pooled:
-                    stacked = torch.cat(current_tensors, dim=0)
-                else:
-                    stacked = torch.cat(current_tensors, dim=0)  # along batch dim
+                fname = (
+                    f"{manifest_key.replace('.', '_')}"
+                    f"_{shard_idx:03d}.safetensors"
+                )
+                stacked = torch.cat(current_tensors, dim=0)
                 save_file({sf_key: stacked}, str(tmpdir / fname))
-                shard_entry = {
+                shards.append({
                     "file": fname,
                     "num_prompts": current_prompts,
-                }
-                if not is_pooled:
-                    shard_entry["num_tokens"] = stacked.shape[0] if stacked.dim() == 2 else sum(
-                        t.shape[1] for t in current_tensors
-                    )
-                shards.append(shard_entry)
+                })
                 shard_files.append(tmpdir / fname)
                 current_tensors = []
                 current_bytes = 0
@@ -566,23 +551,17 @@ def _consolidate_and_shard(
             current_bytes += t_bytes
             current_prompts += 1
 
-        # Write remaining
         if current_tensors:
-            fname = f"{manifest_key.replace('.', '_')}_{shard_idx:03d}.safetensors"
-            if is_pooled:
-                stacked = torch.cat(current_tensors, dim=0)
-            else:
-                stacked = torch.cat(current_tensors, dim=0)
+            fname = (
+                f"{manifest_key.replace('.', '_')}"
+                f"_{shard_idx:03d}.safetensors"
+            )
+            stacked = torch.cat(current_tensors, dim=0)
             save_file({sf_key: stacked}, str(tmpdir / fname))
-            shard_entry = {
+            shards.append({
                 "file": fname,
                 "num_prompts": current_prompts,
-            }
-            if not is_pooled:
-                shard_entry["num_tokens"] = stacked.shape[0] if stacked.dim() == 2 else sum(
-                    t.shape[1] for t in current_tensors
-                )
-            shards.append(shard_entry)
+            })
             shard_files.append(tmpdir / fname)
 
         return shards
@@ -653,14 +632,15 @@ def _consolidate_and_shard(
             continue
         shard_descs = _write_shards(key, sf_key, accum, shard_max_bytes)
         sample = accum[0]
-        is_pooled = sample.dim() <= 2
         dim = sample.shape[-1]
+        # v1: raw layers are always reshaped to (1, dim) before
+        # accumulation, so they're effectively pooled/single-token.
         manifest_tensors[key] = {
             "type": "hidden",
             "layer": layer,
             "dim": dim,
             "dtype": str(sample.dtype).replace("torch.", ""),
-            "pooling": None if not is_pooled else "from_cache",
+            "pooling": "from_cache",
             "shards": shard_descs,
         }
 

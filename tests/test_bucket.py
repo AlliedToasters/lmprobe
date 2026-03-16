@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+import lmprobe.cache as cache_mod
 from lmprobe.bucket import (
     FORMAT_VERSION,
     _build_dataset_info,
@@ -23,6 +24,7 @@ from lmprobe.bucket import (
 from lmprobe.cache import (
     CachedPromptInfo,
     discover_cached,
+    load_prompt_pooled_activations,
     save_prompt_activations,
     save_prompt_pooled_activations,
 )
@@ -41,20 +43,19 @@ def cache_dir(tmp_path, monkeypatch):
 
 @pytest.fixture
 def populated_cache(cache_dir):
-    """Populate cache with a small dataset."""
+    """Populate cache with a small dataset (pooled activations)."""
     prompts = [
         "Who wants to go for a walk?",
         "Fetch the ball!",
         "Purring and scratching",
     ]
     for prompt in prompts:
-        acts = torch.randn(1, SEQ_LEN, HIDDEN_DIM)
-        mask = torch.ones(1, SEQ_LEN)
-        save_prompt_activations(TEST_MODEL, prompt, [0, 1], acts, mask)
-        pooled = torch.randn(1, HIDDEN_DIM)
-        save_prompt_pooled_activations(
-            TEST_MODEL, prompt, [0], pooled, "last_token"
-        )
+        # Store pooled activations for layers 0 and 1
+        for layer in [0, 1]:
+            pooled = torch.randn(1, HIDDEN_DIM)
+            save_prompt_pooled_activations(
+                TEST_MODEL, prompt, [layer], pooled, "last_token"
+            )
     return prompts
 
 
@@ -223,8 +224,8 @@ class TestDiscoverPrompts:
 class TestConsolidateAndShard:
     def test_basic_consolidation(self, populated_cache):
         tensor_types = {
-            "raw_layers": [0, 1],
-            "pooled": {},
+            "raw_layers": [],
+            "pooled": {"last_token": [0, 1]},
             "has_logits": False,
             "logits_top_k": None,
             "has_perplexity": False,
@@ -240,8 +241,8 @@ class TestConsolidateAndShard:
             )
         )
         assert len(manifest_prompts) == 3
-        assert "hidden.layer_0" in manifest_tensors
-        assert "hidden.layer_1" in manifest_tensors
+        assert "pooled.last_token.layer_0" in manifest_tensors
+        assert "pooled.last_token.layer_1" in manifest_tensors
         assert tokens is None  # no tokenizer
 
         # Verify shard files exist
@@ -254,8 +255,8 @@ class TestConsolidateAndShard:
 
     def test_consolidation_with_labels(self, populated_cache):
         tensor_types = {
-            "raw_layers": [0],
-            "pooled": {},
+            "raw_layers": [],
+            "pooled": {"last_token": [0]},
             "has_logits": False,
             "logits_top_k": None,
             "has_perplexity": False,
@@ -300,8 +301,8 @@ class TestConsolidateAndShard:
     def test_small_shard_limit(self, populated_cache):
         """Test that small shard limits create multiple shards."""
         tensor_types = {
-            "raw_layers": [0],
-            "pooled": {},
+            "raw_layers": [],
+            "pooled": {"last_token": [0]},
             "has_logits": False,
             "logits_top_k": None,
             "has_perplexity": False,
@@ -315,7 +316,7 @@ class TestConsolidateAndShard:
             shard_max_bytes=1,  # 1 byte — forces each prompt into its own shard
         )
         # Should have multiple shards
-        shards = manifest_tensors["hidden.layer_0"]["shards"]
+        shards = manifest_tensors["pooled.last_token.layer_0"]["shards"]
         assert len(shards) >= 2
 
         # Clean up
@@ -439,13 +440,13 @@ class TestPushToBucket:
             bucket_id="user/filtered",
             model_name=TEST_MODEL,
             prompts=populated_cache,
-            tensors=["hidden.layer_0"],
+            tensors=["pooled.last_token.layer_0"],
             exist_ok=True,
         )
 
         manifest = uploaded_files["manifest.json"]
-        assert "hidden.layer_0" in manifest["tensors"]
-        assert "hidden.layer_1" not in manifest["tensors"]
+        assert "pooled.last_token.layer_0" in manifest["tensors"]
+        assert "pooled.last_token.layer_1" not in manifest["tensors"]
 
     @patch("lmprobe.bucket._check_bucket_deps")
     def test_push_empty_prompts_raises(self, mock_deps, cache_dir):
@@ -639,3 +640,258 @@ class TestPullFromBucket:
             )
 
         assert count == 3
+
+
+class TestRoundtrip:
+    """Push from cache → pull into fresh cache → verify data matches."""
+
+    def test_push_pull_roundtrip_pooled_activations(self, tmp_path, monkeypatch):
+        """Roundtrip: pooled activations survive push → pull with exact values."""
+        # --- Phase 1: populate source cache ---
+        src_cache = tmp_path / "src_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(src_cache))
+        cache_mod._backend = None
+
+        prompts = [
+            "Who wants to go for a walk?",
+            "Fetch the ball!",
+            "Purring and scratching",
+        ]
+        labels = [1, 1, 0]
+
+        # Save known pooled tensors so we can compare after roundtrip
+        original_pooled: dict[str, dict[int, torch.Tensor]] = {}
+        for prompt in prompts:
+            original_pooled[prompt] = {}
+            for layer in [0, 1]:
+                pooled = torch.randn(1, HIDDEN_DIM)
+                save_prompt_pooled_activations(
+                    TEST_MODEL, prompt, [layer], pooled, "last_token"
+                )
+                original_pooled[prompt][layer] = pooled
+
+        # --- Phase 2: push (capture the uploaded folder) ---
+        bucket_dir = tmp_path / "bucket"
+        bucket_dir.mkdir()
+
+        mock_api = MagicMock()
+
+        def capture_upload(repo_id, folder_path, **kwargs):
+            src = Path(folder_path)
+            for f in src.iterdir():
+                shutil.copy2(str(f), str(bucket_dir / f.name))
+
+        mock_api.upload_folder.side_effect = capture_upload
+
+        with (
+            patch("lmprobe.bucket._check_bucket_deps"),
+            patch("huggingface_hub.HfApi", return_value=mock_api),
+        ):
+            push_to_bucket(
+                bucket_id="user/roundtrip-test",
+                model_name=TEST_MODEL,
+                prompts=prompts,
+                labels=labels,
+                exist_ok=True,
+            )
+
+        # Verify bucket files were created
+        assert (bucket_dir / "manifest.json").exists()
+        assert (bucket_dir / "dataset_info.json").exists()
+
+        with open(bucket_dir / "manifest.json") as f:
+            manifest = json.load(f)
+        assert len(manifest["prompts"]) == 3
+        assert manifest["prompts"][0]["label"] == 1
+        assert manifest["prompts"][2]["label"] == 0
+        assert "pooled.last_token.layer_0" in manifest["tensors"]
+        assert "pooled.last_token.layer_1" in manifest["tensors"]
+
+        # --- Phase 3: pull into a fresh cache ---
+        dst_cache = tmp_path / "dst_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(dst_cache))
+        cache_mod._backend = None
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(bucket_dir / filename)
+
+        with (
+            patch("lmprobe.bucket._check_bucket_deps"),
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=mock_download,
+            ),
+        ):
+            count = pull_from_bucket("user/roundtrip-test")
+
+        assert count == 3
+
+        # --- Phase 4: verify pulled data matches originals ---
+        for prompt in prompts:
+            info = discover_cached(TEST_MODEL, prompt)
+            assert info is not None, f"Prompt not cached after pull: {prompt}"
+            assert "last_token" in info.pooled
+
+            # Load from the fresh cache and compare values
+            for layer in [0, 1]:
+                pulled = load_prompt_pooled_activations(
+                    TEST_MODEL, prompt, [layer], "last_token"
+                )
+                orig = original_pooled[prompt][layer]
+
+                assert pulled.shape == orig.shape, (
+                    f"Shape mismatch for {prompt!r} layer {layer}"
+                )
+                assert torch.allclose(
+                    pulled, orig, atol=1e-6
+                ), f"Value mismatch for {prompt!r} layer {layer}"
+
+    def test_unpooled_raw_activations_rejected(self, tmp_path, monkeypatch):
+        """Pushing unpooled raw activations (seq_len > 1) raises ValueError."""
+        src_cache = tmp_path / "src_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(src_cache))
+        cache_mod._backend = None
+
+        prompt = "test prompt"
+        acts = torch.randn(1, SEQ_LEN, HIDDEN_DIM)  # seq_len=5 > 1
+        mask = torch.ones(1, SEQ_LEN)
+        save_prompt_activations(TEST_MODEL, prompt, [0], acts, mask)
+
+        mock_api = MagicMock()
+        with (
+            patch("lmprobe.bucket._check_bucket_deps"),
+            patch("huggingface_hub.HfApi", return_value=mock_api),
+        ):
+            with pytest.raises(ValueError, match="Unpooled raw activations"):
+                push_to_bucket(
+                    bucket_id="user/should-fail",
+                    model_name=TEST_MODEL,
+                    prompts=[prompt],
+                    tensors=["hidden.layer_0"],
+                    exist_ok=True,
+                )
+
+    def test_push_pull_roundtrip_pooled(self, tmp_path, monkeypatch):
+        """Roundtrip: pooled activations survive push → pull."""
+        src_cache = tmp_path / "src_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(src_cache))
+        cache_mod._backend = None
+
+        prompts = ["prompt A", "prompt B"]
+        original_pooled: dict[str, torch.Tensor] = {}
+        for prompt in prompts:
+            pooled = torch.randn(1, HIDDEN_DIM)
+            save_prompt_pooled_activations(
+                TEST_MODEL, prompt, [5], pooled, "last_token"
+            )
+            original_pooled[prompt] = pooled
+
+        # Push
+        bucket_dir = tmp_path / "bucket"
+        bucket_dir.mkdir()
+        mock_api = MagicMock()
+
+        def capture_upload(repo_id, folder_path, **kwargs):
+            for f in Path(folder_path).iterdir():
+                shutil.copy2(str(f), str(bucket_dir / f.name))
+
+        mock_api.upload_folder.side_effect = capture_upload
+
+        with (
+            patch("lmprobe.bucket._check_bucket_deps"),
+            patch("huggingface_hub.HfApi", return_value=mock_api),
+        ):
+            push_to_bucket(
+                bucket_id="user/pooled-test",
+                model_name=TEST_MODEL,
+                prompts=prompts,
+                exist_ok=True,
+            )
+
+        # Pull into fresh cache
+        dst_cache = tmp_path / "dst_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(dst_cache))
+        cache_mod._backend = None
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(bucket_dir / filename)
+
+        with (
+            patch("lmprobe.bucket._check_bucket_deps"),
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=mock_download,
+            ),
+        ):
+            count = pull_from_bucket("user/pooled-test")
+
+        assert count == 2
+
+        # Verify
+        for prompt in prompts:
+            info = discover_cached(TEST_MODEL, prompt)
+            assert info is not None
+            assert "last_token" in info.pooled
+
+            pulled = load_prompt_pooled_activations(
+                TEST_MODEL, prompt, [5], "last_token"
+            )
+            assert torch.allclose(
+                pulled, original_pooled[prompt], atol=1e-6
+            ), f"Pooled value mismatch for {prompt!r}"
+
+    def test_push_load_roundtrip(self, tmp_path, monkeypatch):
+        """Push → load_from_bucket returns concatenated tensors."""
+        src_cache = tmp_path / "src_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(src_cache))
+        cache_mod._backend = None
+
+        prompts = ["alpha", "beta", "gamma"]
+        all_pooled = []
+        for prompt in prompts:
+            pooled = torch.randn(1, HIDDEN_DIM)
+            save_prompt_pooled_activations(
+                TEST_MODEL, prompt, [0], pooled, "last_token"
+            )
+            all_pooled.append(pooled)
+
+        # Push
+        bucket_dir = tmp_path / "bucket"
+        bucket_dir.mkdir()
+        mock_api = MagicMock()
+
+        def capture_upload(repo_id, folder_path, **kwargs):
+            for f in Path(folder_path).iterdir():
+                shutil.copy2(str(f), str(bucket_dir / f.name))
+
+        mock_api.upload_folder.side_effect = capture_upload
+
+        with (
+            patch("lmprobe.bucket._check_bucket_deps"),
+            patch("huggingface_hub.HfApi", return_value=mock_api),
+        ):
+            push_to_bucket(
+                bucket_id="user/load-test",
+                model_name=TEST_MODEL,
+                prompts=prompts,
+                exist_ok=True,
+            )
+
+        # Load directly (no cache interaction)
+        def mock_download(repo_id, filename, **kwargs):
+            return str(bucket_dir / filename)
+
+        with (
+            patch("lmprobe.bucket._check_bucket_deps"),
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=mock_download,
+            ),
+        ):
+            result, manifest = load_from_bucket("user/load-test")
+
+        assert "pooled.last_token.layer_0" in result
+        loaded = result["pooled.last_token.layer_0"]
+        expected = torch.cat(all_pooled, dim=0)
+        assert loaded.shape == expected.shape
+        assert torch.allclose(loaded, expected, atol=1e-6)
