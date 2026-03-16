@@ -321,7 +321,6 @@ class LocalSource(ActivationSource):
         decoder_layers = _get_decoder_layers(model)
 
         # Set up hooks to capture activations
-        layer_index_set = set(layer_indices)
         captured = {}
         hooks = []
 
