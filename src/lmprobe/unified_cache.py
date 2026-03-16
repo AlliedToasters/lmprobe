@@ -20,12 +20,15 @@ from .cache import (
     get_prompt_cached_pooled_layers,
     get_prompt_cached_raw_layers,
     is_prompt_fully_cached,
+    is_prompt_logits_cached,
     is_prompt_perplexity_cached,
     is_prompt_pooled_cached,
     load_prompt_activations,
+    load_prompt_logits,
     load_prompt_perplexity,
     load_prompt_pooled_activations,
     save_prompt_activations,
+    save_prompt_logits,
     save_prompt_perplexity,
     save_prompt_pooled_activations,
 )
@@ -53,6 +56,8 @@ class WarmupStats:
     perplexity_cached: int
     perplexity_extracted: int
     elapsed_seconds: float
+    logits_cached: int = 0
+    logits_extracted: int = 0
 
     @property
     def cache_hit_rate(self) -> float:
@@ -62,13 +67,44 @@ class WarmupStats:
         return self.activations_cached / self.total_prompts
 
     def __repr__(self) -> str:
-        return (
-            f"WarmupStats(total={self.total_prompts}, "
+        parts = [
+            f"WarmupStats(total={self.total_prompts}",
             f"activations={self.activations_cached} cached "
-            f"+ {self.activations_extracted} extracted, "
-            f"perplexity={self.perplexity_cached} cached + {self.perplexity_extracted} extracted, "
-            f"time={self.elapsed_seconds:.1f}s)"
-        )
+            f"+ {self.activations_extracted} extracted",
+            f"perplexity={self.perplexity_cached} cached "
+            f"+ {self.perplexity_extracted} extracted",
+        ]
+        if self.logits_cached or self.logits_extracted:
+            parts.append(
+                f"logits={self.logits_cached} cached "
+                f"+ {self.logits_extracted} extracted"
+            )
+        parts.append(f"time={self.elapsed_seconds:.1f}s)")
+        return ", ".join(parts)
+
+
+@dataclass
+class CachedLogits:
+    """Cached logits from language model extraction.
+
+    Attributes
+    ----------
+    values : torch.Tensor
+        Logit values. Shape (batch, positions, vocab_size) for full logits,
+        or (batch, positions, K) for top-k logits.
+    indices : torch.Tensor | None
+        Top-k token indices with shape (batch, positions, K) and dtype int32.
+        None when full logits are stored.
+    top_k : int | None
+        K value if top-k logits, None for full logits.
+    positions : str
+        Which token positions are stored: "last" or "all".
+    """
+
+    values: torch.Tensor
+    indices: torch.Tensor | None
+    top_k: int | None
+    positions: str
 
 
 class UnifiedCache:
@@ -144,6 +180,9 @@ class UnifiedCache:
         pooling: str = "last_token",
         backend: str = "local",
         dtype: str | None = None,
+        cache_logits: bool = False,
+        logit_top_k: int | None = None,
+        logit_positions: str = "last",
     ):
         self.model_name = model
         self.layers_spec = layers
@@ -155,6 +194,9 @@ class UnifiedCache:
         self.pooling = pooling
         self.backend_name = backend
         self.dtype = dtype
+        self.cache_logits = cache_logits
+        self.logit_top_k = logit_top_k
+        self.logit_positions = logit_positions
 
         # Validate pooling strategy
         if cache_pooled and pooling not in TRAIN_POOLING_STRATEGIES:
@@ -166,6 +208,12 @@ class UnifiedCache:
             raise ValueError(
                 "pooling='all' is not valid with cache_pooled=True. "
                 "Use 'last_token', 'first_token', or 'mean'."
+            )
+
+        if logit_positions not in ("last", "all"):
+            raise ValueError(
+                f"Invalid logit_positions: {logit_positions!r}. "
+                f"Must be 'last' or 'all'."
             )
 
         # Create backend (lazy-loads model)
@@ -216,7 +264,7 @@ class UnifiedCache:
 
     def _check_cache_status(
         self, prompts: list[str]
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[str], list[str]]:
         """Check which prompts need extraction.
 
         Returns
@@ -224,11 +272,13 @@ class UnifiedCache:
         tuple
             - prompts needing activation extraction
             - prompts needing perplexity extraction (if compute_perplexity=True)
+            - prompts needing logit extraction (if cache_logits=True)
         """
         required_layers = set(self.layer_indices)
 
         need_activations = []
         need_perplexity = []
+        need_logits = []
         partial_cache_count = 0
         partial_cache_found_layers: set[int] | None = None
 
@@ -246,6 +296,14 @@ class UnifiedCache:
             ppl_cached = (
                 is_prompt_perplexity_cached(self.model_name, prompt)
                 if self.compute_perplexity
+                else True
+            )
+
+            logits_cached = (
+                is_prompt_logits_cached(
+                    self.model_name, prompt, self.logit_top_k
+                )
+                if self.cache_logits
                 else True
             )
 
@@ -268,6 +326,9 @@ class UnifiedCache:
             if not ppl_cached:
                 need_perplexity.append(prompt)
 
+            if not logits_cached:
+                need_logits.append(prompt)
+
         if partial_cache_count > 0:
             missing = sorted(required_layers - (partial_cache_found_layers or set()))
             found = sorted(partial_cache_found_layers or set())
@@ -281,7 +342,7 @@ class UnifiedCache:
                 stacklevel=2,
             )
 
-        return need_activations, need_perplexity
+        return need_activations, need_perplexity, need_logits
 
     def warmup(
         self,
@@ -316,19 +377,24 @@ class UnifiedCache:
         layer_indices = sorted(self.layer_indices)
 
         # Check cache status
-        need_activations, need_perplexity = self._check_cache_status(prompts)
+        need_activations, need_perplexity, need_logits = self._check_cache_status(
+            prompts
+        )
 
         # Compute which prompts need unified extraction
         # (prompts that need BOTH or where we can get both cheaply)
         need_activations_set = set(need_activations)
         need_perplexity_set = set(need_perplexity)
-        need_unified = need_activations_set | need_perplexity_set
+        need_logits_set = set(need_logits)
+        need_unified = need_activations_set | need_perplexity_set | need_logits_set
         need_unified_list = [p for p in prompts if p in need_unified]
 
         activations_cached = len(prompts) - len(need_activations)
         perplexity_cached = len(prompts) - len(need_perplexity)
+        logits_cached = len(prompts) - len(need_logits) if self.cache_logits else 0
         activations_extracted = 0
         perplexity_extracted = 0
+        logits_extracted = 0
 
         logger.info(
             f"[UNIFIED] Checking cache for {len(prompts)} prompts, "
@@ -342,6 +408,11 @@ class UnifiedCache:
             logger.info(
                 f"[UNIFIED] Perplexity: {perplexity_cached} cached, "
                 f"{len(need_perplexity)} need extraction"
+            )
+        if self.cache_logits:
+            logger.info(
+                f"[UNIFIED] Logits: {logits_cached} cached, "
+                f"{len(need_logits)} need extraction"
             )
 
         if need_unified_list:
@@ -422,6 +493,18 @@ class UnifiedCache:
                             )
                             perplexity_extracted += 1
 
+                        # Save logits if needed
+                        if self.cache_logits and prompt in need_logits_set:
+                            save_prompt_logits(
+                                self.model_name,
+                                prompt,
+                                batch_logits[j : j + 1],
+                                batch_mask[j : j + 1],
+                                self.logit_top_k,
+                                self.logit_positions,
+                            )
+                            logits_extracted += 1
+
         elapsed = time.time() - start_time
 
         stats = WarmupStats(
@@ -430,12 +513,15 @@ class UnifiedCache:
             activations_extracted=activations_extracted,
             perplexity_cached=perplexity_cached,
             perplexity_extracted=perplexity_extracted,
+            logits_cached=logits_cached,
+            logits_extracted=logits_extracted,
             elapsed_seconds=elapsed,
         )
 
         logger.info(
             f"[UNIFIED] Complete: {activations_extracted} activations + "
-            f"{perplexity_extracted} perplexity extracted in {elapsed:.1f}s"
+            f"{perplexity_extracted} perplexity + "
+            f"{logits_extracted} logits extracted in {elapsed:.1f}s"
         )
 
         return stats
@@ -552,3 +638,49 @@ class UnifiedCache:
             features.append(ppl.float().numpy())
 
         return np.array(features)
+
+    def get_logits(
+        self,
+        prompts: list[str],
+        remote: bool | None = None,
+    ) -> CachedLogits:
+        """Get cached logits for prompts (from cache or via extraction).
+
+        Parameters
+        ----------
+        prompts : list[str]
+            Text prompts.
+        remote : bool | None
+            Override the instance-level remote setting.
+
+        Returns
+        -------
+        CachedLogits
+            Cached logits with values and optional indices tensors.
+        """
+        if not self.cache_logits:
+            raise ValueError(
+                "UnifiedCache was created with cache_logits=False. "
+                "Create a new instance with cache_logits=True."
+            )
+
+        # Ensure cache is warm
+        self.warmup(prompts, remote=remote)
+
+        # Load from cache
+        all_values = []
+        all_indices = []
+        for prompt in prompts:
+            values, indices = load_prompt_logits(
+                self.model_name, prompt, self.logit_top_k
+            )
+            all_values.append(values)
+            if indices is not None:
+                all_indices.append(indices)
+
+        return CachedLogits(
+            values=torch.cat(all_values, dim=0),
+            indices=torch.cat(all_indices, dim=0) if all_indices else None,
+            top_k=self.logit_top_k,
+            positions=self.logit_positions,
+        )
