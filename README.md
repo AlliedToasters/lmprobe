@@ -7,7 +7,7 @@
 This library supports the use of language model "activations" or "latents" to build text classifiers. The intent is to help detect and reduce misuse of AI - for example, chemical, biological, radiological and nuclear (CBRN) weapons development, social engineering at scale, and the development of novel cybersecurity attack vectors.
 
 ## Linear and Simple Models for LLMs
-"Linear Probes" have emerged as an effective and practical way to monitor large language model activity. 
+"Linear Probes" have emerged as an effective and practical way to monitor large language model activity.
 
 ### Background
 
@@ -19,12 +19,23 @@ The goal of `lmprobe` is to make text classifiers for language models easy to bu
 
 ### Compatibility
 
-By default, `lmprobe` uses huggingface and `nnsight` to manage models and extract latents during inference. However, the library is structured to modularize and isolate these aspects so that (ideally) frontier AI labs can extend the library for internal use on their bespoke inference systems.
+By default, `lmprobe` uses HuggingFace Transformers to manage models and extract latents during inference. The library also supports `nnsight` for remote execution on [NDIF](https://nnsight.net/) (National Deep Inference Fabric), allowing you to probe large models without local GPU resources.
 
 ### Installation
 
 ```
 pip install lmprobe
+```
+
+Optional extras:
+
+```bash
+pip install lmprobe[hub]         # HuggingFace Hub integration (push/pull probes)
+pip install lmprobe[s3]          # S3 cache backend
+pip install lmprobe[nnsight]     # nnsight/NDIF remote execution
+pip install lmprobe[plot]        # Layer importance visualization
+pip install lmprobe[embeddings]  # Sentence-transformers baselines
+pip install lmprobe[auto]        # Automatic layer selection (Group Lasso)
 ```
 
 ### Environment Setup
@@ -40,7 +51,7 @@ export NNSIGHT_API_KEY="your-api-key-here"
 ---
 
 ```python
-from lmprobe import LinearProbe
+from lmprobe import Probe
 
 positive_prompts = [  # positive class: "dog" without saying "dog"
     "Who wants to go for a walk?",
@@ -58,7 +69,7 @@ negative_prompts = [  # negative class: "cat" without saying "cat"
 ]
 
 # Configure the probe
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-8B-Instruct",
     layers=16,                              # int, list[int], or "all"
     pooling="last_token",                   # applies to both train and inference
@@ -84,19 +95,22 @@ accuracy = probe.score(test_prompts, [1, 0])
 
 # Save/load for deployment
 probe.save("dog_vs_cat_probe.pkl")
-loaded_probe = LinearProbe.load("dog_vs_cat_probe.pkl")
+loaded_probe = Probe.load("dog_vs_cat_probe.pkl")
 ```
+
+> **Note:** `LinearProbe` still works as an alias for `Probe`.
 
 ---
 
 ## Remote Execution for Large Models
 
-Use `remote=True` to run inference on large models via nnsight's remote servers:
+Use `remote=True` with `backend="nnsight"` to run inference on large models via nnsight's remote servers:
 
 ```python
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-70B-Instruct",
     layers="middle",
+    backend="nnsight",
     remote=True,  # Requires NNSIGHT_API_KEY
 )
 
@@ -113,10 +127,45 @@ predictions = probe.predict(new_prompts, remote=False)
 When selecting multiple layers, activations are **concatenated** along the hidden dimension:
 
 ```python
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-8B-Instruct",
-    layers=[14, 15, 16],  # 3 layers × 4096 dims = 12,288-dim input to classifier
+    layers=[14, 15, 16],  # 3 layers x 4096 dims = 12,288-dim input to classifier
 )
+```
+
+---
+
+## Layer Sweep
+
+Train an independent probe for each layer to find the most informative layers, without loading all layers into memory at once:
+
+```python
+result = Probe.sweep_layers(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    positive_prompts=positive_prompts,
+    negative_prompts=negative_prompts,
+    layers="all",            # or a list of specific layers
+    classifier="ridge",
+)
+
+# Score all layers
+scores = result.score(test_prompts, test_labels)
+# {0: 0.52, 1: 0.55, ..., 31: 0.78}
+
+# Find the best layer
+best = result.best_layer(test_prompts, test_labels)
+print(f"Best layer: {best}")
+
+# Predict with any single layer's probe
+preds = result.probes[best].predict(test_prompts)
+```
+
+You can also use sweep as a layer spec string:
+
+```python
+probe = Probe(model=model, layers="sweep")        # sweep all layers
+probe = Probe(model=model, layers="sweep:10")      # sweep every 10th layer
+probe = Probe(model=model, layers="sweep:55-65")   # sweep a specific range
 ```
 
 ---
@@ -126,7 +175,7 @@ probe = LinearProbe(
 For real-time monitoring, train on a stable representation but score every token:
 
 ```python
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-8B-Instruct",
     layers=16,
     pooling="last_token",          # base strategy
@@ -142,10 +191,10 @@ token_scores = probe.predict_proba(["Wagging my tail happily!"])
 For "flag if ANY token triggers" detection:
 
 ```python
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-8B-Instruct",
     layers=16,
-    pooling="last_token",          # base strategy  
+    pooling="last_token",          # base strategy
     inference_pooling="max",       # override: max score across tokens
 )
 ```
@@ -157,33 +206,56 @@ probe = LinearProbe(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `model` | `str` | *required* | HuggingFace model ID or local path |
-| `layers` | `int \| list[int] \| "all"` | `"middle"` | Which residual stream layers to probe |
+| `layers` | `int \| list[int] \| str` | `"middle"` | Which residual stream layers to probe |
 | `pooling` | `str \| callable` | `"last_token"` | Token aggregation (train & inference) |
 | `train_pooling` | `str \| callable` | — | Override pooling for `fit()` only |
 | `inference_pooling` | `str \| callable` | — | Override pooling for `predict()` only |
 | `classifier` | `str \| sklearn estimator` | `"logistic_regression"` | Classification model |
+| `task` | `str` | `"classification"` | `"classification"` or `"regression"` |
 | `device` | `str` | `"auto"` | `"auto"`, `"cuda:0"`, `"cpu"` |
 | `remote` | `bool` | `False` | Use nnsight remote execution (requires `NNSIGHT_API_KEY`) |
 | `random_state` | `int \| None` | `None` | Random seed for reproducibility (propagates to classifier) |
+| `batch_size` | `int` | `8` | Prompts per forward pass during extraction |
+| `backend` | `str` | `"local"` | `"local"` (HuggingFace) or `"nnsight"` |
+| `dtype` | `str \| None` | `None` | Model dtype: `"float32"`, `"float16"`, `"bfloat16"` |
+| `normalize_layers` | `bool \| str` | `True` | Per-layer normalization for multi-layer probes |
+| `preprocessing` | `str \| None` | `None` | Pipeline before classifier: `"standard"`, `"pca"`, `"standard+pca"` |
+| `pca_components` | `int \| None` | `None` | Number of PCA components |
+| `classifier_kwargs` | `dict \| None` | `None` | Extra kwargs for classifier constructor |
+
+### Layer Specifications
+
+| Spec | Description |
+|------|-------------|
+| `16` | Single layer (negative indexing: `-1` = last) |
+| `[14, 15, 16]` | Multiple layers (concatenated) |
+| `"middle"` | Middle third of layers |
+| `"last"` | Last layer |
+| `"all"` | All layers |
+| `"auto"` | Automatic selection via Group Lasso (requires `pip install lmprobe[auto]`) |
+| `"fast_auto"` | Fast selection via coefficient importance |
+| `"sweep"` | Train independent probe per layer |
+| `"sweep:10"` | Sweep every 10th layer |
+| `"sweep:55-65"` | Sweep layers 55 through 65 |
 
 ### Pooling Strategies
 
 | Strategy | Training | Inference | Description |
 |----------|:--------:|:---------:|-------------|
-| `"last_token"` | ✓ | ✓ | Final token activation (default, matches RepE literature) |
-| `"mean"` | ✓ | ✓ | Mean across all tokens |
-| `"first_token"` | ✓ | ✓ | First token (e.g., `[CLS]`) |
-| `"all"` | ✓ | ✓ | Each token independently |
-| `"max"` | | ✓ | Max score across tokens |
-| `"min"` | | ✓ | Min score across tokens |
+| `"last_token"` | Y | Y | Final token activation (default, matches RepE literature) |
+| `"mean"` | Y | Y | Mean across all tokens |
+| `"first_token"` | Y | Y | First token (e.g., `[CLS]`) |
+| `"all"` | Y | Y | Each token independently |
+| `"max"` | | Y | Max score across tokens |
+| `"min"` | | Y | Min score across tokens |
 
 ### Pooling Collision Rules
 
 Explicit parameters override the base `pooling` value:
 
 ```python
-# pooling="mean", train_pooling="last_token" → train=last_token, inference=mean
-# pooling="mean", inference_pooling="max"    → train=mean, inference=max
+# pooling="mean", train_pooling="last_token" -> train=last_token, inference=mean
+# pooling="mean", inference_pooling="max"    -> train=mean, inference=max
 ```
 
 ---
@@ -203,10 +275,18 @@ Explicit parameters override the base `pooling` value:
 
 ```python
 # Use Mass-Mean Probing (simple but effective)
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-8B-Instruct",
     layers=-1,
     classifier="mass_mean",
+)
+
+# Pass extra kwargs to the classifier
+probe = Probe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=-1,
+    classifier="logistic_regression",
+    classifier_kwargs={"C": 0.01, "solver": "liblinear", "max_iter": 5000},
 )
 ```
 
@@ -217,7 +297,7 @@ probe = LinearProbe(
 Identify which layers are most informative for your task:
 
 ```python
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-8B-Instruct",
     layers="all",  # Extract all layers
     classifier="ridge",
@@ -228,7 +308,7 @@ probe.fit(positive_prompts, negative_prompts)
 # Compute per-layer importance scores
 importances = probe.compute_layer_importance(metric="l2")
 
-# Visualize layer importance
+# Visualize layer importance (requires: pip install lmprobe[plot])
 probe.plot_layer_importance()
 ```
 
@@ -237,7 +317,7 @@ probe.plot_layer_importance()
 Automatically select the most important layers using fast importance analysis:
 
 ```python
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-8B-Instruct",
     layers="fast_auto",      # Auto-select best layers
     fast_auto_top_k=3,       # Use top 3 most important layers
@@ -246,6 +326,192 @@ probe = LinearProbe(
 
 probe.fit(positive_prompts, negative_prompts)
 print(f"Selected layers: {probe.selected_layers_}")
+```
+
+### Automatic Layer Selection via Group Lasso
+
+Use structured sparsity to let the model choose which layers matter:
+
+```python
+# Requires: pip install lmprobe[auto]
+probe = Probe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers="auto",
+    auto_candidates=[0.25, 0.5, 0.75],  # Fractional positions or explicit indices
+    auto_alpha=0.01,                     # Regularization strength
+)
+
+probe.fit(positive_prompts, negative_prompts)
+print(f"Selected layers: {probe.selected_layers_}")
+```
+
+---
+
+## Evaluation
+
+Beyond `score()`, the `evaluate()` method computes multiple metrics at once:
+
+```python
+probe.fit(positive_prompts, negative_prompts)
+
+metrics = probe.evaluate(
+    test_prompts,
+    test_labels,
+    metrics=["accuracy", "precision", "recall", "f1", "roc_auc"],
+)
+# {"accuracy": 0.85, "precision": 0.88, "recall": 0.82, "f1": 0.85, "roc_auc": 0.91}
+```
+
+---
+
+## HuggingFace Hub Integration
+
+Share trained probes via the HuggingFace Hub. Requires `pip install lmprobe[hub]`.
+
+### Push a probe
+
+```python
+probe.fit(positive_prompts, negative_prompts)
+
+url = probe.push_to_hub(
+    "username/dog-vs-cat-probe",
+    description="Detects dog-like vs cat-like text",
+    class_labels={0: "cat", 1: "dog"},
+    tags=["safety", "animals"],
+    include_training_data=True,   # Include prompts for reproducibility
+    private=False,
+)
+print(url)  # https://huggingface.co/username/dog-vs-cat-probe
+```
+
+### Load a probe
+
+```python
+from lmprobe import Probe
+
+probe = Probe.from_hub(
+    "username/dog-vs-cat-probe",
+    trust_classifier=True,   # Required: acknowledge loading serialized model
+    load_model=True,         # Download the base LLM for inference
+    device="auto",
+)
+predictions = probe.predict(["Arf! Let's go outside!"])
+```
+
+### Inspect probe metadata
+
+```python
+from lmprobe import ProbeCard
+
+card = ProbeCard.from_hub("username/dog-vs-cat-probe")
+print(card.base_model)       # meta-llama/Llama-3.1-8B-Instruct
+print(card.layers)           # [16]
+print(card.classifier_type)  # LogisticRegression
+print(card.metrics)          # {"accuracy": 0.85}
+```
+
+---
+
+## Caching
+
+Activation extraction is expensive, so `lmprobe` caches activations automatically. The cache is stored at `~/.cache/lmprobe/` by default (or set `LMPROBE_CACHE_DIR`).
+
+### Cache configuration
+
+```python
+from lmprobe import cache_info, set_cache_backend, set_cache_dtype, set_cache_limit
+
+# Inspect cache
+info = cache_info()
+print(info)
+
+# Reduce disk usage with float16 caching
+set_cache_dtype("float16")
+
+# Set a max cache size (LRU eviction)
+set_cache_limit(50)  # GB
+
+# Use S3 for cross-machine cache sharing (requires: pip install lmprobe[s3])
+set_cache_backend("s3://my-bucket/lmprobe-cache")
+```
+
+### Warmup
+
+Pre-cache activations for a set of prompts before running predictions:
+
+```python
+probe.warmup(test_prompts, batch_size=16)
+
+# Subsequent predict/score calls hit the cache
+predictions = probe.predict(test_prompts)
+```
+
+---
+
+## Preprocessing
+
+Apply feature transformations between activation extraction and classification:
+
+```python
+# StandardScaler before classification
+probe = Probe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=[14, 15, 16],
+    preprocessing="standard",
+)
+
+# PCA dimensionality reduction
+probe = Probe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers="all",
+    preprocessing="pca",
+    pca_components=50,
+)
+
+# Chained: standardize then PCA
+probe = Probe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers="all",
+    preprocessing="standard+pca",
+    pca_components=100,
+)
+```
+
+---
+
+## Regression
+
+Train probes for continuous targets instead of binary classification:
+
+```python
+probe = Probe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=16,
+    task="regression",  # Uses Ridge regression by default
+)
+
+# fit() accepts labels as second argument (not negative_prompts)
+probe.fit(prompts, labels)  # labels: list[float]
+
+predictions = probe.predict(test_prompts)  # continuous values
+r_squared = probe.score(test_prompts, test_labels)
+```
+
+---
+
+## Working with Pre-Computed Activations
+
+Bypass the extraction pipeline and work directly with activation matrices:
+
+```python
+import numpy as np
+
+probe = Probe(classifier="logistic_regression", random_state=42)
+
+# X: (n_samples, hidden_dim), y: (n_samples,)
+probe.fit_from_activations(X_train, y_train)
+predictions = probe.predict_from_activations(X_test)
+accuracy = probe.score_from_activations(X_test, y_test)
 ```
 
 ---
@@ -295,7 +561,6 @@ random_dir = ActivationBaseline(
     method="random_direction",
     model="meta-llama/Llama-3.1-8B-Instruct",
     layers=-1,
-    remote=True,
 )
 random_dir.fit(positive_prompts, negative_prompts)
 random_accuracy = random_dir.score(test_prompts, test_labels)
@@ -342,7 +607,6 @@ print(f"Best baseline: {best.name} with {best.score:.2%} accuracy")
 battery = BaselineBattery(
     model="meta-llama/Llama-3.1-8B-Instruct",
     layers=-1,
-    remote=True,
     include=["bow", "tfidf", "random_direction", "pca"],  # Select specific baselines
 )
 results = battery.fit(positive_prompts, negative_prompts, test_prompts, test_labels)
@@ -358,6 +622,7 @@ results = battery.fit(positive_prompts, negative_prompts, test_prompts, test_lab
 | `majority` | Text | Always predict majority class |
 | `sentence_length` | Text | Classify by text length |
 | `sentence_transformers` | Text | Pretrained embeddings + classifier |
+| `shuffled_labels` | Text | Train on permuted labels (overfitting check) |
 | `random_direction` | Activation | Project onto random unit vector |
 | `pca` | Activation | Top principal components |
 | `layer_0` | Activation | Input embeddings only |
@@ -370,10 +635,11 @@ results = battery.fit(positive_prompts, negative_prompts, test_prompts, test_lab
 When combining multiple layers, normalize each layer's activations independently to prevent high-magnitude layers from dominating:
 
 ```python
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-8B-Instruct",
     layers=[14, 15, 16],
-    normalize_layers="per_layer",  # or "per_neuron" (default), or False
+    normalize_layers=True,          # Default: per-neuron standardization
+    # normalize_layers="per_layer", # Alternative: one mean/std per layer
+    # normalize_layers=False,       # Disable normalization
 )
 ```
-
