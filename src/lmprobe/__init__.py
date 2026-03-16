@@ -48,11 +48,11 @@ __all__ = [
     "clear_model_cache",
     "discover_cached",
     "enable_cache_logging",
-    "load_from_bucket",
+    "load_activation_dataset",
     "plot_layer_importance",
     "plot_layer_importance_heatmap",
-    "pull_from_bucket",
-    "push_to_bucket",
+    "pull_dataset",
+    "push_dataset",
     "set_cache_backend",
     "set_cache_dtype",
     "set_cache_limit",
@@ -142,12 +142,16 @@ def __getattr__(name: str):
             "CachedPromptInfo": CachedPromptInfo,
             "discover_cached": discover_cached,
         }[name]
-    if name in ("push_to_bucket", "pull_from_bucket", "load_from_bucket"):
-        from .bucket import load_from_bucket, pull_from_bucket, push_to_bucket
+    if name in ("push_dataset", "pull_dataset", "load_activation_dataset"):
+        from .sharing import (
+            load_activation_dataset,
+            pull_dataset,
+            push_dataset,
+        )
 
         return {
-            "push_to_bucket": push_to_bucket,
-            "pull_from_bucket": pull_from_bucket,
-            "load_from_bucket": load_from_bucket,
+            "push_dataset": push_dataset,
+            "pull_dataset": pull_dataset,
+            "load_activation_dataset": load_activation_dataset,
         }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

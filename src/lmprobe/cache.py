@@ -348,7 +348,7 @@ def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
     :class:`CachedPromptInfo` describing available layers, pooling
     strategies, logits, etc.
 
-    This is the public API for cache introspection — ``bucket.py``
+    This is the public API for cache introspection — ``sharing.py``
     and other modules should use this rather than parsing internal
     cache key names.
 
