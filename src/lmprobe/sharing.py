@@ -55,7 +55,7 @@ from .cache import (
 
 logger = logging.getLogger(__name__)
 
-FORMAT_VERSION = "1.1"
+FORMAT_VERSION = "1.2"
 DEFAULT_SHARD_BYTES = 1_073_741_824  # 1 GB
 INFO_FILENAME = "lmprobe_info.json"
 PARQUET_PATH = "index/train-00000-of-00001.parquet"
@@ -469,9 +469,9 @@ def _consolidate_and_shard(
 ) -> tuple[Path, dict, list[dict]]:
     """Consolidate cached tensors into sharded safetensors files.
 
-    Layers are co-located within each hidden_layers shard.  All tensor types
-    share the same shard boundaries (same prompt ordering, same num_prompts
-    per shard).
+    Layers are co-located within each hidden_layers shard.  Each tensor type
+    gets independent shard boundaries (v1.2), so small logits data isn't
+    needlessly split across many shards.
 
     Uses streaming consolidation: only one shard's worth of tensors is held
     in memory at a time, so peak memory is bounded by ``shard_max_bytes``
@@ -599,76 +599,81 @@ def _consolidate_and_shard(
         # values (float32) + indices (int64)
         logits_row_bytes = logits_top_k * 4 + logits_top_k * 8
 
+    # Compute independent shard boundaries per tensor type (v1.2)
+    has_hidden = bool(hidden_layers and (hidden_strategy or use_raw))
+    want_logits = bool(has_logits and logits_top_k is not None)
+
     if use_raw:
         # Variable-size rows: bytes depend on per-prompt token count
         per_prompt_bytes = [
-            tok * hidden_dim * 4 * len(hidden_layers)
+            tok * hidden_dim * 4
             for tok in per_prompt_tokens
         ]
-        shard_boundaries = _compute_shard_boundaries_variable(
+        hidden_boundaries = _compute_shard_boundaries_variable(
             per_prompt_bytes, shard_max_bytes,
         )
     else:
-        # Per-layer sharding: row_bytes is per single layer (not all layers)
         hidden_row_bytes = hidden_dim * 4  # float32, single layer
-        max_row_bytes = max(hidden_row_bytes, logits_row_bytes, 1)
-        shard_boundaries = _compute_shard_boundaries(
-            n, max_row_bytes, shard_max_bytes,
+        hidden_boundaries = _compute_shard_boundaries(
+            n, hidden_row_bytes, shard_max_bytes,
+        ) if has_hidden else []
+
+    if want_logits:
+        logits_boundaries = _compute_shard_boundaries(
+            n, max(logits_row_bytes, 1), shard_max_bytes,
         )
+    else:
+        logits_boundaries = []
 
-    # --- Phase 4: Stream shards (load one shard at a time) ---
+    # --- Phase 4: Stream shards per tensor type ---
     tensor_descriptors: dict[str, dict] = {}
-    offset = 0
 
-    for shard_idx, shard_size in enumerate(tqdm(
-        shard_boundaries, desc="Writing shards", unit="shard",
-    )):
-        shard_prompts_text = valid_prompts[offset : offset + shard_size]
-
-        # Assign shard_index and row_offset / token_offset to metadata
+    # --- Hidden pass ---
+    if has_hidden and hidden_boundaries:
+        offset = 0
         token_offset_acc = 0
-        for local_row in range(shard_size):
-            global_row = offset + local_row
-            if global_row < len(prompt_metadata):
-                prompt_metadata[global_row]["shard_index"] = shard_idx
-                prompt_metadata[global_row]["row_offset"] = local_row
-                if use_raw:
-                    prompt_metadata[global_row]["token_offset"] = token_offset_acc
-                    token_offset_acc += per_prompt_tokens[global_row]
+        for shard_idx, shard_size in enumerate(tqdm(
+            hidden_boundaries, desc="Writing hidden shards", unit="shard",
+        )):
+            shard_prompts_text = valid_prompts[offset : offset + shard_size]
 
-        # Load only this shard's tensors from cache
-        shard_data: list[dict] = []
-        for prompt in shard_prompts_text:
-            try:
-                loaded: dict[str, torch.Tensor] = {}
+            # Assign per-type shard metadata
+            for local_row in range(shard_size):
+                global_row = offset + local_row
+                if global_row < len(prompt_metadata):
+                    prompt_metadata[global_row]["shard_index_hidden"] = shard_idx
+                    prompt_metadata[global_row]["row_offset_hidden"] = local_row
+                    # Legacy aliases (point to hidden by default)
+                    prompt_metadata[global_row]["shard_index"] = shard_idx
+                    prompt_metadata[global_row]["row_offset"] = local_row
+                    if use_raw:
+                        prompt_metadata[global_row]["token_offset_hidden"] = token_offset_acc
+                        prompt_metadata[global_row]["token_offset"] = token_offset_acc
+                        token_offset_acc += per_prompt_tokens[global_row]
 
-                if use_raw and hidden_layers:
-                    layer_tensors, _ = _load_hidden_raw_for_prompt(
-                        model_name, prompt, hidden_layers,
-                    )
-                    loaded.update(layer_tensors)
-                elif hidden_strategy and hidden_layers:
-                    layer_tensors = _load_hidden_for_prompt(
-                        model_name, prompt, hidden_layers, hidden_strategy,
-                    )
-                    loaded.update(layer_tensors)
+            # Load and write hidden tensors for this shard
+            shard_data: list[dict] = []
+            for prompt in shard_prompts_text:
+                try:
+                    loaded: dict[str, torch.Tensor] = {}
+                    if use_raw:
+                        layer_tensors, _ = _load_hidden_raw_for_prompt(
+                            model_name, prompt, hidden_layers,
+                        )
+                        loaded.update(layer_tensors)
+                    elif hidden_strategy:
+                        layer_tensors = _load_hidden_for_prompt(
+                            model_name, prompt, hidden_layers, hidden_strategy,
+                        )
+                        loaded.update(layer_tensors)
+                    shard_data.append(loaded)
+                except (FileNotFoundError, KeyError, OSError) as e:
+                    raise OSError(
+                        f"Prompt passed metadata scan but failed to load during "
+                        f"shard write (cache may have been modified concurrently): "
+                        f"{e}"
+                    ) from e
 
-                if has_logits and logits_top_k is not None:
-                    logit_tensors = _load_logits_for_prompt(
-                        model_name, prompt, logits_top_k,
-                    )
-                    loaded.update(logit_tensors)
-
-                shard_data.append(loaded)
-            except (FileNotFoundError, KeyError, OSError) as e:
-                raise OSError(
-                    f"Prompt passed metadata scan but failed to load during "
-                    f"shard write (cache may have been modified concurrently): "
-                    f"{e}"
-                ) from e
-
-        # Write per-layer hidden shard files (v1.1 layout)
-        if hidden_layers and (hidden_strategy or use_raw):
             for layer in hidden_layers:
                 key = f"hidden.layer_{layer}"
                 rows = [p[key] for p in shard_data if key in p]
@@ -681,43 +686,80 @@ def _consolidate_and_shard(
                     save_file(layer_tensor, str(tmpdir / fname))
                     del layer_tensor
 
-        # Write logits_topk shard
-        if has_logits and logits_top_k is not None:
+            del shard_data
+            offset += shard_size
+            if not use_raw:
+                token_offset_acc = 0  # reset per shard only matters for raw
+
+    # --- Logits pass ---
+    if want_logits and logits_boundaries:
+        offset = 0
+        for shard_idx, shard_size in enumerate(tqdm(
+            logits_boundaries, desc="Writing logits shards", unit="shard",
+        )):
+            shard_prompts_text = valid_prompts[offset : offset + shard_size]
+
+            # Assign per-type shard metadata for logits
+            for local_row in range(shard_size):
+                global_row = offset + local_row
+                if global_row < len(prompt_metadata):
+                    prompt_metadata[global_row]["shard_index_logits"] = shard_idx
+                    prompt_metadata[global_row]["row_offset_logits"] = local_row
+                    # If no hidden, legacy columns point to logits
+                    if not has_hidden:
+                        prompt_metadata[global_row]["shard_index"] = shard_idx
+                        prompt_metadata[global_row]["row_offset"] = local_row
+
+            # Load and write logits tensors for this shard
+            shard_data_logits: list[dict] = []
+            for prompt in shard_prompts_text:
+                try:
+                    loaded_l: dict[str, torch.Tensor] = {}
+                    if logits_top_k is not None:
+                        logit_tensors = _load_logits_for_prompt(
+                            model_name, prompt, logits_top_k,
+                        )
+                        loaded_l.update(logit_tensors)
+                    shard_data_logits.append(loaded_l)
+                except (FileNotFoundError, KeyError, OSError) as e:
+                    raise OSError(
+                        f"Prompt passed metadata scan but failed to load during "
+                        f"shard write (cache may have been modified concurrently): "
+                        f"{e}"
+                    ) from e
+
             vals = [
                 p["logits_topk.values"]
-                for p in shard_data
+                for p in shard_data_logits
                 if "logits_topk.values" in p
             ]
             idxs = [
                 p["logits_topk.indices"]
-                for p in shard_data
+                for p in shard_data_logits
                 if "logits_topk.indices" in p
             ]
             if vals and idxs:
-                logits_tensors = {
+                logits_tensors_out = {
                     "logits_topk.values": torch.cat(vals, dim=0),
                     "logits_topk.indices": torch.cat(idxs, dim=0),
                 }
                 fname = f"tensors/logits_topk_{shard_idx:03d}.safetensors"
-                save_file(logits_tensors, str(tmpdir / fname))
-                del logits_tensors
+                save_file(logits_tensors_out, str(tmpdir / fname))
+                del logits_tensors_out
 
-        # Free this shard's data before loading the next
-        del shard_data
-
-        offset += shard_size
+            del shard_data_logits
+            offset += shard_size
 
     # Build tensor descriptors for lmprobe_info.json
-    if hidden_layers and (hidden_strategy or use_raw):
+    if has_hidden and hidden_boundaries:
         hidden_shards = []
         off = 0
-        for si, sz in enumerate(shard_boundaries):
+        for si, sz in enumerate(hidden_boundaries):
             actual = min(sz, n - off)
             shard_desc: dict[str, Any] = {
                 "num_prompts": actual,
             }
             if use_raw:
-                # Total tokens in this shard
                 shard_desc["num_tokens"] = sum(
                     per_prompt_tokens[off : off + actual]
                 )
@@ -741,10 +783,10 @@ def _consolidate_and_shard(
 
         tensor_descriptors["hidden_layers"] = hidden_desc
 
-    if has_logits and logits_top_k is not None:
+    if want_logits and logits_boundaries:
         logits_shards = []
         off = 0
-        for si, sz in enumerate(shard_boundaries):
+        for si, sz in enumerate(logits_boundaries):
             actual = min(sz, n - off)
             logits_shards.append({
                 "file": f"tensors/logits_topk_{si:03d}.safetensors",
@@ -806,11 +848,24 @@ def _write_parquet_index(
         "row_offset": pa.array(row_offsets, type=pa.int32()),
     }
 
+    # Per-type shard columns (v1.2)
+    per_type_keys = {
+        "shard_index_hidden", "row_offset_hidden", "token_offset_hidden",
+        "shard_index_logits", "row_offset_logits",
+    }
+    for ptk in per_type_keys:
+        if any(ptk in p for p in prompt_metadata):
+            vals = [p.get(ptk, 0) for p in prompt_metadata]
+            if "token_offset" in ptk:
+                columns[ptk] = pa.array(vals, type=pa.int64())
+            else:
+                columns[ptk] = pa.array(vals, type=pa.int32())
+
     # token_offset is a fixed column (int64 for large shards) when present
     fixed_keys = {
         "text", "label", "num_tokens", "shard_index", "row_offset",
         "token_offset",
-    }
+    } | per_type_keys
     if any("token_offset" in p for p in prompt_metadata):
         token_offsets = [p.get("token_offset", 0) for p in prompt_metadata]
         columns["token_offset"] = pa.array(token_offsets, type=pa.int64())
@@ -1461,12 +1516,18 @@ def pull_dataset(
     else:
         pull_types = list(tensor_descriptors.keys())
 
-    # Figure out which shards we need
+    # Figure out which shards we need (v1.2: per-type shard indices)
     needed_shards: dict[str, set[int]] = {}
     for i in prompt_indices:
-        shard_idx = index["shard_index"][i]
         for t_type in pull_types:
-            needed_shards.setdefault(t_type, set()).add(shard_idx)
+            if t_type == "logits_topk" and "shard_index_logits" in index:
+                si = index["shard_index_logits"][i]
+            elif t_type == "hidden_layers" and "shard_index_hidden" in index:
+                si = index["shard_index_hidden"][i]
+            else:
+                # Legacy v1.1 fallback: single shard_index for all types
+                si = index["shard_index"][i]
+            needed_shards.setdefault(t_type, set()).add(si)
 
     # Download shard files and record local paths
     # For per-layer layout (v1.1), we download per-layer files
@@ -1567,6 +1628,13 @@ def pull_dataset(
         }
         if "token_offset" in index:
             entry["token_offset"] = index["token_offset"][i]
+        # Per-type fields (v1.2)
+        for col in (
+            "shard_index_hidden", "row_offset_hidden", "token_offset_hidden",
+            "shard_index_logits", "row_offset_logits",
+        ):
+            if col in index:
+                entry[col] = index[col][i]
         shard_index[prompt_hash] = entry
 
     write_shard_registry(model_name, manifest, shard_index)
