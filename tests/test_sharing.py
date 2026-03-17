@@ -1363,9 +1363,11 @@ class TestRoundtrip:
         table = pq.read_table(str(remote_dir / PARQUET_PATH))
 
         assert table.num_rows == 2
-        assert set(table.column_names) == {
+        expected_cols = {
             "text", "label", "num_tokens", "shard_index", "row_offset",
+            "shard_index_hidden", "row_offset_hidden",
         }
+        assert set(table.column_names) == expected_cols
         assert set(table.column("text").to_pylist()) == set(prompts)
         assert set(table.column("label").to_pylist()) == {0, 1}
 
@@ -2317,3 +2319,305 @@ class TestLayersParam:
         ]
         assert len(tensor_downloads) == 1
         assert "hidden_layer000" in tensor_downloads[0]
+
+
+# =============================================================================
+# v1.2 independent shard boundary tests
+# =============================================================================
+
+
+class TestIndependentShardBoundaries:
+    """Test that hidden and logits get independent shard boundaries (v1.2)."""
+
+    @requires_pyarrow
+    def test_different_shard_counts_per_type(self, tmp_path, monkeypatch):
+        """With small logits and large hidden, logits should use fewer shards."""
+        src_cache = tmp_path / "src_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(src_cache))
+        cache_mod._backend = None
+
+        prompts = [f"prompt {i}" for i in range(10)]
+        layers = [0, 1]
+        top_k = 5
+        vocab_size = 50
+
+        for prompt in prompts:
+            # Pooled hidden (fairly large per row)
+            for layer in layers:
+                pooled = torch.randn(1, HIDDEN_DIM)
+                save_prompt_pooled_activations(
+                    TEST_MODEL, prompt, [layer], pooled, "last_token",
+                )
+            # Logits (small per row)
+            logits = torch.randn(1, 1, vocab_size)
+            mask = torch.ones(1, 1, dtype=torch.long)
+            save_prompt_logits(
+                TEST_MODEL, prompt, logits, mask,
+                top_k=top_k, positions="last",
+            )
+
+        # Use a tiny shard size so hidden gets multiple shards
+        # hidden_row_bytes = 32 * 4 = 128 bytes per row
+        # logits_row_bytes = 5 * 4 + 5 * 8 = 60 bytes per row
+        # With shard_max_bytes=384, hidden fits 3 rows/shard (4 shards),
+        # logits fits 6 rows/shard (2 shards)
+        tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            kept_indices=list(range(10)),
+            tensor_types={
+                "raw_layers": [],
+                "pooled": {"last_token": [0, 1]},
+                "has_logits": True,
+                "logits_top_k": top_k,
+                "has_perplexity": False,
+            },
+            labels=None,
+            shard_max_bytes=384,
+            repo_id="user/independent-test",
+        )
+
+        hidden_desc = tensor_descriptors["hidden_layers"]
+        logits_desc = tensor_descriptors["logits_topk"]
+
+        hidden_shard_count = len(hidden_desc["shards"])
+        logits_shard_count = len(logits_desc["shards"])
+
+        # Logits should have fewer shards than hidden
+        assert logits_shard_count < hidden_shard_count, (
+            f"Expected logits ({logits_shard_count} shards) < "
+            f"hidden ({hidden_shard_count} shards)"
+        )
+
+        # Total prompts across all shards should equal 10 for each type
+        assert sum(s["num_prompts"] for s in hidden_desc["shards"]) == 10
+        assert sum(s["num_prompts"] for s in logits_desc["shards"]) == 10
+
+        # Check per-type columns in metadata
+        for pm in prompt_metadata:
+            assert "shard_index_hidden" in pm
+            assert "row_offset_hidden" in pm
+            assert "shard_index_logits" in pm
+            assert "row_offset_logits" in pm
+            # Legacy columns present
+            assert "shard_index" in pm
+            assert "row_offset" in pm
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @requires_pyarrow
+    def test_per_type_columns_in_parquet(self, tmp_path, monkeypatch):
+        """Parquet index includes per-type shard columns."""
+        import pyarrow.parquet as pq
+
+        src_cache = tmp_path / "src_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(src_cache))
+        cache_mod._backend = None
+
+        prompts = ["hello", "world"]
+        for prompt in prompts:
+            pooled = torch.randn(1, HIDDEN_DIM)
+            save_prompt_pooled_activations(
+                TEST_MODEL, prompt, [0], pooled, "last_token",
+            )
+            logits = torch.randn(1, 1, 50)
+            mask = torch.ones(1, 1, dtype=torch.long)
+            save_prompt_logits(
+                TEST_MODEL, prompt, logits, mask,
+                top_k=5, positions="last",
+            )
+
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+        mock_api = MagicMock()
+
+        def capture_upload(repo_id, folder_path, **kwargs):
+            for f in Path(folder_path).rglob("*"):
+                if f.is_file():
+                    rel = f.relative_to(folder_path)
+                    dest = remote_dir / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(f), str(dest))
+
+        mock_api.upload_large_folder.side_effect = capture_upload
+
+        with (
+            patch("lmprobe.sharing._check_hub_deps"),
+            patch("huggingface_hub.HfApi", return_value=mock_api),
+        ):
+            push_dataset(
+                repo_id="user/pertype-test",
+                model_name=TEST_MODEL,
+                prompts=prompts,
+                labels=[1, 0],
+                exist_ok=True,
+            )
+
+        table = pq.read_table(str(remote_dir / PARQUET_PATH))
+        col_names = set(table.column_names)
+        assert "shard_index_hidden" in col_names
+        assert "row_offset_hidden" in col_names
+        assert "shard_index_logits" in col_names
+        assert "row_offset_logits" in col_names
+        # Legacy columns still present
+        assert "shard_index" in col_names
+        assert "row_offset" in col_names
+
+    def test_format_version_is_1_2(self):
+        """Format version is bumped to 1.2."""
+        assert FORMAT_VERSION == "1.2"
+
+    @requires_pyarrow
+    def test_hidden_only_no_logits_columns(self, tmp_path, monkeypatch):
+        """When only hidden is present, no logits columns appear."""
+        src_cache = tmp_path / "src_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(src_cache))
+        cache_mod._backend = None
+
+        prompts = ["hello", "world"]
+        for prompt in prompts:
+            pooled = torch.randn(1, HIDDEN_DIM)
+            save_prompt_pooled_activations(
+                TEST_MODEL, prompt, [0], pooled, "last_token",
+            )
+
+        tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            kept_indices=[0, 1],
+            tensor_types={
+                "raw_layers": [],
+                "pooled": {"last_token": [0]},
+                "has_logits": False,
+                "logits_top_k": None,
+                "has_perplexity": False,
+            },
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/hidden-only",
+        )
+
+        assert "hidden_layers" in tensor_descriptors
+        assert "logits_topk" not in tensor_descriptors
+
+        # No logits columns in metadata
+        for pm in prompt_metadata:
+            assert "shard_index_logits" not in pm
+            assert "row_offset_logits" not in pm
+            # Hidden columns present
+            assert "shard_index_hidden" in pm
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestRawShardBoundaryFix107:
+    """Test fix for #107: raw per_prompt_bytes should not multiply by layers."""
+
+    def test_raw_shard_count_reasonable(self, tmp_path, monkeypatch):
+        """Raw mode shard count should be based on per-layer size, not all layers."""
+        src_cache = tmp_path / "src_cache"
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(src_cache))
+        cache_mod._backend = None
+
+        prompts = [f"prompt {i}" for i in range(5)]
+        seq_lens = [10, 10, 10, 10, 10]
+        layers = [0, 1, 2, 3]  # 4 layers
+
+        for prompt, sl in zip(prompts, seq_lens):
+            act = torch.randn(1, sl, HIDDEN_DIM * len(layers))
+            mask = torch.ones(1, sl, dtype=torch.long)
+            save_prompt_activations(TEST_MODEL, prompt, layers, act, mask)
+
+        # Per-prompt bytes (single layer): 10 tokens * 32 dim * 4 bytes = 1280
+        # With shard_max_bytes=4000, should fit 3 rows per shard -> 2 shards
+        # Bug #107 would compute 10*32*4*4=5120 per prompt -> only 1 per shard -> 5 shards
+        tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            kept_indices=list(range(5)),
+            tensor_types={
+                "raw_layers": [0, 1, 2, 3],
+                "pooled": {},
+                "has_logits": False,
+                "logits_top_k": None,
+                "has_perplexity": False,
+            },
+            labels=None,
+            shard_max_bytes=4000,
+            repo_id="user/raw-fix107",
+        )
+
+        hidden_desc = tensor_descriptors["hidden_layers"]
+        shard_count = len(hidden_desc["shards"])
+
+        # With fix: 1280 bytes/prompt, 4000 byte shards -> 3 prompts/shard -> 2 shards
+        # Without fix: 5120 bytes/prompt, 4000 byte shards -> 1 prompt/shard -> 5 shards
+        assert shard_count == 2, (
+            f"Expected 2 shards (per-layer sizing), got {shard_count}"
+        )
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestBackwardCompatLegacySingleShardIndex:
+    """Test that v1.1 datasets with single shard_index still work."""
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_pull_v11_single_shard_index(self, mock_deps, tmp_path, cache_dir):
+        """pull_dataset works with v1.1 datasets that only have shard_index."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from safetensors.torch import save_file
+
+        remote_dir = tmp_path / "remote"
+        (remote_dir / "tensors").mkdir(parents=True)
+        (remote_dir / "index").mkdir(parents=True)
+
+        prompts = ["prompt 0", "prompt 1"]
+        t0 = torch.randn(2, HIDDEN_DIM)
+        save_file(
+            {"hidden.layer_0": t0},
+            str(remote_dir / "tensors" / "hidden_layer000_shard000.safetensors"),
+        )
+
+        # v1.1 Parquet: only legacy columns (no per-type columns)
+        table = pa.table({
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([None, None], type=pa.int32()),
+            "num_tokens": pa.array([5, 5], type=pa.int32()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1], type=pa.int32()),
+        })
+        pq.write_table(table, str(remote_dir / PARQUET_PATH))
+
+        lmprobe_info = {
+            "format_version": "1.1",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 2,
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "layout": "per_layer",
+                    "pooling": "last_token",
+                    "row_bytes": HIDDEN_DIM * 4,
+                    "shards": [{"num_prompts": 2}],
+                }
+            },
+            "provenance": {},
+        }
+        with open(remote_dir / INFO_FILENAME, "w") as f:
+            json.dump(lmprobe_info, f)
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            count = pull_dataset("user/v11-test")
+
+        assert count == 2

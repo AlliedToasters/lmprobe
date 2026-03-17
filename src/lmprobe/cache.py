@@ -906,8 +906,8 @@ def _load_raw_from_shard(
             f"but shard has storage={storage!r}"
         )
 
-    shard_idx = entry["shard_index"]
-    tok_off = entry["token_offset"]
+    shard_idx = entry.get("shard_index_hidden", entry.get("shard_index"))
+    tok_off = entry.get("token_offset_hidden", entry.get("token_offset"))
     num_tok = entry["num_tokens"]
 
     shards = t_info["shards"]
@@ -919,7 +919,7 @@ def _load_raw_from_shard(
     layout = t_info.get("layout")
 
     if layout == "per_layer":
-        # v1.1 per-layer layout: each layer in its own file
+        # v1.1+ per-layer layout: each layer in its own file
         layer_slices = []
         for layer in layers:
             per_layer_paths = shards[shard_idx].get("per_layer_paths", {})
@@ -995,7 +995,7 @@ def _load_pooled_from_shard(
 
     storage = t_info.get("storage", "pooled")
     layout = t_info.get("layout")
-    shard_idx = entry["shard_index"]
+    shard_idx = entry.get("shard_index_hidden", entry.get("shard_index"))
 
     shards = t_info["shards"]
     if shard_idx >= len(shards):
@@ -1004,12 +1004,12 @@ def _load_pooled_from_shard(
         )
 
     if layout == "per_layer":
-        # v1.1 per-layer layout
+        # v1.1+ per-layer layout
         per_layer_paths = shards[shard_idx].get("per_layer_paths", {})
         layer_slices = []
 
         if storage == "full_sequence":
-            tok_off = entry["token_offset"]
+            tok_off = entry.get("token_offset_hidden", entry.get("token_offset"))
             num_tok = entry["num_tokens"]
             for layer in layers:
                 layer_path = per_layer_paths.get(
@@ -1029,7 +1029,7 @@ def _load_pooled_from_shard(
                     ]
                     layer_slices.append((layer, last_tok))
         else:
-            row_offset = entry["row_offset"]
+            row_offset = entry.get("row_offset_hidden", entry.get("row_offset"))
             for layer in layers:
                 layer_path = per_layer_paths.get(
                     layer
@@ -1113,8 +1113,8 @@ def _load_logits_from_shard(
     if t_info is None:
         raise FileNotFoundError("No logits_topk in shard manifest")
 
-    shard_idx = entry["shard_index"]
-    row_offset = entry["row_offset"]
+    shard_idx = entry.get("shard_index_logits", entry.get("shard_index"))
+    row_offset = entry.get("row_offset_logits", entry.get("row_offset"))
 
     shards = t_info["shards"]
     if shard_idx >= len(shards):
