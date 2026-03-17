@@ -598,6 +598,27 @@ class TestPushDataset:
 
     @patch("lmprobe.sharing._check_hub_deps")
     @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_push_always_uses_upload_large_folder(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """upload_large_folder is always used regardless of dataset size."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        push_dataset(
+            repo_id="user/test-dataset",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+        )
+
+        mock_api.upload_large_folder.assert_called_once()
+        mock_api.upload_folder.assert_not_called()
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
     def test_push_labels_length_mismatch(
         self, mock_pyarrow, mock_deps, populated_cache,
     ):
