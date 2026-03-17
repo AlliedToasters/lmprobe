@@ -349,6 +349,7 @@ class UnifiedCache:
         self,
         prompts: list[str],
         remote: bool | None = None,
+        max_retries: int | None = None,
     ) -> WarmupStats:
         """Extract and cache activations/perplexity for prompts.
 
@@ -361,6 +362,9 @@ class UnifiedCache:
             Text prompts to warm up the cache for.
         remote : bool | None
             Override the instance-level remote setting.
+        max_retries : int | None
+            Maximum number of retry attempts per batch for transient errors.
+            Defaults to 3 for remote extraction, 0 for local.
 
         Returns
         -------
@@ -416,6 +420,8 @@ class UnifiedCache:
                 f"{len(need_logits)} need extraction"
             )
 
+        failed_count = 0
+
         if need_unified_list:
             backend = self._resolved_backend
             num_batches = (len(need_unified_list) + self.batch_size - 1) // self.batch_size
@@ -437,6 +443,14 @@ class UnifiedCache:
                 else None
             )
 
+            # Resolve retry count: only retry for remote extraction
+            effective_retries = max_retries if max_retries is not None else (3 if remote else 0)
+            if not remote:
+                effective_retries = 0  # never retry local — would hide real errors
+
+            if effective_retries > 0:
+                from .retry import retry_with_backoff
+
             with torch.no_grad():
                 for batch_idx in tqdm(
                     range(0, len(need_unified_list), self.batch_size),
@@ -447,15 +461,40 @@ class UnifiedCache:
                     batch_prompts = need_unified_list[
                         batch_idx : batch_idx + self.batch_size
                     ]
+                    batch_num = batch_idx // self.batch_size + 1
 
                     # Single forward pass captures both activations and logits
-                    batch_acts, batch_mask, batch_logits, batch_logits_indices = (
-                        backend.extract_batch_with_logits(
-                            batch_prompts, layer_indices,
-                            remote=remote,
-                            logit_top_k=effective_top_k,
-                        )
-                    )
+                    try:
+                        if effective_retries > 0:
+                            batch_acts, batch_mask, batch_logits, batch_logits_indices = (
+                                retry_with_backoff(
+                                    lambda bp=batch_prompts: backend.extract_batch_with_logits(
+                                        bp, layer_indices,
+                                        remote=remote,
+                                        logit_top_k=effective_top_k,
+                                    ),
+                                    max_retries=effective_retries,
+                                    context=f"batch {batch_num}/{num_batches}",
+                                )
+                            )
+                        else:
+                            batch_acts, batch_mask, batch_logits, batch_logits_indices = (
+                                backend.extract_batch_with_logits(
+                                    batch_prompts, layer_indices,
+                                    remote=remote,
+                                    logit_top_k=effective_top_k,
+                                )
+                            )
+                    except Exception:
+                        if remote and effective_retries > 0:
+                            # Skip this batch — partial progress is saved
+                            failed_count += len(batch_prompts)
+                            logger.error(
+                                f"[UNIFIED] Skipping batch {batch_num}/{num_batches} "
+                                f"({len(batch_prompts)} prompts) after {effective_retries} retries"
+                            )
+                            continue
+                        raise
 
                     # Compute perplexity features from logits
                     if self.compute_perplexity:
@@ -532,6 +571,13 @@ class UnifiedCache:
                                     self.logit_positions,
                                 )
                             logits_extracted += 1
+
+        if need_unified_list and failed_count > 0:
+            logger.warning(
+                f"[UNIFIED] Remote extraction incomplete: {failed_count} prompts failed "
+                f"after retries. Cached results were saved for successful batches. "
+                f"Re-run to retry the remaining prompts (cached results will be reused)."
+            )
 
         elapsed = time.time() - start_time
 
