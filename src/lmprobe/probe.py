@@ -389,6 +389,7 @@ class Probe:
     def __init__(
         self,
         model: str | None = None,
+        dataset: str | None = None,
         layers: int | list[int] | str = "middle",
         pooling: str = "last_token",
         train_pooling: str | None = None,
@@ -412,6 +413,7 @@ class Probe:
         mass_mean_augment: bool = False,
     ):
         self.model = model
+        self.dataset = dataset
         self.layers = layers
         self.pooling = pooling
         self.train_pooling = train_pooling
@@ -434,6 +436,10 @@ class Probe:
         self.pca_components = pca_components
         self.mass_mean_augment = mass_mean_augment
 
+        # Dataset state (lazy)
+        self._dataset_metadata: object | None = None  # DatasetMetadata
+        self._dataset_pulled_prompts: set[str] = set()
+
         # Detect sweep mode before other validations
         self._sweep_mode, self._sweep_layers_spec = _parse_sweep_spec(layers)
 
@@ -450,8 +456,8 @@ class Probe:
                 "Use backend='nnsight' for remote execution."
             )
 
-        # Resolve pooling strategies (only needed if model is provided)
-        if model is not None:
+        # Resolve pooling strategies (needed if model or dataset is provided)
+        if model is not None or dataset is not None:
             self._train_pooling, self._inference_pooling = resolve_pooling(
                 pooling, train_pooling, inference_pooling
             )
@@ -507,12 +513,139 @@ class Probe:
         self._evaluation_results_: dict | None = None
 
     def _check_model(self) -> None:
-        """Check that a model was provided (needed for prompt-based methods)."""
-        if self.model is None:
+        """Check that a model or dataset was provided (needed for prompt-based methods)."""
+        if self.model is None and self.dataset is None:
             raise ValueError(
-                "No model specified. Either pass model= to Probe() "
-                "or use the *_from_activations() methods instead."
+                "No model or dataset specified. Either pass model= or "
+                "dataset= to Probe(), or use the *_from_activations() "
+                "methods instead."
             )
+
+    def _ensure_dataset_metadata(self):
+        """Lazily fetch and cache dataset metadata.
+
+        Returns
+        -------
+        DatasetMetadata
+            Parsed metadata from the remote dataset.
+
+        Raises
+        ------
+        ValueError
+            If ``self.model`` is set and doesn't match the dataset's model.
+        """
+        if self._dataset_metadata is not None:
+            return self._dataset_metadata
+
+        from .sharing import fetch_dataset_metadata
+
+        meta = fetch_dataset_metadata(self.dataset)
+        # Validate model compatibility
+        if self.model is not None and self.model != meta.model_name:
+            raise ValueError(
+                f"Model mismatch: Probe has model={self.model!r} but dataset "
+                f"{self.dataset!r} was built with model={meta.model_name!r}. "
+                f"Either remove model= to use dataset alone, or use a "
+                f"matching model."
+            )
+        self._dataset_metadata = meta
+        return meta
+
+    def _resolve_layers_from_dataset(self) -> list[int]:
+        """Resolve layer specification using dataset metadata (no model needed).
+
+        Downloads only the HF ``config.json`` (~1KB) to get the model's
+        layer count, then applies the user's ``layers`` spec.
+        """
+        from .extraction import get_num_layers_from_config, resolve_layers
+
+        meta = self._ensure_dataset_metadata()
+        num_layers = get_num_layers_from_config(meta.model_name)
+        return resolve_layers(self.layers, num_layers)
+
+    def _pull_dataset_for_prompts(
+        self, prompts: list[str], layers: list[int]
+    ) -> None:
+        """Download only the dataset shards needed for *prompts*."""
+        new_prompts = [p for p in prompts if p not in self._dataset_pulled_prompts]
+        if not new_prompts:
+            return
+
+        from .sharing import pull_dataset
+
+        pull_dataset(
+            self.dataset,
+            target_prompts=new_prompts,
+            layers=layers,
+        )
+        self._dataset_pulled_prompts.update(new_prompts)
+
+    def _load_and_pool_from_cache(
+        self,
+        prompts: list[str],
+        layers: list[int],
+        pooling_strategy: str,
+    ) -> tuple[np.ndarray, None]:
+        """Load activations from cache and apply pooling (model-free path).
+
+        Used when ``dataset`` is set but ``model`` is None.  All prompts
+        must already be in the local cache (populated by
+        ``_pull_dataset_for_prompts``).
+
+        Returns
+        -------
+        tuple[np.ndarray, None]
+            ``(pooled_activations, None)`` — attention mask is always None
+            because dataset activations don't need score-level pooling.
+        """
+        from .cache import load_prompt_activations
+
+        meta = self._ensure_dataset_metadata()
+
+        all_acts = []
+        all_masks = []
+        missing = []
+        for prompt in prompts:
+            try:
+                acts, mask = load_prompt_activations(
+                    meta.model_name, prompt, layers
+                )
+                all_acts.append(acts)
+                all_masks.append(mask)
+            except FileNotFoundError:
+                missing.append(prompt)
+
+        if missing:
+            raise ValueError(
+                f"Cannot find activations for {len(missing)} prompt(s) in "
+                f"dataset {self.dataset!r} and no model is available for "
+                f"extraction. Missing prompts: {missing[:3]!r}"
+                + (f" ... and {len(missing) - 3} more" if len(missing) > 3 else "")
+            )
+
+        # Pad to same sequence length and stack
+        max_len = max(a.shape[0] for a in all_acts)
+        padded = []
+        padded_masks = []
+        for acts, mask in zip(all_acts, all_masks):
+            seq_len = acts.shape[0]
+            if seq_len < max_len:
+                pad_size = max_len - seq_len
+                acts = torch.nn.functional.pad(acts, (0, 0, 0, pad_size))
+                mask = torch.nn.functional.pad(mask, (0, pad_size))
+            padded.append(acts)
+            padded_masks.append(mask)
+
+        activations = torch.stack(padded)  # (batch, seq_len, hidden_dim)
+        attention_mask = torch.stack(padded_masks)  # (batch, seq_len)
+
+        pool_fn = get_pooling_fn(pooling_strategy)
+        pooled = pool_fn(activations, attention_mask)
+
+        if pooled.dim() == 2:
+            return pooled.detach().cpu().float().numpy(), None
+        else:
+            return pooled.detach().cpu().float().numpy(), attention_mask
 
     def _get_remote(self, remote: bool | None) -> bool:
         """Resolve remote parameter with method-level override."""
@@ -684,6 +817,10 @@ class Probe:
         if pooling_strategy == "all":
             return None
 
+        # No extractor means model-free (dataset-only); pooled cache uses model name
+        if self._extractor is None:
+            return None
+
         layer_indices = self._extractor.layer_indices
         required_layers = set(layer_indices)
 
@@ -739,6 +876,22 @@ class Probe:
             if pooled_from_cache is not None:
                 # Success! Return directly without extraction
                 return pooled_from_cache, None
+
+        # If a dataset is configured, pull needed shards first so
+        # CachedExtractor finds them via the shard registry.
+        if self.dataset is not None:
+            self._ensure_dataset_metadata()
+            if self._extractor is not None:
+                ds_layers = sorted(self._extractor.layer_indices)
+            else:
+                ds_layers = self._resolve_layers_from_dataset()
+            self._pull_dataset_for_prompts(prompts, ds_layers)
+
+            # Model-free path: load directly from cache
+            if self._extractor is None:
+                return self._load_and_pool_from_cache(
+                    prompts, ds_layers, pooling_strategy
+                )
 
         # Fall back to extraction + pooling
         effective_retries = max_retries if max_retries is not None else self.max_retries
@@ -804,20 +957,32 @@ class Probe:
             improve throughput on GPU.
         """
         self._check_model()
-        use_remote = self._get_remote(remote)
-        effective_retries = max_retries if max_retries is not None else self.max_retries
 
-        if batch_size is not None:
-            original_batch_size = self._extractor.batch_size
-            self._extractor.batch_size = batch_size
-        try:
-            self._cached_extractor.extract(
-                prompts, remote=use_remote, max_retries=effective_retries,
-                cache_only=True,
-            )
-        finally:
+        # Pull from dataset if configured
+        if self.dataset is not None:
+            self._ensure_dataset_metadata()
+            if self._extractor is not None:
+                pull_layers = sorted(self._extractor.layer_indices)
+            else:
+                pull_layers = self._resolve_layers_from_dataset()
+            self._pull_dataset_for_prompts(prompts, pull_layers)
+
+        # Model extraction (CachedExtractor skips already-cached prompts)
+        if self._extractor is not None:
+            use_remote = self._get_remote(remote)
+            effective_retries = max_retries if max_retries is not None else self.max_retries
+
             if batch_size is not None:
-                self._extractor.batch_size = original_batch_size
+                original_batch_size = self._extractor.batch_size
+                self._extractor.batch_size = batch_size
+            try:
+                self._cached_extractor.extract(
+                    prompts, remote=use_remote, max_retries=effective_retries,
+                    cache_only=True,
+                )
+            finally:
+                if batch_size is not None:
+                    self._extractor.batch_size = original_batch_size
 
     def fit(
         self,
@@ -933,7 +1098,10 @@ class Probe:
             labels = np.repeat(labels, seq_len)
 
         # Auto-disable normalize_layers when preprocessing includes StandardScaler
-        n_layers = len(self._extractor.layer_indices)
+        if self._extractor is not None:
+            n_layers = len(self._extractor.layer_indices)
+        else:
+            n_layers = len(self._resolve_layers_from_dataset())
         scaling_strategy = self._get_scaling_strategy()
         if scaling_strategy is not None and self._preprocessing_includes_standard():
             import warnings

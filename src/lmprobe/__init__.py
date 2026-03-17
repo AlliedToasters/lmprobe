@@ -36,6 +36,7 @@ __all__ = [
     "CacheInfo",
     "CachedLogits",
     "CachedPromptInfo",
+    "DatasetMetadata",
     "LayerSweepResult",
     "LinearProbe",
     "Probe",
@@ -48,6 +49,7 @@ __all__ = [
     "clear_model_cache",
     "discover_cached",
     "enable_cache_logging",
+    "fetch_dataset_metadata",
     "load_activation_dataset",
     "plot_layer_importance",
     "plot_layer_importance_heatmap",
@@ -142,8 +144,13 @@ def __getattr__(name: str):
             "CachedPromptInfo": CachedPromptInfo,
             "discover_cached": discover_cached,
         }[name]
-    if name in ("push_dataset", "pull_dataset", "load_activation_dataset"):
+    if name in (
+        "push_dataset", "pull_dataset", "load_activation_dataset",
+        "fetch_dataset_metadata", "DatasetMetadata",
+    ):
         from .sharing import (
+            DatasetMetadata,
+            fetch_dataset_metadata,
             load_activation_dataset,
             pull_dataset,
             push_dataset,
@@ -153,5 +160,7 @@ def __getattr__(name: str):
             "push_dataset": push_dataset,
             "pull_dataset": pull_dataset,
             "load_activation_dataset": load_activation_dataset,
+            "fetch_dataset_metadata": fetch_dataset_metadata,
+            "DatasetMetadata": DatasetMetadata,
         }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

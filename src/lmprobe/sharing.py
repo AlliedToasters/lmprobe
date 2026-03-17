@@ -34,6 +34,7 @@ import logging
 import re
 import tempfile
 import warnings
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1250,6 +1251,91 @@ def push_dataset(
 
     logger.info(f"[SHARING] Pushed {num_prompts} prompts to {url}")
     return url
+
+
+@dataclass
+class DatasetMetadata:
+    """Metadata from a remote activation dataset.
+
+    Returned by :func:`fetch_dataset_metadata`.  Contains just enough
+    information to resolve layers, validate model compatibility, and
+    check prompt availability without downloading any tensor data.
+    """
+
+    model_name: str
+    available_layers: list[int]
+    num_prompts: int
+    format_version: str
+    tensor_descriptors: dict
+    prompts: list[str] = field(default_factory=list)
+
+
+def fetch_dataset_metadata(
+    repo_id: str,
+    *,
+    token: str | None = None,
+) -> DatasetMetadata:
+    """Fetch lightweight metadata from a remote activation dataset.
+
+    Downloads only ``lmprobe_info.json`` (~KB) and the Parquet index
+    (~KB–MB) — no tensor data is transferred.
+
+    Parameters
+    ----------
+    repo_id : str
+        HuggingFace Dataset repo ID (e.g. ``"user/my-activations"``).
+    token : str | None
+        HuggingFace API token.
+
+    Returns
+    -------
+    DatasetMetadata
+        Parsed metadata including model name, available layers, prompt
+        list, and tensor descriptors.
+    """
+    _check_hub_deps()
+    from huggingface_hub import hf_hub_download
+
+    info_path = hf_hub_download(
+        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
+    )
+    parquet_path = hf_hub_download(
+        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
+    )
+
+    with open(info_path) as f:
+        lmprobe_info = json.load(f)
+
+    model_name = lmprobe_info["model"]["name"]
+    format_version = lmprobe_info.get("format_version", "1.0")
+    tensor_descriptors = lmprobe_info.get("tensors", {})
+
+    # Extract available layers from hidden_layers descriptor
+    available_layers: list[int] = []
+    hidden_info = tensor_descriptors.get("hidden_layers", {})
+    if hidden_info.get("layout") == "per_layer":
+        available_layers = hidden_info.get("layers", [])
+    else:
+        # v1.0 co-located: all layers are available but not enumerated
+        # Try to infer from shard keys if possible
+        available_layers = hidden_info.get("layers", [])
+
+    # Read prompts from Parquet index
+    _check_pyarrow()
+    import pyarrow.parquet as pq
+
+    index_table = pq.read_table(parquet_path)
+    index = index_table.to_pydict()
+    prompts = index.get("text", [])
+
+    return DatasetMetadata(
+        model_name=model_name,
+        available_layers=available_layers,
+        num_prompts=len(prompts),
+        format_version=format_version,
+        tensor_descriptors=tensor_descriptors,
+        prompts=prompts,
+    )
 
 
 def pull_dataset(
