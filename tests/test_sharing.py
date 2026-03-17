@@ -598,6 +598,50 @@ class TestPushDataset:
 
     @patch("lmprobe.sharing._check_hub_deps")
     @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_push_uses_upload_large_folder_for_big_datasets(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """upload_large_folder is used when total size exceeds 1 GB."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        # Make _folder_size return > 1 GB to trigger upload_large_folder
+        with patch("lmprobe.sharing._folder_size", return_value=2_000_000_000):
+            push_dataset(
+                repo_id="user/large-dataset",
+                model_name=TEST_MODEL,
+                prompts=populated_cache,
+                labels=[1, 1, 0],
+                exist_ok=True,
+            )
+
+        mock_api.upload_large_folder.assert_called_once()
+        mock_api.upload_folder.assert_not_called()
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_push_uses_upload_folder_for_small_datasets(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """upload_folder is used when total size is under 1 GB."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        push_dataset(
+            repo_id="user/small-dataset",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+        )
+
+        mock_api.upload_folder.assert_called_once()
+        mock_api.upload_large_folder.assert_not_called()
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
     def test_push_labels_length_mismatch(
         self, mock_pyarrow, mock_deps, populated_cache,
     ):

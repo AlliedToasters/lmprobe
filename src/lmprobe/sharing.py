@@ -90,6 +90,11 @@ def _check_pyarrow() -> None:
         )
 
 
+def _folder_size(folder: Path) -> int:
+    """Return total size in bytes of all files under *folder*."""
+    return sum(f.stat().st_size for f in folder.rglob("*") if f.is_file())
+
+
 # =============================================================================
 # Discovery helpers (unchanged from v1 — these are already correct)
 # =============================================================================
@@ -1176,14 +1181,26 @@ def push_dataset(
     api.create_repo(
         repo_id, exist_ok=exist_ok, private=private, repo_type="dataset",
     )
-    api.upload_folder(
-        repo_id=repo_id,
-        folder_path=str(tmpdir),
-        repo_type="dataset",
-        commit_message=(
-            f"Upload activation dataset ({num_prompts} prompts)"
-        ),
-    )
+    total_size = _folder_size(tmpdir)
+    if total_size > 1_000_000_000:  # 1 GB
+        logger.info(
+            "[SHARING] Large dataset (%.1f GB), using upload_large_folder",
+            total_size / 1e9,
+        )
+        api.upload_large_folder(
+            repo_id=repo_id,
+            folder_path=str(tmpdir),
+            repo_type="dataset",
+        )
+    else:
+        api.upload_folder(
+            repo_id=repo_id,
+            folder_path=str(tmpdir),
+            repo_type="dataset",
+            commit_message=(
+                f"Upload activation dataset ({num_prompts} prompts)"
+            ),
+        )
     url = f"https://huggingface.co/datasets/{repo_id}"
 
     # Cleanup
