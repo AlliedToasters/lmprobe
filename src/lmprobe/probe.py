@@ -513,7 +513,7 @@ class Probe:
         self._evaluation_results_: dict | None = None
 
     def _check_model(self) -> None:
-        """Check that a model or dataset was provided (needed for prompt-based methods)."""
+        """Check that a model or dataset is available for prompt-based methods."""
         if self.model is None and self.dataset is None:
             raise ValueError(
                 "No model or dataset specified. Either pass model= or "
@@ -592,6 +592,10 @@ class Probe:
         must already be in the local cache (populated by
         ``_pull_dataset_for_prompts``).
 
+        Pools each prompt individually to avoid padding-induced memory
+        waste.  Peak memory is O(max_seq × hidden_dim) rather than
+        O(batch × max_seq × hidden_dim).
+
         Returns
         -------
         tuple[np.ndarray, None]
@@ -601,19 +605,22 @@ class Probe:
         from .cache import load_prompt_activations
 
         meta = self._ensure_dataset_metadata()
+        pool_fn = get_pooling_fn(pooling_strategy)
 
-        all_acts = []
-        all_masks = []
+        pooled_rows = []
         missing = []
         for prompt in prompts:
             try:
                 acts, mask = load_prompt_activations(
                     meta.model_name, prompt, layers
                 )
-                all_acts.append(acts)
-                all_masks.append(mask)
             except FileNotFoundError:
                 missing.append(prompt)
+                continue
+
+            # Pool single prompt: unsqueeze to (1, seq_len, hidden_dim)
+            pooled = pool_fn(acts.unsqueeze(0), mask.unsqueeze(0))
+            pooled_rows.append(pooled.detach().cpu().float())
 
         if missing:
             raise ValueError(
@@ -623,29 +630,9 @@ class Probe:
                 + (f" ... and {len(missing) - 3} more" if len(missing) > 3 else "")
             )
 
-        # Pad to same sequence length and stack
-        max_len = max(a.shape[0] for a in all_acts)
-        padded = []
-        padded_masks = []
-        for acts, mask in zip(all_acts, all_masks):
-            seq_len = acts.shape[0]
-            if seq_len < max_len:
-                pad_size = max_len - seq_len
-                acts = torch.nn.functional.pad(acts, (0, 0, 0, pad_size))
-                mask = torch.nn.functional.pad(mask, (0, pad_size))
-            padded.append(acts)
-            padded_masks.append(mask)
-
-        activations = torch.stack(padded)  # (batch, seq_len, hidden_dim)
-        attention_mask = torch.stack(padded_masks)  # (batch, seq_len)
-
-        pool_fn = get_pooling_fn(pooling_strategy)
-        pooled = pool_fn(activations, attention_mask)
-
-        if pooled.dim() == 2:
-            return pooled.detach().cpu().float().numpy(), None
-        else:
-            return pooled.detach().cpu().float().numpy(), attention_mask
+        # Concatenate pooled results: each is (1, hidden_dim)
+        result = torch.cat(pooled_rows, dim=0)
+        return result.numpy(), None
 
     def _get_remote(self, remote: bool | None) -> bool:
         """Resolve remote parameter with method-level override."""

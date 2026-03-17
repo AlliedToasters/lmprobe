@@ -1531,9 +1531,12 @@ def pull_dataset(
         for si, shard_meta in enumerate(t_info["shards"]):
             entry = dict(shard_meta)
             if layout == "per_layer":
-                # Store per-layer local paths
+                # Store per-layer local paths (use string keys for JSON compat)
                 if si in per_layer_paths.get(t_type, {}):
-                    entry["per_layer_paths"] = per_layer_paths[t_type][si]
+                    entry["per_layer_paths"] = {
+                        str(k): v
+                        for k, v in per_layer_paths[t_type][si].items()
+                    }
             else:
                 if si in shard_local_paths.get(t_type, {}):
                     entry["local_path"] = shard_local_paths[t_type][si]
