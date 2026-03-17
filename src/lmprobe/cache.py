@@ -909,7 +909,6 @@ def _load_raw_from_shard(
     shard_idx = entry["shard_index"]
     tok_off = entry["token_offset"]
     num_tok = entry["num_tokens"]
-    hidden_dim = t_info.get("dim", 0)
 
     shards = t_info["shards"]
     if shard_idx >= len(shards):
@@ -972,7 +971,6 @@ def _load_pooled_from_shard(
 
     storage = t_info.get("storage", "pooled")
     shard_idx = entry["shard_index"]
-    hidden_dim = t_info.get("dim", 0)
 
     shards = t_info["shards"]
     if shard_idx >= len(shards):
