@@ -39,12 +39,14 @@ import torch
 
 from .cache import (
     CachedPromptInfo,
+    _hash_string,
     discover_cached,
     load_prompt_activations,
     load_prompt_logits,
     load_prompt_pooled_activations,
     save_prompt_activations,
     save_prompt_pooled_activations,
+    write_shard_registry,
 )
 
 logger = logging.getLogger(__name__)
@@ -1205,12 +1207,15 @@ def pull_dataset(
     target_prompts: list[str] | None = None,
     overwrite: bool = False,
     token: str | None = None,
+    materialize: bool = False,
+    num_workers: int = 0,
 ) -> int:
     """Pull activations from a HuggingFace Dataset repo into local cache.
 
-    Downloads lmprobe_info.json + Parquet index, determines which shards are
-    needed, downloads them, and unpacks per-prompt activations into the local
-    cache.
+    By default (``materialize=False``), downloads shard files and builds a
+    shard registry so activations can be served lazily on-the-fly without
+    unpacking per-prompt files.  Set ``materialize=True`` to unpack per-prompt
+    safetensors files (the pre-0.8 behavior).
 
     Parameters
     ----------
@@ -1225,11 +1230,18 @@ def pull_dataset(
         If False (default), skip prompts already in local cache.
     token : str | None
         HuggingFace API token.
+    materialize : bool
+        If True, unpack per-prompt safetensors files into the cache (old
+        behavior).  If False (default), only build the shard registry for
+        lazy on-the-fly loading.
+    num_workers : int
+        Number of parallel workers for materialization.  0 (default) runs
+        in the main process.  Only used when ``materialize=True``.
 
     Returns
     -------
     int
-        Number of prompts unpacked into local cache.
+        Number of prompts available (lazy) or unpacked (materialize).
     """
     _check_hub_deps()
     from huggingface_hub import hf_hub_download
@@ -1315,133 +1327,249 @@ def pull_dataset(
         for t_type in pull_types:
             needed_shards.setdefault(t_type, set()).add(shard_idx)
 
-    from safetensors import safe_open
-    from tqdm import tqdm
-
-    # Build reverse mapping: for each tensor type + shard, which prompts?
+    # Download shard files and record local paths
+    shard_local_paths: dict[str, dict[int, str]] = {}  # t_type -> shard_idx -> path
     for t_type in pull_types:
         t_info = tensor_descriptors[t_type]
         shards = t_info["shards"]
+        shard_local_paths[t_type] = {}
 
         for shard_idx in sorted(needed_shards.get(t_type, [])):
             if shard_idx >= len(shards):
                 continue
             shard = shards[shard_idx]
-
             shard_path = hf_hub_download(
                 repo_id, shard["file"],
                 repo_type="dataset", token=token,
             )
+            shard_local_paths[t_type][shard_idx] = shard_path
 
-            # Find prompts in this shard
+    # ---- Build shard registry (manifest + index) ----
+    # Manifest: tensor descriptors with local shard paths
+    manifest_tensors = {}
+    for t_type in pull_types:
+        t_info = tensor_descriptors[t_type]
+        shards_with_paths = []
+        for si, shard_meta in enumerate(t_info["shards"]):
+            entry = dict(shard_meta)
+            if si in shard_local_paths.get(t_type, {}):
+                entry["local_path"] = shard_local_paths[t_type][si]
+            shards_with_paths.append(entry)
+        manifest_tensors[t_type] = {
+            **t_info,
+            "shards": shards_with_paths,
+        }
+
+    manifest = {
+        "model_name": model_name,
+        "tensors": manifest_tensors,
+    }
+
+    # Shard index: prompt_hash -> offset info
+    # Load existing shard index to merge (supports multiple repos)
+    from .cache import _load_shard_index
+    existing_index = _load_shard_index(model_name) or {}
+
+    shard_index = dict(existing_index)
+    for i in prompt_indices:
+        prompt_text = index["text"][i]
+        prompt_hash = _hash_string(prompt_text)
+        entry: dict[str, Any] = {
+            "shard_index": index["shard_index"][i],
+            "row_offset": index["row_offset"][i],
+            "num_tokens": index["num_tokens"][i],
+        }
+        if "token_offset" in index:
+            entry["token_offset"] = index["token_offset"][i]
+        shard_index[prompt_hash] = entry
+
+    write_shard_registry(model_name, manifest, shard_index)
+
+    total_prompts = len(prompt_indices)
+
+    if not materialize:
+        logger.info(
+            f"[SHARING] Registered {total_prompts} prompts in shard registry "
+            f"(lazy mode, no per-prompt files)"
+        )
+        return total_prompts
+
+    # ---- Materialize: unpack per-prompt files (old behavior) ----
+    _materialize_prompts(
+        model_name=model_name,
+        tensor_descriptors=tensor_descriptors,
+        pull_types=pull_types,
+        index=index,
+        prompt_indices=prompt_indices,
+        needed_shards=needed_shards,
+        shard_local_paths=shard_local_paths,
+        num_workers=num_workers,
+    )
+
+    logger.info(f"[SHARING] Unpacked {total_prompts} prompts into local cache")
+    return total_prompts
+
+
+def _unpack_shard_prompts(
+    model_name: str,
+    t_type: str,
+    t_info: dict,
+    shard_path: str,
+    shard_prompts: list[int],
+    index: dict,
+) -> None:
+    """Unpack per-prompt files from a single shard.
+
+    This is the core materialization logic, extracted so it can be called
+    from the main process or from a worker process.
+    """
+    from safetensors import safe_open
+    from tqdm import tqdm
+
+    with safe_open(shard_path, framework="pt") as f:
+        sf_keys = list(f.keys())
+        tensors_data = {k: f.get_tensor(k) for k in sf_keys}
+
+    storage = t_info.get("storage", "pooled")
+
+    for pi in tqdm(
+        shard_prompts,
+        desc=f"Unpacking {t_type}",
+        unit="prompt",
+        leave=False,
+    ):
+        prompt_text = index["text"][pi]
+
+        if t_type == "hidden_layers" and storage == "full_sequence":
+            tok_off = index["token_offset"][pi]
+            num_tok = index["num_tokens"][pi]
+            hidden_dim = t_info.get("dim", 0)
+
+            layer_slices = []
+            for sf_key in sf_keys:
+                match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
+                if not match:
+                    continue
+                layer = int(match.group(1))
+                chunk = tensors_data[sf_key][tok_off : tok_off + num_tok]
+                layer_slices.append((layer, chunk))
+
+            layer_slices.sort(key=lambda x: x[0])
+            sorted_layers = [ls[0] for ls in layer_slices]
+            raw_act = torch.cat(
+                [ls[1] for ls in layer_slices], dim=-1
+            )
+            raw_act = raw_act.unsqueeze(0)
+            mask = torch.ones(1, num_tok, dtype=torch.long)
+
+            save_prompt_activations(
+                model_name, prompt_text,
+                sorted_layers, raw_act, mask,
+            )
+
+            for layer_idx, layer_num in enumerate(sorted_layers):
+                start = layer_idx * hidden_dim
+                end = (layer_idx + 1) * hidden_dim
+                last_tok = raw_act[0, -1, start:end].unsqueeze(0)
+                save_prompt_pooled_activations(
+                    model_name, prompt_text,
+                    [layer_num], last_tok, "last_token",
+                )
+
+        elif t_type == "hidden_layers":
+            row_offset = index["row_offset"][pi]
+            pooling = t_info.get("pooling", "last_token")
+            for sf_key in sf_keys:
+                m = re.match(r"^hidden\.layer_(\d+)$", sf_key)
+                if not m:
+                    continue
+                layer = int(m.group(1))
+                row = tensors_data[sf_key][
+                    row_offset : row_offset + 1
+                ]
+                save_prompt_pooled_activations(
+                    model_name, prompt_text,
+                    [layer], row, pooling,
+                )
+
+        elif t_type == "logits_topk":
+            row_offset = index["row_offset"][pi]
+            v_row = tensors_data["logits_topk.values"][
+                row_offset : row_offset + 1
+            ]
+            i_row = tensors_data["logits_topk.indices"][
+                row_offset : row_offset + 1
+            ]
+            from .cache import (
+                _LOGITS_TOP_K_INDICES_KEY,
+                _LOGITS_TOP_K_VALUES_KEY,
+                _merge_save_backend,
+                _prepare_tensor,
+                _prompt_cache_key,
+                _register_model,
+            )
+
+            _register_model(model_name)
+            cache_key = _prompt_cache_key(model_name, prompt_text)
+            new_tensors = {
+                _LOGITS_TOP_K_VALUES_KEY: _prepare_tensor(v_row),
+                _LOGITS_TOP_K_INDICES_KEY: _prepare_tensor(i_row),
+            }
+            _merge_save_backend(cache_key, new_tensors)
+
+
+def _materialize_prompts(
+    *,
+    model_name: str,
+    tensor_descriptors: dict,
+    pull_types: list[str],
+    index: dict,
+    prompt_indices: list[int],
+    needed_shards: dict[str, set[int]],
+    shard_local_paths: dict[str, dict[int, str]],
+    num_workers: int = 0,
+) -> None:
+    """Unpack per-prompt files from shard files.
+
+    If num_workers > 0, uses ProcessPoolExecutor for parallel unpacking.
+    """
+    # Collect all (t_type, shard_idx, shard_path, shard_prompts) jobs
+    jobs = []
+    for t_type in pull_types:
+        t_info = tensor_descriptors[t_type]
+        for shard_idx in sorted(needed_shards.get(t_type, [])):
+            if shard_idx not in shard_local_paths.get(t_type, {}):
+                continue
+            shard_path = shard_local_paths[t_type][shard_idx]
             shard_prompts = [
                 i for i in prompt_indices
                 if index["shard_index"][i] == shard_idx
             ]
+            if not shard_prompts:
+                continue
+            jobs.append((t_type, t_info, shard_path, shard_prompts))
 
-            with safe_open(shard_path, framework="pt") as f:
-                sf_keys = list(f.keys())
-                tensors_data = {k: f.get_tensor(k) for k in sf_keys}
+    if num_workers > 0:
+        from concurrent.futures import ProcessPoolExecutor
 
-            storage = t_info.get("storage", "pooled")
-
-            for pi in tqdm(
-                shard_prompts,
-                desc=f"Unpacking {t_type} shard {shard_idx}",
-                unit="prompt",
-                leave=False,
-            ):
-                prompt_text = index["text"][pi]
-
-                if t_type == "hidden_layers" and storage == "full_sequence":
-                    # Full-sequence: use token_offset + num_tokens
-                    tok_off = index["token_offset"][pi]
-                    num_tok = index["num_tokens"][pi]
-                    hidden_dim = t_info.get("dim", 0)
-
-                    # Reconstruct raw format: concat layers on dim=-1
-                    layer_slices = []
-                    for sf_key in sf_keys:
-                        match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
-                        if not match:
-                            continue
-                        layer = int(match.group(1))
-                        # (num_tok, hidden_dim)
-                        chunk = tensors_data[sf_key][tok_off : tok_off + num_tok]
-                        layer_slices.append((layer, chunk))
-
-                    layer_slices.sort(key=lambda x: x[0])
-                    sorted_layers = [ls[0] for ls in layer_slices]
-                    # Concat on dim=-1: (num_tok, hidden_dim * n_layers)
-                    raw_act = torch.cat(
-                        [ls[1] for ls in layer_slices], dim=-1
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = []
+            for t_type, t_info, shard_path, shard_prompts in jobs:
+                futures.append(
+                    executor.submit(
+                        _unpack_shard_prompts,
+                        model_name, t_type, t_info,
+                        shard_path, shard_prompts, index,
                     )
-                    # Unsqueeze batch: (1, num_tok, total_dim)
-                    raw_act = raw_act.unsqueeze(0)
-                    mask = torch.ones(1, num_tok, dtype=torch.long)
-
-                    # Save raw activations
-                    save_prompt_activations(
-                        model_name, prompt_text,
-                        sorted_layers, raw_act, mask,
-                    )
-
-                    # Also save pooled (last token) for probe convenience
-                    for layer_idx, layer_num in enumerate(sorted_layers):
-                        start = layer_idx * hidden_dim
-                        end = (layer_idx + 1) * hidden_dim
-                        # Last token of this layer
-                        last_tok = raw_act[0, -1, start:end].unsqueeze(0)
-                        save_prompt_pooled_activations(
-                            model_name, prompt_text,
-                            [layer_num], last_tok, "last_token",
-                        )
-
-                elif t_type == "hidden_layers":
-                    # Pooled storage (existing path)
-                    row_offset = index["row_offset"][pi]
-                    pooling = t_info.get("pooling", "last_token")
-                    for sf_key in sf_keys:
-                        m = re.match(r"^hidden\.layer_(\d+)$", sf_key)
-                        if not m:
-                            continue
-                        layer = int(m.group(1))
-                        row = tensors_data[sf_key][
-                            row_offset : row_offset + 1
-                        ]
-                        save_prompt_pooled_activations(
-                            model_name, prompt_text,
-                            [layer], row, pooling,
-                        )
-
-                elif t_type == "logits_topk":
-                    row_offset = index["row_offset"][pi]
-                    v_row = tensors_data["logits_topk.values"][
-                        row_offset : row_offset + 1
-                    ]
-                    i_row = tensors_data["logits_topk.indices"][
-                        row_offset : row_offset + 1
-                    ]
-                    from .cache import (
-                        _LOGITS_TOP_K_INDICES_KEY,
-                        _LOGITS_TOP_K_VALUES_KEY,
-                        _merge_save_backend,
-                        _prepare_tensor,
-                        _prompt_cache_key,
-                        _register_model,
-                    )
-
-                    _register_model(model_name)
-                    cache_key = _prompt_cache_key(model_name, prompt_text)
-                    new_tensors = {
-                        _LOGITS_TOP_K_VALUES_KEY: _prepare_tensor(v_row),
-                        _LOGITS_TOP_K_INDICES_KEY: _prepare_tensor(i_row),
-                    }
-                    _merge_save_backend(cache_key, new_tensors)
-
-    unpacked = len(prompt_indices)
-    logger.info(f"[SHARING] Unpacked {unpacked} prompts into local cache")
-    return unpacked
+                )
+            for fut in futures:
+                fut.result()  # Raise any exceptions
+    else:
+        for t_type, t_info, shard_path, shard_prompts in jobs:
+            _unpack_shard_prompts(
+                model_name, t_type, t_info,
+                shard_path, shard_prompts, index,
+            )
 
 
 def load_activation_dataset(
