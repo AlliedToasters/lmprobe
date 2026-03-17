@@ -1177,6 +1177,11 @@ def push_dataset(
     api.create_repo(
         repo_id, exist_ok=exist_ok, private=private, repo_type="dataset",
     )
+    total_size = sum(f.stat().st_size for f in tmpdir.rglob("*") if f.is_file())
+    logger.info(
+        "[SHARING] Uploading dataset (%.2f GB) via upload_large_folder",
+        total_size / 1e9,
+    )
     api.upload_large_folder(
         repo_id=repo_id,
         folder_path=str(tmpdir),
