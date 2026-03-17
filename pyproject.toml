@@ -70,10 +70,15 @@ hub = [
     "huggingface_hub>=0.20",
     "skops>=0.9",
 ]
+docs = [
+    "mkdocs-material>=9.0",
+    "mkdocstrings[python]>=0.24",
+    "mkdocs-section-index>=0.3",
+]
 
 [project.urls]
 Homepage = "https://github.com/AlliedToasters/lmprobe"
-Documentation = "https://github.com/AlliedToasters/lmprobe#readme"
+Documentation = "https://alliedtoasters.github.io/lmprobe"
 Repository = "https://github.com/AlliedToasters/lmprobe"
 
 [tool.hatch.build.targets.wheel]

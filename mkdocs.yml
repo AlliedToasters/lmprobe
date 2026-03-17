@@ -1,0 +1,79 @@
+site_name: lmprobe
+site_description: Train probes on language model activations for AI safety monitoring
+site_url: https://alliedtoasters.github.io/lmprobe
+repo_url: https://github.com/AlliedToasters/lmprobe
+repo_name: AlliedToasters/lmprobe
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - search.suggest
+    - content.code.copy
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_root_heading: true
+            show_source: false
+            heading_level: 2
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            docstring_style: numpy
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Guides:
+    - Contrastive Probing: guides/contrastive.md
+    - Layer Selection & Sweep: guides/layer-sweep.md
+    - Baselines: guides/baselines.md
+    - Remote Execution: guides/remote.md
+    - Caching: guides/caching.md
+  - API Reference:
+    - Probe: reference/probe.md
+    - Baseline: reference/baseline.md
+    - Pooling: reference/pooling.md
+    - Classifiers: reference/classifiers.md
+    - Cache: reference/cache.md
+  - Design:
+    - API Philosophy: design/001-api-philosophy.md
+    - Pooling Strategies: design/002-pooling-strategies.md
+    - Layer Selection: design/003-layer-selection.md
+    - Classifier Interface: design/004-classifier-interface.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
