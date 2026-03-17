@@ -1960,7 +1960,10 @@ def _collect_cache_entries() -> list[tuple[Path, int, float]]:
 
         # v2 safetensors files
         for sf_file in model_dir.glob("*.safetensors"):
-            stat = sf_file.stat()
+            try:
+                stat = sf_file.stat()
+            except FileNotFoundError:
+                continue  # File was deleted between listing and stat
             entries.append((sf_file, stat.st_size, stat.st_mtime))
 
         # v1 directories
