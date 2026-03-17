@@ -287,10 +287,13 @@ class TestConsolidateAndShard:
         desc = tensor_descriptors["hidden_layers"]
         assert desc["layers"] == [0, 1]
         assert desc["type"] == "hidden"
+        assert desc["layout"] == "per_layer"
 
-        # Verify shard files exist
-        for shard in desc["shards"]:
-            assert (tmpdir / shard["file"]).exists()
+        # Verify per-layer shard files exist
+        for shard_idx, shard in enumerate(desc["shards"]):
+            for layer in desc["layers"]:
+                fname = f"tensors/hidden_layer{layer:03d}_shard{shard_idx:03d}.safetensors"
+                assert (tmpdir / fname).exists()
 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -340,8 +343,8 @@ class TestConsolidateAndShard:
 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def test_co_located_layers(self, populated_cache):
-        """Verify multiple layers end up in the same shard file."""
+    def test_per_layer_files(self, populated_cache):
+        """Verify each layer gets its own shard file with a single key."""
         tensor_types = {
             "raw_layers": [],
             "pooled": {"last_token": [0, 1]},
@@ -361,12 +364,13 @@ class TestConsolidateAndShard:
 
         from safetensors import safe_open
 
-        shard_file = tmpdir / tensor_descriptors["hidden_layers"]["shards"][0]["file"]
-        with safe_open(str(shard_file), framework="pt") as f:
-            keys = list(f.keys())
-
-        assert "hidden.layer_0" in keys
-        assert "hidden.layer_1" in keys
+        for layer in [0, 1]:
+            fname = f"tensors/hidden_layer{layer:03d}_shard000.safetensors"
+            shard_file = tmpdir / fname
+            assert shard_file.exists()
+            with safe_open(str(shard_file), framework="pt") as f:
+                keys = list(f.keys())
+            assert keys == [f"hidden.layer_{layer}"]
 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -572,7 +576,7 @@ class TestPushDataset:
                     else:
                         uploaded_files[str(rel)] = f.read_bytes()
 
-        mock_api.upload_folder.side_effect = capture_upload
+        mock_api.upload_large_folder.side_effect = capture_upload
 
         url = push_dataset(
             repo_id="user/test-dataset",
@@ -584,7 +588,7 @@ class TestPushDataset:
 
         assert "user/test-dataset" in url
         mock_api.create_repo.assert_called_once()
-        mock_api.upload_folder.assert_called_once()
+        mock_api.upload_large_folder.assert_called_once()
 
         # Check file structure
         assert INFO_FILENAME in uploaded_files
@@ -595,6 +599,7 @@ class TestPushDataset:
         assert info["num_prompts"] == 3
         assert "hidden_layers" in info["tensors"]
         assert info["prompt_ordering"] == "random"
+        assert info["tensors"]["hidden_layers"]["layout"] == "per_layer"
 
     @patch("lmprobe.sharing._check_hub_deps")
     @patch("lmprobe.sharing._check_pyarrow")
@@ -645,7 +650,7 @@ class TestPushDataset:
 
 class TestLoadActivationDataset:
     def _setup_remote_files(self, tmp_path):
-        """Create remote files in the new format."""
+        """Create remote files in v1.1 per-layer format."""
         from safetensors.torch import save_file
 
         (tmp_path / "tensors").mkdir(parents=True)
@@ -654,11 +659,11 @@ class TestLoadActivationDataset:
         tensor = torch.randn(3, HIDDEN_DIM)
         save_file(
             {"hidden.layer_0": tensor},
-            str(tmp_path / "tensors" / "hidden_layers_000.safetensors"),
+            str(tmp_path / "tensors" / "hidden_layer000_shard000.safetensors"),
         )
 
         lmprobe_info = {
-            "format_version": "1.0",
+            "format_version": "1.1",
             "model": {"name": TEST_MODEL, "revision": None},
             "num_prompts": 3,
             "prompt_ordering": "random",
@@ -668,11 +673,11 @@ class TestLoadActivationDataset:
                     "layers": [0],
                     "dim": HIDDEN_DIM,
                     "dtype": "float32",
+                    "layout": "per_layer",
                     "pooling": "last_token",
                     "row_bytes": HIDDEN_DIM * 4,
                     "shards": [
                         {
-                            "file": "tensors/hidden_layers_000.safetensors",
                             "num_prompts": 3,
                         }
                     ],
@@ -742,7 +747,7 @@ class TestLoadActivationDataset:
 @requires_pyarrow
 class TestPullDataset:
     def _setup_remote_files(self, tmp_path):
-        """Create remote files in the new format."""
+        """Create remote files in v1.1 per-layer format."""
         import pyarrow as pa
         import pyarrow.parquet as pq
         from safetensors.torch import save_file
@@ -754,7 +759,7 @@ class TestPullDataset:
         tensor = torch.randn(3, HIDDEN_DIM)
         save_file(
             {"hidden.layer_0": tensor},
-            str(tmp_path / "tensors" / "hidden_layers_000.safetensors"),
+            str(tmp_path / "tensors" / "hidden_layer000_shard000.safetensors"),
         )
 
         # Write Parquet index
@@ -768,7 +773,7 @@ class TestPullDataset:
         pq.write_table(table, str(tmp_path / PARQUET_PATH))
 
         lmprobe_info = {
-            "format_version": "1.0",
+            "format_version": "1.1",
             "model": {"name": TEST_MODEL, "revision": None},
             "num_prompts": 3,
             "prompt_ordering": "random",
@@ -778,11 +783,11 @@ class TestPullDataset:
                     "layers": [0],
                     "dim": HIDDEN_DIM,
                     "dtype": "float32",
+                    "layout": "per_layer",
                     "pooling": "last_token",
                     "row_bytes": HIDDEN_DIM * 4,
                     "shards": [
                         {
-                            "file": "tensors/hidden_layers_000.safetensors",
                             "num_prompts": 3,
                         }
                     ],
@@ -839,7 +844,7 @@ class TestLazyPullDataset:
     """Tests for lazy (default) pull_dataset behavior."""
 
     def _setup_remote_files(self, tmp_path):
-        """Create remote files in the new format (same as TestPullDataset)."""
+        """Create remote files in v1.1 per-layer format."""
         import pyarrow as pa
         import pyarrow.parquet as pq
         from safetensors.torch import save_file
@@ -851,7 +856,7 @@ class TestLazyPullDataset:
         tensor = torch.randn(3, HIDDEN_DIM)
         save_file(
             {"hidden.layer_0": tensor},
-            str(tmp_path / "tensors" / "hidden_layers_000.safetensors"),
+            str(tmp_path / "tensors" / "hidden_layer000_shard000.safetensors"),
         )
 
         table = pa.table({
@@ -864,7 +869,7 @@ class TestLazyPullDataset:
         pq.write_table(table, str(tmp_path / PARQUET_PATH))
 
         lmprobe_info = {
-            "format_version": "1.0",
+            "format_version": "1.1",
             "model": {"name": TEST_MODEL, "revision": None},
             "num_prompts": 3,
             "prompt_ordering": "random",
@@ -874,11 +879,11 @@ class TestLazyPullDataset:
                     "layers": [0],
                     "dim": HIDDEN_DIM,
                     "dtype": "float32",
+                    "layout": "per_layer",
                     "pooling": "last_token",
                     "row_bytes": HIDDEN_DIM * 4,
                     "shards": [
                         {
-                            "file": "tensors/hidden_layers_000.safetensors",
                             "num_prompts": 3,
                         }
                     ],
@@ -1035,7 +1040,7 @@ class TestLazyPullDataset:
             assert torch.allclose(pooled, tensor[i : i + 1], atol=1e-6)
 
     def _setup_raw_remote_files(self, tmp_path):
-        """Create remote files with full_sequence storage."""
+        """Create remote files with full_sequence storage (v1.1 per-layer)."""
         import pyarrow as pa
         import pyarrow.parquet as pq
         from safetensors.torch import save_file
@@ -1051,14 +1056,15 @@ class TestLazyPullDataset:
         total_tokens = sum(seq_lens)
         layer_tensors = {}
         for layer in layers:
-            layer_tensors[f"hidden.layer_{layer}"] = torch.randn(
-                total_tokens, HIDDEN_DIM
+            t = torch.randn(total_tokens, HIDDEN_DIM)
+            layer_tensors[f"hidden.layer_{layer}"] = t
+            save_file(
+                {f"hidden.layer_{layer}": t},
+                str(
+                    tmp_path / "tensors"
+                    / f"hidden_layer{layer:03d}_shard000.safetensors"
+                ),
             )
-
-        save_file(
-            layer_tensors,
-            str(tmp_path / "tensors" / "hidden_layers_000.safetensors"),
-        )
 
         token_offsets = [0, seq_lens[0]]
         table = pa.table({
@@ -1072,7 +1078,7 @@ class TestLazyPullDataset:
         pq.write_table(table, str(tmp_path / PARQUET_PATH))
 
         lmprobe_info = {
-            "format_version": "1.0",
+            "format_version": "1.1",
             "model": {"name": TEST_MODEL, "revision": None},
             "num_prompts": 2,
             "prompt_ordering": "sequential",
@@ -1083,11 +1089,11 @@ class TestLazyPullDataset:
                     "dim": HIDDEN_DIM,
                     "dtype": "float32",
                     "storage": "full_sequence",
+                    "layout": "per_layer",
                     "pooling": "last_token",
                     "row_bytes": HIDDEN_DIM * 4,
                     "shards": [
                         {
-                            "file": "tensors/hidden_layers_000.safetensors",
                             "num_prompts": 2,
                         }
                     ],
@@ -1180,7 +1186,7 @@ class TestRoundtrip:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(str(f), str(dest))
 
-        mock_api.upload_folder.side_effect = capture_upload
+        mock_api.upload_large_folder.side_effect = capture_upload
 
         with (
             patch("lmprobe.sharing._check_hub_deps"),
@@ -1271,7 +1277,7 @@ class TestRoundtrip:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(str(f), str(dest))
 
-        mock_api.upload_folder.side_effect = capture_upload
+        mock_api.upload_large_folder.side_effect = capture_upload
 
         with (
             patch("lmprobe.sharing._check_hub_deps"),
@@ -1339,7 +1345,7 @@ class TestRoundtrip:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(str(f), str(dest))
 
-        mock_api.upload_folder.side_effect = capture_upload
+        mock_api.upload_large_folder.side_effect = capture_upload
 
         with (
             patch("lmprobe.sharing._check_hub_deps"),
@@ -1364,7 +1370,7 @@ class TestRoundtrip:
         assert set(table.column("label").to_pylist()) == {0, 1}
 
     def test_safetensors_standalone_readable(self, tmp_path, monkeypatch):
-        """Verify safetensors shards have co-located layer keys."""
+        """Verify per-layer safetensors shards have single key each."""
         from safetensors import safe_open
 
         src_cache = tmp_path / "src_cache"
@@ -1391,7 +1397,7 @@ class TestRoundtrip:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(str(f), str(dest))
 
-        mock_api.upload_folder.side_effect = capture_upload
+        mock_api.upload_large_folder.side_effect = capture_upload
 
         with (
             patch("lmprobe.sharing._check_hub_deps"),
@@ -1404,19 +1410,21 @@ class TestRoundtrip:
                 exist_ok=True,
             )
 
-        # Find and read the shard file
-        shard_files = list(
-            (remote_dir / "tensors").glob("hidden_layers_*.safetensors")
-        )
-        assert len(shard_files) >= 1
+        # Per-layer files: hidden_layer{L}_shard{S}.safetensors
+        for layer in [0, 1]:
+            shard_files = list(
+                (remote_dir / "tensors").glob(
+                    f"hidden_layer{layer:03d}_shard*.safetensors"
+                )
+            )
+            assert len(shard_files) >= 1
 
-        with safe_open(str(shard_files[0]), framework="pt") as f:
-            keys = list(f.keys())
-            assert "hidden.layer_0" in keys
-            assert "hidden.layer_1" in keys
+            with safe_open(str(shard_files[0]), framework="pt") as f:
+                keys = list(f.keys())
+                assert keys == [f"hidden.layer_{layer}"]
 
-            layer_0 = f.get_tensor("hidden.layer_0")
-            assert layer_0.shape == (2, HIDDEN_DIM)
+                tensor = f.get_tensor(f"hidden.layer_{layer}")
+                assert tensor.shape == (2, HIDDEN_DIM)
 
 
 # =============================================================================
@@ -1555,7 +1563,7 @@ class TestPushMetadataValidation:
                     else:
                         uploaded_files[str(rel)] = f.read_bytes()
 
-        mock_api.upload_folder.side_effect = capture_upload
+        mock_api.upload_large_folder.side_effect = capture_upload
 
         meta = [
             {"statement_id": "s0", "category": "cities"},
@@ -1666,7 +1674,8 @@ class TestConsolidateRawActivations:
             repo_id="user/raw-test",
         )
 
-        shard_file = tmpdir / tensor_descriptors["hidden_layers"]["shards"][0]["file"]
+        # Per-layer file for layer 0
+        shard_file = tmpdir / "tensors/hidden_layer000_shard000.safetensors"
         with safe_open(str(shard_file), framework="pt") as f:
             layer_0 = f.get_tensor("hidden.layer_0")
             # Total tokens = 3 + 5 + 4 = 12 (may be shuffled but total same)
@@ -1733,7 +1742,7 @@ class TestFullSequenceRoundtrip:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(str(f), str(dest))
 
-        mock_api.upload_folder.side_effect = capture_upload
+        mock_api.upload_large_folder.side_effect = capture_upload
 
         with (
             patch("lmprobe.sharing._check_hub_deps"),
@@ -1818,7 +1827,7 @@ class TestFullSequenceRoundtrip:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(str(f), str(dest))
 
-        mock_api.upload_folder.side_effect = capture_upload
+        mock_api.upload_large_folder.side_effect = capture_upload
 
         with (
             patch("lmprobe.sharing._check_hub_deps"),
@@ -1893,7 +1902,7 @@ class TestFullSequenceWithLogits:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(str(f), str(dest))
 
-        mock_api.upload_folder.side_effect = capture_upload
+        mock_api.upload_large_folder.side_effect = capture_upload
 
         with (
             patch("lmprobe.sharing._check_hub_deps"),
@@ -1981,3 +1990,330 @@ class TestPooledStorageUnchanged:
             assert "row_offset" in pm
 
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# =============================================================================
+# v1.0 backward-compatibility tests
+# =============================================================================
+
+
+class TestV10BackwardCompat:
+    """Test that v1.0 co-located datasets are still readable."""
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_load_activation_dataset_v10(self, mock_deps, tmp_path):
+        """load_activation_dataset reads v1.0 co-located format."""
+        from safetensors.torch import save_file
+
+        (tmp_path / "tensors").mkdir(parents=True)
+
+        tensor = torch.randn(3, HIDDEN_DIM)
+        tensor1 = torch.randn(3, HIDDEN_DIM)
+        save_file(
+            {"hidden.layer_0": tensor, "hidden.layer_1": tensor1},
+            str(tmp_path / "tensors" / "hidden_layers_000.safetensors"),
+        )
+
+        lmprobe_info = {
+            "format_version": "1.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 3,
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0, 1],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "shards": [
+                        {
+                            "file": "tensors/hidden_layers_000.safetensors",
+                            "num_prompts": 3,
+                        }
+                    ],
+                }
+            },
+            "provenance": {},
+        }
+        with open(tmp_path / INFO_FILENAME, "w") as f:
+            json.dump(lmprobe_info, f)
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(tmp_path / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            result, info = load_activation_dataset("user/v10-test")
+
+        assert "hidden.layer_0" in result
+        assert "hidden.layer_1" in result
+        assert result["hidden.layer_0"].shape == (3, HIDDEN_DIM)
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_pull_v10_colocated(self, mock_deps, tmp_path, cache_dir):
+        """pull_dataset reads v1.0 co-located format."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from safetensors.torch import save_file
+
+        remote_dir = tmp_path / "remote"
+        (remote_dir / "tensors").mkdir(parents=True)
+        (remote_dir / "index").mkdir(parents=True)
+
+        prompts = ["v10 prompt 0", "v10 prompt 1"]
+        tensor = torch.randn(2, HIDDEN_DIM)
+        save_file(
+            {"hidden.layer_0": tensor},
+            str(remote_dir / "tensors" / "hidden_layers_000.safetensors"),
+        )
+
+        table = pa.table({
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([None, None], type=pa.int32()),
+            "num_tokens": pa.array([5, 5], type=pa.int32()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1], type=pa.int32()),
+        })
+        pq.write_table(table, str(remote_dir / PARQUET_PATH))
+
+        lmprobe_info = {
+            "format_version": "1.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 2,
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "pooling": "last_token",
+                    "row_bytes": HIDDEN_DIM * 4,
+                    "shards": [
+                        {
+                            "file": "tensors/hidden_layers_000.safetensors",
+                            "num_prompts": 2,
+                        }
+                    ],
+                }
+            },
+            "provenance": {},
+        }
+        with open(remote_dir / INFO_FILENAME, "w") as f:
+            json.dump(lmprobe_info, f)
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            count = pull_dataset("user/v10-test")
+
+        assert count == 2
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_layers_param_ignored_v10(self, mock_deps, tmp_path):
+        """layers param on v1.0 dataset emits warning and is ignored."""
+        from safetensors.torch import save_file
+
+        (tmp_path / "tensors").mkdir(parents=True)
+
+        tensor = torch.randn(3, HIDDEN_DIM)
+        tensor1 = torch.randn(3, HIDDEN_DIM)
+        save_file(
+            {"hidden.layer_0": tensor, "hidden.layer_1": tensor1},
+            str(tmp_path / "tensors" / "hidden_layers_000.safetensors"),
+        )
+
+        lmprobe_info = {
+            "format_version": "1.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 3,
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0, 1],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "shards": [
+                        {
+                            "file": "tensors/hidden_layers_000.safetensors",
+                            "num_prompts": 3,
+                        }
+                    ],
+                }
+            },
+            "provenance": {},
+        }
+        with open(tmp_path / INFO_FILENAME, "w") as f:
+            json.dump(lmprobe_info, f)
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(tmp_path / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            with pytest.warns(UserWarning, match="layers parameter is ignored"):
+                result, info = load_activation_dataset(
+                    "user/v10-test", layers=[0],
+                )
+
+        # Both layers are returned despite layers=[0] filter
+        assert "hidden.layer_0" in result
+        assert "hidden.layer_1" in result
+
+
+@requires_pyarrow
+class TestLayersParam:
+    """Test selective layer download with layers parameter."""
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_load_activation_dataset_layers_filter(
+        self, mock_deps, tmp_path,
+    ):
+        """layers param downloads only requested layers."""
+        from safetensors.torch import save_file
+
+        (tmp_path / "tensors").mkdir(parents=True)
+
+        t0 = torch.randn(3, HIDDEN_DIM)
+        t1 = torch.randn(3, HIDDEN_DIM)
+        save_file(
+            {"hidden.layer_0": t0},
+            str(tmp_path / "tensors" / "hidden_layer000_shard000.safetensors"),
+        )
+        save_file(
+            {"hidden.layer_1": t1},
+            str(tmp_path / "tensors" / "hidden_layer001_shard000.safetensors"),
+        )
+
+        lmprobe_info = {
+            "format_version": "1.1",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 3,
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0, 1],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "layout": "per_layer",
+                    "pooling": "last_token",
+                    "row_bytes": HIDDEN_DIM * 4,
+                    "shards": [
+                        {"num_prompts": 3},
+                    ],
+                }
+            },
+            "provenance": {},
+        }
+        with open(tmp_path / INFO_FILENAME, "w") as f:
+            json.dump(lmprobe_info, f)
+
+        downloaded_files = []
+
+        def mock_download(repo_id, filename, **kwargs):
+            downloaded_files.append(filename)
+            return str(tmp_path / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            result, info = load_activation_dataset(
+                "user/test", layers=[0],
+            )
+
+        assert "hidden.layer_0" in result
+        assert "hidden.layer_1" not in result
+
+        # Only layer 0 shard should be downloaded (plus info file)
+        tensor_downloads = [
+            f for f in downloaded_files if f.startswith("tensors/")
+        ]
+        assert len(tensor_downloads) == 1
+        assert "hidden_layer000" in tensor_downloads[0]
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_pull_dataset_layers_filter(self, mock_deps, tmp_path, cache_dir):
+        """pull_dataset with layers only downloads requested layers."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from safetensors.torch import save_file
+
+        remote_dir = tmp_path / "remote"
+        (remote_dir / "tensors").mkdir(parents=True)
+        (remote_dir / "index").mkdir(parents=True)
+
+        prompts = ["prompt 0", "prompt 1"]
+        t0 = torch.randn(2, HIDDEN_DIM)
+        t1 = torch.randn(2, HIDDEN_DIM)
+        save_file(
+            {"hidden.layer_0": t0},
+            str(
+                remote_dir / "tensors"
+                / "hidden_layer000_shard000.safetensors"
+            ),
+        )
+        save_file(
+            {"hidden.layer_1": t1},
+            str(
+                remote_dir / "tensors"
+                / "hidden_layer001_shard000.safetensors"
+            ),
+        )
+
+        table = pa.table({
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([None, None], type=pa.int32()),
+            "num_tokens": pa.array([5, 5], type=pa.int32()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1], type=pa.int32()),
+        })
+        pq.write_table(table, str(remote_dir / PARQUET_PATH))
+
+        lmprobe_info = {
+            "format_version": "1.1",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 2,
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0, 1],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "layout": "per_layer",
+                    "pooling": "last_token",
+                    "row_bytes": HIDDEN_DIM * 4,
+                    "shards": [
+                        {"num_prompts": 2},
+                    ],
+                }
+            },
+            "provenance": {},
+        }
+        with open(remote_dir / INFO_FILENAME, "w") as f:
+            json.dump(lmprobe_info, f)
+
+        downloaded_files = []
+
+        def mock_download(repo_id, filename, **kwargs):
+            downloaded_files.append(filename)
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            count = pull_dataset("user/test", layers=[0])
+
+        assert count == 2
+
+        # Only layer 0 shard was downloaded (plus info + parquet)
+        tensor_downloads = [
+            f for f in downloaded_files if f.startswith("tensors/")
+        ]
+        assert len(tensor_downloads) == 1
+        assert "hidden_layer000" in tensor_downloads[0]

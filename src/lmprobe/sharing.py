@@ -8,8 +8,9 @@ and the HF Dataset Viewer.
 
 **Safetensors tensor store** (``tensors/``): large activation tensors stored
 as raw contiguous bytes.  Plays well with Xet's content-defined chunking
-for byte-level dedup.  Layers are co-located per shard; tensor types
-(hidden vs logits) are in separate files.
+for byte-level dedup.  Hidden layers use per-layer sharding (v1.1): each
+file contains a single layer across a batch of prompts.  Logits shards
+are unchanged (no layer axis).
 
 Everything lives in a single HF Dataset repo::
 
@@ -19,8 +20,10 @@ Everything lives in a single HF Dataset repo::
       index/
         train-00000-of-00001.parquet         # queryable prompt metadata
       tensors/
-        hidden_layers_000.safetensors        # all hidden layers for shard 0
-        logits_topk_000.safetensors          # topk logits for shard 0
+        hidden_layer000_shard000.safetensors  # layer 0 for shard 0
+        hidden_layer000_shard001.safetensors  # layer 0 for shard 1
+        hidden_layer001_shard000.safetensors  # layer 1 for shard 0
+        logits_topk_000.safetensors           # topk logits for shard 0
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ import logging
 import re
 import tempfile
 import warnings
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -51,7 +55,7 @@ from .cache import (
 
 logger = logging.getLogger(__name__)
 
-FORMAT_VERSION = "1.0"
+FORMAT_VERSION = "1.1"
 DEFAULT_SHARD_BYTES = 1_073_741_824  # 1 GB
 INFO_FILENAME = "lmprobe_info.json"
 PARQUET_PATH = "index/train-00000-of-00001.parquet"
@@ -605,7 +609,8 @@ def _consolidate_and_shard(
             per_prompt_bytes, shard_max_bytes,
         )
     else:
-        hidden_row_bytes = len(hidden_layers) * hidden_dim * 4  # float32
+        # Per-layer sharding: row_bytes is per single layer (not all layers)
+        hidden_row_bytes = hidden_dim * 4  # float32, single layer
         max_row_bytes = max(hidden_row_bytes, logits_row_bytes, 1)
         shard_boundaries = _compute_shard_boundaries(
             n, max_row_bytes, shard_max_bytes,
@@ -662,19 +667,19 @@ def _consolidate_and_shard(
                     f"{e}"
                 ) from e
 
-        # Write hidden_layers shard
+        # Write per-layer hidden shard files (v1.1 layout)
         if hidden_layers and (hidden_strategy or use_raw):
-            shard_tensors = {}
             for layer in hidden_layers:
                 key = f"hidden.layer_{layer}"
                 rows = [p[key] for p in shard_data if key in p]
                 if rows:
-                    shard_tensors[key] = torch.cat(rows, dim=0)
-
-            if shard_tensors:
-                fname = f"tensors/hidden_layers_{shard_idx:03d}.safetensors"
-                save_file(shard_tensors, str(tmpdir / fname))
-            del shard_tensors
+                    layer_tensor = {key: torch.cat(rows, dim=0)}
+                    fname = (
+                        f"tensors/hidden_layer{layer:03d}"
+                        f"_shard{shard_idx:03d}.safetensors"
+                    )
+                    save_file(layer_tensor, str(tmpdir / fname))
+                    del layer_tensor
 
         # Write logits_topk shard
         if has_logits and logits_top_k is not None:
@@ -709,7 +714,6 @@ def _consolidate_and_shard(
         for si, sz in enumerate(shard_boundaries):
             actual = min(sz, n - off)
             shard_desc: dict[str, Any] = {
-                "file": f"tensors/hidden_layers_{si:03d}.safetensors",
                 "num_prompts": actual,
             }
             if use_raw:
@@ -725,6 +729,7 @@ def _consolidate_and_shard(
             "layers": hidden_layers,
             "dim": hidden_dim,
             "dtype": "float32",
+            "layout": "per_layer",
             "shards": hidden_shards,
         }
         if use_raw:
@@ -732,7 +737,7 @@ def _consolidate_and_shard(
         else:
             hidden_desc["storage"] = "pooled"
             hidden_desc["pooling"] = hidden_strategy
-            hidden_desc["row_bytes"] = len(hidden_layers) * hidden_dim * 4
+            hidden_desc["row_bytes"] = hidden_dim * 4
 
         tensor_descriptors["hidden_layers"] = hidden_desc
 
@@ -942,11 +947,18 @@ def _build_readme(
     model_url = f"https://huggingface.co/{model_name}"
 
     # Find example shard and detect storage mode
-    example_shard = "tensors/hidden_layers_000.safetensors"
+    example_shard = "tensors/hidden_layer000_shard000.safetensors"
     is_full_sequence = False
     for info in tensor_descriptors.values():
         shards = info.get("shards", [])
-        if shards:
+        layout = info.get("layout")
+        if layout == "per_layer" and shards:
+            # Derive filename from convention
+            layers = info.get("layers", [0])
+            example_shard = (
+                f"tensors/hidden_layer{layers[0]:03d}_shard000.safetensors"
+            )
+        elif shards and "file" in shards[0]:
             example_shard = shards[0]["file"]
         if info.get("storage") == "full_sequence":
             is_full_sequence = True
@@ -1025,10 +1037,9 @@ with open("{INFO_FILENAME}") as f:
     info = json.load(f)
 print(list(info["tensors"].keys()))  # e.g. ["hidden_layers", "logits_topk"]
 
-# 3. Load a shard — layers are co-located, use safetensors partial read
-#    for single-layer access.
+# 3. Load a shard — per-layer files: hidden_layer{{L:03d}}_shard{{S:03d}}.safetensors
 with safe_open("{example_shard}", framework="pt") as f:
-    print(f.keys())  # e.g. ["hidden.layer_0", "hidden.layer_1"]
+    print(f.keys())  # e.g. ["hidden.layer_0"]
     layer_0 = f.get_tensor("hidden.layer_0")
 
 # 4. Map prompt index -> shard row
@@ -1240,10 +1251,96 @@ def push_dataset(
     return url
 
 
+@dataclass
+class DatasetMetadata:
+    """Metadata from a remote activation dataset.
+
+    Returned by :func:`fetch_dataset_metadata`.  Contains just enough
+    information to resolve layers, validate model compatibility, and
+    check prompt availability without downloading any tensor data.
+    """
+
+    model_name: str
+    available_layers: list[int]
+    num_prompts: int
+    format_version: str
+    tensor_descriptors: dict
+    prompts: list[str] = field(default_factory=list)
+
+
+def fetch_dataset_metadata(
+    repo_id: str,
+    *,
+    token: str | None = None,
+) -> DatasetMetadata:
+    """Fetch lightweight metadata from a remote activation dataset.
+
+    Downloads only ``lmprobe_info.json`` (~KB) and the Parquet index
+    (~KB–MB) — no tensor data is transferred.
+
+    Parameters
+    ----------
+    repo_id : str
+        HuggingFace Dataset repo ID (e.g. ``"user/my-activations"``).
+    token : str | None
+        HuggingFace API token.
+
+    Returns
+    -------
+    DatasetMetadata
+        Parsed metadata including model name, available layers, prompt
+        list, and tensor descriptors.
+    """
+    _check_hub_deps()
+    from huggingface_hub import hf_hub_download
+
+    info_path = hf_hub_download(
+        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
+    )
+    parquet_path = hf_hub_download(
+        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
+    )
+
+    with open(info_path) as f:
+        lmprobe_info = json.load(f)
+
+    model_name = lmprobe_info["model"]["name"]
+    format_version = lmprobe_info.get("format_version", "1.0")
+    tensor_descriptors = lmprobe_info.get("tensors", {})
+
+    # Extract available layers from hidden_layers descriptor
+    available_layers: list[int] = []
+    hidden_info = tensor_descriptors.get("hidden_layers", {})
+    if hidden_info.get("layout") == "per_layer":
+        available_layers = hidden_info.get("layers", [])
+    else:
+        # v1.0 co-located: all layers are available but not enumerated
+        # Try to infer from shard keys if possible
+        available_layers = hidden_info.get("layers", [])
+
+    # Read prompts from Parquet index
+    _check_pyarrow()
+    import pyarrow.parquet as pq
+
+    index_table = pq.read_table(parquet_path)
+    index = index_table.to_pydict()
+    prompts = index.get("text", [])
+
+    return DatasetMetadata(
+        model_name=model_name,
+        available_layers=available_layers,
+        num_prompts=len(prompts),
+        format_version=format_version,
+        tensor_descriptors=tensor_descriptors,
+        prompts=prompts,
+    )
+
+
 def pull_dataset(
     repo_id: str,
     *,
     tensors: list[str] | None = None,
+    layers: list[int] | None = None,
     target_prompts: list[str] | None = None,
     overwrite: bool = False,
     token: str | None = None,
@@ -1264,6 +1361,10 @@ def pull_dataset(
     tensors : list[str] | None
         Only pull these tensor types (``["hidden_layers"]``,
         ``["logits_topk"]``).  None pulls all.
+    layers : list[int] | None
+        Only download these hidden layers (e.g. ``[0, 1]``).  Requires
+        per-layer layout (v1.1).  On v1.0 co-located datasets, this
+        parameter is ignored with a warning.  None downloads all layers.
     target_prompts : list[str] | None
         Only pull these prompts.  None pulls all.
     overwrite : bool
@@ -1368,32 +1469,77 @@ def pull_dataset(
             needed_shards.setdefault(t_type, set()).add(shard_idx)
 
     # Download shard files and record local paths
+    # For per-layer layout (v1.1), we download per-layer files
+    # For co-located layout (v1.0), we download the single shard file
     shard_local_paths: dict[str, dict[int, str]] = {}  # t_type -> shard_idx -> path
+    # Per-layer: t_type -> shard_idx -> {layer: path}
+    per_layer_paths: dict[str, dict[int, dict[int, str]]] = {}
+
     for t_type in pull_types:
         t_info = tensor_descriptors[t_type]
         shards = t_info["shards"]
-        shard_local_paths[t_type] = {}
+        layout = t_info.get("layout")
 
-        for shard_idx in sorted(needed_shards.get(t_type, [])):
-            if shard_idx >= len(shards):
-                continue
-            shard = shards[shard_idx]
-            shard_path = hf_hub_download(
-                repo_id, shard["file"],
-                repo_type="dataset", token=token,
-            )
-            shard_local_paths[t_type][shard_idx] = shard_path
+        if layout == "per_layer":
+            # v1.1 per-layer layout: derive filenames
+            all_layers = t_info.get("layers", [])
+            download_layers = all_layers
+            if layers is not None:
+                download_layers = [ly for ly in all_layers if ly in layers]
+
+            per_layer_paths[t_type] = {}
+            for shard_idx in sorted(needed_shards.get(t_type, [])):
+                if shard_idx >= len(shards):
+                    continue
+                per_layer_paths[t_type][shard_idx] = {}
+                for layer in download_layers:
+                    fname = (
+                        f"tensors/hidden_layer{layer:03d}"
+                        f"_shard{shard_idx:03d}.safetensors"
+                    )
+                    shard_path = hf_hub_download(
+                        repo_id, fname,
+                        repo_type="dataset", token=token,
+                    )
+                    per_layer_paths[t_type][shard_idx][layer] = shard_path
+        else:
+            # v1.0 co-located layout
+            if layers is not None:
+                warnings.warn(
+                    "layers parameter is ignored for v1.0 co-located datasets "
+                    "(all layers are in the same file)",
+                    stacklevel=2,
+                )
+            shard_local_paths[t_type] = {}
+            for shard_idx in sorted(needed_shards.get(t_type, [])):
+                if shard_idx >= len(shards):
+                    continue
+                shard = shards[shard_idx]
+                shard_path = hf_hub_download(
+                    repo_id, shard["file"],
+                    repo_type="dataset", token=token,
+                )
+                shard_local_paths[t_type][shard_idx] = shard_path
 
     # ---- Build shard registry (manifest + index) ----
     # Manifest: tensor descriptors with local shard paths
     manifest_tensors = {}
     for t_type in pull_types:
         t_info = tensor_descriptors[t_type]
+        layout = t_info.get("layout")
         shards_with_paths = []
         for si, shard_meta in enumerate(t_info["shards"]):
             entry = dict(shard_meta)
-            if si in shard_local_paths.get(t_type, {}):
-                entry["local_path"] = shard_local_paths[t_type][si]
+            if layout == "per_layer":
+                # Store per-layer local paths (use string keys for JSON compat)
+                if si in per_layer_paths.get(t_type, {}):
+                    entry["per_layer_paths"] = {
+                        str(k): v
+                        for k, v in per_layer_paths[t_type][si].items()
+                    }
+            else:
+                if si in shard_local_paths.get(t_type, {}):
+                    entry["local_path"] = shard_local_paths[t_type][si]
             shards_with_paths.append(entry)
         manifest_tensors[t_type] = {
             **t_info,
@@ -1443,6 +1589,7 @@ def pull_dataset(
         prompt_indices=prompt_indices,
         needed_shards=needed_shards,
         shard_local_paths=shard_local_paths,
+        per_layer_paths=per_layer_paths,
         num_workers=num_workers,
     )
 
@@ -1454,7 +1601,7 @@ def _unpack_shard_prompts(
     model_name: str,
     t_type: str,
     t_info: dict,
-    shard_path: str,
+    shard_path: str | dict[int, str],
     shard_prompts: list[int],
     index: dict,
 ) -> None:
@@ -1462,13 +1609,28 @@ def _unpack_shard_prompts(
 
     This is the core materialization logic, extracted so it can be called
     from the main process or from a worker process.
+
+    Parameters
+    ----------
+    shard_path : str | dict[int, str]
+        For v1.0 co-located layout: path to the single shard file.
+        For v1.1 per-layer layout: dict mapping layer index to file path.
     """
     from safetensors import safe_open
     from tqdm import tqdm
 
-    with safe_open(shard_path, framework="pt") as f:
-        sf_keys = list(f.keys())
-        tensors_data = {k: f.get_tensor(k) for k in sf_keys}
+    if isinstance(shard_path, dict):
+        # Per-layer layout: load each per-layer file
+        tensors_data: dict[str, torch.Tensor] = {}
+        for layer, layer_path in shard_path.items():
+            with safe_open(layer_path, framework="pt") as f:
+                for k in f.keys():
+                    tensors_data[k] = f.get_tensor(k)
+        sf_keys = list(tensors_data.keys())
+    else:
+        with safe_open(shard_path, framework="pt") as f:
+            sf_keys = list(f.keys())
+            tensors_data = {k: f.get_tensor(k) for k in sf_keys}
 
     storage = t_info.get("storage", "pooled")
 
@@ -1567,27 +1729,41 @@ def _materialize_prompts(
     prompt_indices: list[int],
     needed_shards: dict[str, set[int]],
     shard_local_paths: dict[str, dict[int, str]],
+    per_layer_paths: dict[str, dict[int, dict[int, str]]] | None = None,
     num_workers: int = 0,
 ) -> None:
     """Unpack per-prompt files from shard files.
 
     If num_workers > 0, uses ProcessPoolExecutor for parallel unpacking.
     """
+    if per_layer_paths is None:
+        per_layer_paths = {}
+
     # Collect all (t_type, shard_idx, shard_path, shard_prompts) jobs
     jobs = []
     for t_type in pull_types:
         t_info = tensor_descriptors[t_type]
+        layout = t_info.get("layout")
+
         for shard_idx in sorted(needed_shards.get(t_type, [])):
-            if shard_idx not in shard_local_paths.get(t_type, {}):
-                continue
-            shard_path = shard_local_paths[t_type][shard_idx]
             shard_prompts = [
                 i for i in prompt_indices
                 if index["shard_index"][i] == shard_idx
             ]
             if not shard_prompts:
                 continue
-            jobs.append((t_type, t_info, shard_path, shard_prompts))
+
+            if layout == "per_layer":
+                # Per-layer: pass dict of layer paths as shard_path
+                layer_paths = per_layer_paths.get(t_type, {}).get(shard_idx)
+                if not layer_paths:
+                    continue
+                jobs.append((t_type, t_info, layer_paths, shard_prompts))
+            else:
+                if shard_idx not in shard_local_paths.get(t_type, {}):
+                    continue
+                shard_path = shard_local_paths[t_type][shard_idx]
+                jobs.append((t_type, t_info, shard_path, shard_prompts))
 
     if num_workers > 0:
         from concurrent.futures import ProcessPoolExecutor
@@ -1616,6 +1792,7 @@ def load_activation_dataset(
     repo_id: str,
     *,
     tensors: list[str] | None = None,
+    layers: list[int] | None = None,
     token: str | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict]:
     """Load tensors directly from a HuggingFace Dataset repo.
@@ -1630,6 +1807,10 @@ def load_activation_dataset(
     tensors : list[str] | None
         Only load these tensor types (``["hidden_layers"]``,
         ``["logits_topk"]``).  None loads all.
+    layers : list[int] | None
+        Only download these hidden layers.  Requires per-layer layout
+        (v1.1).  On v1.0 co-located datasets, ignored with a warning.
+        None downloads all layers.
     token : str | None
         HuggingFace API token.
 
@@ -1674,19 +1855,50 @@ def load_activation_dataset(
     for t_type in load_types:
         t_info = tensor_descriptors[t_type]
         shards = t_info["shards"]
+        layout = t_info.get("layout")
 
         shard_data: dict[str, list[torch.Tensor]] = {}
 
-        for shard in shards:
-            shard_path = hf_hub_download(
-                repo_id, shard["file"],
-                repo_type="dataset", token=token,
-            )
-            with safe_open(shard_path, framework="pt") as f:
-                for sf_key in f.keys():
-                    shard_data.setdefault(sf_key, []).append(
-                        f.get_tensor(sf_key)
+        if layout == "per_layer":
+            # v1.1 per-layer: derive filenames
+            all_layers = t_info.get("layers", [])
+            download_layers = all_layers
+            if layers is not None:
+                download_layers = [ly for ly in all_layers if ly in layers]
+
+            for shard_idx, _shard in enumerate(shards):
+                for layer in download_layers:
+                    fname = (
+                        f"tensors/hidden_layer{layer:03d}"
+                        f"_shard{shard_idx:03d}.safetensors"
                     )
+                    shard_path = hf_hub_download(
+                        repo_id, fname,
+                        repo_type="dataset", token=token,
+                    )
+                    with safe_open(shard_path, framework="pt") as f:
+                        for sf_key in f.keys():
+                            shard_data.setdefault(sf_key, []).append(
+                                f.get_tensor(sf_key)
+                            )
+        else:
+            # v1.0 co-located layout
+            if layers is not None:
+                warnings.warn(
+                    "layers parameter is ignored for v1.0 co-located "
+                    "datasets (all layers are in the same file)",
+                    stacklevel=2,
+                )
+            for shard in shards:
+                shard_path = hf_hub_download(
+                    repo_id, shard["file"],
+                    repo_type="dataset", token=token,
+                )
+                with safe_open(shard_path, framework="pt") as f:
+                    for sf_key in f.keys():
+                        shard_data.setdefault(sf_key, []).append(
+                            f.get_tensor(sf_key)
+                        )
 
         for sf_key, parts in shard_data.items():
             result[sf_key] = torch.cat(parts, dim=0)
