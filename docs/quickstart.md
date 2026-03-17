@@ -101,11 +101,8 @@ test_labels = [1, 0]  # ground truth
 accuracy = probe.score(test_prompts, test_labels)
 
 # Multiple metrics at once
-metrics = probe.evaluate(
-    test_prompts,
-    test_labels,
-    metrics=["accuracy", "precision", "recall", "f1", "roc_auc"],
-)
+metrics = probe.evaluate(test_prompts, test_labels)
+# {"accuracy": 0.85, "f1": 0.85, "precision": 0.88, "recall": 0.82, "auroc": 0.91, ...}
 ```
 
 ---

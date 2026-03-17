@@ -70,7 +70,10 @@ probe = Probe(
 probe.fit(positive_prompts, negative_prompts)
 
 importances = probe.compute_layer_importance(metric="l2")
-# {0: 0.03, 1: 0.05, ..., 31: 0.42}
+# array([0.03, 0.05, ..., 0.42]) — shape (n_layers,), sums to 1.0
+# Use probe.candidate_layers_ to map index → layer number
+best_idx = importances.argmax()
+print(f"Most important layer: {probe.candidate_layers_[best_idx]}")
 ```
 
 Visualize (requires `pip install lmprobe[plot]`):

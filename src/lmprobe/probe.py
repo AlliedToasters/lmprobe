@@ -1135,7 +1135,7 @@ class Probe:
         # Clone and fit classifier
         self.classifier_ = clone(self._classifier_template)
         self.classifier_.fit(X, labels)
-        self.classes_ = self.classifier_.classes_
+        self.classes_ = getattr(self.classifier_, "classes_", None)
 
         return self
 

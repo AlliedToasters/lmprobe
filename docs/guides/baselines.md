@@ -93,7 +93,7 @@ print(results.summary())
 #   random                         0.4906  (fit: 0.00s, predict: 0.00s)
 #   majority                       0.5556  (fit: 0.00s, predict: 0.00s)
 
-best = results.best()
+best = results.get_best()[0]
 print(f"Best baseline: {best.name} — {best.score:.2%}")
 
 # With activation baselines (requires model)

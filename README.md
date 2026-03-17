@@ -308,7 +308,10 @@ probe = Probe(
 probe.fit(positive_prompts, negative_prompts)
 
 # Compute per-layer importance scores
+# Returns np.ndarray of shape (n_layers,), normalized to sum to 1.0
 importances = probe.compute_layer_importance(metric="l2")
+best_idx = importances.argmax()
+print(f"Most important layer: {probe.candidate_layers_[best_idx]}")
 
 # Visualize layer importance (requires: pip install lmprobe[plot])
 probe.plot_layer_importance()
@@ -356,12 +359,8 @@ Beyond `score()`, the `evaluate()` method computes multiple metrics at once:
 ```python
 probe.fit(positive_prompts, negative_prompts)
 
-metrics = probe.evaluate(
-    test_prompts,
-    test_labels,
-    metrics=["accuracy", "precision", "recall", "f1", "roc_auc"],
-)
-# {"accuracy": 0.85, "precision": 0.88, "recall": 0.82, "f1": 0.85, "roc_auc": 0.91}
+metrics = probe.evaluate(test_prompts, test_labels)
+# {"accuracy": 0.85, "f1": 0.85, "precision": 0.88, "recall": 0.82, "auroc": 0.91, ...}
 ```
 
 ---
@@ -675,7 +674,7 @@ print(results.summary())
 #   ...
 
 # Get best baseline
-best = results.best()
+best = results.get_best()[0]
 print(f"Best baseline: {best.name} with {best.score:.2%} accuracy")
 
 # With activation baselines (requires model)
