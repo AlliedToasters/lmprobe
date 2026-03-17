@@ -656,12 +656,11 @@ def _consolidate_and_shard(
 
                 shard_data.append(loaded)
             except (FileNotFoundError, KeyError, OSError) as e:
-                logger.warning(
-                    f"[SHARING] Failed to load prompt during shard write "
-                    f"(was valid during scan): {e}"
-                )
-                # Append empty dict to preserve alignment with metadata
-                shard_data.append({})
+                raise OSError(
+                    f"Prompt passed metadata scan but failed to load during "
+                    f"shard write (cache may have been modified concurrently): "
+                    f"{e}"
+                ) from e
 
         # Write hidden_layers shard
         if hidden_layers and (hidden_strategy or use_raw):
