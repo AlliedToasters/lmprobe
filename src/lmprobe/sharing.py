@@ -630,14 +630,10 @@ def _consolidate_and_shard(
 
     # --- Hidden pass ---
     if has_hidden and hidden_boundaries:
+        # Phase 4a: Assign shard metadata (no data loading yet)
         offset = 0
         token_offset_acc = 0
-        for shard_idx, shard_size in enumerate(tqdm(
-            hidden_boundaries, desc="Writing hidden shards", unit="shard",
-        )):
-            shard_prompts_text = valid_prompts[offset : offset + shard_size]
-
-            # Assign per-type shard metadata
+        for shard_idx, shard_size in enumerate(hidden_boundaries):
             for local_row in range(shard_size):
                 global_row = offset + local_row
                 if global_row < len(prompt_metadata):
@@ -650,46 +646,52 @@ def _consolidate_and_shard(
                         prompt_metadata[global_row]["token_offset_hidden"] = token_offset_acc
                         prompt_metadata[global_row]["token_offset"] = token_offset_acc
                         token_offset_acc += per_prompt_tokens[global_row]
+            offset += shard_size
 
-            # Load and write hidden tensors for this shard
-            shard_data: list[dict] = []
-            for prompt in shard_prompts_text:
-                try:
-                    loaded: dict[str, torch.Tensor] = {}
-                    if use_raw:
-                        layer_tensors, _ = _load_hidden_raw_for_prompt(
-                            model_name, prompt, hidden_layers,
-                        )
-                        loaded.update(layer_tensors)
-                    elif hidden_strategy:
-                        layer_tensors = _load_hidden_for_prompt(
-                            model_name, prompt, hidden_layers, hidden_strategy,
-                        )
-                        loaded.update(layer_tensors)
-                    shard_data.append(loaded)
-                except (FileNotFoundError, KeyError, OSError) as e:
-                    raise OSError(
-                        f"Prompt passed metadata scan but failed to load during "
-                        f"shard write (cache may have been modified concurrently): "
-                        f"{e}"
-                    ) from e
-
+        # Phase 4b: Write per-layer shard files one layer at a time.
+        # Loop order: layer → shard, so peak RAM = one shard's worth of one layer
+        # (not all layers × all prompts as the old order required).
+        total_layer_shards = len(hidden_layers) * len(hidden_boundaries)
+        with tqdm(
+            total=total_layer_shards, desc="Writing hidden shards", unit="shard"
+        ) as pbar:
             for layer in hidden_layers:
                 key = f"hidden.layer_{layer}"
-                rows = [p[key] for p in shard_data if key in p]
-                if rows:
-                    layer_tensor = {key: torch.cat(rows, dim=0)}
-                    fname = (
-                        f"tensors/hidden_layer{layer:03d}"
-                        f"_shard{shard_idx:03d}.safetensors"
-                    )
-                    save_file(layer_tensor, str(tmpdir / fname))
-                    del layer_tensor
-
-            del shard_data
-            offset += shard_size
-            if not use_raw:
-                token_offset_acc = 0  # reset per shard only matters for raw
+                offset = 0
+                for shard_idx, shard_size in enumerate(hidden_boundaries):
+                    shard_prompts_text = valid_prompts[offset : offset + shard_size]
+                    rows: list[torch.Tensor] = []
+                    for prompt in shard_prompts_text:
+                        try:
+                            if use_raw:
+                                layer_tensors, _ = _load_hidden_raw_for_prompt(
+                                    model_name, prompt, [layer],
+                                )
+                            elif hidden_strategy:
+                                layer_tensors = _load_hidden_for_prompt(
+                                    model_name, prompt, [layer], hidden_strategy,
+                                )
+                            else:
+                                layer_tensors = {}
+                            if key in layer_tensors:
+                                rows.append(layer_tensors[key])
+                        except (FileNotFoundError, KeyError, OSError) as e:
+                            raise OSError(
+                                f"Prompt passed metadata scan but failed to load during "
+                                f"shard write (cache may have been modified concurrently): "
+                                f"{e}"
+                            ) from e
+                    if rows:
+                        layer_tensor = {key: torch.cat(rows, dim=0)}
+                        fname = (
+                            f"tensors/hidden_layer{layer:03d}"
+                            f"_shard{shard_idx:03d}.safetensors"
+                        )
+                        save_file(layer_tensor, str(tmpdir / fname))
+                        del layer_tensor
+                    del rows
+                    offset += shard_size
+                    pbar.update(1)
 
     # --- Logits pass ---
     if want_logits and logits_boundaries:
