@@ -64,12 +64,13 @@ def pool_last_token(
         return activations[:, -1, :]
 
     # Find the last non-padding position for each sequence
-    # attention_mask is 1 for real tokens, 0 for padding
-    seq_lengths = attention_mask.sum(dim=1)  # (batch,)
-    last_indices = (seq_lengths - 1).long()  # (batch,)
+    # Works for both left-padding and right-padding
+    batch_size = activations.shape[0]
+    last_indices = torch.stack(
+        [attention_mask[i].nonzero(as_tuple=True)[0][-1] for i in range(batch_size)]
+    )
 
     # Gather the last token for each sequence
-    batch_size = activations.shape[0]
     batch_indices = torch.arange(batch_size, device=activations.device)
     return activations[batch_indices, last_indices, :]
 
