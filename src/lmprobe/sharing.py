@@ -949,7 +949,6 @@ def _build_readme(
     # Find example shard and detect storage mode
     example_shard = "tensors/hidden_layer000_shard000.safetensors"
     is_full_sequence = False
-    is_per_layer = False
     for info in tensor_descriptors.values():
         shards = info.get("shards", [])
         layout = info.get("layout")
@@ -959,7 +958,6 @@ def _build_readme(
             example_shard = (
                 f"tensors/hidden_layer{layers[0]:03d}_shard000.safetensors"
             )
-            is_per_layer = True
         elif shards and "file" in shards[0]:
             example_shard = shards[0]["file"]
         if info.get("storage") == "full_sequence":
@@ -1487,7 +1485,7 @@ def pull_dataset(
             all_layers = t_info.get("layers", [])
             download_layers = all_layers
             if layers is not None:
-                download_layers = [l for l in all_layers if l in layers]
+                download_layers = [ly for ly in all_layers if ly in layers]
 
             per_layer_paths[t_type] = {}
             for shard_idx in sorted(needed_shards.get(t_type, [])):
@@ -1863,7 +1861,7 @@ def load_activation_dataset(
             all_layers = t_info.get("layers", [])
             download_layers = all_layers
             if layers is not None:
-                download_layers = [l for l in all_layers if l in layers]
+                download_layers = [ly for ly in all_layers if ly in layers]
 
             for shard_idx, _shard in enumerate(shards):
                 for layer in download_layers:
