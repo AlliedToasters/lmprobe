@@ -50,6 +50,7 @@ nav:
     - Contrastive Probing: guides/contrastive.md
     - Layer Selection & Sweep: guides/layer-sweep.md
     - HuggingFace Datasets: guides/datasets.md
+    - 'Tutorial: Geometry of Truth': guides/got-tutorial.md
     - Baselines: guides/baselines.md
     - Remote Execution: guides/remote.md
     - Caching: guides/caching.md
