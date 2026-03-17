@@ -618,8 +618,8 @@ class Probe:
                 missing.append(prompt)
                 continue
 
-            # Pool single prompt: unsqueeze to (1, seq_len, hidden_dim)
-            pooled = pool_fn(acts.unsqueeze(0), mask.unsqueeze(0))
+            # acts is already (1, seq_len, hidden_dim); mask is (1, seq_len)
+            pooled = pool_fn(acts, mask)
             pooled_rows.append(pooled.detach().cpu().float())
 
         if missing:
