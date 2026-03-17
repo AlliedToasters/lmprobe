@@ -1414,9 +1414,9 @@ def save_prompt_logits(
 
     # Select positions
     if positions == "last":
-        # Find last non-padding position
+        # Find last non-padding position (works for both left- and right-padding)
         mask = attention_mask[0]  # (seq_len,)
-        last_pos = mask.sum().long().item() - 1
+        last_pos = mask.nonzero(as_tuple=True)[0][-1].item()
         selected_logits = logits[:, last_pos : last_pos + 1, :]  # (1, 1, vocab_size)
     elif positions == "all":
         selected_logits = logits  # (1, seq_len, vocab_size)
@@ -1474,8 +1474,9 @@ def save_prompt_topk_logits(
 
     # Select positions
     if positions == "last":
+        # Find last non-padding position (works for both left- and right-padding)
         mask = attention_mask[0]  # (seq_len,)
-        last_pos = mask.sum().long().item() - 1
+        last_pos = mask.nonzero(as_tuple=True)[0][-1].item()
         selected_values = values[:, last_pos : last_pos + 1, :]  # (1, 1, K)
         selected_indices = indices[:, last_pos : last_pos + 1, :]  # (1, 1, K)
     elif positions == "all":
