@@ -49,12 +49,14 @@ nav:
   - Guides:
     - Contrastive Probing: guides/contrastive.md
     - Layer Selection & Sweep: guides/layer-sweep.md
+    - HuggingFace Datasets: guides/datasets.md
     - Baselines: guides/baselines.md
     - Remote Execution: guides/remote.md
     - Caching: guides/caching.md
   - API Reference:
     - Probe: reference/probe.md
     - Baseline: reference/baseline.md
+    - Datasets: reference/datasets.md
     - Pooling: reference/pooling.md
     - Classifiers: reference/classifiers.md
     - Cache: reference/cache.md
