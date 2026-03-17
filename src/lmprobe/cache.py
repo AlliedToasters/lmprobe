@@ -44,6 +44,14 @@ import torch
 from .cache_backends import CacheBackend, LocalCacheBackend
 
 # =============================================================================
+# Shard registry types (lazy caching for pull_dataset)
+# =============================================================================
+
+# In-memory caches for shard manifest/index JSON to avoid re-reading on every call.
+_shard_manifests: dict[str, dict] = {}
+_shard_indices: dict[str, dict] = {}
+
+# =============================================================================
 # Logging
 # =============================================================================
 
@@ -372,10 +380,18 @@ def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
         if isinstance(backend, LocalCacheBackend):
             cache_dir = get_prompt_cache_dir(model_name, prompt)
             if not cache_dir.exists():
+                # Try shard registry before giving up
+                shard_info = _discover_from_shard(model_name, prompt)
+                if shard_info is not None:
+                    return shard_info
                 return None
             # v1 has limited info — just raw layers and maybe perplexity
             raw_layers = sorted(get_prompt_cached_layers(cache_dir))
             if not raw_layers:
+                # Try shard registry
+                shard_info = _discover_from_shard(model_name, prompt)
+                if shard_info is not None:
+                    return shard_info
                 return None
             has_perplexity = (cache_dir / "perplexity.pt").exists()
             # Check for v1 pooled dirs
@@ -406,7 +422,8 @@ def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
                 has_perplexity=has_perplexity,
                 num_tokens=num_tokens,
             )
-        return None
+        # Non-local backend, no v1/v2 cache — try shard registry
+        return _discover_from_shard(model_name, prompt)
 
     # v2: parse safetensors keys
     tensor_keys = _get_tensor_keys_from_backend(key)
@@ -719,6 +736,344 @@ def _read_model_name(model_dir: Path) -> str | None:
 
 
 # =============================================================================
+# Shard Registry I/O (lazy caching for pull_dataset)
+# =============================================================================
+
+
+def _shard_manifest_key(model_name: str) -> str:
+    """Backend key for the shard manifest JSON."""
+    model_hash = _hash_string(model_name)
+    return f"{model_hash}/_shard_manifest.json"
+
+
+def _shard_index_key(model_name: str) -> str:
+    """Backend key for the shard index JSON."""
+    model_hash = _hash_string(model_name)
+    return f"{model_hash}/_shard_index.json"
+
+
+def write_shard_registry(
+    model_name: str,
+    manifest: dict,
+    index: dict,
+) -> None:
+    """Write shard manifest and index to the cache backend.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    manifest : dict
+        Repo-level metadata: model name, tensor descriptors, shard file paths.
+    index : dict
+        Per-prompt offsets: prompt_hash -> {shard_index, row_offset, ...}.
+    """
+    _register_model(model_name)
+    backend = get_backend()
+
+    m_key = _shard_manifest_key(model_name)
+    i_key = _shard_index_key(model_name)
+
+    backend.write_text(m_key, json.dumps(manifest))
+    backend.write_text(i_key, json.dumps(index))
+
+    # Update in-memory caches
+    _shard_manifests[model_name] = manifest
+    _shard_indices[model_name] = index
+
+
+def _load_shard_manifest(model_name: str) -> dict | None:
+    """Load shard manifest, using in-memory cache if available."""
+    if model_name in _shard_manifests:
+        return _shard_manifests[model_name]
+
+    backend = get_backend()
+    key = _shard_manifest_key(model_name)
+    if not backend.exists(key):
+        return None
+
+    manifest = json.loads(backend.read_text(key))
+    _shard_manifests[model_name] = manifest
+    return manifest
+
+
+def _load_shard_index(model_name: str) -> dict | None:
+    """Load shard index, using in-memory cache if available."""
+    if model_name in _shard_indices:
+        return _shard_indices[model_name]
+
+    backend = get_backend()
+    key = _shard_index_key(model_name)
+    if not backend.exists(key):
+        return None
+
+    index = json.loads(backend.read_text(key))
+    _shard_indices[model_name] = index
+    return index
+
+
+def _lookup_shard(
+    model_name: str, prompt: str
+) -> dict | None:
+    """Look up shard info for a prompt from the shard index.
+
+    Returns
+    -------
+    dict | None
+        Entry from the shard index with keys like shard_index, row_offset,
+        token_offset, num_tokens. None if not found.
+    """
+    index = _load_shard_index(model_name)
+    if index is None:
+        return None
+    prompt_hash = _hash_string(prompt)
+    return index.get(prompt_hash)
+
+
+def _discover_from_shard(model_name: str, prompt: str) -> CachedPromptInfo | None:
+    """Build CachedPromptInfo from shard manifest metadata (no data loading)."""
+    entry = _lookup_shard(model_name, prompt)
+    if entry is None:
+        return None
+
+    manifest = _load_shard_manifest(model_name)
+    if manifest is None:
+        return None
+
+    tensor_descs = manifest.get("tensors", {})
+    raw_layers: list[int] = []
+    pooled: dict[str, list[int]] = {}
+    has_logits = False
+    logits_top_k = None
+    has_perplexity = False
+    num_tokens = entry.get("num_tokens")
+
+    for t_type, t_info in tensor_descs.items():
+        layers = t_info.get("layers", [])
+        storage = t_info.get("storage", "pooled")
+        if t_type == "hidden_layers":
+            if storage == "full_sequence":
+                raw_layers = sorted(layers)
+                # full_sequence shards also provide last_token pooled
+                pooling = t_info.get("pooling", "last_token")
+                pooled[pooling] = sorted(layers)
+            else:
+                pooling = t_info.get("pooling", "last_token")
+                pooled[pooling] = sorted(layers)
+        elif t_type == "logits_topk":
+            has_logits = True
+            logits_top_k = t_info.get("top_k")
+
+    return CachedPromptInfo(
+        raw_layers=raw_layers,
+        pooled=pooled,
+        has_logits=has_logits,
+        logits_top_k=logits_top_k,
+        has_perplexity=has_perplexity,
+        num_tokens=num_tokens,
+    )
+
+
+def _load_raw_from_shard(
+    model_name: str, prompt: str, layers: list[int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load raw activations for a prompt by slicing from a shard file.
+
+    Returns (activations, attention_mask) like load_prompt_activations.
+    """
+    import re
+
+    from safetensors import safe_open
+
+    entry = _lookup_shard(model_name, prompt)
+    if entry is None:
+        raise FileNotFoundError(
+            f"No shard entry found for prompt: {prompt!r}"
+        )
+
+    manifest = _load_shard_manifest(model_name)
+    if manifest is None:
+        raise FileNotFoundError("No shard manifest found")
+
+    t_info = manifest["tensors"].get("hidden_layers")
+    if t_info is None:
+        raise FileNotFoundError("No hidden_layers in shard manifest")
+
+    storage = t_info.get("storage", "pooled")
+    if storage != "full_sequence":
+        raise FileNotFoundError(
+            "Raw activations require full_sequence storage, "
+            f"but shard has storage={storage!r}"
+        )
+
+    shard_idx = entry["shard_index"]
+    tok_off = entry["token_offset"]
+    num_tok = entry["num_tokens"]
+    hidden_dim = t_info.get("dim", 0)
+
+    shards = t_info["shards"]
+    if shard_idx >= len(shards):
+        raise FileNotFoundError(
+            f"Shard index {shard_idx} out of range (have {len(shards)} shards)"
+        )
+
+    shard_path = shards[shard_idx]["local_path"]
+    if not Path(shard_path).exists():
+        raise FileNotFoundError(
+            f"Shard file not found: {shard_path}. "
+            "The HF hub cache may have been evicted. "
+            "Re-run pull_dataset() to re-download."
+        )
+
+    with safe_open(shard_path, framework="pt") as f:
+        sf_keys = list(f.keys())
+        layer_slices = []
+        for sf_key in sf_keys:
+            match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
+            if not match:
+                continue
+            layer = int(match.group(1))
+            if layer not in layers:
+                continue
+            chunk = f.get_tensor(sf_key)[tok_off : tok_off + num_tok]
+            layer_slices.append((layer, chunk))
+
+    layer_slices.sort(key=lambda x: x[0])
+    raw_act = torch.cat([ls[1] for ls in layer_slices], dim=-1)
+    raw_act = raw_act.unsqueeze(0)  # (1, num_tok, total_dim)
+    mask = torch.ones(1, num_tok, dtype=torch.long)
+    return raw_act, mask
+
+
+def _load_pooled_from_shard(
+    model_name: str, prompt: str, layers: list[int], pooling: str
+) -> torch.Tensor:
+    """Load pooled activations for a prompt by slicing from a shard file.
+
+    Returns tensor with shape (1, n_layers * hidden_dim).
+    """
+    import re
+
+    from safetensors import safe_open
+
+    entry = _lookup_shard(model_name, prompt)
+    if entry is None:
+        raise FileNotFoundError(
+            f"No shard entry found for prompt: {prompt!r}"
+        )
+
+    manifest = _load_shard_manifest(model_name)
+    if manifest is None:
+        raise FileNotFoundError("No shard manifest found")
+
+    t_info = manifest["tensors"].get("hidden_layers")
+    if t_info is None:
+        raise FileNotFoundError("No hidden_layers in shard manifest")
+
+    storage = t_info.get("storage", "pooled")
+    shard_idx = entry["shard_index"]
+    hidden_dim = t_info.get("dim", 0)
+
+    shards = t_info["shards"]
+    if shard_idx >= len(shards):
+        raise FileNotFoundError(
+            f"Shard index {shard_idx} out of range (have {len(shards)} shards)"
+        )
+
+    shard_path = shards[shard_idx]["local_path"]
+    if not Path(shard_path).exists():
+        raise FileNotFoundError(
+            f"Shard file not found: {shard_path}. "
+            "The HF hub cache may have been evicted. "
+            "Re-run pull_dataset() to re-download."
+        )
+
+    with safe_open(shard_path, framework="pt") as f:
+        sf_keys = list(f.keys())
+
+        if storage == "full_sequence":
+            # Extract last token for each layer
+            tok_off = entry["token_offset"]
+            num_tok = entry["num_tokens"]
+            layer_slices = []
+            for sf_key in sf_keys:
+                match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
+                if not match:
+                    continue
+                layer = int(match.group(1))
+                if layer not in layers:
+                    continue
+                # Last token of this prompt's token range
+                last_tok = f.get_tensor(sf_key)[
+                    tok_off + num_tok - 1 : tok_off + num_tok
+                ]
+                layer_slices.append((layer, last_tok))
+        else:
+            # Pooled storage: direct row offset
+            row_offset = entry["row_offset"]
+            layer_slices = []
+            for sf_key in sf_keys:
+                match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
+                if not match:
+                    continue
+                layer = int(match.group(1))
+                if layer not in layers:
+                    continue
+                row = f.get_tensor(sf_key)[row_offset : row_offset + 1]
+                layer_slices.append((layer, row))
+
+    layer_slices.sort(key=lambda x: x[0])
+    return torch.cat([ls[1] for ls in layer_slices], dim=-1)
+
+
+def _load_logits_from_shard(
+    model_name: str, prompt: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load top-k logits for a prompt from a shard file.
+
+    Returns (values, indices).
+    """
+    from safetensors import safe_open
+
+    entry = _lookup_shard(model_name, prompt)
+    if entry is None:
+        raise FileNotFoundError(
+            f"No shard entry found for prompt: {prompt!r}"
+        )
+
+    manifest = _load_shard_manifest(model_name)
+    if manifest is None:
+        raise FileNotFoundError("No shard manifest found")
+
+    t_info = manifest["tensors"].get("logits_topk")
+    if t_info is None:
+        raise FileNotFoundError("No logits_topk in shard manifest")
+
+    shard_idx = entry["shard_index"]
+    row_offset = entry["row_offset"]
+
+    shards = t_info["shards"]
+    if shard_idx >= len(shards):
+        raise FileNotFoundError(
+            f"Shard index {shard_idx} out of range (have {len(shards)} shards)"
+        )
+
+    shard_path = shards[shard_idx]["local_path"]
+    if not Path(shard_path).exists():
+        raise FileNotFoundError(
+            f"Shard file not found: {shard_path}. "
+            "The HF hub cache may have been evicted. "
+            "Re-run pull_dataset() to re-download."
+        )
+
+    with safe_open(shard_path, framework="pt") as f:
+        values = f.get_tensor("logits_topk.values")[row_offset : row_offset + 1]
+        indices = f.get_tensor("logits_topk.indices")[row_offset : row_offset + 1]
+
+    return values, indices
+
+
+# =============================================================================
 # Per-Prompt Cache (v2 safetensors with v1 fallback)
 # =============================================================================
 
@@ -777,6 +1132,11 @@ def get_prompt_cached_raw_layers(
         if cache_dir.exists():
             return get_prompt_cached_layers(cache_dir)
 
+    # Shard registry fallback
+    shard_info = _discover_from_shard(model_name, prompt)
+    if shard_info is not None and shard_info.raw_layers:
+        return set(shard_info.raw_layers)
+
     return None
 
 
@@ -799,7 +1159,13 @@ def is_prompt_fully_cached(
         cache_dir = get_prompt_cache_dir(model_name, prompt)
         cached = get_prompt_cached_layers(cache_dir)
         has_mask = (cache_dir / "attention_mask.pt").exists()
-        return required_layers.issubset(cached) and has_mask
+        if required_layers.issubset(cached) and has_mask:
+            return True
+
+    # Shard registry fallback (full_sequence storage has raw layers)
+    shard_info = _discover_from_shard(model_name, prompt)
+    if shard_info is not None and shard_info.raw_layers:
+        return required_layers.issubset(set(shard_info.raw_layers))
 
     return False
 
@@ -809,7 +1175,7 @@ def load_prompt_activations(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Load cached raw activations for a single prompt.
 
-    Returns (activations, attention_mask). Checks v2 then v1.
+    Returns (activations, attention_mask). Checks v2 then v1, then shard registry.
     """
     backend = get_backend()
     key = _prompt_cache_key(model_name, prompt)
@@ -826,13 +1192,19 @@ def load_prompt_activations(
     # v1 fallback (local only)
     if isinstance(backend, LocalCacheBackend):
         cache_dir = get_prompt_cache_dir(model_name, prompt)
-        layer_acts = []
-        for layer in layers:
-            acts = torch.load(cache_dir / f"layer_{layer}.pt", weights_only=True)
-            layer_acts.append(acts)
-        activations = torch.cat(layer_acts, dim=-1)
-        mask = torch.load(cache_dir / "attention_mask.pt", weights_only=True)
-        return activations, mask
+        if cache_dir.exists() and (cache_dir / "attention_mask.pt").exists():
+            layer_acts = []
+            for layer in layers:
+                acts = torch.load(cache_dir / f"layer_{layer}.pt", weights_only=True)
+                layer_acts.append(acts)
+            activations = torch.cat(layer_acts, dim=-1)
+            mask = torch.load(cache_dir / "attention_mask.pt", weights_only=True)
+            return activations, mask
+
+    # Shard registry fallback
+    entry = _lookup_shard(model_name, prompt)
+    if entry is not None:
+        return _load_raw_from_shard(model_name, prompt, layers)
 
     raise FileNotFoundError(f"No cached activations found for prompt: {prompt!r}")
 
@@ -1081,21 +1453,29 @@ def load_prompt_logits(
     backend = get_backend()
     key = _prompt_cache_key(model_name, prompt)
 
-    if not backend.exists(key):
-        raise FileNotFoundError(
-            f"No cached logits found for prompt: {prompt!r}"
-        )
+    if backend.exists(key):
+        backend.touch(key)
 
-    backend.touch(key)
+        if top_k is not None:
+            tensors = _load_tensors_from_backend(
+                key, [_LOGITS_TOP_K_VALUES_KEY, _LOGITS_TOP_K_INDICES_KEY]
+            )
+            return tensors[_LOGITS_TOP_K_VALUES_KEY], tensors[_LOGITS_TOP_K_INDICES_KEY]
+        else:
+            tensors = _load_tensors_from_backend(key, [_LOGITS_KEY])
+            return tensors[_LOGITS_KEY], None
 
+    # Shard registry fallback (logits_topk only)
     if top_k is not None:
-        tensors = _load_tensors_from_backend(
-            key, [_LOGITS_TOP_K_VALUES_KEY, _LOGITS_TOP_K_INDICES_KEY]
-        )
-        return tensors[_LOGITS_TOP_K_VALUES_KEY], tensors[_LOGITS_TOP_K_INDICES_KEY]
-    else:
-        tensors = _load_tensors_from_backend(key, [_LOGITS_KEY])
-        return tensors[_LOGITS_KEY], None
+        entry = _lookup_shard(model_name, prompt)
+        if entry is not None:
+            manifest = _load_shard_manifest(model_name)
+            if manifest and "logits_topk" in manifest.get("tensors", {}):
+                return _load_logits_from_shard(model_name, prompt)
+
+    raise FileNotFoundError(
+        f"No cached logits found for prompt: {prompt!r}"
+    )
 
 
 # =============================================================================
@@ -1133,6 +1513,11 @@ def get_prompt_cached_pooled_layers(
                     continue
             return cached
 
+    # Shard registry fallback
+    shard_info = _discover_from_shard(model_name, prompt)
+    if shard_info is not None and pooling in shard_info.pooled:
+        return set(shard_info.pooled[pooling])
+
     return None
 
 
@@ -1166,11 +1551,17 @@ def load_prompt_pooled_activations(
     if isinstance(backend, LocalCacheBackend):
         cache_dir = get_prompt_cache_dir(model_name, prompt)
         pooled_dir = cache_dir / get_pooled_cache_key(pooling)
-        layer_acts = []
-        for layer in layers:
-            acts = torch.load(pooled_dir / f"layer_{layer}.pt", weights_only=True)
-            layer_acts.append(acts)
-        return torch.cat(layer_acts, dim=-1)
+        if pooled_dir.exists():
+            layer_acts = []
+            for layer in layers:
+                acts = torch.load(pooled_dir / f"layer_{layer}.pt", weights_only=True)
+                layer_acts.append(acts)
+            return torch.cat(layer_acts, dim=-1)
+
+    # Shard registry fallback
+    entry = _lookup_shard(model_name, prompt)
+    if entry is not None:
+        return _load_pooled_from_shard(model_name, prompt, layers, pooling)
 
     raise FileNotFoundError(
         f"No cached pooled activations found for prompt: {prompt!r}"

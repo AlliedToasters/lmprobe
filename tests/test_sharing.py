@@ -805,7 +805,7 @@ class TestPullDataset:
         with patch(
             "huggingface_hub.hf_hub_download", side_effect=mock_download,
         ):
-            count = pull_dataset("user/test")
+            count = pull_dataset("user/test", materialize=True)
 
         assert count == 3
 
@@ -829,9 +829,310 @@ class TestPullDataset:
         with patch(
             "huggingface_hub.hf_hub_download", side_effect=mock_download,
         ):
-            count = pull_dataset("user/test", overwrite=False)
+            count = pull_dataset("user/test", overwrite=False, materialize=True)
 
         assert count == 2
+
+
+@requires_pyarrow
+class TestLazyPullDataset:
+    """Tests for lazy (default) pull_dataset behavior."""
+
+    def _setup_remote_files(self, tmp_path):
+        """Create remote files in the new format (same as TestPullDataset)."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from safetensors.torch import save_file
+
+        (tmp_path / "tensors").mkdir(parents=True)
+        (tmp_path / "index").mkdir(parents=True)
+
+        prompts = ["prompt 0", "prompt 1", "prompt 2"]
+        tensor = torch.randn(3, HIDDEN_DIM)
+        save_file(
+            {"hidden.layer_0": tensor},
+            str(tmp_path / "tensors" / "hidden_layers_000.safetensors"),
+        )
+
+        table = pa.table({
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([None, None, None], type=pa.int32()),
+            "num_tokens": pa.array([5, 5, 5], type=pa.int32()),
+            "shard_index": pa.array([0, 0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1, 2], type=pa.int32()),
+        })
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+
+        lmprobe_info = {
+            "format_version": "1.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 3,
+            "prompt_ordering": "random",
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "pooling": "last_token",
+                    "row_bytes": HIDDEN_DIM * 4,
+                    "shards": [
+                        {
+                            "file": "tensors/hidden_layers_000.safetensors",
+                            "num_prompts": 3,
+                        }
+                    ],
+                }
+            },
+            "provenance": {},
+        }
+        with open(tmp_path / INFO_FILENAME, "w") as f:
+            json.dump(lmprobe_info, f)
+
+        return tmp_path, prompts, tensor
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_pull_lazy_default(self, mock_deps, tmp_path, cache_dir):
+        """Default pull creates no per-prompt files, but manifest exists."""
+        remote_dir, prompts, _ = self._setup_remote_files(tmp_path / "remote")
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            count = pull_dataset("user/test")
+
+        assert count == 3
+
+        # No per-prompt safetensors files should exist
+        from lmprobe.cache import _hash_string, get_cache_dir
+        model_hash = _hash_string(TEST_MODEL)
+        model_dir = get_cache_dir() / model_hash
+        per_prompt_files = list(model_dir.glob("*.safetensors"))
+        assert len(per_prompt_files) == 0
+
+        # But manifest and index should exist
+        assert (model_dir / "_shard_manifest.json").exists()
+        assert (model_dir / "_shard_index.json").exists()
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_pull_lazy_discover_cached(self, mock_deps, tmp_path, cache_dir):
+        """discover_cached returns correct info for lazy-pulled prompts."""
+        remote_dir, prompts, _ = self._setup_remote_files(tmp_path / "remote")
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            pull_dataset("user/test")
+
+        for prompt in prompts:
+            info = discover_cached(TEST_MODEL, prompt)
+            assert info is not None, f"Prompt not discoverable: {prompt}"
+            assert "last_token" in info.pooled
+            assert 0 in info.pooled["last_token"]
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_pull_lazy_load_pooled(self, mock_deps, tmp_path, cache_dir):
+        """load_prompt_pooled_activations returns correct data from shard."""
+        remote_dir, prompts, tensor = self._setup_remote_files(
+            tmp_path / "remote"
+        )
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            pull_dataset("user/test")
+
+        for i, prompt in enumerate(prompts):
+            pooled = load_prompt_pooled_activations(
+                TEST_MODEL, prompt, [0], "last_token"
+            )
+            assert pooled.shape == (1, HIDDEN_DIM)
+            assert torch.allclose(pooled, tensor[i : i + 1], atol=1e-6)
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_pull_lazy_dedup_prefers_per_prompt(
+        self, mock_deps, tmp_path, cache_dir,
+    ):
+        """Per-prompt cache takes priority over shard data."""
+        remote_dir, prompts, tensor = self._setup_remote_files(
+            tmp_path / "remote"
+        )
+
+        # Pre-cache prompt 0 with different data
+        custom_pooled = torch.randn(1, HIDDEN_DIM)
+        save_prompt_pooled_activations(
+            TEST_MODEL, "prompt 0", [0], custom_pooled, "last_token"
+        )
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            pull_dataset("user/test")
+
+        # prompt 0 should return the per-prompt data, not shard data
+        loaded = load_prompt_pooled_activations(
+            TEST_MODEL, "prompt 0", [0], "last_token"
+        )
+        assert torch.allclose(loaded, custom_pooled, atol=1e-6)
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_pull_materialize_true(self, mock_deps, tmp_path, cache_dir):
+        """materialize=True creates per-prompt files (old behavior)."""
+        remote_dir, prompts, _ = self._setup_remote_files(tmp_path / "remote")
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            count = pull_dataset("user/test", materialize=True)
+
+        assert count == 3
+
+        # Per-prompt safetensors files should exist
+        from lmprobe.cache import _hash_string, get_cache_dir
+        model_hash = _hash_string(TEST_MODEL)
+        model_dir = get_cache_dir() / model_hash
+        per_prompt_files = list(model_dir.glob("*.safetensors"))
+        assert len(per_prompt_files) == 3
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_pull_materialize_parallel(self, mock_deps, tmp_path, cache_dir):
+        """num_workers=2 produces same results as sequential."""
+        remote_dir, prompts, tensor = self._setup_remote_files(
+            tmp_path / "remote"
+        )
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            count = pull_dataset(
+                "user/test", materialize=True, num_workers=2,
+            )
+
+        assert count == 3
+        for i, prompt in enumerate(prompts):
+            pooled = load_prompt_pooled_activations(
+                TEST_MODEL, prompt, [0], "last_token"
+            )
+            assert pooled.shape == (1, HIDDEN_DIM)
+            assert torch.allclose(pooled, tensor[i : i + 1], atol=1e-6)
+
+    def _setup_raw_remote_files(self, tmp_path):
+        """Create remote files with full_sequence storage."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from safetensors.torch import save_file
+
+        (tmp_path / "tensors").mkdir(parents=True)
+        (tmp_path / "index").mkdir(parents=True)
+
+        prompts = ["raw prompt 0", "raw prompt 1"]
+        seq_lens = [3, 5]
+        layers = [0, 1]
+
+        # Build per-layer tensors: concat all prompts' tokens
+        total_tokens = sum(seq_lens)
+        layer_tensors = {}
+        for layer in layers:
+            layer_tensors[f"hidden.layer_{layer}"] = torch.randn(
+                total_tokens, HIDDEN_DIM
+            )
+
+        save_file(
+            layer_tensors,
+            str(tmp_path / "tensors" / "hidden_layers_000.safetensors"),
+        )
+
+        token_offsets = [0, seq_lens[0]]
+        table = pa.table({
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([None, None], type=pa.int32()),
+            "num_tokens": pa.array(seq_lens, type=pa.int32()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 0], type=pa.int32()),
+            "token_offset": pa.array(token_offsets, type=pa.int32()),
+        })
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+
+        lmprobe_info = {
+            "format_version": "1.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 2,
+            "prompt_ordering": "sequential",
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": layers,
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "storage": "full_sequence",
+                    "pooling": "last_token",
+                    "row_bytes": HIDDEN_DIM * 4,
+                    "shards": [
+                        {
+                            "file": "tensors/hidden_layers_000.safetensors",
+                            "num_prompts": 2,
+                        }
+                    ],
+                }
+            },
+            "provenance": {},
+        }
+        with open(tmp_path / INFO_FILENAME, "w") as f:
+            json.dump(lmprobe_info, f)
+
+        return tmp_path, prompts, seq_lens, layers, layer_tensors
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_pull_lazy_load_raw(self, mock_deps, tmp_path, cache_dir):
+        """load_prompt_activations returns correct data from shard."""
+        remote_dir, prompts, seq_lens, layers, layer_tensors = (
+            self._setup_raw_remote_files(tmp_path / "remote")
+        )
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            pull_dataset("user/test")
+
+        token_offsets = [0, seq_lens[0]]
+        for i, prompt in enumerate(prompts):
+            act, mask = load_prompt_activations(TEST_MODEL, prompt, layers)
+            assert act.shape == (1, seq_lens[i], HIDDEN_DIM * len(layers))
+            assert mask.shape == (1, seq_lens[i])
+
+            # Verify data matches
+            tok_off = token_offsets[i]
+            num_tok = seq_lens[i]
+            expected_slices = []
+            for layer in layers:
+                expected_slices.append(
+                    layer_tensors[f"hidden.layer_{layer}"][
+                        tok_off : tok_off + num_tok
+                    ]
+                )
+            expected = torch.cat(expected_slices, dim=-1).unsqueeze(0)
+            assert torch.allclose(act, expected, atol=1e-6)
 
 
 @requires_pyarrow
@@ -917,7 +1218,7 @@ class TestRoundtrip:
                 side_effect=mock_download,
             ),
         ):
-            count = pull_dataset("user/roundtrip-test")
+            count = pull_dataset("user/roundtrip-test", materialize=True)
 
         assert count == 3
 
@@ -1466,7 +1767,7 @@ class TestFullSequenceRoundtrip:
                 side_effect=mock_download,
             ),
         ):
-            count = pull_dataset("user/raw-roundtrip")
+            count = pull_dataset("user/raw-roundtrip", materialize=True)
 
         assert count == 3
 
@@ -1635,7 +1936,7 @@ class TestFullSequenceWithLogits:
                 side_effect=mock_download,
             ),
         ):
-            count = pull_dataset("user/raw-logits")
+            count = pull_dataset("user/raw-logits", materialize=True)
 
         assert count == 3
 

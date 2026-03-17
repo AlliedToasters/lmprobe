@@ -29,5 +29,11 @@ def _reset_cache_backend():
 
     old = cache_mod._backend
     cache_mod._backend = None
+    old_manifests = dict(cache_mod._shard_manifests)
+    old_indices = dict(cache_mod._shard_indices)
+    cache_mod._shard_manifests.clear()
+    cache_mod._shard_indices.clear()
     yield
     cache_mod._backend = old
+    cache_mod._shard_manifests.update(old_manifests)
+    cache_mod._shard_indices.update(old_indices)
