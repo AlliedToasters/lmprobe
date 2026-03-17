@@ -469,6 +469,10 @@ def _consolidate_and_shard(
     share the same shard boundaries (same prompt ordering, same num_prompts
     per shard).
 
+    Uses streaming consolidation: only one shard's worth of tensors is held
+    in memory at a time, so peak memory is bounded by ``shard_max_bytes``
+    regardless of total dataset size.
+
     Returns
     -------
     tmpdir : Path
@@ -503,56 +507,41 @@ def _consolidate_and_shard(
     elif use_raw:
         hidden_layers = raw_layers
 
-    # --- Phase 1: Load all prompts, build metadata ---
+    # --- Phase 1: Metadata-only pass (no tensor loading) ---
     from tqdm import tqdm
 
-    prompt_data: list[dict] = []  # per-prompt loaded tensors
     prompt_metadata: list[dict] = []
+    valid_prompts: list[str] = []  # prompts that exist in cache
     per_prompt_tokens: list[int] = []  # only used when use_raw
     skipped_count = 0
 
-    for idx in tqdm(kept_indices, desc="Loading from cache", unit="prompt"):
+    for idx in tqdm(kept_indices, desc="Scanning cache metadata", unit="prompt"):
         prompt = prompts[idx]
         label = labels[idx] if labels is not None else None
         extra_meta: dict[str, Any] = {}
         if metadata is not None:
             extra_meta = dict(metadata[idx])
 
-        try:
-            loaded: dict[str, torch.Tensor] = {}
-
-            if use_raw and hidden_layers:
-                # Full-sequence path
-                layer_tensors, num_tok = _load_hidden_raw_for_prompt(
-                    model_name, prompt, hidden_layers,
-                )
-                loaded.update(layer_tensors)
-                per_prompt_tokens.append(num_tok)
-            elif hidden_strategy and hidden_layers:
-                # Pooled path (existing)
-                layer_tensors = _load_hidden_for_prompt(
-                    model_name, prompt, hidden_layers, hidden_strategy,
-                )
-                loaded.update(layer_tensors)
-
-            # Logits
-            if has_logits and logits_top_k is not None:
-                logit_tensors = _load_logits_for_prompt(
-                    model_name, prompt, logits_top_k,
-                )
-                loaded.update(logit_tensors)
-
-        except (FileNotFoundError, KeyError, OSError) as e:
+        info = discover_cached(model_name, prompt)
+        if info is None:
             skipped_count += 1
-            logger.debug(f"[SHARING] Skipping prompt index {idx}: {e}")
+            logger.debug(f"[SHARING] Skipping prompt index {idx}: not in cache")
             continue
 
-        # Determine num_tokens from first hidden layer tensor
-        # (pooled tensors don't carry seq_len, but discover_cached has it)
-        info = discover_cached(model_name, prompt)
-        num_tokens = info.num_tokens if info else None
+        num_tokens = info.num_tokens
 
-        prompt_data.append(loaded)
+        # For raw mode, we need num_tokens to compute shard boundaries
+        if use_raw and hidden_layers:
+            if num_tokens is None:
+                skipped_count += 1
+                logger.debug(
+                    f"[SHARING] Skipping prompt index {idx}: "
+                    f"no num_tokens metadata for raw mode"
+                )
+                continue
+            per_prompt_tokens.append(num_tokens)
+
+        valid_prompts.append(prompt)
         prompt_metadata.append({
             "text": prompt,
             "label": label,
@@ -574,19 +563,32 @@ def _consolidate_and_shard(
 
     # --- Phase 2: Shuffle prompts (deterministic) ---
     seed = _deterministic_seed(repo_id)
-    n = len(prompt_data)
+    n = len(valid_prompts)
     perm = _shuffle_indices(n, seed)
-    prompt_data = [prompt_data[i] for i in perm]
+    valid_prompts = [valid_prompts[i] for i in perm]
     prompt_metadata = [prompt_metadata[i] for i in perm]
     if per_prompt_tokens:
         per_prompt_tokens = [per_prompt_tokens[i] for i in perm]
 
     # --- Phase 3: Compute shard boundaries ---
+    # Probe one prompt for hidden_dim (loads and immediately frees one tensor)
     hidden_dim = 0
-    if hidden_layers and prompt_data:
+    if hidden_layers and valid_prompts:
+        sample_prompt = valid_prompts[0]
+        if use_raw:
+            sample_tensors, _ = _load_hidden_raw_for_prompt(
+                model_name, sample_prompt, hidden_layers[:1],
+            )
+        elif hidden_strategy:
+            sample_tensors = _load_hidden_for_prompt(
+                model_name, sample_prompt, hidden_layers[:1], hidden_strategy,
+            )
+        else:
+            sample_tensors = {}
         sample_key = f"hidden.layer_{hidden_layers[0]}"
-        if sample_key in prompt_data[0]:
-            hidden_dim = prompt_data[0][sample_key].shape[-1]
+        if sample_key in sample_tensors:
+            hidden_dim = sample_tensors[sample_key].shape[-1]
+        del sample_tensors
 
     logits_row_bytes = 0
     if has_logits and logits_top_k is not None:
@@ -609,13 +611,17 @@ def _consolidate_and_shard(
             n, max_row_bytes, shard_max_bytes,
         )
 
-    # --- Phase 4: Write safetensors shards ---
+    # --- Phase 4: Stream shards (load one shard at a time) ---
     tensor_descriptors: dict[str, dict] = {}
     offset = 0
 
-    # Assign shard_index and row_offset / token_offset to each prompt
-    for shard_idx, shard_size in enumerate(shard_boundaries):
-        token_offset_acc = 0  # cumulative token offset within shard (raw mode)
+    for shard_idx, shard_size in enumerate(tqdm(
+        shard_boundaries, desc="Writing shards", unit="shard",
+    )):
+        shard_prompts_text = valid_prompts[offset : offset + shard_size]
+
+        # Assign shard_index and row_offset / token_offset to metadata
+        token_offset_acc = 0
         for local_row in range(shard_size):
             global_row = offset + local_row
             if global_row < len(prompt_metadata):
@@ -625,31 +631,61 @@ def _consolidate_and_shard(
                     prompt_metadata[global_row]["token_offset"] = token_offset_acc
                     token_offset_acc += per_prompt_tokens[global_row]
 
-        shard_prompts = prompt_data[offset : offset + shard_size]
+        # Load only this shard's tensors from cache
+        shard_data: list[dict] = []
+        for prompt in shard_prompts_text:
+            try:
+                loaded: dict[str, torch.Tensor] = {}
+
+                if use_raw and hidden_layers:
+                    layer_tensors, _ = _load_hidden_raw_for_prompt(
+                        model_name, prompt, hidden_layers,
+                    )
+                    loaded.update(layer_tensors)
+                elif hidden_strategy and hidden_layers:
+                    layer_tensors = _load_hidden_for_prompt(
+                        model_name, prompt, hidden_layers, hidden_strategy,
+                    )
+                    loaded.update(layer_tensors)
+
+                if has_logits and logits_top_k is not None:
+                    logit_tensors = _load_logits_for_prompt(
+                        model_name, prompt, logits_top_k,
+                    )
+                    loaded.update(logit_tensors)
+
+                shard_data.append(loaded)
+            except (FileNotFoundError, KeyError, OSError) as e:
+                raise OSError(
+                    f"Prompt passed metadata scan but failed to load during "
+                    f"shard write (cache may have been modified concurrently): "
+                    f"{e}"
+                ) from e
 
         # Write hidden_layers shard
         if hidden_layers and (hidden_strategy or use_raw):
             shard_tensors = {}
             for layer in hidden_layers:
                 key = f"hidden.layer_{layer}"
-                rows = [p[key] for p in shard_prompts if key in p]
+                rows = [p[key] for p in shard_data if key in p]
                 if rows:
                     shard_tensors[key] = torch.cat(rows, dim=0)
 
             if shard_tensors:
                 fname = f"tensors/hidden_layers_{shard_idx:03d}.safetensors"
                 save_file(shard_tensors, str(tmpdir / fname))
+            del shard_tensors
 
         # Write logits_topk shard
         if has_logits and logits_top_k is not None:
             vals = [
                 p["logits_topk.values"]
-                for p in shard_prompts
+                for p in shard_data
                 if "logits_topk.values" in p
             ]
             idxs = [
                 p["logits_topk.indices"]
-                for p in shard_prompts
+                for p in shard_data
                 if "logits_topk.indices" in p
             ]
             if vals and idxs:
@@ -659,6 +695,10 @@ def _consolidate_and_shard(
                 }
                 fname = f"tensors/logits_topk_{shard_idx:03d}.safetensors"
                 save_file(logits_tensors, str(tmpdir / fname))
+                del logits_tensors
+
+        # Free this shard's data before loading the next
+        del shard_data
 
         offset += shard_size
 
