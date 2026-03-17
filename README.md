@@ -3,6 +3,7 @@
 [![PyPI version](https://badge.fury.io/py/lmprobe.svg)](https://pypi.org/project/lmprobe/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Docs](https://img.shields.io/badge/docs-alliedtoasters.github.io%2Flmprobe-blue)](https://alliedtoasters.github.io/lmprobe)
 
 This library supports the use of language model "activations" or "latents" to build text classifiers. The intent is to help detect and reduce misuse of AI - for example, chemical, biological, radiological and nuclear (CBRN) weapons development, social engineering at scale, and the development of novel cybersecurity attack vectors.
 
@@ -206,6 +207,7 @@ probe = Probe(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `model` | `str` | *required* | HuggingFace model ID or local path |
+| `dataset` | `str \| None` | `None` | HuggingFace Dataset repo ID with pre-extracted activations (replaces `model` for extraction) |
 | `layers` | `int \| list[int] \| str` | `"middle"` | Which residual stream layers to probe |
 | `pooling` | `str \| callable` | `"last_token"` | Token aggregation (train & inference) |
 | `train_pooling` | `str \| callable` | — | Override pooling for `fit()` only |
@@ -444,6 +446,79 @@ probe.warmup(test_prompts, batch_size=16)
 
 # Subsequent predict/score calls hit the cache
 predictions = probe.predict(test_prompts)
+```
+
+---
+
+## Activation Datasets
+
+Extract activations once from a large model, share them as a HuggingFace Dataset, and let others train probes without ever loading the model locally. Requires `pip install lmprobe[hub]`.
+
+### Push cached activations to HuggingFace
+
+After extracting activations (via `probe.fit()`, `probe.warmup()`, or any extraction call), push the local cache to a HuggingFace Dataset repo:
+
+```python
+from lmprobe import push_dataset
+
+# Activations must already be cached locally for these prompts + model
+url = push_dataset(
+    repo_id="username/llama-safety-activations",
+    model_name="meta-llama/Llama-3.1-8B-Instruct",
+    prompts=all_prompts,
+    labels=all_labels,           # optional, stored in the Parquet index
+    description="Safety probe activations for Llama-3.1-8B",
+    private=False,
+)
+print(url)  # https://huggingface.co/datasets/username/llama-safety-activations
+```
+
+### Train a probe from a dataset (no model required)
+
+Once activations are on HuggingFace, anyone can train probes without loading the LLM:
+
+```python
+from lmprobe import Probe
+
+# No model= needed — activations are pulled from the dataset on demand
+probe = Probe(
+    dataset="username/llama-safety-activations",
+    layers=16,
+    classifier="logistic_regression",
+)
+
+probe.fit(positive_prompts, negative_prompts)
+predictions = probe.predict(test_prompts)
+```
+
+Activations are downloaded lazily per prompt and cached locally — repeated calls are fast.
+
+### Pull a full dataset to local cache
+
+Pre-download all shards before running experiments:
+
+```python
+from lmprobe import pull_dataset
+
+n = pull_dataset(
+    repo_id="username/llama-safety-activations",
+    layers=[16],          # only fetch the layers you need
+)
+print(f"Pulled {n} prompts")
+```
+
+### Load raw tensors directly
+
+For custom workflows that need the raw activation tensors:
+
+```python
+from lmprobe import load_activation_dataset
+
+tensors, info = load_activation_dataset(
+    repo_id="username/llama-safety-activations",
+    layers=[16],
+)
+# tensors["hidden.layer_16"]: shape (n_prompts, hidden_dim)
 ```
 
 ---
