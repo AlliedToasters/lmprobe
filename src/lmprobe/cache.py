@@ -862,7 +862,7 @@ def _discover_from_shard(model_name: str, prompt: str) -> CachedPromptInfo | Non
                 pooled[pooling] = sorted(layers)
         elif t_type == "logits_topk":
             has_logits = True
-            logits_top_k = t_info.get("top_k")
+            logits_top_k = t_info.get("k")
 
     return CachedPromptInfo(
         raw_layers=raw_layers,

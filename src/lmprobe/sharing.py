@@ -1378,7 +1378,6 @@ def pull_dataset(
             "shard_index": index["shard_index"][i],
             "row_offset": index["row_offset"][i],
             "num_tokens": index["num_tokens"][i],
-            "prompt_text": prompt_text,
         }
         if "token_offset" in index:
             entry["token_offset"] = index["token_offset"][i]

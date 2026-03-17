@@ -1,5 +1,7 @@
 """Shared pytest fixtures for lmprobe tests."""
 
+import copy
+
 import pytest
 
 # Tiny Llama model with random weights for fast functional testing
@@ -29,8 +31,8 @@ def _reset_cache_backend():
 
     old = cache_mod._backend
     cache_mod._backend = None
-    old_manifests = dict(cache_mod._shard_manifests)
-    old_indices = dict(cache_mod._shard_indices)
+    old_manifests = copy.deepcopy(cache_mod._shard_manifests)
+    old_indices = copy.deepcopy(cache_mod._shard_indices)
     cache_mod._shard_manifests.clear()
     cache_mod._shard_indices.clear()
     yield
