@@ -1,6 +1,6 @@
 # Caching
 
-Activation extraction is expensive — a single forward pass through a large model can take seconds. `lmprobe` caches activations automatically so repeated calls with the same prompts are fast.
+Activation extraction is expensive. A single forward pass through a large model can take seconds. `lmprobe` caches activations automatically so repeated calls with the same prompts are fast.
 
 ---
 
@@ -61,7 +61,7 @@ set_cache_backend("s3://my-bucket/lmprobe-cache")
 ```
 
 !!! note "S3 is for datasets, not ephemeral caching"
-    The S3 backend is designed for building and sharing large activation datasets — e.g., pre-extracting activations for thousands of prompts across machines. It is not intended as a drop-in replacement for the local cache for short-lived work.
+    The S3 backend is designed for building and sharing large activation datasets: pre-extracting activations for thousands of prompts across machines. It is not intended as a drop-in replacement for the local cache for short-lived work.
 
 Configure AWS credentials via the standard environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`) or an IAM role.
 

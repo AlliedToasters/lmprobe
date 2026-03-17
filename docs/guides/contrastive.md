@@ -146,7 +146,7 @@ r_squared = probe.score(test_prompts, test_labels)
 | `"ridge"` | Faster, no `predict_proba`. Good for large datasets. |
 | `"svm"` | SVM with probability calibration. |
 | `"lda"` | Linear Discriminant Analysis. |
-| `"mass_mean"` | Mass-Mean Probing — difference-in-means direction. Simple and often competitive. |
+| `"mass_mean"` | Mass-Mean Probing: difference-in-means direction. Simple and often competitive. |
 | `"sgd"` | SGD classifier. Useful for very large datasets. |
 
 Pass a custom sklearn estimator directly:

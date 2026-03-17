@@ -1,6 +1,6 @@
 # Layer Selection & Sweep
 
-Different layers of a language model encode different information. Finding the right layer — or combination of layers — is often the most impactful tuning decision.
+Different layers of a language model encode different information. Finding the right layer (or combination of layers)can be an impactful tuning decision.
 
 ---
 
@@ -46,7 +46,7 @@ print(f"Best layer: {best}")
 preds = result.probes[best].predict(test_prompts)
 ```
 
-You can also use sweep as a layer spec string — useful when you want to sweep as part of a normal `Probe` workflow:
+You can also use sweep as a layer spec string, useful when you want to sweep as part of a normal `Probe` workflow:
 
 ```python
 probe = Probe(model=model, layers="sweep")        # sweep all

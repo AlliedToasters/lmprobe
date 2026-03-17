@@ -14,7 +14,7 @@ pip install lmprobe
 
 ## 1. Define your contrast pairs
 
-Probes are trained *contrastively* — you provide examples of the positive class and examples of the negative class. The model learns what separates them in activation space.
+Probes are trained *contrastively*: you provide examples of the positive class and examples of the negative class. The model learns what separates them in activation space.
 
 ```python
 positive_prompts = [  # dog-like text, without using the word "dog"
@@ -72,7 +72,7 @@ See [API Reference: Probe](reference/probe.md) for the full parameter table.
 probe.fit(positive_prompts, negative_prompts)
 ```
 
-This extracts activations from the model for each prompt, pools them, and fits the classifier. Activations are cached automatically — re-running `fit()` with the same prompts is fast.
+This extracts activations from the model for each prompt, pools them, and fits the classifier. Activations are cached automatically. Re-running `fit()` with the same prompts is fast.
 
 ---
 

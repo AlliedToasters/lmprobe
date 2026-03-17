@@ -6,13 +6,13 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-`lmprobe` makes it easy to build text classifiers from a language model's internal representations — enabling AI safety monitoring through detection of deception, harmful intent, CBRN misuse, and other safety-relevant properties.
+`lmprobe` makes it easy to build text classifiers from a language model's internal representations. It has been used for detection of deception, harmful intent, CBRN misuse, and other safety-relevant properties, but can also be used to build arbitrary classifiers and even regression.
 
 ---
 
-## What is a linear probe?
+## What is a probe?
 
-A linear probe is a simple classifier trained on a model's intermediate activations (residual stream, hidden states) rather than its output text. Because the classifier is linear, it's fast to train, interpretable, and provably reflects what the model *represents* — not just what it *says*.
+A probe is a classifier trained on a model's intermediate activations (residual stream, hidden states) rather than its output text. A very common type of probe is the linear probe: because the classifier is linear, it's fast to train, interpretable, and provably reflects what the model *represents,* not just what it *says*.
 
 Key results from the literature:
 

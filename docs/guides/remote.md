@@ -79,7 +79,7 @@ predictions = probe.predict(test_prompts)  # now runs fully from cache
 ## Known considerations
 
 - Remote execution returns nnsight proxy tensors rather than direct tensors. `lmprobe` handles this via `hasattr(act, "value")` checks in `extraction.py`.
-- Network latency affects batch processing — use smaller `batch_size` for remote calls.
+- Network latency affects batch processing. Use smaller `batch_size` for remote calls.
 - Error handling for missing/invalid API keys raises an informative exception before any network calls are made.
 
 ---
