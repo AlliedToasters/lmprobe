@@ -4,6 +4,7 @@ import warnings
 
 import numpy as np
 import pytest
+import torch
 
 from lmprobe.cache import (
     get_prompt_cache_dir,
@@ -836,3 +837,153 @@ class TestServerSideTopK:
         assert result.values.shape == (1, 1, K)
         assert result.indices is not None
         assert result.indices.shape == (1, 1, K)
+
+
+class TestComputeLogitsFromCache:
+    """Tests for computing logits from cached activations without a forward pass."""
+
+    def test_compute_logits_basic(self, tiny_model, tmp_path, monkeypatch):
+        """Logits appear in cache after compute_logits_from_cache."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        prompts = ["hello world", "test prompt"]
+
+        # Warm up with raw activations (need full sequence for layer loading)
+        cache = UnifiedCache(
+            model=tiny_model, layers="all",
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache.warmup(prompts)
+
+        # Compute logits from cache
+        computed = cache.compute_logits_from_cache(prompts)
+        assert computed == 2
+
+        # Verify logits are now cached
+        for prompt in prompts:
+            assert is_prompt_logits_cached(tiny_model, prompt)
+
+    def test_compute_logits_topk(self, tiny_model, tmp_path, monkeypatch):
+        """Top-k compression works with compute_logits_from_cache."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        prompts = ["topk compute test"]
+        K = 5
+
+        cache = UnifiedCache(
+            model=tiny_model, layers="all",
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache.warmup(prompts)
+
+        computed = cache.compute_logits_from_cache(prompts, top_k=K)
+        assert computed == 1
+
+        # Verify top-k logits are cached
+        assert is_prompt_logits_cached(tiny_model, prompts[0], top_k=K)
+
+        from lmprobe.cache import load_prompt_logits
+
+        values, indices = load_prompt_logits(tiny_model, prompts[0], top_k=K)
+        assert values.shape[-1] == K
+        assert indices is not None
+        assert indices.shape[-1] == K
+
+    def test_compute_logits_skips_cached(self, tiny_model, tmp_path, monkeypatch):
+        """Returns 0 when all prompts already have logits cached."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        prompts = ["already cached test"]
+
+        cache = UnifiedCache(
+            model=tiny_model, layers="all",
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache.warmup(prompts)
+
+        # First call computes
+        assert cache.compute_logits_from_cache(prompts) == 1
+
+        # Second call skips
+        assert cache.compute_logits_from_cache(prompts) == 0
+
+    def test_compute_logits_requires_last_layer(self, tiny_model, tmp_path, monkeypatch):
+        """ValueError if last layer not in cached layers."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        prompts = ["layer check test"]
+
+        # Only cache layer 0, not the last layer (layer 1 for tiny model)
+        cache = UnifiedCache(
+            model=tiny_model, layers=[0],
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache.warmup(prompts)
+
+        with pytest.raises(ValueError, match="Last layer"):
+            cache.compute_logits_from_cache(prompts)
+
+    def test_compute_logits_matches_forward_pass(self, tiny_model, tmp_path, monkeypatch):
+        """Critical correctness test: norm(x) @ W matches actual model logits."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        prompts = ["correctness test prompt"]
+
+        # Extract with logits via forward pass
+        cache_with_logits = UnifiedCache(
+            model=tiny_model, layers="all",
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False, cache_logits=True,
+            logit_positions="last",
+        )
+        cache_with_logits.warmup(prompts)
+
+        # Get forward-pass logits
+        forward_logits = cache_with_logits.get_logits(prompts)
+        forward_values = forward_logits.values  # (1, 1, vocab_size)
+
+        # Clear logits from cache but keep activations
+        # We need a fresh cache dir for compute_logits_from_cache
+        import shutil
+
+        # Use a second tmp dir for the compute-from-cache path
+        tmp_path2 = tmp_path / "compute_test"
+        tmp_path2.mkdir()
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path2))
+
+        # Reset cache backend to pick up new dir
+        import lmprobe.cache as cache_mod
+
+        cache_mod._backend = None
+
+        cache_no_logits = UnifiedCache(
+            model=tiny_model, layers="all",
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache_no_logits.warmup(prompts)
+
+        # Compute logits from cache
+        cache_no_logits.compute_logits_from_cache(prompts)
+
+        # Load computed logits
+        from lmprobe.cache import load_prompt_logits
+
+        computed_values, _ = load_prompt_logits(tiny_model, prompts[0])
+        # computed_values: (1, 1, vocab_size)
+
+        # Should match forward pass logits closely
+        assert forward_values.shape == computed_values.shape, (
+            f"Shape mismatch: forward={forward_values.shape}, "
+            f"computed={computed_values.shape}"
+        )
+        # Cast to same dtype for comparison (weights may be bfloat16)
+        fv = forward_values.float()
+        cv = computed_values.float()
+        assert torch.allclose(fv, cv, atol=1e-2), (
+            f"Max diff: {(fv - cv).abs().max().item()}"
+        )

@@ -486,6 +486,117 @@ class TestLinearProbeWithCache:
             assert get_prompt_cached_layers(cache_dir) == {0, 1}
 
 
+class TestBatchLayerLoading:
+    """Tests for load_layer_across_prompts and load_layer_last_token."""
+
+    def test_load_layer_across_prompts_basic(self, tiny_model, tmp_path, monkeypatch):
+        """load_layer_across_prompts returns correct shapes and count."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        from lmprobe.cache import load_layer_across_prompts
+        from lmprobe.unified_cache import UnifiedCache
+
+        prompts = ["hello world", "another prompt"]
+        cache = UnifiedCache(
+            model=tiny_model, layers=[0, 1],
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache.warmup(prompts)
+
+        acts_list, masks_list = load_layer_across_prompts(tiny_model, prompts, layer=0)
+
+        assert len(acts_list) == 2
+        assert len(masks_list) == 2
+        for acts, mask in zip(acts_list, masks_list):
+            assert acts.ndim == 3  # (1, seq_len, hidden_dim)
+            assert acts.shape[0] == 1
+            assert mask.ndim == 2  # (1, seq_len)
+            assert mask.shape[0] == 1
+            assert acts.shape[1] == mask.shape[1]
+
+    def test_load_layer_across_prompts_variable_seqlen(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """Different prompts can have different sequence lengths."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        from lmprobe.cache import load_layer_across_prompts
+        from lmprobe.unified_cache import UnifiedCache
+
+        prompts = ["hi", "this is a much longer prompt with many tokens"]
+        cache = UnifiedCache(
+            model=tiny_model, layers=[0, 1],
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache.warmup(prompts)
+
+        acts_list, masks_list = load_layer_across_prompts(tiny_model, prompts, layer=1)
+
+        assert len(acts_list) == 2
+        # Different prompts may have different seq_len
+        seq_len_0 = acts_list[0].shape[1]
+        seq_len_1 = acts_list[1].shape[1]
+        # The longer prompt should have more tokens
+        assert seq_len_1 >= seq_len_0
+
+    def test_load_layer_last_token_shape(self, tiny_model, tmp_path, monkeypatch):
+        """load_layer_last_token returns (N, hidden_dim)."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        from lmprobe.cache import load_layer_last_token
+        from lmprobe.unified_cache import UnifiedCache
+
+        prompts = ["test one", "test two", "test three"]
+        cache = UnifiedCache(
+            model=tiny_model, layers=[0, 1],
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache.warmup(prompts)
+
+        result = load_layer_last_token(tiny_model, prompts, layer=0)
+        assert result.ndim == 2
+        assert result.shape[0] == 3  # N prompts
+
+    def test_load_layer_last_token_matches_manual(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """load_layer_last_token matches manual extraction from full activations."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        from lmprobe.cache import load_layer_last_token, load_prompt_activations
+        from lmprobe.unified_cache import UnifiedCache
+
+        prompts = ["manual comparison test"]
+        cache = UnifiedCache(
+            model=tiny_model, layers=[0, 1],
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache.warmup(prompts)
+
+        # Get via load_layer_last_token
+        result = load_layer_last_token(tiny_model, prompts, layer=0)
+
+        # Get manually from full activations
+        acts, mask = load_prompt_activations(tiny_model, prompts[0], [0])
+        last_pos = mask[0].nonzero(as_tuple=True)[0][-1].item()
+        expected = acts[0, last_pos, :]
+
+        assert torch.allclose(result[0], expected)
+
+    def test_load_layer_uncached_raises(self, tiny_model, tmp_path, monkeypatch):
+        """Error on missing cache."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        from lmprobe.cache import load_layer_across_prompts
+
+        with pytest.raises(FileNotFoundError):
+            load_layer_across_prompts(tiny_model, ["uncached prompt"], layer=0)
+
+
 class TestUnifiedCacheLinearProbeIntegration:
     """Tests for cache compatibility between UnifiedCache and LinearProbe."""
 

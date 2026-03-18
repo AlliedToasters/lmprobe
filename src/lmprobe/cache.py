@@ -1273,6 +1273,114 @@ def load_prompt_activations(
     raise FileNotFoundError(f"No cached activations found for prompt: {prompt!r}")
 
 
+def load_layer_across_prompts(
+    model_name: str,
+    prompts: list[str],
+    layer: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Load a single layer's raw activations across multiple prompts.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    prompts : list[str]
+        Prompt texts to load.
+    layer : int
+        Layer index to load.
+
+    Returns
+    -------
+    tuple[list[torch.Tensor], list[torch.Tensor]]
+        (activations_list, masks_list) where each element has shape
+        (1, seq_len_i, hidden_dim) and (1, seq_len_i) respectively.
+
+    Raises
+    ------
+    FileNotFoundError
+        If any prompt's cache is missing.
+    """
+    all_acts = []
+    all_masks = []
+
+    layer_key = _raw_layer_key(layer)
+
+    for prompt in prompts:
+        backend = get_backend()
+        key = _prompt_cache_key(model_name, prompt)
+
+        if backend.exists(key):
+            backend.touch(key)
+            tensors = _load_tensors_from_backend(
+                key, [layer_key, _ATTENTION_MASK_KEY]
+            )
+            all_acts.append(tensors[layer_key])
+            all_masks.append(tensors[_ATTENTION_MASK_KEY])
+            continue
+
+        # v1 fallback (local only)
+        if isinstance(backend, LocalCacheBackend):
+            cache_dir = get_prompt_cache_dir(model_name, prompt)
+            layer_path = cache_dir / f"layer_{layer}.pt"
+            mask_path = cache_dir / "attention_mask.pt"
+            if layer_path.exists() and mask_path.exists():
+                all_acts.append(
+                    torch.load(layer_path, weights_only=True)
+                )
+                all_masks.append(
+                    torch.load(mask_path, weights_only=True)
+                )
+                continue
+
+        # Shard registry fallback
+        entry = _lookup_shard(model_name, prompt)
+        if entry is not None:
+            acts, mask = _load_raw_from_shard(model_name, prompt, [layer])
+            # _load_raw_from_shard concatenates layers on last dim;
+            # with a single layer this is already (1, seq_len, hidden_dim)
+            all_acts.append(acts)
+            all_masks.append(mask)
+            continue
+
+        raise FileNotFoundError(
+            f"No cached activations for layer {layer} found for prompt: {prompt!r}"
+        )
+
+    return all_acts, all_masks
+
+
+def load_layer_last_token(
+    model_name: str,
+    prompts: list[str],
+    layer: int,
+) -> torch.Tensor:
+    """Load a single layer's last-token activation across multiple prompts.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    prompts : list[str]
+        Prompt texts to load.
+    layer : int
+        Layer index to load.
+
+    Returns
+    -------
+    torch.Tensor
+        Stacked last-token activations with shape (N, hidden_dim).
+    """
+    acts_list, masks_list = load_layer_across_prompts(model_name, prompts, layer)
+
+    vectors = []
+    for acts, mask in zip(acts_list, masks_list):
+        # acts: (1, seq_len, hidden_dim), mask: (1, seq_len)
+        last_pos = mask[0].nonzero(as_tuple=True)[0][-1].item()
+        vectors.append(acts[0, last_pos, :])
+
+    return torch.stack(vectors, dim=0)
+
+
 def save_prompt_activations(
     model_name: str,
     prompt: str,

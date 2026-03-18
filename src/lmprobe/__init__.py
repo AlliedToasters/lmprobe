@@ -40,6 +40,8 @@ __all__ = [
     "LayerSweepResult",
     "LinearProbe",
     "Probe",
+    "load_layer_across_prompts",
+    "load_layer_last_token",
     "ModelCacheInfo",
     "PerLayerScaler",
     "ProbeCard",
@@ -137,6 +139,13 @@ def __getattr__(name: str):
         from .hub import ProbeCard
 
         return ProbeCard
+    if name in ("load_layer_across_prompts", "load_layer_last_token"):
+        from .cache import load_layer_across_prompts, load_layer_last_token
+
+        return {
+            "load_layer_across_prompts": load_layer_across_prompts,
+            "load_layer_last_token": load_layer_last_token,
+        }[name]
     if name in ("CachedPromptInfo", "discover_cached"):
         from .cache import CachedPromptInfo, discover_cached
 
