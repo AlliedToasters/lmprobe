@@ -624,6 +624,51 @@ class TestPushDataset:
 
     @patch("lmprobe.sharing._check_hub_deps")
     @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_push_num_workers_passed_to_upload(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """num_workers is forwarded to upload_large_folder."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        push_dataset(
+            repo_id="user/test-dataset",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+            num_workers=8,
+        )
+
+        mock_api.upload_large_folder.assert_called_once()
+        call_kwargs = mock_api.upload_large_folder.call_args[1]
+        assert call_kwargs["num_workers"] == 8
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_push_num_workers_default_omitted(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """num_workers=None does not pass num_workers to upload_large_folder."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        push_dataset(
+            repo_id="user/test-dataset",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+        )
+
+        mock_api.upload_large_folder.assert_called_once()
+        call_kwargs = mock_api.upload_large_folder.call_args[1]
+        assert "num_workers" not in call_kwargs
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
     def test_push_labels_length_mismatch(
         self, mock_pyarrow, mock_deps, populated_cache,
     ):
