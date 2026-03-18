@@ -1055,7 +1055,6 @@ class TestSidecarFiles:
         })
 
         # Write new data to sidecar
-        new_values = torch.full((1, 1, 5), 42.0)
         logits = torch.randn(1, 3, 100)
         mask = torch.ones(1, 3)
         save_prompt_logits(self.model, self.prompt, logits, mask, top_k=5)
