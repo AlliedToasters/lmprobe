@@ -8,6 +8,10 @@ import torch
 from lmprobe.cache import (
     CacheInfo,
     _hash_string,
+    _merge_save_backend,
+    _prompt_cache_key,
+    _prompt_logits_key,
+    _prompt_perplexity_key,
     cache_info,
     get_cached_layers,
     get_extraction_cache_dir,
@@ -17,15 +21,19 @@ from lmprobe.cache import (
     invalidate_extraction_cache,
     is_prompt_fully_cached,
     is_prompt_logits_cached,
+    is_prompt_perplexity_cached,
     is_prompt_pooled_cached,
     load_attention_mask,
     load_layer,
     load_prompt_activations,
     load_prompt_logits,
+    load_prompt_perplexity,
     load_prompt_pooled_activations,
     save_attention_mask,
     save_layer,
     save_prompt_activations,
+    save_prompt_logits,
+    save_prompt_perplexity,
     save_prompt_pooled_activations,
     save_prompt_topk_logits,
     set_cache_dtype,
@@ -946,3 +954,129 @@ class TestSavePromptTopkLogits:
         assert loaded_indices.shape == (1, 1, K)
         # Values should match position 5 of the original
         assert torch.allclose(loaded_values[0, 0], values[0, 5], atol=1e-4)
+
+
+class TestSidecarFiles:
+    """Tests for sidecar file storage of logits and perplexity (#120).
+
+    Verifies that logits/perplexity write to separate sidecar files
+    instead of merging into the main activation file, and that backward
+    compat with pre-sidecar entries is preserved.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.cache_dir = tmp_path
+        self.model = "test-model"
+        self.prompt = "sidecar test prompt"
+
+    def test_logits_creates_sidecar_file(self):
+        """save_prompt_logits writes to .logits.safetensors, not main file."""
+        from lmprobe.cache import get_backend
+
+        logits = torch.randn(1, 5, 100)
+        mask = torch.ones(1, 5)
+        save_prompt_logits(self.model, self.prompt, logits, mask, top_k=10)
+
+        backend = get_backend()
+        sidecar_key = _prompt_logits_key(self.model, self.prompt)
+        main_key = _prompt_cache_key(self.model, self.prompt)
+
+        assert backend.exists(sidecar_key), "Sidecar file should exist"
+        assert not backend.exists(main_key), "Main file should not be created"
+
+    def test_perplexity_creates_sidecar_file(self):
+        """save_prompt_perplexity writes to .perplexity.safetensors."""
+        from lmprobe.cache import get_backend
+
+        perp = torch.tensor([1.5, 2.0, 0.8])
+        save_prompt_perplexity(self.model, self.prompt, perp)
+
+        backend = get_backend()
+        sidecar_key = _prompt_perplexity_key(self.model, self.prompt)
+        main_key = _prompt_cache_key(self.model, self.prompt)
+
+        assert backend.exists(sidecar_key), "Sidecar file should exist"
+        assert not backend.exists(main_key), "Main file should not be created"
+
+    def test_logits_roundtrip_via_sidecar(self):
+        """Logits saved to sidecar can be loaded back."""
+        logits = torch.randn(1, 5, 100)
+        mask = torch.ones(1, 5)
+        save_prompt_logits(self.model, self.prompt, logits, mask, top_k=10)
+
+        assert is_prompt_logits_cached(self.model, self.prompt, top_k=10)
+        values, indices = load_prompt_logits(self.model, self.prompt, top_k=10)
+        assert values.shape == (1, 1, 10)
+        assert indices.shape == (1, 1, 10)
+
+    def test_perplexity_roundtrip_via_sidecar(self):
+        """Perplexity saved to sidecar can be loaded back."""
+        perp = torch.tensor([1.5, 2.0, 0.8])
+        save_prompt_perplexity(self.model, self.prompt, perp)
+
+        assert is_prompt_perplexity_cached(self.model, self.prompt)
+        loaded = load_prompt_perplexity(self.model, self.prompt)
+        assert torch.allclose(loaded, perp, atol=1e-3)
+
+    def test_backward_compat_logits_in_main_file(self):
+        """Logits merged into main file (pre-sidecar) can still be loaded."""
+        # Simulate pre-sidecar behavior: merge logits into main file
+        logits = torch.randn(1, 1, 100)
+        main_key = _prompt_cache_key(self.model, self.prompt)
+        _merge_save_backend(main_key, {
+            "logits_top_k_values": logits,
+            "logits_top_k_indices": torch.zeros(1, 1, 100, dtype=torch.int32),
+        })
+
+        assert is_prompt_logits_cached(self.model, self.prompt, top_k=100)
+        values, indices = load_prompt_logits(self.model, self.prompt, top_k=100)
+        assert values.shape == (1, 1, 100)
+
+    def test_backward_compat_perplexity_in_main_file(self):
+        """Perplexity merged into main file (pre-sidecar) can still be loaded."""
+        perp = torch.tensor([1.5, 2.0, 0.8])
+        main_key = _prompt_cache_key(self.model, self.prompt)
+        _merge_save_backend(main_key, {"perplexity": perp})
+
+        assert is_prompt_perplexity_cached(self.model, self.prompt)
+        loaded = load_prompt_perplexity(self.model, self.prompt)
+        assert torch.allclose(loaded, perp, atol=1e-3)
+
+    def test_sidecar_preferred_over_main_file(self):
+        """When both sidecar and main file have logits, sidecar wins."""
+        # Write old data to main file
+        main_key = _prompt_cache_key(self.model, self.prompt)
+        old_values = torch.ones(1, 1, 5)
+        _merge_save_backend(main_key, {
+            "logits_top_k_values": old_values,
+            "logits_top_k_indices": torch.zeros(1, 1, 5, dtype=torch.int32),
+        })
+
+        # Write new data to sidecar
+        new_values = torch.full((1, 1, 5), 42.0)
+        logits = torch.randn(1, 3, 100)
+        mask = torch.ones(1, 3)
+        save_prompt_logits(self.model, self.prompt, logits, mask, top_k=5)
+
+        # Load should come from sidecar (not old main file data)
+        values, indices = load_prompt_logits(self.model, self.prompt, top_k=5)
+        # The sidecar values come from topk of our random logits, not ones
+        assert not torch.allclose(values, old_values)
+
+    def test_sidecar_not_counted_as_extra_prompt(self):
+        """cache_info should not double-count sidecar files as prompts."""
+        acts = torch.randn(1, 5, 32)
+        mask = torch.ones(1, 5)
+        save_prompt_activations(self.model, self.prompt, [0], acts, mask)
+
+        perp = torch.tensor([1.0, 2.0, 3.0])
+        save_prompt_perplexity(self.model, self.prompt, perp)
+
+        logits = torch.randn(1, 5, 100)
+        save_prompt_logits(self.model, self.prompt, logits, mask, top_k=10)
+
+        info = cache_info(self.model)
+        assert len(info.models) == 1
+        assert info.models[0].num_prompts == 1  # not 3
