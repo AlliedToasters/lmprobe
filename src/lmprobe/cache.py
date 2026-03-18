@@ -375,7 +375,42 @@ def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
     backend = get_backend()
     key = _prompt_cache_key(model_name, prompt)
 
+    # Check if sidecar files exist even when main file doesn't (#120)
+    logits_sidecar = _prompt_logits_key(model_name, prompt)
+    perplexity_sidecar = _prompt_perplexity_key(model_name, prompt)
+    has_logits_sidecar = backend.exists(logits_sidecar)
+    has_perplexity_sidecar = backend.exists(perplexity_sidecar)
+
     if not backend.exists(key):
+        # If only sidecar files exist (logits/perplexity saved without activations)
+        if has_logits_sidecar or has_perplexity_sidecar:
+            has_logits = False
+            has_topk = False
+            logits_top_k = None
+            if has_logits_sidecar:
+                sidecar_keys = _get_tensor_keys_from_backend(logits_sidecar)
+                has_logits = _LOGITS_KEY in sidecar_keys
+                has_topk = (
+                    _LOGITS_TOP_K_VALUES_KEY in sidecar_keys
+                    and _LOGITS_TOP_K_INDICES_KEY in sidecar_keys
+                )
+                if has_topk:
+                    try:
+                        tensors = _load_tensors_from_backend(
+                            logits_sidecar, [_LOGITS_TOP_K_VALUES_KEY]
+                        )
+                        logits_top_k = tensors[_LOGITS_TOP_K_VALUES_KEY].shape[-1]
+                    except Exception:
+                        pass
+            return CachedPromptInfo(
+                raw_layers=[],
+                pooled={},
+                has_logits=has_logits,
+                logits_top_k=logits_top_k,
+                has_perplexity=has_perplexity_sidecar,
+                num_tokens=None,
+            )
+
         # v1 fallback: check for legacy directory (local only)
         if isinstance(backend, LocalCacheBackend):
             cache_dir = get_prompt_cache_dir(model_name, prompt)
@@ -430,18 +465,30 @@ def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
 
     raw_layers = sorted(_parse_raw_layer_keys(tensor_keys))
     pooled = _parse_all_pooled_keys(tensor_keys)
-    has_logits = _LOGITS_KEY in tensor_keys
-    has_topk = (
-        _LOGITS_TOP_K_VALUES_KEY in tensor_keys
-        and _LOGITS_TOP_K_INDICES_KEY in tensor_keys
-    )
-    has_perplexity = _PERPLEXITY_KEY in tensor_keys
+
+    # Check for logits/perplexity in sidecar files first, then main file (#120)
+    if has_logits_sidecar:
+        sidecar_keys = _get_tensor_keys_from_backend(logits_sidecar)
+        has_logits = _LOGITS_KEY in sidecar_keys
+        has_topk = (
+            _LOGITS_TOP_K_VALUES_KEY in sidecar_keys
+            and _LOGITS_TOP_K_INDICES_KEY in sidecar_keys
+        )
+    else:
+        has_logits = _LOGITS_KEY in tensor_keys
+        has_topk = (
+            _LOGITS_TOP_K_VALUES_KEY in tensor_keys
+            and _LOGITS_TOP_K_INDICES_KEY in tensor_keys
+        )
+
+    has_perplexity = has_perplexity_sidecar or _PERPLEXITY_KEY in tensor_keys
 
     # Determine top-k value by loading the shape of the topk values tensor
     logits_top_k = None
     if has_topk:
         try:
-            tensors = _load_tensors_from_backend(key, [_LOGITS_TOP_K_VALUES_KEY])
+            source_key = logits_sidecar if has_logits_sidecar else key
+            tensors = _load_tensors_from_backend(source_key, [_LOGITS_TOP_K_VALUES_KEY])
             logits_top_k = tensors[_LOGITS_TOP_K_VALUES_KEY].shape[-1]
         except Exception:
             pass
@@ -475,6 +522,20 @@ def _prompt_cache_key(model_name: str, prompt: str) -> str:
     model_hash = _hash_string(model_name)
     prompt_hash = _hash_string(prompt)
     return f"{model_hash}/{prompt_hash}.safetensors"
+
+
+def _prompt_logits_key(model_name: str, prompt: str) -> str:
+    """Get the backend key for a prompt's logits sidecar file."""
+    model_hash = _hash_string(model_name)
+    prompt_hash = _hash_string(prompt)
+    return f"{model_hash}/{prompt_hash}.logits.safetensors"
+
+
+def _prompt_perplexity_key(model_name: str, prompt: str) -> str:
+    """Get the backend key for a prompt's perplexity sidecar file."""
+    model_hash = _hash_string(model_name)
+    prompt_hash = _hash_string(prompt)
+    return f"{model_hash}/{prompt_hash}.perplexity.safetensors"
 
 
 def _model_name_key(model_name: str) -> str:
@@ -1414,8 +1475,14 @@ def save_prompt_activations(
 def is_prompt_perplexity_cached(model_name: str, prompt: str) -> bool:
     """Check if perplexity features are cached for a prompt."""
     backend = get_backend()
-    key = _prompt_cache_key(model_name, prompt)
 
+    # Check sidecar file first (#120)
+    sidecar_key = _prompt_perplexity_key(model_name, prompt)
+    if backend.exists(sidecar_key):
+        return True
+
+    # Fall back to main file (backward compat with pre-sidecar entries)
+    key = _prompt_cache_key(model_name, prompt)
     if backend.exists(key):
         tensor_keys = _get_tensor_keys_from_backend(key)
         return _PERPLEXITY_KEY in tensor_keys
@@ -1431,8 +1498,16 @@ def is_prompt_perplexity_cached(model_name: str, prompt: str) -> bool:
 def load_prompt_perplexity(model_name: str, prompt: str) -> torch.Tensor:
     """Load cached perplexity features (3,) for a single prompt."""
     backend = get_backend()
-    key = _prompt_cache_key(model_name, prompt)
 
+    # Check sidecar file first (#120)
+    sidecar_key = _prompt_perplexity_key(model_name, prompt)
+    if backend.exists(sidecar_key):
+        backend.touch(sidecar_key)
+        tensors = _load_tensors_from_backend(sidecar_key, [_PERPLEXITY_KEY])
+        return tensors[_PERPLEXITY_KEY]
+
+    # Fall back to main file (backward compat with pre-sidecar entries)
+    key = _prompt_cache_key(model_name, prompt)
     if backend.exists(key):
         backend.touch(key)
         tensors = _load_tensors_from_backend(key, [_PERPLEXITY_KEY])
@@ -1451,11 +1526,16 @@ def load_prompt_perplexity(model_name: str, prompt: str) -> torch.Tensor:
 def save_prompt_perplexity(
     model_name: str, prompt: str, perplexity_features: torch.Tensor
 ) -> None:
-    """Save perplexity features for a single prompt."""
+    """Save perplexity features for a single prompt.
+
+    Writes to a small sidecar file (``{hash}.perplexity.safetensors``)
+    instead of merging into the main activation file, avoiding a full
+    read-modify-write of potentially multi-GB activation data (#120).
+    """
     _register_model(model_name)
-    key = _prompt_cache_key(model_name, prompt)
-    new_tensors = {_PERPLEXITY_KEY: _prepare_tensor(perplexity_features)}
-    _merge_save_backend(key, new_tensors)
+    key = _prompt_perplexity_key(model_name, prompt)
+    tensors = {_PERPLEXITY_KEY: _prepare_tensor(perplexity_features)}
+    _save_tensors_to_backend(key, tensors)
 
 
 # =============================================================================
@@ -1478,8 +1558,20 @@ def is_prompt_logits_cached(
         If None, checks for full logits. If int, checks for top-k logits.
     """
     backend = get_backend()
-    key = _prompt_cache_key(model_name, prompt)
 
+    # Check sidecar file first (#120)
+    sidecar_key = _prompt_logits_key(model_name, prompt)
+    if backend.exists(sidecar_key):
+        tensor_keys = _get_tensor_keys_from_backend(sidecar_key)
+        if top_k is not None:
+            return (
+                _LOGITS_TOP_K_VALUES_KEY in tensor_keys
+                and _LOGITS_TOP_K_INDICES_KEY in tensor_keys
+            )
+        return _LOGITS_KEY in tensor_keys
+
+    # Fall back to main file (backward compat with pre-sidecar entries)
+    key = _prompt_cache_key(model_name, prompt)
     if backend.exists(key):
         tensor_keys = _get_tensor_keys_from_backend(key)
         if top_k is not None:
@@ -1518,7 +1610,6 @@ def save_prompt_logits(
         Which token positions to store: "last" (default) or "all".
     """
     _register_model(model_name)
-    key = _prompt_cache_key(model_name, prompt)
 
     # Select positions
     if positions == "last":
@@ -1543,7 +1634,9 @@ def save_prompt_logits(
     else:
         new_tensors = {_LOGITS_KEY: _prepare_tensor(selected_logits)}
 
-    _merge_save_backend(key, new_tensors)
+    # Write to sidecar file instead of merging into main activation file (#120)
+    sidecar_key = _prompt_logits_key(model_name, prompt)
+    _save_tensors_to_backend(sidecar_key, new_tensors)
 
 
 def save_prompt_topk_logits(
@@ -1578,7 +1671,6 @@ def save_prompt_topk_logits(
         Which token positions to store: "last" (default) or "all".
     """
     _register_model(model_name)
-    key = _prompt_cache_key(model_name, prompt)
 
     # Select positions
     if positions == "last":
@@ -1599,7 +1691,9 @@ def save_prompt_topk_logits(
         _LOGITS_TOP_K_VALUES_KEY: _prepare_tensor(selected_values),
         _LOGITS_TOP_K_INDICES_KEY: _prepare_tensor(selected_indices.to(torch.int32)),
     }
-    _merge_save_backend(key, new_tensors)
+    # Write to sidecar file instead of merging into main activation file (#120)
+    sidecar_key = _prompt_logits_key(model_name, prompt)
+    _save_tensors_to_backend(sidecar_key, new_tensors)
 
 
 def load_prompt_logits(
@@ -1624,11 +1718,24 @@ def load_prompt_logits(
         and indices has shape (1, positions, K) with dtype int32.
     """
     backend = get_backend()
-    key = _prompt_cache_key(model_name, prompt)
 
+    # Check sidecar file first (#120)
+    sidecar_key = _prompt_logits_key(model_name, prompt)
+    if backend.exists(sidecar_key):
+        backend.touch(sidecar_key)
+        if top_k is not None:
+            tensors = _load_tensors_from_backend(
+                sidecar_key, [_LOGITS_TOP_K_VALUES_KEY, _LOGITS_TOP_K_INDICES_KEY]
+            )
+            return tensors[_LOGITS_TOP_K_VALUES_KEY], tensors[_LOGITS_TOP_K_INDICES_KEY]
+        else:
+            tensors = _load_tensors_from_backend(sidecar_key, [_LOGITS_KEY])
+            return tensors[_LOGITS_KEY], None
+
+    # Fall back to main file (backward compat with pre-sidecar entries)
+    key = _prompt_cache_key(model_name, prompt)
     if backend.exists(key):
         backend.touch(key)
-
         if top_k is not None:
             tensors = _load_tensors_from_backend(
                 key, [_LOGITS_TOP_K_VALUES_KEY, _LOGITS_TOP_K_INDICES_KEY]
@@ -1789,6 +1896,7 @@ class ModelCacheInfo:
     num_layers: int
     has_pooled: bool
     has_perplexity: bool
+    has_logits: bool = False
 
     @property
     def size_gb(self) -> float:
@@ -1800,6 +1908,7 @@ class ModelCacheInfo:
             f"  {name}  {self.size_gb:.1f} GB  "
             f"({self.num_prompts} prompts, {self.num_layers} layers"
             f"{', pooled' if self.has_pooled else ''}"
+            f"{', logits' if self.has_logits else ''}"
             f"{', perplexity' if self.has_perplexity else ''})"
         )
 
@@ -1887,18 +1996,37 @@ def _cache_info_local(backend: LocalCacheBackend, model: str | None = None) -> C
         all_layers: set[int] = set()
         has_pooled = False
         has_perplexity = False
+        has_logits = False
 
         # Scan v2 safetensors files
         for sf_file in model_dir.glob("*.safetensors"):
             fsize = sf_file.stat().st_size
             fmtime = sf_file.stat().st_mtime
             model_size += fsize
-            num_prompts += 1
+
+            # Sidecar files (.logits.safetensors, .perplexity.safetensors)
+            # don't count as separate prompts (#120)
+            is_sidecar = (
+                sf_file.name.endswith(".logits.safetensors")
+                or sf_file.name.endswith(".perplexity.safetensors")
+            )
+            if not is_sidecar:
+                num_prompts += 1
 
             if oldest_mtime is None or fmtime < oldest_mtime:
                 oldest_mtime = fmtime
             if newest_mtime is None or fmtime > newest_mtime:
                 newest_mtime = fmtime
+
+            # Check sidecar files for perplexity
+            if sf_file.name.endswith(".perplexity.safetensors"):
+                has_perplexity = True
+                continue
+
+            # Logits sidecar — flag it, no layer/pooling info to extract
+            if sf_file.name.endswith(".logits.safetensors"):
+                has_logits = True
+                continue
 
             try:
                 keys = _load_sf_keys(sf_file)
@@ -1907,6 +2035,8 @@ def _cache_info_local(backend: LocalCacheBackend, model: str | None = None) -> C
                     has_pooled = True
                 if _PERPLEXITY_KEY in keys:
                     has_perplexity = True
+                if _LOGITS_KEY in keys or _LOGITS_TOP_K_VALUES_KEY in keys:
+                    has_logits = True
             except Exception:
                 pass
 
@@ -1946,6 +2076,7 @@ def _cache_info_local(backend: LocalCacheBackend, model: str | None = None) -> C
                     num_layers=len(all_layers),
                     has_pooled=has_pooled,
                     has_perplexity=has_perplexity,
+                    has_logits=has_logits,
                 )
             )
 
@@ -1994,17 +2125,33 @@ def _cache_info_backend(backend: CacheBackend, model: str | None = None) -> Cach
         all_layers: set[int] = set()
         has_pooled = False
         has_perplexity = False
+        has_logits = False
 
         for entry_key, size, mtime in m_entries:
             model_size += size
-            num_prompts += 1
+
+            # Sidecar files don't count as separate prompts (#120)
+            is_sidecar = (
+                entry_key.endswith(".logits.safetensors")
+                or entry_key.endswith(".perplexity.safetensors")
+            )
+            if not is_sidecar:
+                num_prompts += 1
 
             if oldest_mtime is None or mtime < oldest_mtime:
                 oldest_mtime = mtime
             if newest_mtime is None or mtime > newest_mtime:
                 newest_mtime = mtime
 
-            # Try to read tensor keys
+            # Detect sidecar files
+            if entry_key.endswith(".perplexity.safetensors"):
+                has_perplexity = True
+                continue
+            if entry_key.endswith(".logits.safetensors"):
+                has_logits = True
+                continue
+
+            # Try to read tensor keys from main files
             if entry_key.endswith(".safetensors"):
                 try:
                     data = backend.read_bytes(entry_key)
@@ -2014,6 +2161,8 @@ def _cache_info_backend(backend: CacheBackend, model: str | None = None) -> Cach
                         has_pooled = True
                     if _PERPLEXITY_KEY in tensor_keys:
                         has_perplexity = True
+                    if _LOGITS_KEY in tensor_keys or _LOGITS_TOP_K_VALUES_KEY in tensor_keys:
+                        has_logits = True
                 except Exception:
                     pass
 
@@ -2028,6 +2177,7 @@ def _cache_info_backend(backend: CacheBackend, model: str | None = None) -> Cach
                     num_layers=len(all_layers),
                     has_pooled=has_pooled,
                     has_perplexity=has_perplexity,
+                    has_logits=has_logits,
                 )
             )
 
