@@ -1186,6 +1186,7 @@ def push_dataset(
     description: str | None = None,
     license: str = "cc-by-4.0",
     token: str | None = None,
+    num_workers: int | None = None,
 ) -> str:
     """Push cached activations to a HuggingFace Dataset repo.
 
@@ -1220,6 +1221,10 @@ def push_dataset(
         License identifier for the dataset card. Default ``"cc-by-4.0"``.
     token : str | None
         HuggingFace API token.
+    num_workers : int | None
+        Number of workers for parallel file uploads.  Passed directly to
+        ``upload_large_folder``.  ``None`` (default) uses the
+        ``huggingface_hub`` default (currently 16 workers).
 
     Returns
     -------
@@ -1369,6 +1374,7 @@ def push_dataset(
         repo_id=repo_id,
         folder_path=str(tmpdir),
         repo_type="dataset",
+        num_workers=num_workers,
     )
     url = f"https://huggingface.co/datasets/{repo_id}"
 
