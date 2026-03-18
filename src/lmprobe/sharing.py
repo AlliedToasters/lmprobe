@@ -1186,7 +1186,7 @@ def push_dataset(
     num_workers : int | None
         Number of workers for parallel file uploads.  Passed directly to
         ``upload_large_folder``.  ``None`` (default) uses the
-        ``huggingface_hub`` default.
+        ``huggingface_hub`` default (currently 16 workers).
 
     Returns
     -------
@@ -1297,14 +1297,12 @@ def push_dataset(
         "[SHARING] Uploading dataset (%.2f GB) via upload_large_folder",
         total_size / 1e9,
     )
-    upload_kwargs: dict = dict(
+    api.upload_large_folder(
         repo_id=repo_id,
         folder_path=str(tmpdir),
         repo_type="dataset",
+        num_workers=num_workers,
     )
-    if num_workers is not None:
-        upload_kwargs["num_workers"] = num_workers
-    api.upload_large_folder(**upload_kwargs)
     url = f"https://huggingface.co/datasets/{repo_id}"
 
     # Cleanup
