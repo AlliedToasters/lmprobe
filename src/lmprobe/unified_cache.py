@@ -891,3 +891,86 @@ class UnifiedCache:
 
         logger.info("[LOGITS] Computed logits for %d prompts", computed)
         return computed
+
+    def compute_perplexity_from_cache(
+        self,
+        prompts: list[str],
+        device: str | None = None,
+        batch_size: int = 16,
+    ) -> int:
+        """Compute perplexity from cached last-layer activations.
+
+        Reconstructs full-sequence logits as ``norm(hidden) @ lm_head.T``,
+        computes cross-entropy loss against input_ids (re-tokenized),
+        and caches the perplexity stats (mean, min, max).
+
+        Full-sequence logits are NOT saved to disk (too large).
+
+        Parameters
+        ----------
+        prompts : list[str]
+            Prompts whose last-layer raw activations are already cached.
+        device : str | None
+            Device for computation. Defaults to "cpu".
+        batch_size : int
+            Number of prompts to process per batch.
+
+        Returns
+        -------
+        int
+            Number of prompts for which perplexity was newly computed.
+
+        Raises
+        ------
+        ValueError
+            If the last layer is not in ``self.layer_indices``.
+        """
+        device = device or "cpu"
+
+        # Determine the last layer index
+        num_layers = get_num_layers_from_config(self.model_name)
+        last_layer = num_layers - 1
+
+        if last_layer not in self.layer_indices:
+            raise ValueError(
+                f"Last layer ({last_layer}) is not in cached layer_indices "
+                f"{self.layer_indices}. Cache must include the last layer to "
+                f"compute perplexity."
+            )
+
+        # Filter to prompts that don't already have perplexity cached
+        uncached = [
+            p for p in prompts
+            if not is_prompt_perplexity_cached(self.model_name, p)
+        ]
+
+        if not uncached:
+            logger.info(
+                "[PERPLEXITY] All %d prompts already have perplexity cached",
+                len(prompts),
+            )
+            return 0
+
+        logger.info(
+            "[PERPLEXITY] Computing perplexity for %d prompts "
+            "(%d already cached)",
+            len(uncached), len(prompts) - len(uncached),
+        )
+
+        from .logit_utils import compute_perplexity_from_activations
+
+        computed = 0
+        for batch_start in range(0, len(uncached), batch_size):
+            batch_prompts = uncached[batch_start : batch_start + batch_size]
+
+            with torch.no_grad():
+                ppl_tensors = compute_perplexity_from_activations(
+                    self.model_name, batch_prompts, last_layer, device=device,
+                )
+
+            for prompt, ppl_tensor in zip(batch_prompts, ppl_tensors):
+                save_prompt_perplexity(self.model_name, prompt, ppl_tensor)
+                computed += 1
+
+        logger.info("[PERPLEXITY] Computed perplexity for %d prompts", computed)
+        return computed

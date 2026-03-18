@@ -983,3 +983,130 @@ class TestComputeLogitsFromCache:
         assert torch.allclose(fv, cv, atol=1e-2), (
             f"Max diff: {(fv - cv).abs().max().item()}"
         )
+
+
+class TestComputePerplexityFromCache:
+    """Tests for computing perplexity from cached activations."""
+
+    def test_compute_perplexity_from_cache_basic(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """Perplexity appears in cache after compute_perplexity_from_cache."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        prompts = ["hello world", "test prompt"]
+
+        # Warm up with raw activations (need full sequence for perplexity)
+        cache = UnifiedCache(
+            model=tiny_model, layers="all",
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache.warmup(prompts)
+
+        # Compute perplexity from cache
+        computed = cache.compute_perplexity_from_cache(prompts)
+        assert computed == 2
+
+        # Verify perplexity is now cached
+        for prompt in prompts:
+            assert is_prompt_perplexity_cached(tiny_model, prompt)
+
+    def test_compute_perplexity_from_cache_skips_cached(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """Returns 0 when all prompts already have perplexity cached."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        prompts = ["already cached perplexity test"]
+
+        cache = UnifiedCache(
+            model=tiny_model, layers="all",
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache.warmup(prompts)
+
+        # First call computes
+        assert cache.compute_perplexity_from_cache(prompts) == 1
+
+        # Second call skips
+        assert cache.compute_perplexity_from_cache(prompts) == 0
+
+    def test_compute_perplexity_from_cache_requires_last_layer(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """ValueError if last layer not in cached layers."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        prompts = ["perplexity layer check test"]
+
+        # Only cache layer 0, not the last layer
+        cache = UnifiedCache(
+            model=tiny_model, layers=[0],
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache.warmup(prompts)
+
+        with pytest.raises(ValueError, match="Last layer"):
+            cache.compute_perplexity_from_cache(prompts)
+
+    def test_compute_perplexity_from_cache_matches_forward_pass(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """Critical: perplexity from cache path matches forward-pass perplexity."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        prompts = ["perplexity correctness test"]
+
+        # Extract with perplexity via forward pass
+        cache_with_ppl = UnifiedCache(
+            model=tiny_model, layers="all",
+            compute_perplexity=True, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache_with_ppl.warmup(prompts)
+
+        # Get forward-pass perplexity
+        forward_ppl = cache_with_ppl.get_perplexity(prompts)  # (1, 3)
+
+        # Use a second tmp dir for the compute-from-cache path
+        tmp_path2 = tmp_path / "ppl_compute_test"
+        tmp_path2.mkdir()
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path2))
+
+        # Reset cache backend to pick up new dir
+        import lmprobe.cache as cache_mod
+
+        cache_mod._backend = None
+
+        cache_no_ppl = UnifiedCache(
+            model=tiny_model, layers="all",
+            compute_perplexity=False, device="cpu", remote=False,
+            cache_pooled=False,
+        )
+        cache_no_ppl.warmup(prompts)
+
+        # Compute perplexity from cache
+        cache_no_ppl.compute_perplexity_from_cache(prompts)
+
+        # Load computed perplexity
+        from lmprobe.cache import load_prompt_perplexity
+
+        computed_ppl = load_prompt_perplexity(tiny_model, prompts[0])
+        computed_ppl = computed_ppl.float().numpy().reshape(1, -1)
+
+        # Should match forward pass perplexity closely
+        assert forward_ppl.shape == computed_ppl.shape, (
+            f"Shape mismatch: forward={forward_ppl.shape}, "
+            f"computed={computed_ppl.shape}"
+        )
+        # Tolerance is generous because the forward-pass path and cache path
+        # may differ in dtype handling (bfloat16 vs float32 intermediate).
+        # The key check is that values are in the same ballpark.
+        assert np.allclose(forward_ppl, computed_ppl, rtol=5e-2), (
+            f"Max relative diff too large. "
+            f"Forward: {forward_ppl}, Computed: {computed_ppl}, "
+            f"Max abs diff: {np.abs(forward_ppl - computed_ppl).max()}"
+        )

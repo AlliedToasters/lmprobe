@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import torch
 import torch.nn.functional as functional
 
@@ -203,3 +204,117 @@ def apply_norm(
         )
     else:
         raise ValueError(f"Unknown norm_type: {norm_type!r}")
+
+
+def compute_perplexity_from_activations(
+    model_name: str,
+    prompts: list[str],
+    last_layer: int,
+    device: str = "cpu",
+) -> list[torch.Tensor]:
+    """Compute perplexity stats from cached last-layer activations.
+
+    For each prompt: loads full-sequence activations from cache, reconstructs
+    logits via ``norm(hidden) @ lm_head.T``, computes cross-entropy loss,
+    and returns perplexity stats (mean, min, max).
+
+    Full-sequence logits are computed in memory and discarded immediately
+    (too large to cache to disk).
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID or local path.
+    prompts : list[str]
+        Prompts whose last-layer activations are already cached (raw, not pooled).
+    last_layer : int
+        The last layer index (must be cached).
+    device : str
+        Device for computation.
+
+    Returns
+    -------
+    list[torch.Tensor]
+        List of (3,) tensors: [mean_ppl, min_ppl, max_ppl] per prompt.
+
+    Raises
+    ------
+    FileNotFoundError
+        If any prompt's activations are not cached.
+    """
+    from transformers import AutoTokenizer
+
+    from .cache import load_layer_across_prompts
+
+    # Download norm + lm_head weights (one-time, HF-cached)
+    norm_weight, lm_head_weight, norm_config = download_lm_head_weights(
+        model_name, device=device,
+    )
+
+    # Load tokenizer (one-time)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    results = []
+
+    for prompt in prompts:
+        # Load full-sequence activations for this prompt
+        acts_list, masks_list = load_layer_across_prompts(
+            model_name, [prompt], last_layer,
+        )
+        # acts: (1, seq_len, hidden_dim), mask: (1, seq_len)
+        acts = acts_list[0].to(device=device, dtype=norm_weight.dtype)
+        mask = masks_list[0]
+
+        # Apply norm
+        normed = apply_norm(
+            acts,
+            norm_weight,
+            norm_config["eps"],
+            norm_config["norm_type"],
+            norm_config["norm_bias"],
+        )
+
+        # Compute logits: (1, seq_len, hidden_dim) @ (hidden_dim, vocab_size)
+        logits = normed @ lm_head_weight.T  # (1, seq_len, vocab_size)
+
+        # Tokenize to get input_ids for cross-entropy labels
+        tokenized = tokenizer(prompt, return_tensors="pt")
+        input_ids = tokenized["input_ids"]  # (1, seq_len)
+
+        # Compute per-token cross-entropy (next-token prediction)
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = input_ids[..., 1:].contiguous().to(shift_logits.device)
+        shift_mask = mask[..., 1:].contiguous().to(shift_logits.device)
+
+        loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
+        per_token_loss = loss_fn(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        )
+
+        # Mask out padding tokens
+        valid_mask = shift_mask.view(-1) == 1
+        valid_losses = per_token_loss[valid_mask]
+
+        if len(valid_losses) == 0:
+            ppl_tensor = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+        else:
+            mean_loss = valid_losses.mean().item()
+            min_loss = valid_losses.min().item()
+            max_loss = valid_losses.max().item()
+
+            ppl_tensor = torch.tensor(
+                [
+                    float(np.exp(mean_loss)),
+                    float(np.exp(min_loss)),
+                    float(np.exp(max_loss)),
+                ],
+                dtype=torch.float32,
+            )
+
+        results.append(ppl_tensor)
+
+        # Free logits immediately
+        del logits, normed, acts
+
+    return results
