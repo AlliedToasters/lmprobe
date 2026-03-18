@@ -14,12 +14,24 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-# Model types that use RMSNorm (vs LayerNorm)
-_RMS_NORM_TYPES = frozenset({
-    "llama", "mistral", "mixtral", "qwen2", "qwen2_moe",
-    "gemma", "gemma2", "phi3", "cohere", "deepseek_v2",
-    "internlm2", "stablelm",
-})
+
+def _detect_norm_type(config) -> tuple[str, float]:
+    """Detect norm type and epsilon from model config attributes.
+
+    Uses config attributes rather than a hardcoded model_type list,
+    so new architectures are handled automatically.
+    """
+    if hasattr(config, "rms_norm_eps"):
+        return "rms_norm", config.rms_norm_eps
+    elif hasattr(config, "layer_norm_eps"):
+        return "layer_norm", config.layer_norm_eps
+    else:
+        # Fallback: assume RMSNorm with standard epsilon
+        logger.warning(
+            "Could not detect norm type from config (no rms_norm_eps or "
+            "layer_norm_eps attribute). Defaulting to rms_norm with eps=1e-5."
+        )
+        return "rms_norm", 1e-5
 
 
 def download_lm_head_weights(
@@ -28,6 +40,9 @@ def download_lm_head_weights(
     dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     """Download only norm + lm_head weights from a HuggingFace model.
+
+    For sharded models, downloads only the 1-2 shard files containing
+    the needed weights (not the full model).
 
     Parameters
     ----------
@@ -46,15 +61,15 @@ def download_lm_head_weights(
         - lm_head_weight: (vocab_size, hidden_dim)
         - config_dict: {"eps": float, "norm_type": str, "norm_bias": Tensor|None}
     """
+    import json
     from pathlib import Path
 
+    from huggingface_hub import hf_hub_download
     from safetensors import safe_open
     from transformers import AutoConfig
 
     config = AutoConfig.from_pretrained(model_name)
-    model_type = getattr(config, "model_type", "")
-    norm_type = "rms_norm" if model_type in _RMS_NORM_TYPES else "layer_norm"
-    eps = getattr(config, "rms_norm_eps", None) or getattr(config, "layer_norm_eps", 1e-5)
+    norm_type, eps = _detect_norm_type(config)
     tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
 
     # Determine weight key names
@@ -69,53 +84,53 @@ def download_lm_head_weights(
     else:
         needed_keys.add(lm_head_key)
 
-    # Try to locate the safetensors files
     local_path = Path(model_name)
-    if local_path.is_dir():
-        model_dir = local_path
+    is_local = local_path.is_dir()
+
+    # Try sharded model first, then single file
+    loaded = {}
+
+    if is_local:
+        index_path = local_path / "model.safetensors.index.json"
     else:
-        from huggingface_hub import snapshot_download
+        try:
+            index_path = Path(hf_hub_download(
+                model_name, "model.safetensors.index.json"
+            ))
+        except Exception:
+            index_path = None
 
-        model_dir = Path(snapshot_download(
-            model_name,
-            allow_patterns=["*.safetensors", "*.safetensors.index.json"],
-        ))
-
-    # Check for sharded model
-    index_path = model_dir / "model.safetensors.index.json"
-    if index_path.exists():
-        import json
-
+    if index_path is not None and index_path.exists():
+        # Sharded model: download only the needed shard files
         with open(index_path) as f:
-            index = json.load(f)
-        weight_map = index["weight_map"]
+            weight_map = json.load(f)["weight_map"]
 
-        # Collect unique shard files we need
+        # Identify which shard files contain our weights
         shard_files = set()
         for wk in needed_keys:
             if wk in weight_map:
                 shard_files.add(weight_map[wk])
             elif wk == lm_head_key and embed_key in weight_map:
-                # Tied embeddings: lm_head not in map, use embed_tokens
                 shard_files.add(weight_map[embed_key])
                 tie_word_embeddings = True
 
-        loaded = {}
         for shard_file in shard_files:
-            shard_path = str(model_dir / shard_file)
+            if is_local:
+                shard_path = str(local_path / shard_file)
+            else:
+                shard_path = hf_hub_download(model_name, shard_file)
             with safe_open(shard_path, framework="pt", device=device) as f:
                 for k in f.keys():
                     if k in needed_keys or (k == embed_key and tie_word_embeddings):
                         loaded[k] = f.get_tensor(k)
     else:
         # Single safetensors file
-        sf_path = model_dir / "model.safetensors"
-        if not sf_path.exists():
-            raise FileNotFoundError(
-                f"No safetensors file found for model {model_name} at {model_dir}"
-            )
-        loaded = {}
-        with safe_open(str(sf_path), framework="pt", device=device) as f:
+        if is_local:
+            sf_path = str(local_path / "model.safetensors")
+        else:
+            sf_path = hf_hub_download(model_name, "model.safetensors")
+
+        with safe_open(sf_path, framework="pt", device=device) as f:
             for k in f.keys():
                 if k in needed_keys or (k == embed_key and tie_word_embeddings):
                     loaded[k] = f.get_tensor(k)
@@ -133,7 +148,6 @@ def download_lm_head_weights(
             f"Available keys: {list(loaded.keys())}"
         )
 
-    # Check for norm bias
     norm_bias = loaded.get(norm_bias_key)
 
     if dtype is not None:

@@ -1304,9 +1304,9 @@ def load_layer_across_prompts(
     all_masks = []
 
     layer_key = _raw_layer_key(layer)
+    backend = get_backend()
 
     for prompt in prompts:
-        backend = get_backend()
         key = _prompt_cache_key(model_name, prompt)
 
         if backend.exists(key):

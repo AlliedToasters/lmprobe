@@ -33,7 +33,6 @@ from .cache import (
     save_prompt_pooled_activations,
     save_prompt_topk_logits,
 )
-from .extraction import get_num_layers_from_config
 from .extraction import (
     compute_perplexity_from_logits,
     get_num_layers_from_config,
