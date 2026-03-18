@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import torch
 import torch.nn.functional as functional
 
@@ -203,3 +204,131 @@ def apply_norm(
         )
     else:
         raise ValueError(f"Unknown norm_type: {norm_type!r}")
+
+
+def compute_perplexity_from_activations(
+    model_name: str,
+    prompts: list[str],
+    last_layer: int,
+    device: str = "cpu",
+    norm_weight: torch.Tensor | None = None,
+    lm_head_weight: torch.Tensor | None = None,
+    norm_config: dict | None = None,
+    tokenizer: object | None = None,
+) -> list[torch.Tensor]:
+    """Compute perplexity stats from cached last-layer activations.
+
+    For each prompt: loads full-sequence activations from cache, reconstructs
+    logits via ``norm(hidden) @ lm_head.T``, computes cross-entropy loss,
+    and returns perplexity stats (mean, min, max).
+
+    Full-sequence logits are computed in memory and discarded immediately
+    (too large to cache to disk).
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID or local path.
+    prompts : list[str]
+        Prompts whose last-layer activations are already cached (raw, not pooled).
+    last_layer : int
+        The last layer index (must be cached).
+    device : str
+        Device for computation.
+    norm_weight : torch.Tensor | None
+        Pre-loaded norm weight. If None, downloaded automatically.
+    lm_head_weight : torch.Tensor | None
+        Pre-loaded lm_head weight. If None, downloaded automatically.
+    norm_config : dict | None
+        Pre-loaded norm config. If None, downloaded automatically.
+    tokenizer : object | None
+        Pre-loaded tokenizer. If None, loaded automatically.
+
+    Returns
+    -------
+    list[torch.Tensor]
+        List of (3,) tensors: [mean_ppl, min_ppl, max_ppl] per prompt.
+
+    Raises
+    ------
+    FileNotFoundError
+        If any prompt's activations are not cached.
+    """
+    from .cache import load_layer_across_prompts
+
+    # Download norm + lm_head weights if not provided
+    if norm_weight is None or lm_head_weight is None or norm_config is None:
+        norm_weight, lm_head_weight, norm_config = download_lm_head_weights(
+            model_name, device=device,
+        )
+
+    # Load tokenizer if not provided
+    if tokenizer is None:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    results = []
+
+    for prompt in prompts:
+        # Load full-sequence activations for this prompt
+        acts_list, masks_list = load_layer_across_prompts(
+            model_name, [prompt], last_layer,
+        )
+        # acts: (1, padded_seq_len, hidden_dim), mask: (1, padded_seq_len)
+        acts = acts_list[0].to(device=device, dtype=norm_weight.dtype)
+        mask = masks_list[0]
+
+        # Truncate to real (non-padded) length using mask.
+        # Cached activations may be padded from batched extraction.
+        real_len = mask[0].sum().item()
+        acts = acts[:, :real_len, :]
+
+        # Apply norm
+        normed = apply_norm(
+            acts,
+            norm_weight,
+            norm_config["eps"],
+            norm_config["norm_type"],
+            norm_config["norm_bias"],
+        )
+
+        # Compute logits: (1, real_len, hidden_dim) @ (hidden_dim, vocab_size)
+        logits = normed @ lm_head_weight.T  # (1, real_len, vocab_size)
+
+        # Tokenize to get input_ids for cross-entropy labels
+        tokenized = tokenizer(prompt, return_tensors="pt")
+        input_ids = tokenized["input_ids"]  # (1, real_len)
+
+        # Compute per-token cross-entropy (next-token prediction)
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = input_ids[..., 1:].contiguous().to(shift_logits.device)
+
+        loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
+        per_token_loss = loss_fn(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        )
+
+        if len(per_token_loss) == 0:
+            ppl_tensor = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+        else:
+            mean_loss = per_token_loss.mean().item()
+            min_loss = per_token_loss.min().item()
+            max_loss = per_token_loss.max().item()
+
+            ppl_tensor = torch.tensor(
+                [
+                    float(np.exp(mean_loss)),
+                    float(np.exp(min_loss)),
+                    float(np.exp(max_loss)),
+                ],
+                dtype=torch.float32,
+            )
+
+        results.append(ppl_tensor)
+
+        # Free logits immediately
+        del logits, normed, acts
+
+    return results

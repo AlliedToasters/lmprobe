@@ -325,9 +325,6 @@ class BaselineProbe:
             load_prompt_perplexity,
             save_prompt_perplexity,
         )
-        from .extraction import _require_nnsight, configure_remote, get_cached_model
-
-        _require_nnsight()
 
         # Check which prompts are already cached
         cached_indices = []
@@ -352,6 +349,30 @@ class BaselineProbe:
         # If all prompts are cached, return early
         if not uncached_prompts:
             return features
+
+        # Try computing perplexity from cached activations (no forward pass)
+        newly_computed = self._try_perplexity_from_activation_cache(
+            uncached_prompts, uncached_indices, features,
+        )
+        if newly_computed > 0:
+            # Re-check which prompts are still uncached
+            still_uncached = []
+            still_uncached_indices = []
+            for prompt, idx in zip(uncached_prompts, uncached_indices):
+                if not is_prompt_perplexity_cached(self.model, prompt):
+                    still_uncached.append(prompt)
+                    still_uncached_indices.append(idx)
+            uncached_prompts = still_uncached
+            uncached_indices = still_uncached_indices
+
+        # If all prompts are now cached, return early
+        if not uncached_prompts:
+            return features
+
+        # Fall back to nnsight forward pass for remaining uncached prompts
+        from .extraction import _require_nnsight, configure_remote, get_cached_model
+
+        _require_nnsight()
 
         # Configure remote if needed
         if self.remote:
@@ -380,16 +401,22 @@ class BaselineProbe:
             # Shift logits and labels for next-token prediction
             shift_logits = logits_val[..., :-1, :].contiguous()
             shift_labels = inputs["input_ids"][..., 1:].contiguous()
+            shift_mask = inputs["attention_mask"][..., 1:].contiguous()
 
             # Move to same device
             if shift_logits.device != shift_labels.device:
                 shift_labels = shift_labels.to(shift_logits.device)
+                shift_mask = shift_mask.to(shift_logits.device)
 
             loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
             per_token_loss = loss_fn(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
             )
+
+            # Mask out padding tokens
+            valid_mask = shift_mask.view(-1) == 1
+            per_token_loss = per_token_loss[valid_mask]
 
             # Compute perplexity statistics
             mean_loss = per_token_loss.mean().item()
@@ -407,6 +434,55 @@ class BaselineProbe:
             features[idx] = ppl_tensor.float().numpy()
 
         return features
+
+    def _try_perplexity_from_activation_cache(
+        self,
+        uncached_prompts: list[str],
+        uncached_indices: list[int],
+        features: np.ndarray,
+    ) -> int:
+        """Try computing perplexity from cached raw activations.
+
+        If last-layer raw activations exist in cache, computes perplexity
+        without a forward pass. Updates features array in-place.
+
+        Returns number of prompts computed this way.
+        """
+        import torch
+
+        from .cache import save_prompt_perplexity
+        from .extraction import get_num_layers_from_config
+
+        num_layers = get_num_layers_from_config(self.model)
+        last_layer = num_layers - 1
+
+        # Check which prompts have raw activations cached
+        from .cache import get_prompt_cached_raw_layers
+
+        prompts_with_acts = []
+        for prompt in uncached_prompts:
+            cached_layers = get_prompt_cached_raw_layers(self.model, prompt)
+            if cached_layers is not None and last_layer in cached_layers:
+                prompts_with_acts.append(prompt)
+
+        if not prompts_with_acts:
+            return 0
+
+        from .logit_utils import compute_perplexity_from_activations
+
+        with torch.no_grad():
+            ppl_tensors = compute_perplexity_from_activations(
+                self.model, prompts_with_acts, last_layer, device="cpu",
+            )
+
+        # Save results and update features array
+        prompt_to_idx = dict(zip(uncached_prompts, uncached_indices))
+        for prompt, ppl_tensor in zip(prompts_with_acts, ppl_tensors):
+            save_prompt_perplexity(self.model, prompt, ppl_tensor)
+            idx = prompt_to_idx[prompt]
+            features[idx] = ppl_tensor.float().numpy()
+
+        return len(prompts_with_acts)
 
     def _check_sentence_transformers_installed(self) -> None:
         """Check that sentence-transformers is installed."""
