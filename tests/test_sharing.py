@@ -22,6 +22,7 @@ from lmprobe.sharing import (
     FORMAT_VERSION,
     INFO_FILENAME,
     PARQUET_PATH,
+    _STAGE_SENTINEL,
     _build_lmprobe_info,
     _build_readme,
     _compute_shard_boundaries_variable,
@@ -29,6 +30,7 @@ from lmprobe.sharing import (
     _consolidate_and_shard,
     _discover_prompts,
     _filter_tensor_types,
+    _staging_dir_path,
     _write_parquet_index,
     load_activation_dataset,
     pull_dataset,
@@ -2621,3 +2623,150 @@ class TestBackwardCompatLegacySingleShardIndex:
             count = pull_dataset("user/v11-test")
 
         assert count == 2
+
+
+# =============================================================================
+# Deterministic staging directory tests
+# =============================================================================
+
+
+class TestStagingDir:
+    """Tests for deterministic staging directory and resume logic."""
+
+    def test_staging_dir_deterministic(self, cache_dir):
+        """Same arguments produce the same staging path."""
+        prompts = ["hello", "world"]
+        path1 = _staging_dir_path("user/repo", "model-a", prompts)
+        path2 = _staging_dir_path("user/repo", "model-a", prompts)
+        assert path1 == path2
+
+    def test_staging_dir_different_for_different_args(self, cache_dir):
+        """Different arguments produce different staging paths."""
+        prompts = ["hello", "world"]
+        path_a = _staging_dir_path("user/repo", "model-a", prompts)
+        path_b = _staging_dir_path("user/repo", "model-b", prompts)
+        path_c = _staging_dir_path("user/other-repo", "model-a", prompts)
+        path_d = _staging_dir_path("user/repo", "model-a", ["different"])
+        assert len({path_a, path_b, path_c, path_d}) == 4
+
+    def test_staging_dir_order_independent(self, cache_dir):
+        """Prompt order does not affect staging path (sorted internally)."""
+        path1 = _staging_dir_path("user/repo", "m", ["b", "a"])
+        path2 = _staging_dir_path("user/repo", "m", ["a", "b"])
+        assert path1 == path2
+
+    def test_staging_dir_under_cache(self, cache_dir):
+        """Staging dir lives under the cache directory."""
+        path = _staging_dir_path("user/repo", "m", ["x"])
+        assert str(path).startswith(str(cache_dir))
+        assert "staging" in path.parts
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_push_dataset_resumes_from_sentinel(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache, cache_dir
+    ):
+        """When sentinel exists, consolidation is skipped entirely."""
+        prompts = populated_cache
+        repo_id = "user/resume-test"
+        model_name = TEST_MODEL
+
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        staging_dir = _staging_dir_path(repo_id, model_name, prompts)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        (staging_dir / "tensors").mkdir(exist_ok=True)
+        (staging_dir / "index").mkdir(exist_ok=True)
+
+        # Write a minimal lmprobe_info.json
+        info = _build_lmprobe_info(model_name, len(prompts), {})
+        with open(staging_dir / INFO_FILENAME, "w") as f:
+            json.dump(info, f)
+
+        # Write a dummy parquet so upload_large_folder has something
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = pa.table({
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([None] * len(prompts), type=pa.int32()),
+            "num_tokens": pa.array([5] * len(prompts), type=pa.int32()),
+        })
+        pq.write_table(table, str(staging_dir / PARQUET_PATH))
+
+        # Write README
+        with open(staging_dir / "README.md", "w") as f:
+            f.write("test")
+
+        # Touch the sentinel
+        (staging_dir / _STAGE_SENTINEL).touch()
+
+        with patch(
+            "lmprobe.sharing._consolidate_and_shard"
+        ) as mock_consolidate:
+            push_dataset(
+                repo_id, model_name, prompts, exist_ok=True,
+            )
+            # Consolidation should NOT have been called
+            mock_consolidate.assert_not_called()
+            # Upload should still have been called
+            mock_api.upload_large_folder.assert_called_once()
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_push_dataset_creates_sentinel_after_staging(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache, cache_dir
+    ):
+        """Sentinel is created after consolidation completes."""
+        prompts = populated_cache
+        repo_id = "user/sentinel-test"
+        model_name = TEST_MODEL
+
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        staging_dir = _staging_dir_path(repo_id, model_name, prompts)
+        sentinel = staging_dir / _STAGE_SENTINEL
+
+        # Sentinel should not exist before push
+        assert not sentinel.exists()
+
+        # Make upload fail so we can inspect state before cleanup
+        mock_api.upload_large_folder.side_effect = Exception("upload fail")
+
+        with pytest.raises(Exception, match="upload fail"):
+            push_dataset(
+                repo_id, model_name, prompts, exist_ok=True,
+            )
+
+        # Sentinel should exist after consolidation even though upload failed
+        assert sentinel.exists()
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_staging_dir_cleaned_on_success(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache, cache_dir
+    ):
+        """Staging directory is removed after successful upload."""
+        prompts = populated_cache
+        repo_id = "user/cleanup-test"
+        model_name = TEST_MODEL
+
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        staging_dir = _staging_dir_path(repo_id, model_name, prompts)
+
+        push_dataset(
+            repo_id, model_name, prompts, exist_ok=True,
+        )
+
+        # Staging dir should be cleaned up
+        assert not staging_dir.exists()

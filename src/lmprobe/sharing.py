@@ -59,6 +59,7 @@ FORMAT_VERSION = "1.2"
 DEFAULT_SHARD_BYTES = 1_073_741_824  # 1 GB
 INFO_FILENAME = "lmprobe_info.json"
 PARQUET_PATH = "index/train-00000-of-00001.parquet"
+_STAGE_SENTINEL = "_stage_complete"
 
 
 # =============================================================================
@@ -95,6 +96,20 @@ def _check_pyarrow() -> None:
             "Install with: pip install pyarrow"
         )
 
+
+
+# =============================================================================
+# Staging helpers
+# =============================================================================
+
+
+def _staging_dir_path(repo_id: str, model_name: str, prompts: list[str]) -> Path:
+    """Deterministic staging directory for resumable uploads."""
+    from .cache import get_cache_dir
+
+    content = json.dumps([repo_id, model_name, sorted(prompts)], sort_keys=True)
+    key = hashlib.sha256(content.encode()).hexdigest()[:16]
+    return get_cache_dir() / "staging" / key
 
 
 # =============================================================================
@@ -466,6 +481,7 @@ def _consolidate_and_shard(
     shard_max_bytes: int,
     repo_id: str,
     metadata: list[dict] | None = None,
+    tmpdir: Path | None = None,
 ) -> tuple[Path, dict, list[dict]]:
     """Consolidate cached tensors into sharded safetensors files.
 
@@ -488,9 +504,10 @@ def _consolidate_and_shard(
     """
     from safetensors.torch import save_file
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="lmprobe_sharing_"))
-    (tmpdir / "tensors").mkdir()
-    (tmpdir / "index").mkdir()
+    if tmpdir is None:
+        tmpdir = Path(tempfile.mkdtemp(prefix="lmprobe_sharing_"))
+    (tmpdir / "tensors").mkdir(parents=True, exist_ok=True)
+    (tmpdir / "index").mkdir(parents=True, exist_ok=True)
 
     pooled = tensor_types["pooled"]
     has_logits = tensor_types["has_logits"]
@@ -1244,41 +1261,58 @@ def push_dataset(
             f"logits={available['has_logits']}"
         )
 
-    # Step 4: Consolidate and shard
-    logger.info("[SHARING] Consolidating cached tensors into shards...")
-    tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
-        model_name=model_name,
-        prompts=prompts,
-        kept_indices=kept_indices,
-        tensor_types=tensor_types,
-        labels=labels,
-        shard_max_bytes=shard_max_bytes,
-        repo_id=repo_id,
-        metadata=metadata,
-    )
+    # Step 4: Compute deterministic staging dir for resumable uploads
+    staging_dir = _staging_dir_path(repo_id, model_name, prompts)
+    sentinel = staging_dir / _STAGE_SENTINEL
 
-    # Step 5: Write Parquet index
-    _write_parquet_index(tmpdir, prompt_metadata)
+    if sentinel.exists():
+        logger.info(
+            "[SHARING] Found completed staging dir, skipping consolidation"
+        )
+        with open(staging_dir / INFO_FILENAME) as f:
+            lmprobe_info = json.load(f)
+        tmpdir = staging_dir
+        num_prompts = lmprobe_info["num_prompts"]
+    else:
+        # Full consolidation path
+        logger.info("[SHARING] Consolidating cached tensors into shards...")
+        tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=model_name,
+            prompts=prompts,
+            kept_indices=kept_indices,
+            tensor_types=tensor_types,
+            labels=labels,
+            shard_max_bytes=shard_max_bytes,
+            repo_id=repo_id,
+            metadata=metadata,
+            tmpdir=staging_dir,
+        )
 
-    # Step 6: Write metadata
-    num_prompts = len(prompt_metadata)
-    lmprobe_info = _build_lmprobe_info(
-        model_name, num_prompts, tensor_descriptors,
-    )
+        # Step 5: Write Parquet index
+        _write_parquet_index(tmpdir, prompt_metadata)
 
-    with open(tmpdir / INFO_FILENAME, "w") as f:
-        json.dump(lmprobe_info, f, indent=2)
+        # Step 6: Write metadata
+        num_prompts = len(prompt_metadata)
+        lmprobe_info = _build_lmprobe_info(
+            model_name, num_prompts, tensor_descriptors,
+        )
 
-    readme = _build_readme(
-        model_name=model_name,
-        lmprobe_info=lmprobe_info,
-        num_prompts=num_prompts,
-        repo_id=repo_id,
-        description=description,
-        license=license,
-    )
-    with open(tmpdir / "README.md", "w") as f:
-        f.write(readme)
+        with open(tmpdir / INFO_FILENAME, "w") as f:
+            json.dump(lmprobe_info, f, indent=2)
+
+        readme = _build_readme(
+            model_name=model_name,
+            lmprobe_info=lmprobe_info,
+            num_prompts=num_prompts,
+            repo_id=repo_id,
+            description=description,
+            license=license,
+        )
+        with open(tmpdir / "README.md", "w") as f:
+            f.write(readme)
+
+        # Touch sentinel AFTER all staging is complete
+        sentinel.touch()
 
     # Step 7: Upload
     from huggingface_hub import HfApi
