@@ -167,17 +167,21 @@ for classifier in ["logistic_regression", "ridge", "lda", "mass_mean"]:
 
 ### Layer sweep from a dataset
 
+`Probe.sweep_layers()` requires a local model, so with a dataset-backed probe, loop manually:
+
 ```python
-result = Probe.sweep_layers(
-    dataset="username/llama-8b-safety-activations",
-    positive_prompts=positive_prompts,
-    negative_prompts=negative_prompts,
-    layers="all",
-    classifier="ridge",
-    random_state=42,
-)
-scores = result.score(test_prompts, test_labels)
-best = result.best_layer(test_prompts, test_labels)
+scores = {}
+for layer in range(32):
+    p = Probe(
+        dataset="username/llama-8b-safety-activations",
+        layers=layer,
+        classifier="ridge",
+        random_state=42,
+    )
+    p.fit(positive_prompts, negative_prompts)
+    scores[layer] = p.score(test_prompts, test_labels)
+
+best = max(scores, key=scores.get)
 print(f"Best layer: {best}, accuracy: {scores[best]:.3f}")
 ```
 
@@ -191,9 +195,9 @@ Before training, check what's in a dataset without downloading tensors:
 from lmprobe import fetch_dataset_metadata
 
 meta = fetch_dataset_metadata("username/llama-8b-safety-activations")
-print(meta.model_name)   # meta-llama/Llama-3.1-8B-Instruct
-print(meta.layers)       # [0, 1, 2, ..., 31]
-print(meta.n_prompts)    # 500
+print(meta.model_name)       # meta-llama/Llama-3.1-8B-Instruct
+print(meta.available_layers) # [0, 1, 2, ..., 31]
+print(meta.num_prompts)      # 500
 ```
 
 ---

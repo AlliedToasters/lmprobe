@@ -63,11 +63,10 @@ layer0 = ActivationBaseline(
     layers=-1,
 )
 
-# Perplexity — model's own token probabilities
-perplexity = ActivationBaseline(
+# Perplexity — model's own token probabilities (uses BaselineProbe, not ActivationBaseline)
+perplexity = BaselineProbe(
     method="perplexity",
     model="meta-llama/Llama-3.1-8B-Instruct",
-    layers=-1,
 )
 ```
 
