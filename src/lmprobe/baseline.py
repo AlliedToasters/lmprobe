@@ -401,16 +401,22 @@ class BaselineProbe:
             # Shift logits and labels for next-token prediction
             shift_logits = logits_val[..., :-1, :].contiguous()
             shift_labels = inputs["input_ids"][..., 1:].contiguous()
+            shift_mask = inputs["attention_mask"][..., 1:].contiguous()
 
             # Move to same device
             if shift_logits.device != shift_labels.device:
                 shift_labels = shift_labels.to(shift_logits.device)
+                shift_mask = shift_mask.to(shift_logits.device)
 
             loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
             per_token_loss = loss_fn(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
             )
+
+            # Mask out padding tokens
+            valid_mask = shift_mask.view(-1) == 1
+            per_token_loss = per_token_loss[valid_mask]
 
             # Compute perplexity statistics
             mean_loss = per_token_loss.mean().item()
@@ -451,10 +457,10 @@ class BaselineProbe:
         last_layer = num_layers - 1
 
         # Check which prompts have raw activations cached
+        from .cache import get_prompt_cached_raw_layers
+
         prompts_with_acts = []
         for prompt in uncached_prompts:
-            from .cache import get_prompt_cached_raw_layers
-
             cached_layers = get_prompt_cached_raw_layers(self.model, prompt)
             if cached_layers is not None and last_layer in cached_layers:
                 prompts_with_acts.append(prompt)

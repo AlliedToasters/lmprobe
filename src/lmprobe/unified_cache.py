@@ -957,7 +957,18 @@ class UnifiedCache:
             len(uncached), len(prompts) - len(uncached),
         )
 
-        from .logit_utils import compute_perplexity_from_activations
+        from transformers import AutoTokenizer
+
+        from .logit_utils import (
+            compute_perplexity_from_activations,
+            download_lm_head_weights,
+        )
+
+        # Load weights and tokenizer once, reuse across all batches
+        norm_weight, lm_head_weight, norm_config = download_lm_head_weights(
+            self.model_name, device=device,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
         computed = 0
         for batch_start in range(0, len(uncached), batch_size):
@@ -966,6 +977,8 @@ class UnifiedCache:
             with torch.no_grad():
                 ppl_tensors = compute_perplexity_from_activations(
                     self.model_name, batch_prompts, last_layer, device=device,
+                    norm_weight=norm_weight, lm_head_weight=lm_head_weight,
+                    norm_config=norm_config, tokenizer=tokenizer,
                 )
 
             for prompt, ppl_tensor in zip(batch_prompts, ppl_tensors):

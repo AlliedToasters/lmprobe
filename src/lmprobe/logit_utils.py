@@ -211,6 +211,10 @@ def compute_perplexity_from_activations(
     prompts: list[str],
     last_layer: int,
     device: str = "cpu",
+    norm_weight: torch.Tensor | None = None,
+    lm_head_weight: torch.Tensor | None = None,
+    norm_config: dict | None = None,
+    tokenizer: object | None = None,
 ) -> list[torch.Tensor]:
     """Compute perplexity stats from cached last-layer activations.
 
@@ -231,6 +235,14 @@ def compute_perplexity_from_activations(
         The last layer index (must be cached).
     device : str
         Device for computation.
+    norm_weight : torch.Tensor | None
+        Pre-loaded norm weight. If None, downloaded automatically.
+    lm_head_weight : torch.Tensor | None
+        Pre-loaded lm_head weight. If None, downloaded automatically.
+    norm_config : dict | None
+        Pre-loaded norm config. If None, downloaded automatically.
+    tokenizer : object | None
+        Pre-loaded tokenizer. If None, loaded automatically.
 
     Returns
     -------
@@ -242,17 +254,19 @@ def compute_perplexity_from_activations(
     FileNotFoundError
         If any prompt's activations are not cached.
     """
-    from transformers import AutoTokenizer
-
     from .cache import load_layer_across_prompts
 
-    # Download norm + lm_head weights (one-time, HF-cached)
-    norm_weight, lm_head_weight, norm_config = download_lm_head_weights(
-        model_name, device=device,
-    )
+    # Download norm + lm_head weights if not provided
+    if norm_weight is None or lm_head_weight is None or norm_config is None:
+        norm_weight, lm_head_weight, norm_config = download_lm_head_weights(
+            model_name, device=device,
+        )
 
-    # Load tokenizer (one-time)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Load tokenizer if not provided
+    if tokenizer is None:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     results = []
 
