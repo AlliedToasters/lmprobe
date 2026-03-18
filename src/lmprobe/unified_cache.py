@@ -758,3 +758,136 @@ class UnifiedCache:
             top_k=self.logit_top_k,
             positions=self.logit_positions,
         )
+
+    def compute_logits_from_cache(
+        self,
+        prompts: list[str],
+        positions: str = "last",
+        top_k: int | None = None,
+        device: str | None = None,
+        batch_size: int = 64,
+    ) -> int:
+        """Compute logits from cached last-layer activations without a forward pass.
+
+        Downloads only the model's final norm and lm_head weights, then
+        computes ``logits = norm(hidden_state) @ lm_head.T`` from the
+        cached last-layer activations.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            Prompts whose last-layer activations are already cached.
+        positions : str
+            Which positions to compute logits for. Currently only "last"
+            is supported.
+        top_k : int | None
+            If set, store only top-k logit values and indices.
+        device : str | None
+            Device for computation. Defaults to "cpu".
+        batch_size : int
+            Number of prompts to process at once for the matmul.
+
+        Returns
+        -------
+        int
+            Number of prompts for which logits were newly computed.
+
+        Raises
+        ------
+        ValueError
+            If the last layer is not in ``self.layer_indices`` or if
+            ``positions`` is not "last".
+        """
+        if positions != "last":
+            raise ValueError(
+                f"Only positions='last' is currently supported, got {positions!r}"
+            )
+
+        device = device or "cpu"
+
+        # Determine the last layer index
+        num_layers = get_num_layers_from_config(self.model_name)
+        last_layer = num_layers - 1
+
+        if last_layer not in self.layer_indices:
+            raise ValueError(
+                f"Last layer ({last_layer}) is not in cached layer_indices "
+                f"{self.layer_indices}. Cache must include the last layer to "
+                f"compute logits."
+            )
+
+        # Filter to prompts that don't already have logits cached
+        uncached = []
+        for prompt in prompts:
+            if not is_prompt_logits_cached(self.model_name, prompt, top_k):
+                uncached.append(prompt)
+
+        if not uncached:
+            logger.info("[LOGITS] All %d prompts already have logits cached", len(prompts))
+            return 0
+
+        logger.info(
+            "[LOGITS] Computing logits for %d prompts (%d already cached)",
+            len(uncached), len(prompts) - len(uncached),
+        )
+
+        # Download norm + lm_head weights
+        from .logit_utils import apply_norm, download_lm_head_weights
+
+        norm_weight, lm_head_weight, norm_config = download_lm_head_weights(
+            self.model_name, device=device,
+        )
+
+        # Process in batches
+        computed = 0
+        for batch_start in range(0, len(uncached), batch_size):
+            batch_prompts = uncached[batch_start : batch_start + batch_size]
+
+            # Load last-layer, last-token activations
+            from .cache import load_layer_last_token
+
+            hidden_states = load_layer_last_token(
+                self.model_name, batch_prompts, last_layer,
+            )  # (B, hidden_dim)
+
+            hidden_states = hidden_states.to(device=device, dtype=norm_weight.dtype)
+
+            # Apply norm
+            normed = apply_norm(
+                hidden_states,
+                norm_weight,
+                norm_config["eps"],
+                norm_config["norm_type"],
+                norm_config["norm_bias"],
+            )
+
+            # Compute logits: (B, hidden_dim) @ (hidden_dim, vocab_size) -> (B, vocab_size)
+            logits = normed @ lm_head_weight.T  # (B, vocab_size)
+
+            # Save each prompt's logits
+            for j, prompt in enumerate(batch_prompts):
+                # Shape for save: (1, 1, vocab_size) — 1 batch, 1 position
+                prompt_logits = logits[j : j + 1].unsqueeze(1)  # (1, 1, vocab_size)
+
+                # Create a dummy mask for save_prompt_logits (last position)
+                dummy_mask = torch.ones(1, 1, dtype=torch.long)
+
+                if top_k is not None:
+                    values, indices = torch.topk(prompt_logits, top_k, dim=-1)
+                    save_prompt_topk_logits(
+                        self.model_name, prompt,
+                        values, indices, dummy_mask,
+                        positions="all",  # already selected "last"
+                    )
+                else:
+                    save_prompt_logits(
+                        self.model_name, prompt,
+                        prompt_logits, dummy_mask,
+                        top_k=None,
+                        positions="all",  # already selected "last"
+                    )
+
+            computed += len(batch_prompts)
+
+        logger.info("[LOGITS] Computed logits for %d prompts", computed)
+        return computed
