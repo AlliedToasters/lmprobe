@@ -59,6 +59,7 @@ FORMAT_VERSION = "1.2"
 DEFAULT_SHARD_BYTES = 1_073_741_824  # 1 GB
 INFO_FILENAME = "lmprobe_info.json"
 PARQUET_PATH = "index/train-00000-of-00001.parquet"
+_STAGE_SENTINEL = "_stage_complete"
 
 
 # =============================================================================
@@ -95,6 +96,41 @@ def _check_pyarrow() -> None:
             "Install with: pip install pyarrow"
         )
 
+
+
+# =============================================================================
+# Staging helpers
+# =============================================================================
+
+
+def _staging_dir_path(
+    repo_id: str,
+    model_name: str,
+    prompts: list[str],
+    *,
+    shard_max_bytes: int = DEFAULT_SHARD_BYTES,
+    labels: list[int | str | None] | None = None,
+    metadata: list[dict] | None = None,
+    tensors: list[str] | None = None,
+) -> Path:
+    """Deterministic staging directory for resumable uploads.
+
+    The hash key includes all parameters that affect staged output so that
+    retrying with different settings produces a fresh staging dir rather
+    than silently resuming from mismatched data.
+    """
+    from .cache import get_cache_dir
+
+    key_parts: list[Any] = [repo_id, model_name, prompts, shard_max_bytes]
+    if labels is not None:
+        key_parts.append(["labels", labels])
+    if metadata is not None:
+        key_parts.append(["metadata", metadata])
+    if tensors is not None:
+        key_parts.append(["tensors", sorted(tensors)])
+    content = json.dumps(key_parts, sort_keys=True)
+    key = hashlib.sha256(content.encode()).hexdigest()[:16]
+    return get_cache_dir() / "staging" / key
 
 
 # =============================================================================
@@ -466,6 +502,7 @@ def _consolidate_and_shard(
     shard_max_bytes: int,
     repo_id: str,
     metadata: list[dict] | None = None,
+    tmpdir: Path | None = None,
 ) -> tuple[Path, dict, list[dict]]:
     """Consolidate cached tensors into sharded safetensors files.
 
@@ -488,9 +525,10 @@ def _consolidate_and_shard(
     """
     from safetensors.torch import save_file
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="lmprobe_sharing_"))
-    (tmpdir / "tensors").mkdir()
-    (tmpdir / "index").mkdir()
+    if tmpdir is None:
+        tmpdir = Path(tempfile.mkdtemp(prefix="lmprobe_sharing_"))
+    (tmpdir / "tensors").mkdir(parents=True, exist_ok=True)
+    (tmpdir / "index").mkdir(parents=True, exist_ok=True)
 
     pooled = tensor_types["pooled"]
     has_logits = tensor_types["has_logits"]
@@ -1244,48 +1282,83 @@ def push_dataset(
             f"logits={available['has_logits']}"
         )
 
-    # Step 4: Consolidate and shard
-    logger.info("[SHARING] Consolidating cached tensors into shards...")
-    tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
-        model_name=model_name,
-        prompts=prompts,
-        kept_indices=kept_indices,
-        tensor_types=tensor_types,
-        labels=labels,
-        shard_max_bytes=shard_max_bytes,
-        repo_id=repo_id,
-        metadata=metadata,
+    # Step 4: Compute deterministic staging dir for resumable uploads
+    staging_dir = _staging_dir_path(
+        repo_id, model_name, prompts,
+        shard_max_bytes=shard_max_bytes, labels=labels,
+        metadata=metadata, tensors=tensors,
     )
+    sentinel = staging_dir / _STAGE_SENTINEL
 
-    # Step 5: Write Parquet index
-    _write_parquet_index(tmpdir, prompt_metadata)
+    resuming = sentinel.exists()
+    if resuming:
+        import time
 
-    # Step 6: Write metadata
-    num_prompts = len(prompt_metadata)
-    lmprobe_info = _build_lmprobe_info(
-        model_name, num_prompts, tensor_descriptors,
-    )
+        age_days = (time.time() - sentinel.stat().st_mtime) / 86400
+        logger.info(
+            "[SHARING] Resuming from staging dir: %s (%.1f days old)",
+            staging_dir, age_days,
+        )
+        if age_days > 3:
+            logger.warning(
+                "[SHARING] Staging dir is %.0f days old — if parameters "
+                "have changed, delete it to force re-consolidation: %s",
+                age_days, staging_dir,
+            )
+        with open(staging_dir / INFO_FILENAME) as f:
+            lmprobe_info = json.load(f)
+        tmpdir = staging_dir
+        num_prompts = lmprobe_info["num_prompts"]
+    else:
+        # Full consolidation path
+        logger.info("[SHARING] Consolidating cached tensors into shards...")
+        tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=model_name,
+            prompts=prompts,
+            kept_indices=kept_indices,
+            tensor_types=tensor_types,
+            labels=labels,
+            shard_max_bytes=shard_max_bytes,
+            repo_id=repo_id,
+            metadata=metadata,
+            tmpdir=staging_dir,
+        )
 
-    with open(tmpdir / INFO_FILENAME, "w") as f:
-        json.dump(lmprobe_info, f, indent=2)
+        # Step 5: Write Parquet index
+        _write_parquet_index(tmpdir, prompt_metadata)
 
-    readme = _build_readme(
-        model_name=model_name,
-        lmprobe_info=lmprobe_info,
-        num_prompts=num_prompts,
-        repo_id=repo_id,
-        description=description,
-        license=license,
-    )
-    with open(tmpdir / "README.md", "w") as f:
-        f.write(readme)
+        # Step 6: Write metadata
+        num_prompts = len(prompt_metadata)
+        lmprobe_info = _build_lmprobe_info(
+            model_name, num_prompts, tensor_descriptors,
+        )
+
+        with open(tmpdir / INFO_FILENAME, "w") as f:
+            json.dump(lmprobe_info, f, indent=2)
+
+        readme = _build_readme(
+            model_name=model_name,
+            lmprobe_info=lmprobe_info,
+            num_prompts=num_prompts,
+            repo_id=repo_id,
+            description=description,
+            license=license,
+        )
+        with open(tmpdir / "README.md", "w") as f:
+            f.write(readme)
+
+        # Touch sentinel AFTER all staging is complete
+        sentinel.touch()
 
     # Step 7: Upload
     from huggingface_hub import HfApi
 
     api = HfApi(token=token)
     api.create_repo(
-        repo_id, exist_ok=exist_ok, private=private, repo_type="dataset",
+        repo_id,
+        exist_ok=True if resuming else exist_ok,
+        private=private,
+        repo_type="dataset",
     )
     total_size = sum(f.stat().st_size for f in tmpdir.rglob("*") if f.is_file())
     logger.info(
