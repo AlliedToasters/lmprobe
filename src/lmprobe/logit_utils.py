@@ -275,9 +275,14 @@ def compute_perplexity_from_activations(
         acts_list, masks_list = load_layer_across_prompts(
             model_name, [prompt], last_layer,
         )
-        # acts: (1, seq_len, hidden_dim), mask: (1, seq_len)
+        # acts: (1, padded_seq_len, hidden_dim), mask: (1, padded_seq_len)
         acts = acts_list[0].to(device=device, dtype=norm_weight.dtype)
         mask = masks_list[0]
+
+        # Truncate to real (non-padded) length using mask.
+        # Cached activations may be padded from batched extraction.
+        real_len = mask[0].sum().item()
+        acts = acts[:, :real_len, :]
 
         # Apply norm
         normed = apply_norm(
@@ -288,17 +293,16 @@ def compute_perplexity_from_activations(
             norm_config["norm_bias"],
         )
 
-        # Compute logits: (1, seq_len, hidden_dim) @ (hidden_dim, vocab_size)
-        logits = normed @ lm_head_weight.T  # (1, seq_len, vocab_size)
+        # Compute logits: (1, real_len, hidden_dim) @ (hidden_dim, vocab_size)
+        logits = normed @ lm_head_weight.T  # (1, real_len, vocab_size)
 
         # Tokenize to get input_ids for cross-entropy labels
         tokenized = tokenizer(prompt, return_tensors="pt")
-        input_ids = tokenized["input_ids"]  # (1, seq_len)
+        input_ids = tokenized["input_ids"]  # (1, real_len)
 
         # Compute per-token cross-entropy (next-token prediction)
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = input_ids[..., 1:].contiguous().to(shift_logits.device)
-        shift_mask = mask[..., 1:].contiguous().to(shift_logits.device)
 
         loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
         per_token_loss = loss_fn(
@@ -306,16 +310,12 @@ def compute_perplexity_from_activations(
             shift_labels.view(-1),
         )
 
-        # Mask out padding tokens
-        valid_mask = shift_mask.view(-1) == 1
-        valid_losses = per_token_loss[valid_mask]
-
-        if len(valid_losses) == 0:
+        if len(per_token_loss) == 0:
             ppl_tensor = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
         else:
-            mean_loss = valid_losses.mean().item()
-            min_loss = valid_losses.min().item()
-            max_loss = valid_losses.max().item()
+            mean_loss = per_token_loss.mean().item()
+            min_loss = per_token_loss.min().item()
+            max_loss = per_token_loss.max().item()
 
             ppl_tensor = torch.tensor(
                 [
