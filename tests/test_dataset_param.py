@@ -151,9 +151,9 @@ class TestLoadAndPoolFromCache:
         meta = _make_metadata(model_name="test-model")
         probe._dataset_metadata = meta
 
-        # Fake activations: seq_len=3, hidden_dim=4 (2 layers × 2 dim)
-        acts = torch.randn(3, 4)
-        mask = torch.ones(3)
+        # Fake activations: (1, seq_len=3, hidden_dim=4) — batch dim included
+        acts = torch.randn(1, 3, 4)
+        mask = torch.ones(1, 3)
 
         with patch(
             "lmprobe.cache.load_prompt_activations",
@@ -207,7 +207,7 @@ class TestFitPredictDataset:
         seq_len = 3
 
         def fake_load(_model_name, _prompt, _layers):
-            return torch.randn(seq_len, hidden_dim), torch.ones(seq_len)
+            return torch.randn(1, seq_len, hidden_dim), torch.ones(1, seq_len)
 
         with patch(
             "lmprobe.sharing.fetch_dataset_metadata", return_value=meta
