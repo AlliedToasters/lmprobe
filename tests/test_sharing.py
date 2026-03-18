@@ -19,10 +19,10 @@ from lmprobe.cache import (
     save_prompt_pooled_activations,
 )
 from lmprobe.sharing import (
+    _STAGE_SENTINEL,
     FORMAT_VERSION,
     INFO_FILENAME,
     PARQUET_PATH,
-    _STAGE_SENTINEL,
     _build_lmprobe_info,
     _build_readme,
     _compute_shard_boundaries_variable,
