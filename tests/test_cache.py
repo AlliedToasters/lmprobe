@@ -1080,3 +1080,5 @@ class TestSidecarFiles:
         info = cache_info(self.model)
         assert len(info.models) == 1
         assert info.models[0].num_prompts == 1  # not 3
+        assert info.models[0].has_logits is True
+        assert info.models[0].has_perplexity is True

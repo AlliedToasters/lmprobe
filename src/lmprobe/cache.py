@@ -1896,6 +1896,7 @@ class ModelCacheInfo:
     num_layers: int
     has_pooled: bool
     has_perplexity: bool
+    has_logits: bool = False
 
     @property
     def size_gb(self) -> float:
@@ -1907,6 +1908,7 @@ class ModelCacheInfo:
             f"  {name}  {self.size_gb:.1f} GB  "
             f"({self.num_prompts} prompts, {self.num_layers} layers"
             f"{', pooled' if self.has_pooled else ''}"
+            f"{', logits' if self.has_logits else ''}"
             f"{', perplexity' if self.has_perplexity else ''})"
         )
 
@@ -1994,6 +1996,7 @@ def _cache_info_local(backend: LocalCacheBackend, model: str | None = None) -> C
         all_layers: set[int] = set()
         has_pooled = False
         has_perplexity = False
+        has_logits = False
 
         # Scan v2 safetensors files
         for sf_file in model_dir.glob("*.safetensors"):
@@ -2020,8 +2023,9 @@ def _cache_info_local(backend: LocalCacheBackend, model: str | None = None) -> C
                 has_perplexity = True
                 continue
 
-            # Skip logits sidecar — no layer/pooling info to extract
+            # Logits sidecar — flag it, no layer/pooling info to extract
             if sf_file.name.endswith(".logits.safetensors"):
+                has_logits = True
                 continue
 
             try:
@@ -2031,6 +2035,8 @@ def _cache_info_local(backend: LocalCacheBackend, model: str | None = None) -> C
                     has_pooled = True
                 if _PERPLEXITY_KEY in keys:
                     has_perplexity = True
+                if _LOGITS_KEY in keys or _LOGITS_TOP_K_VALUES_KEY in keys:
+                    has_logits = True
             except Exception:
                 pass
 
@@ -2070,6 +2076,7 @@ def _cache_info_local(backend: LocalCacheBackend, model: str | None = None) -> C
                     num_layers=len(all_layers),
                     has_pooled=has_pooled,
                     has_perplexity=has_perplexity,
+                    has_logits=has_logits,
                 )
             )
 
@@ -2118,17 +2125,33 @@ def _cache_info_backend(backend: CacheBackend, model: str | None = None) -> Cach
         all_layers: set[int] = set()
         has_pooled = False
         has_perplexity = False
+        has_logits = False
 
         for entry_key, size, mtime in m_entries:
             model_size += size
-            num_prompts += 1
+
+            # Sidecar files don't count as separate prompts (#120)
+            is_sidecar = (
+                entry_key.endswith(".logits.safetensors")
+                or entry_key.endswith(".perplexity.safetensors")
+            )
+            if not is_sidecar:
+                num_prompts += 1
 
             if oldest_mtime is None or mtime < oldest_mtime:
                 oldest_mtime = mtime
             if newest_mtime is None or mtime > newest_mtime:
                 newest_mtime = mtime
 
-            # Try to read tensor keys
+            # Detect sidecar files
+            if entry_key.endswith(".perplexity.safetensors"):
+                has_perplexity = True
+                continue
+            if entry_key.endswith(".logits.safetensors"):
+                has_logits = True
+                continue
+
+            # Try to read tensor keys from main files
             if entry_key.endswith(".safetensors"):
                 try:
                     data = backend.read_bytes(entry_key)
@@ -2138,6 +2161,8 @@ def _cache_info_backend(backend: CacheBackend, model: str | None = None) -> Cach
                         has_pooled = True
                     if _PERPLEXITY_KEY in tensor_keys:
                         has_perplexity = True
+                    if _LOGITS_KEY in tensor_keys or _LOGITS_TOP_K_VALUES_KEY in tensor_keys:
+                        has_logits = True
                 except Exception:
                     pass
 
@@ -2152,6 +2177,7 @@ def _cache_info_backend(backend: CacheBackend, model: str | None = None) -> Cach
                     num_layers=len(all_layers),
                     has_pooled=has_pooled,
                     has_perplexity=has_perplexity,
+                    has_logits=has_logits,
                 )
             )
 
