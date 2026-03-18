@@ -103,11 +103,26 @@ def _check_pyarrow() -> None:
 # =============================================================================
 
 
-def _staging_dir_path(repo_id: str, model_name: str, prompts: list[str]) -> Path:
-    """Deterministic staging directory for resumable uploads."""
+def _staging_dir_path(
+    repo_id: str,
+    model_name: str,
+    prompts: list[str],
+    *,
+    shard_max_bytes: int = DEFAULT_SHARD_BYTES,
+    labels: list[int | str | None] | None = None,
+) -> Path:
+    """Deterministic staging directory for resumable uploads.
+
+    The hash key includes all parameters that affect staged output so that
+    retrying with different settings produces a fresh staging dir rather
+    than silently resuming from mismatched data.
+    """
     from .cache import get_cache_dir
 
-    content = json.dumps([repo_id, model_name, sorted(prompts)], sort_keys=True)
+    key_parts: list[Any] = [repo_id, model_name, prompts, shard_max_bytes]
+    if labels is not None:
+        key_parts.append(labels)
+    content = json.dumps(key_parts, sort_keys=True)
     key = hashlib.sha256(content.encode()).hexdigest()[:16]
     return get_cache_dir() / "staging" / key
 
@@ -1262,13 +1277,27 @@ def push_dataset(
         )
 
     # Step 4: Compute deterministic staging dir for resumable uploads
-    staging_dir = _staging_dir_path(repo_id, model_name, prompts)
+    staging_dir = _staging_dir_path(
+        repo_id, model_name, prompts,
+        shard_max_bytes=shard_max_bytes, labels=labels,
+    )
     sentinel = staging_dir / _STAGE_SENTINEL
 
-    if sentinel.exists():
+    resuming = sentinel.exists()
+    if resuming:
+        import time
+
+        age_days = (time.time() - sentinel.stat().st_mtime) / 86400
         logger.info(
-            "[SHARING] Found completed staging dir, skipping consolidation"
+            "[SHARING] Resuming from staging dir: %s (%.1f days old)",
+            staging_dir, age_days,
         )
+        if age_days > 3:
+            logger.warning(
+                "[SHARING] Staging dir is %.0f days old — if parameters "
+                "have changed, delete it to force re-consolidation: %s",
+                age_days, staging_dir,
+            )
         with open(staging_dir / INFO_FILENAME) as f:
             lmprobe_info = json.load(f)
         tmpdir = staging_dir
@@ -1319,7 +1348,10 @@ def push_dataset(
 
     api = HfApi(token=token)
     api.create_repo(
-        repo_id, exist_ok=exist_ok, private=private, repo_type="dataset",
+        repo_id,
+        exist_ok=True if resuming else exist_ok,
+        private=private,
+        repo_type="dataset",
     )
     total_size = sum(f.stat().st_size for f in tmpdir.rglob("*") if f.is_file())
     logger.info(

@@ -2649,11 +2649,28 @@ class TestStagingDir:
         path_d = _staging_dir_path("user/repo", "model-a", ["different"])
         assert len({path_a, path_b, path_c, path_d}) == 4
 
-    def test_staging_dir_order_independent(self, cache_dir):
-        """Prompt order does not affect staging path (sorted internally)."""
+    def test_staging_dir_order_dependent(self, cache_dir):
+        """Different prompt order produces different staging path.
+
+        Labels and metadata are positionally aligned with prompts, so
+        reordering prompts with the same labels would produce wrong data.
+        """
         path1 = _staging_dir_path("user/repo", "m", ["b", "a"])
         path2 = _staging_dir_path("user/repo", "m", ["a", "b"])
-        assert path1 == path2
+        assert path1 != path2
+
+    def test_staging_dir_includes_shard_bytes(self, cache_dir):
+        """Different shard_max_bytes produces different staging path."""
+        path1 = _staging_dir_path("user/repo", "m", ["x"], shard_max_bytes=1024)
+        path2 = _staging_dir_path("user/repo", "m", ["x"], shard_max_bytes=2048)
+        assert path1 != path2
+
+    def test_staging_dir_includes_labels(self, cache_dir):
+        """Different labels produce different staging path."""
+        path1 = _staging_dir_path("user/repo", "m", ["x"], labels=[0])
+        path2 = _staging_dir_path("user/repo", "m", ["x"], labels=[1])
+        path3 = _staging_dir_path("user/repo", "m", ["x"], labels=None)
+        assert len({path1, path2, path3}) == 3
 
     def test_staging_dir_under_cache(self, cache_dir):
         """Staging dir lives under the cache directory."""
@@ -2707,13 +2724,22 @@ class TestStagingDir:
         with patch(
             "lmprobe.sharing._consolidate_and_shard"
         ) as mock_consolidate:
+            # Note: exist_ok=False (the default) — resume should force True
             push_dataset(
-                repo_id, model_name, prompts, exist_ok=True,
+                repo_id, model_name, prompts,
             )
             # Consolidation should NOT have been called
             mock_consolidate.assert_not_called()
             # Upload should still have been called
             mock_api.upload_large_folder.assert_called_once()
+            # create_repo should have been called with exist_ok=True
+            # even though we didn't pass exist_ok=True to push_dataset
+            mock_api.create_repo.assert_called_once_with(
+                repo_id,
+                exist_ok=True,
+                private=False,
+                repo_type="dataset",
+            )
 
     @requires_pyarrow
     @patch("lmprobe.sharing._check_hub_deps")
