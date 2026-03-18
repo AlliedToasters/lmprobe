@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as functional
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +198,7 @@ def apply_norm(
         return hidden_states * norm_weight
     elif norm_type == "layer_norm":
         hidden_dim = hidden_states.shape[-1]
-        return F.layer_norm(
+        return functional.layer_norm(
             hidden_states, (hidden_dim,), norm_weight, norm_bias, eps
         )
     else:

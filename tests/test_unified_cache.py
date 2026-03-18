@@ -946,10 +946,6 @@ class TestComputeLogitsFromCache:
         forward_logits = cache_with_logits.get_logits(prompts)
         forward_values = forward_logits.values  # (1, 1, vocab_size)
 
-        # Clear logits from cache but keep activations
-        # We need a fresh cache dir for compute_logits_from_cache
-        import shutil
-
         # Use a second tmp dir for the compute-from-cache path
         tmp_path2 = tmp_path / "compute_test"
         tmp_path2.mkdir()
