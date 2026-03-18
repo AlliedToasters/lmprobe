@@ -110,6 +110,8 @@ def _staging_dir_path(
     *,
     shard_max_bytes: int = DEFAULT_SHARD_BYTES,
     labels: list[int | str | None] | None = None,
+    metadata: list[dict] | None = None,
+    tensors: list[str] | None = None,
 ) -> Path:
     """Deterministic staging directory for resumable uploads.
 
@@ -121,7 +123,11 @@ def _staging_dir_path(
 
     key_parts: list[Any] = [repo_id, model_name, prompts, shard_max_bytes]
     if labels is not None:
-        key_parts.append(labels)
+        key_parts.append(["labels", labels])
+    if metadata is not None:
+        key_parts.append(["metadata", metadata])
+    if tensors is not None:
+        key_parts.append(["tensors", sorted(tensors)])
     content = json.dumps(key_parts, sort_keys=True)
     key = hashlib.sha256(content.encode()).hexdigest()[:16]
     return get_cache_dir() / "staging" / key
@@ -1280,6 +1286,7 @@ def push_dataset(
     staging_dir = _staging_dir_path(
         repo_id, model_name, prompts,
         shard_max_bytes=shard_max_bytes, labels=labels,
+        metadata=metadata, tensors=tensors,
     )
     sentinel = staging_dir / _STAGE_SENTINEL
 

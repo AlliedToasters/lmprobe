@@ -2672,6 +2672,20 @@ class TestStagingDir:
         path3 = _staging_dir_path("user/repo", "m", ["x"], labels=None)
         assert len({path1, path2, path3}) == 3
 
+    def test_staging_dir_includes_metadata(self, cache_dir):
+        """Different metadata produce different staging path."""
+        path1 = _staging_dir_path("user/repo", "m", ["x"], metadata=[{"k": "a"}])
+        path2 = _staging_dir_path("user/repo", "m", ["x"], metadata=[{"k": "b"}])
+        path3 = _staging_dir_path("user/repo", "m", ["x"], metadata=None)
+        assert len({path1, path2, path3}) == 3
+
+    def test_staging_dir_includes_tensors_filter(self, cache_dir):
+        """Different tensors filter produces different staging path."""
+        path1 = _staging_dir_path("user/repo", "m", ["x"], tensors=["hidden_layers"])
+        path2 = _staging_dir_path("user/repo", "m", ["x"], tensors=["logits_topk"])
+        path3 = _staging_dir_path("user/repo", "m", ["x"], tensors=None)
+        assert len({path1, path2, path3}) == 3
+
     def test_staging_dir_under_cache(self, cache_dir):
         """Staging dir lives under the cache directory."""
         path = _staging_dir_path("user/repo", "m", ["x"])
