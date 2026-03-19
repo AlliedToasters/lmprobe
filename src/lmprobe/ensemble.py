@@ -38,6 +38,12 @@ class ProbeEnsemble:
         Aggregation strategy: ``"soft"`` (average probabilities) or
         ``"hard"`` (majority vote). Default ``"soft"``.
 
+        .. note::
+           Soft voting requires all member probes to support
+           ``predict_proba()`` (e.g. logistic regression, SVM with
+           probability=True). Classifiers like Ridge that lack
+           ``predict_proba`` must use ``voting="hard"``.
+
     Examples
     --------
     >>> from lmprobe import Probe
@@ -312,6 +318,17 @@ class ProbeEnsemble:
             Averaged class probabilities, shape (n_samples, n_classes).
         """
         self._check_fitted()
+
+        # Verify all probes support predict_proba
+        for i, probe in enumerate(self.probes_):
+            if not hasattr(probe.classifier_, "predict_proba"):
+                raise TypeError(
+                    f"Probe {i} (classifier={probe.classifier!r}) does not "
+                    f"support predict_proba(). Use voting='hard' for "
+                    f"ensembles containing classifiers without probability "
+                    f"estimates, or switch to a different classifier."
+                )
+
         self._warmup_cache(prompts)
 
         kwargs = {}

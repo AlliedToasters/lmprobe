@@ -267,7 +267,58 @@ class TestCacheEfficiency:
         assert preds.shape == (2,)
 
 
-# ── 9. Shape assertions ─────────────────────────────────────────────
+# ── 9. Soft voting with non-proba classifier ────────────────────────
+
+class TestSoftVotingNonProba:
+    def test_soft_voting_rejects_ridge(self, tiny_model):
+        """Soft voting raises TypeError for classifiers without predict_proba."""
+        p1 = Probe(
+            model=tiny_model,
+            layers=-1,
+            classifier="logistic_regression",
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        p2 = Probe(
+            model=tiny_model,
+            layers=-1,
+            classifier="ridge",
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        ensemble = ProbeEnsemble([p1, p2], voting="soft")
+        ensemble.fit(POS, NEG)
+
+        with pytest.raises(TypeError, match="does not support predict_proba"):
+            ensemble.predict_proba(TEST_PROMPTS)
+
+    def test_hard_voting_works_with_ridge(self, tiny_model):
+        """Hard voting works even when some classifiers lack predict_proba."""
+        p1 = Probe(
+            model=tiny_model,
+            layers=-1,
+            classifier="logistic_regression",
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        p2 = Probe(
+            model=tiny_model,
+            layers=-1,
+            classifier="ridge",
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        ensemble = ProbeEnsemble([p1, p2], voting="hard")
+        ensemble.fit(POS, NEG)
+        preds = ensemble.predict(TEST_PROMPTS)
+        assert preds.shape == (2,)
+
+
+# ── 10. Shape assertions ────────────────────────────────────────────
 
 class TestShapeAssertions:
     def test_all_output_shapes(self, two_probes):
