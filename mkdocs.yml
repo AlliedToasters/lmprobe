@@ -56,6 +56,7 @@ nav:
     - Caching: guides/caching.md
   - API Reference:
     - Probe: reference/probe.md
+    - Ensemble: reference/ensemble.md
     - Baseline: reference/baseline.md
     - Datasets: reference/datasets.md
     - Pooling: reference/pooling.md
