@@ -8,7 +8,6 @@ import pytest
 
 from lmprobe import Probe, ProbeEnsemble
 
-
 # ── Fixtures ──────────────────────────────────────────────────────────
 
 POS = [
@@ -148,7 +147,7 @@ class TestWeightedVoting:
         # Fit both ensembles
         e_uniform = ProbeEnsemble(two_probes)
         e_uniform.fit(POS, NEG)
-        probas_uniform = e_uniform.predict_proba(TEST_PROMPTS)
+        e_uniform.predict_proba(TEST_PROMPTS)  # ensure it runs
 
         # Re-fit with heavily weighted first probe
         e_weighted = ProbeEnsemble(two_probes, weights=[100.0, 0.001])
@@ -346,13 +345,6 @@ class TestSampleWeight:
 
     def test_sample_weight_affects_predictions(self, tiny_model):
         """Extreme weights should shift predictions vs uniform."""
-        base = Probe(
-            model=tiny_model,
-            layers=-1,
-            device="cpu",
-            remote=False,
-            random_state=42,
-        )
         n_total = len(POS) + len(NEG)
 
         # Fit with uniform weights
