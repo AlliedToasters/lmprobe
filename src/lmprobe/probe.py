@@ -22,8 +22,8 @@ from .cache import (
 from .classifiers import resolve_classifier
 from .extraction import ActivationExtractor
 from .pooling import (
-    SCORE_POOLING_STRATEGIES,
     get_pooling_fn,
+    parse_pooling_strategy,
     reduce_scores,
     resolve_pooling,
 )
@@ -803,6 +803,11 @@ class Probe:
         """
         # "all" pooling cannot use pre-pooled cache (needs full sequence)
         if pooling_strategy == "all":
+            return None
+
+        # Score-level pooling needs full sequence for per-token classification
+        parsed = parse_pooling_strategy(pooling_strategy)
+        if parsed.is_score_pooling:
             return None
 
         # No extractor means model-free (dataset-only); pooled cache uses model name
@@ -1614,8 +1619,9 @@ class Probe:
             batch_size=batch_size,
         )
 
-        # Check for score-level pooling
-        is_score_pooling = self._inference_pooling in SCORE_POOLING_STRATEGIES
+        # Parse the inference pooling strategy to determine if score-level
+        parsed = parse_pooling_strategy(self._inference_pooling)
+        is_score_pooling = parsed.is_score_pooling
 
         if X.ndim == 3:
             # Per-token activations: (batch, seq_len, hidden_dim)
@@ -1644,7 +1650,7 @@ class Probe:
             probs = probs_flat.reshape(batch_size, seq_len, n_classes)
 
             if is_score_pooling:
-                # Apply score-level pooling (max/min)
+                # Apply score-level pooling (e.g., max, min, score:mean)
                 probs_tensor = torch.from_numpy(probs)
                 reduced = reduce_scores(
                     probs_tensor,
