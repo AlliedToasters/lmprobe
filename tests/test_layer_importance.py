@@ -175,6 +175,7 @@ class TestComputeLayerImportance:
     def test_plotting_works_after_compute(self, tiny_model):
         """plot_layer_importance works after compute_layer_importance."""
         pytest.importorskip("matplotlib")
+        pytest.importorskip("seaborn")
 
         probe = LinearProbe(
             model=tiny_model,
