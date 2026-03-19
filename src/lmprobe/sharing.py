@@ -49,6 +49,7 @@ from .cache import (
     load_prompt_logits,
     load_prompt_perplexity,
     load_prompt_pooled_activations,
+    load_prompt_token_perplexity,
     save_prompt_activations,
     save_prompt_pooled_activations,
     write_shard_registry,
@@ -608,7 +609,7 @@ def _consolidate_and_shard(
                 meta_entry["perplexity_min"] = float(ppl[1])
                 meta_entry["perplexity_max"] = float(ppl[2])
             except (FileNotFoundError, KeyError, IndexError):
-                logger.debug(
+                logger.warning(
                     f"[SHARING] Could not load perplexity for prompt "
                     f"index {idx}, skipping perplexity columns"
                 )
@@ -616,22 +617,27 @@ def _consolidate_and_shard(
         # Add per-token perplexity data when available
         if has_token_perplexity:
             try:
-                from .cache import load_prompt_token_perplexity
-                tok_ppl, tok_ids = load_prompt_token_perplexity(model_name, prompt)
+                tok_ppl, tok_ids = load_prompt_token_perplexity(
+                    model_name, prompt,
+                )
                 meta_entry["token_ids"] = tok_ids.tolist()
                 meta_entry["token_perplexity"] = tok_ppl.tolist()
                 # Decode token strings if we have a tokenizer
                 if _tokenizer_cache.get("instance") is None:
                     from transformers import AutoTokenizer
-                    _tokenizer_cache["instance"] = AutoTokenizer.from_pretrained(model_name)
+                    _tokenizer_cache["instance"] = (
+                        AutoTokenizer.from_pretrained(model_name)
+                    )
                 tokenizer = _tokenizer_cache["instance"]
                 meta_entry["token_strings"] = [
-                    tokenizer.decode([tid]) for tid in tok_ids.tolist()
+                    tokenizer.decode([tid])
+                    for tid in tok_ids.tolist()
                 ]
             except (FileNotFoundError, KeyError, IndexError):
-                logger.debug(
-                    f"[SHARING] Could not load token perplexity for prompt "
-                    f"index {idx}, skipping token perplexity columns"
+                logger.warning(
+                    f"[SHARING] Could not load token perplexity "
+                    f"for prompt index {idx}, skipping token "
+                    f"perplexity columns"
                 )
 
         prompt_metadata.append(meta_entry)
