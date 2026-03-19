@@ -215,7 +215,8 @@ def compute_perplexity_from_activations(
     lm_head_weight: torch.Tensor | None = None,
     norm_config: dict | None = None,
     tokenizer: object | None = None,
-) -> list[torch.Tensor]:
+    return_per_token: bool = False,
+) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
     """Compute perplexity stats from cached last-layer activations.
 
     For each prompt: loads full-sequence activations from cache, reconstructs
@@ -243,11 +244,14 @@ def compute_perplexity_from_activations(
         Pre-loaded norm config. If None, downloaded automatically.
     tokenizer : object | None
         Pre-loaded tokenizer. If None, loaded automatically.
+    return_per_token : bool
+        If True, also return per-token perplexity and token IDs.
 
     Returns
     -------
-    list[torch.Tensor]
-        List of (3,) tensors: [mean_ppl, min_ppl, max_ppl] per prompt.
+    list[torch.Tensor] or tuple
+        If return_per_token is False: list of (3,) tensors per prompt.
+        If return_per_token is True: (aggregates, per_token_ppl_list, token_ids_list).
 
     Raises
     ------
@@ -269,6 +273,8 @@ def compute_perplexity_from_activations(
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     results = []
+    per_token_ppl_list: list[torch.Tensor] = []
+    token_ids_list: list[torch.Tensor] = []
 
     for prompt in prompts:
         # Load full-sequence activations for this prompt
@@ -312,6 +318,9 @@ def compute_perplexity_from_activations(
 
         if len(per_token_loss) == 0:
             ppl_tensor = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+            if return_per_token:
+                per_token_ppl_list.append(torch.tensor([], dtype=torch.float32))
+                token_ids_list.append(input_ids[0].cpu())
         else:
             mean_loss = per_token_loss.mean().item()
             min_loss = per_token_loss.min().item()
@@ -326,9 +335,18 @@ def compute_perplexity_from_activations(
                 dtype=torch.float32,
             )
 
+            if return_per_token:
+                per_token_ppl_list.append(
+                    torch.exp(per_token_loss).cpu().float()
+                )
+                token_ids_list.append(input_ids[0].cpu())
+
         results.append(ppl_tensor)
 
         # Free logits immediately
         del logits, normed, acts
+
+    if return_per_token:
+        return results, per_token_ppl_list, token_ids_list
 
     return results

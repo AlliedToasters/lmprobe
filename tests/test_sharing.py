@@ -108,7 +108,7 @@ class TestComputeTensorIntersection:
             pooled={"last_token": [0, 1]},
             has_logits=False,
             logits_top_k=None,
-            has_perplexity=True,
+            has_perplexity=True, has_token_perplexity=False,
             num_tokens=5,
         )
         result = _compute_tensor_intersection([info])
@@ -120,11 +120,11 @@ class TestComputeTensorIntersection:
     def test_intersection_of_layers(self):
         info1 = CachedPromptInfo(
             raw_layers=[0, 1, 2], pooled={}, has_logits=False,
-            logits_top_k=None, has_perplexity=False, num_tokens=5,
+            logits_top_k=None, has_perplexity=False, has_token_perplexity=False, num_tokens=5,
         )
         info2 = CachedPromptInfo(
             raw_layers=[1, 2, 3], pooled={}, has_logits=False,
-            logits_top_k=None, has_perplexity=False, num_tokens=5,
+            logits_top_k=None, has_perplexity=False, has_token_perplexity=False, num_tokens=5,
         )
         result = _compute_tensor_intersection([info1, info2])
         assert result["raw_layers"] == [1, 2]
@@ -132,12 +132,12 @@ class TestComputeTensorIntersection:
     def test_intersection_of_pooled_strategies(self):
         info1 = CachedPromptInfo(
             raw_layers=[], pooled={"last_token": [0], "mean": [0]},
-            has_logits=False, logits_top_k=None, has_perplexity=False,
+            has_logits=False, logits_top_k=None, has_perplexity=False, has_token_perplexity=False,
             num_tokens=5,
         )
         info2 = CachedPromptInfo(
             raw_layers=[], pooled={"last_token": [0]},
-            has_logits=False, logits_top_k=None, has_perplexity=False,
+            has_logits=False, logits_top_k=None, has_perplexity=False, has_token_perplexity=False,
             num_tokens=5,
         )
         result = _compute_tensor_intersection([info1, info2])
@@ -147,11 +147,11 @@ class TestComputeTensorIntersection:
     def test_logits_topk_consistent(self):
         info1 = CachedPromptInfo(
             raw_layers=[], pooled={}, has_logits=False,
-            logits_top_k=100, has_perplexity=False, num_tokens=5,
+            logits_top_k=100, has_perplexity=False, has_token_perplexity=False, num_tokens=5,
         )
         info2 = CachedPromptInfo(
             raw_layers=[], pooled={}, has_logits=False,
-            logits_top_k=100, has_perplexity=False, num_tokens=5,
+            logits_top_k=100, has_perplexity=False, has_token_perplexity=False, num_tokens=5,
         )
         result = _compute_tensor_intersection([info1, info2])
         assert result["has_logits"] is True
@@ -160,11 +160,11 @@ class TestComputeTensorIntersection:
     def test_logits_topk_inconsistent(self):
         info1 = CachedPromptInfo(
             raw_layers=[], pooled={}, has_logits=False,
-            logits_top_k=100, has_perplexity=False, num_tokens=5,
+            logits_top_k=100, has_perplexity=False, has_token_perplexity=False, num_tokens=5,
         )
         info2 = CachedPromptInfo(
             raw_layers=[], pooled={}, has_logits=False,
-            logits_top_k=50, has_perplexity=False, num_tokens=5,
+            logits_top_k=50, has_perplexity=False, has_token_perplexity=False, num_tokens=5,
         )
         result = _compute_tensor_intersection([info1, info2])
         assert result["has_logits"] is False
@@ -172,7 +172,7 @@ class TestComputeTensorIntersection:
     def test_topk_preferred_over_full(self):
         info = CachedPromptInfo(
             raw_layers=[], pooled={}, has_logits=True,
-            logits_top_k=100, has_perplexity=False, num_tokens=5,
+            logits_top_k=100, has_perplexity=False, has_token_perplexity=False, num_tokens=5,
         )
         result = _compute_tensor_intersection([info, info])
         assert result["has_logits"] is True
@@ -181,11 +181,11 @@ class TestComputeTensorIntersection:
     def test_perplexity_intersection(self):
         info1 = CachedPromptInfo(
             raw_layers=[], pooled={}, has_logits=False,
-            logits_top_k=None, has_perplexity=True, num_tokens=5,
+            logits_top_k=None, has_perplexity=True, has_token_perplexity=False, num_tokens=5,
         )
         info2 = CachedPromptInfo(
             raw_layers=[], pooled={}, has_logits=False,
-            logits_top_k=None, has_perplexity=False, num_tokens=5,
+            logits_top_k=None, has_perplexity=False, has_token_perplexity=False, num_tokens=5,
         )
         result = _compute_tensor_intersection([info1, info2])
         assert result["has_perplexity"] is False

@@ -279,6 +279,8 @@ def _pooled_layer_key(pooling: str, layer: int) -> str:
 
 _ATTENTION_MASK_KEY = "attention_mask"
 _PERPLEXITY_KEY = "perplexity"
+_TOKEN_PERPLEXITY_KEY = "token_perplexity"
+_TOKEN_IDS_KEY = "token_ids"
 _LOGITS_KEY = "logits"
 _LOGITS_TOP_K_VALUES_KEY = "logits_top_k_values"
 _LOGITS_TOP_K_INDICES_KEY = "logits_top_k_indices"
@@ -346,6 +348,7 @@ class CachedPromptInfo:
     has_logits: bool
     logits_top_k: int | None
     has_perplexity: bool
+    has_token_perplexity: bool
     num_tokens: int | None
 
 
@@ -402,12 +405,17 @@ def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
                         logits_top_k = tensors[_LOGITS_TOP_K_VALUES_KEY].shape[-1]
                     except Exception:
                         pass
+            has_token_ppl = False
+            if has_perplexity_sidecar:
+                ppl_keys = _get_tensor_keys_from_backend(perplexity_sidecar)
+                has_token_ppl = _TOKEN_PERPLEXITY_KEY in ppl_keys
             return CachedPromptInfo(
                 raw_layers=[],
                 pooled={},
                 has_logits=has_logits,
                 logits_top_k=logits_top_k,
                 has_perplexity=has_perplexity_sidecar,
+                has_token_perplexity=has_token_ppl,
                 num_tokens=None,
             )
 
@@ -455,6 +463,7 @@ def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
                 has_logits=False,
                 logits_top_k=None,
                 has_perplexity=has_perplexity,
+                has_token_perplexity=False,  # v1 never has token perplexity
                 num_tokens=num_tokens,
             )
         # Non-local backend, no v1/v2 cache — try shard registry
@@ -483,6 +492,14 @@ def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
 
     has_perplexity = has_perplexity_sidecar or _PERPLEXITY_KEY in tensor_keys
 
+    # Check for token-level perplexity in sidecar
+    has_token_perplexity = False
+    if has_perplexity_sidecar:
+        ppl_sidecar_keys = _get_tensor_keys_from_backend(perplexity_sidecar)
+        has_token_perplexity = _TOKEN_PERPLEXITY_KEY in ppl_sidecar_keys
+    elif _TOKEN_PERPLEXITY_KEY in tensor_keys:
+        has_token_perplexity = True
+
     # Determine top-k value by loading the shape of the topk values tensor
     logits_top_k = None
     if has_topk:
@@ -508,6 +525,7 @@ def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
         has_logits=has_logits,
         logits_top_k=logits_top_k,
         has_perplexity=has_perplexity,
+        has_token_perplexity=has_token_perplexity,
         num_tokens=num_tokens,
     )
 
@@ -925,6 +943,7 @@ def _discover_from_shard(model_name: str, prompt: str) -> CachedPromptInfo | Non
         has_logits=has_logits,
         logits_top_k=logits_top_k,
         has_perplexity=has_perplexity,
+        has_token_perplexity=False,  # shard registry doesn't track token perplexity
         num_tokens=num_tokens,
     )
 
@@ -1518,18 +1537,74 @@ def load_prompt_perplexity(model_name: str, prompt: str) -> torch.Tensor:
 
 
 def save_prompt_perplexity(
-    model_name: str, prompt: str, perplexity_features: torch.Tensor
+    model_name: str,
+    prompt: str,
+    perplexity_features: torch.Tensor,
+    token_perplexity: torch.Tensor | None = None,
+    token_ids: torch.Tensor | None = None,
 ) -> None:
     """Save perplexity features for a single prompt.
 
     Writes to a small sidecar file (``{hash}.perplexity.safetensors``)
     instead of merging into the main activation file, avoiding a full
     read-modify-write of potentially multi-GB activation data (#120).
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    prompt : str
+        The prompt text.
+    perplexity_features : torch.Tensor
+        Aggregate perplexity stats, shape (3,).
+    token_perplexity : torch.Tensor | None
+        Per-token perplexity values, shape (num_real_tokens - 1,).
+    token_ids : torch.Tensor | None
+        Input token IDs, shape (num_real_tokens,).
     """
     _register_model(model_name)
     key = _prompt_perplexity_key(model_name, prompt)
     tensors = {_PERPLEXITY_KEY: _prepare_tensor(perplexity_features)}
+    if token_perplexity is not None:
+        tensors[_TOKEN_PERPLEXITY_KEY] = _prepare_tensor(token_perplexity.float())
+    if token_ids is not None:
+        tensors[_TOKEN_IDS_KEY] = _prepare_tensor(token_ids.long())
     _save_tensors_to_backend(key, tensors)
+
+
+def is_prompt_token_perplexity_cached(model_name: str, prompt: str) -> bool:
+    """Check if per-token perplexity is cached for a prompt."""
+    backend = get_backend()
+    key = _prompt_perplexity_key(model_name, prompt)
+    if backend.exists(key):
+        tensor_keys = _get_tensor_keys_from_backend(key)
+        return _TOKEN_PERPLEXITY_KEY in tensor_keys
+    return False
+
+
+def load_prompt_token_perplexity(
+    model_name: str, prompt: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load per-token perplexity and token IDs for a single prompt.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        (token_perplexity, token_ids) where token_perplexity has shape
+        (num_real_tokens - 1,) and token_ids has shape (num_real_tokens,).
+    """
+    backend = get_backend()
+    sidecar_key = _prompt_perplexity_key(model_name, prompt)
+    if backend.exists(sidecar_key):
+        backend.touch(sidecar_key)
+        tensors = _load_tensors_from_backend(
+            sidecar_key, [_TOKEN_PERPLEXITY_KEY, _TOKEN_IDS_KEY]
+        )
+        return tensors[_TOKEN_PERPLEXITY_KEY], tensors[_TOKEN_IDS_KEY]
+
+    raise FileNotFoundError(
+        f"No cached token perplexity found for prompt: {prompt!r}"
+    )
 
 
 # =============================================================================

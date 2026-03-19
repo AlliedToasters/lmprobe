@@ -498,6 +498,8 @@ class UnifiedCache:
                         raise
 
                     # Compute perplexity features from logits
+                    ppl_token_ppl_list = None
+                    ppl_token_ids_list = None
                     if self.compute_perplexity:
                         # Get input_ids for perplexity computation
                         tokenized = backend.tokenizer(
@@ -505,11 +507,13 @@ class UnifiedCache:
                             return_tensors="pt",
                             padding=True,
                         )
-                        ppl_features = compute_perplexity_from_logits(
+                        ppl_result = compute_perplexity_from_logits(
                             batch_logits,
                             tokenized["input_ids"],
                             batch_mask,
+                            return_per_token=True,
                         )
+                        ppl_features, ppl_token_ppl_list, ppl_token_ids_list = ppl_result
 
                     # Save each prompt's data
                     for j, prompt in enumerate(batch_prompts):
@@ -543,8 +547,18 @@ class UnifiedCache:
 
                         # Save perplexity if needed
                         if self.compute_perplexity and prompt in need_perplexity_set:
+                            tok_ppl = (
+                                ppl_token_ppl_list[j]
+                                if ppl_token_ppl_list is not None else None
+                            )
+                            tok_ids = (
+                                ppl_token_ids_list[j]
+                                if ppl_token_ids_list is not None else None
+                            )
                             save_prompt_perplexity(
-                                self.model_name, prompt, ppl_features[j]
+                                self.model_name, prompt, ppl_features[j],
+                                token_perplexity=tok_ppl,
+                                token_ids=tok_ids,
                             )
                             perplexity_extracted += 1
 
@@ -978,14 +992,20 @@ class UnifiedCache:
             batch_prompts = uncached[batch_start : batch_start + batch_size]
 
             with torch.no_grad():
-                ppl_tensors = compute_perplexity_from_activations(
+                result = compute_perplexity_from_activations(
                     self.model_name, batch_prompts, last_layer, device=device,
                     norm_weight=norm_weight, lm_head_weight=lm_head_weight,
                     norm_config=norm_config, tokenizer=tokenizer,
+                    return_per_token=True,
                 )
+                ppl_tensors, token_ppl_list, token_ids_list = result
 
-            for prompt, ppl_tensor in zip(batch_prompts, ppl_tensors):
-                save_prompt_perplexity(self.model_name, prompt, ppl_tensor)
+            for i, (prompt, ppl_tensor) in enumerate(zip(batch_prompts, ppl_tensors)):
+                save_prompt_perplexity(
+                    self.model_name, prompt, ppl_tensor,
+                    token_perplexity=token_ppl_list[i],
+                    token_ids=token_ids_list[i],
+                )
                 computed += 1
 
         logger.info("[PERPLEXITY] Computed perplexity for %d prompts", computed)

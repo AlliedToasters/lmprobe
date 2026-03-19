@@ -47,7 +47,9 @@ from .cache import (
     discover_cached,
     load_prompt_activations,
     load_prompt_logits,
+    load_prompt_perplexity,
     load_prompt_pooled_activations,
+    load_prompt_token_perplexity,
     save_prompt_activations,
     save_prompt_pooled_activations,
     write_shard_registry,
@@ -60,6 +62,7 @@ DEFAULT_SHARD_BYTES = 1_073_741_824  # 1 GB
 INFO_FILENAME = "lmprobe_info.json"
 PARQUET_PATH = "index/train-00000-of-00001.parquet"
 _STAGE_SENTINEL = "_stage_complete"
+_tokenizer_cache: dict[str, Any] = {}
 
 
 # =============================================================================
@@ -244,6 +247,7 @@ def _compute_tensor_intersection(
             "has_logits": False,
             "logits_top_k": None,
             "has_perplexity": False,
+            "has_token_perplexity": False,
         }
 
     raw_sets = [set(i.raw_layers) for i in infos]
@@ -287,6 +291,7 @@ def _compute_tensor_intersection(
         logits_top_k = None
 
     has_perplexity = all(i.has_perplexity for i in infos)
+    has_token_perplexity = all(i.has_token_perplexity for i in infos)
 
     return {
         "raw_layers": raw_intersection,
@@ -294,6 +299,7 @@ def _compute_tensor_intersection(
         "has_logits": has_logits,
         "logits_top_k": logits_top_k,
         "has_perplexity": has_perplexity,
+        "has_token_perplexity": has_token_perplexity,
     }
 
 
@@ -314,6 +320,7 @@ def _filter_tensor_types(
         "has_logits": False,
         "logits_top_k": available.get("logits_top_k"),
         "has_perplexity": False,
+        "has_token_perplexity": False,
     }
 
     for key in tensors_filter:
@@ -329,6 +336,7 @@ def _filter_tensor_types(
 
         if key == "perplexity" and available["has_perplexity"]:
             result["has_perplexity"] = True
+            result["has_token_perplexity"] = available.get("has_token_perplexity", False)
             continue
 
         logger.warning(
@@ -533,6 +541,8 @@ def _consolidate_and_shard(
     pooled = tensor_types["pooled"]
     has_logits = tensor_types["has_logits"]
     logits_top_k = tensor_types["logits_top_k"]
+    has_perplexity = tensor_types.get("has_perplexity", False)
+    has_token_perplexity = tensor_types.get("has_token_perplexity", False)
 
     # Auto-detect: if raw_layers available, store full-sequence
     raw_layers = tensor_types.get("raw_layers", [])
@@ -584,12 +594,53 @@ def _consolidate_and_shard(
             per_prompt_tokens.append(num_tokens)
 
         valid_prompts.append(prompt)
-        prompt_metadata.append({
+        meta_entry: dict[str, Any] = {
             "text": prompt,
             "label": label,
             "num_tokens": num_tokens,
             **extra_meta,
-        })
+        }
+
+        # Add per-token perplexity stats when available in cache
+        if has_perplexity:
+            try:
+                ppl = load_prompt_perplexity(model_name, prompt)
+                meta_entry["perplexity_mean"] = float(ppl[0])
+                meta_entry["perplexity_min"] = float(ppl[1])
+                meta_entry["perplexity_max"] = float(ppl[2])
+            except (FileNotFoundError, KeyError, IndexError):
+                logger.warning(
+                    f"[SHARING] Could not load perplexity for prompt "
+                    f"index {idx}, skipping perplexity columns"
+                )
+
+        # Add per-token perplexity data when available
+        if has_token_perplexity:
+            try:
+                tok_ppl, tok_ids = load_prompt_token_perplexity(
+                    model_name, prompt,
+                )
+                meta_entry["token_ids"] = tok_ids.tolist()
+                meta_entry["token_perplexity"] = tok_ppl.tolist()
+                # Decode token strings if we have a tokenizer
+                if _tokenizer_cache.get("instance") is None:
+                    from transformers import AutoTokenizer
+                    _tokenizer_cache["instance"] = (
+                        AutoTokenizer.from_pretrained(model_name)
+                    )
+                tokenizer = _tokenizer_cache["instance"]
+                meta_entry["token_strings"] = [
+                    tokenizer.decode([tid])
+                    for tid in tok_ids.tolist()
+                ]
+            except (FileNotFoundError, KeyError, IndexError):
+                logger.warning(
+                    f"[SHARING] Could not load token perplexity "
+                    f"for prompt index {idx}, skipping token "
+                    f"perplexity columns"
+                )
+
+        prompt_metadata.append(meta_entry)
 
     if skipped_count > 0:
         logger.warning(
@@ -919,6 +970,20 @@ def _write_parquet_index(
             sample = next((v for v in values if v is not None), None)
             if sample is None:
                 pa_type = pa.string()
+            elif isinstance(sample, list):
+                # Infer list element type from first element
+                if sample and isinstance(sample[0], int):
+                    pa_type = pa.list_(pa.int64())
+                elif sample and isinstance(sample[0], float):
+                    pa_type = pa.list_(pa.float64())
+                elif sample and isinstance(sample[0], str):
+                    pa_type = pa.list_(pa.string())
+                else:
+                    pa_type = pa.list_(pa.string())
+                    values = [
+                        [str(x) for x in v] if v is not None else None
+                        for v in values
+                    ]
             elif isinstance(sample, int):
                 pa_type = pa.int32()
             elif isinstance(sample, float):
