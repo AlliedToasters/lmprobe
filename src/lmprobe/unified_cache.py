@@ -32,6 +32,7 @@ from .cache import (
     save_prompt_perplexity,
     save_prompt_pooled_activations,
     save_prompt_topk_logits,
+    evict,
 )
 from .extraction import (
     compute_perplexity_from_logits,
@@ -598,6 +599,7 @@ class UnifiedCache:
             f"{logits_extracted} logits extracted in {elapsed:.1f}s"
         )
 
+        evict()
         return stats
 
     def get_activations(
@@ -890,6 +892,7 @@ class UnifiedCache:
             computed += len(batch_prompts)
 
         logger.info("[LOGITS] Computed logits for %d prompts", computed)
+        evict()
         return computed
 
     def compute_perplexity_from_cache(
@@ -986,4 +989,5 @@ class UnifiedCache:
                 computed += 1
 
         logger.info("[PERPLEXITY] Computed perplexity for %d prompts", computed)
+        evict()
         return computed

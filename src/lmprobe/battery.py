@@ -17,6 +17,7 @@ import numpy as np
 
 from .activation_baseline import ActivationBaseline
 from .baseline import BaselineProbe
+from .cache import evict
 
 if TYPE_CHECKING:
     from sklearn.base import BaseEstimator
@@ -371,6 +372,7 @@ class BaselineBattery:
             )
 
         self.results_ = BaselineResults(results=results)
+        evict()
         return self.results_
 
     def get_best(self, n: int = 1) -> list[BaselineResult]:
