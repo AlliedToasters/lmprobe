@@ -248,8 +248,28 @@ probe = Probe(
 | `"mean"` | Y | Y | Mean across all tokens |
 | `"first_token"` | Y | Y | First token (e.g., `[CLS]`) |
 | `"all"` | Y | Y | Each token independently |
-| `"max"` | | Y | Max score across tokens |
-| `"min"` | | Y | Min score across tokens |
+| `"max"` | | Y | Max score across tokens (post-probe) |
+| `"min"` | | Y | Min score across tokens (post-probe) |
+
+### Pooling Stage Prefixes
+
+Strategies can be prefixed with `score:` (post-probe) or `activation:` (pre-probe) to control *when* pooling happens:
+
+- **Activation pooling** (pre-probe): Reduces activations before classification — the classifier sees one vector per sequence.
+- **Score pooling** (post-probe): Classifies every token independently, then reduces the per-token scores.
+
+```python
+# Post-probe: classify each token, then average probabilities
+probe = Probe(inference_pooling="score:mean")
+
+# Pre-probe: take max activation per dimension, then classify once
+probe = Probe(inference_pooling="activation:max")
+
+# Bare names use sensible defaults (backward compatible):
+# "mean" → activation:mean, "max" → score:max
+```
+
+All base strategies (`last_token`, `first_token`, `mean`, `max`, `min`) can be used with either prefix.
 
 ### Pooling Collision Rules
 
@@ -716,4 +736,80 @@ probe = Probe(
     # normalize_layers="per_layer", # Alternative: one mean/std per layer
     # normalize_layers=False,       # Disable normalization
 )
+```
+
+---
+
+## Probe Ensembles
+
+Combine multiple probes into an ensemble for more robust predictions and uncertainty estimation.
+
+### Basic ensemble
+
+```python
+from lmprobe import Probe, ProbeEnsemble
+
+# Combine probes with different classifiers
+p1 = Probe(model="meta-llama/Llama-3.1-8B-Instruct", layers=-1, classifier="logistic_regression")
+p2 = Probe(model="meta-llama/Llama-3.1-8B-Instruct", layers=-1, classifier="svm")
+p3 = Probe(model="meta-llama/Llama-3.1-8B-Instruct", layers=16, classifier="logistic_regression")
+
+ensemble = ProbeEnsemble([p1, p2, p3], voting="soft")
+ensemble.fit(positive_prompts, negative_prompts)
+
+predictions = ensemble.predict(test_prompts)           # (n_samples,)
+probabilities = ensemble.predict_proba(test_prompts)   # (n_samples, n_classes)
+accuracy = ensemble.score(test_prompts, test_labels)
+```
+
+### Factory construction
+
+Create ensembles from config dicts sharing a common model:
+
+```python
+ensemble = ProbeEnsemble.from_configs(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    configs=[
+        {"layers": -1, "classifier": "logistic_regression"},
+        {"layers": -1, "classifier": "svm"},
+        {"layers": 16, "classifier": "ridge"},
+    ],
+    voting="hard",    # majority vote (required when using Ridge)
+    device="auto",    # shared kwargs
+)
+```
+
+### Bootstrap stability analysis
+
+Clone a single probe into N bootstrap resamples to measure prediction stability:
+
+```python
+base_probe = Probe(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    layers=-1,
+    classifier="logistic_regression",
+)
+
+ensemble = ProbeEnsemble.bootstrap(base_probe, n_resamples=10, random_state=42)
+ensemble.fit(positive_prompts, negative_prompts)
+
+# Per-sample uncertainty: high std = ensemble members disagree
+uncertainty = ensemble.prediction_std(test_prompts)  # (n_samples,)
+```
+
+Bootstrap mode supports `sample_weight` and `groups` for group-balanced resampling:
+
+```python
+ensemble.fit(
+    positive_prompts, negative_prompts,
+    sample_weight=weights,    # per-sample importance weights
+    groups=group_labels,      # group-balanced bootstrap resampling
+)
+```
+
+### Save and load
+
+```python
+ensemble.save("my_ensemble.pkl")
+loaded = ProbeEnsemble.load("my_ensemble.pkl")
 ```
