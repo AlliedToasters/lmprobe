@@ -671,7 +671,8 @@ def compute_perplexity_from_logits(
     logits: torch.Tensor,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-) -> torch.Tensor:
+    return_per_token: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
     """Compute perplexity features from logits.
 
     Handles batched computation with proper masking for variable-length sequences.
@@ -684,11 +685,16 @@ def compute_perplexity_from_logits(
         Input token IDs, shape (batch, seq_len).
     attention_mask : torch.Tensor
         Attention mask, shape (batch, seq_len). 1 for real tokens, 0 for padding.
+    return_per_token : bool
+        If True, also return per-token perplexity values and token IDs.
 
     Returns
     -------
-    torch.Tensor
-        Perplexity features, shape (batch, 3) - [mean_ppl, min_ppl, max_ppl] per prompt.
+    torch.Tensor or tuple
+        If return_per_token is False: shape (batch, 3) - [mean_ppl, min_ppl, max_ppl].
+        If return_per_token is True: (aggregates, per_token_ppl_list, token_ids_list)
+        where per_token_ppl_list is a list of 1D tensors (variable length, masked)
+        and token_ids_list is a list of 1D tensors of real token IDs per prompt.
     """
     import numpy as np
 
@@ -713,12 +719,19 @@ def compute_perplexity_from_logits(
 
     # Compute features per prompt
     features = []
+    per_token_ppl_list: list[torch.Tensor] = []
+    token_ids_list: list[torch.Tensor] = []
+
     for i in range(batch_size):
         valid_losses = per_token_loss[i][shift_mask[i] == 1]
 
         if len(valid_losses) == 0:
             # Edge case: empty sequence after shift
             features.append([1.0, 1.0, 1.0])
+            if return_per_token:
+                per_token_ppl_list.append(torch.tensor([], dtype=torch.float32))
+                real_ids = input_ids[i][attention_mask[i] == 1]
+                token_ids_list.append(real_ids.cpu())
             continue
 
         mean_loss = valid_losses.mean().item()
@@ -731,7 +744,18 @@ def compute_perplexity_from_logits(
 
         features.append([mean_ppl, min_ppl, max_ppl])
 
-    return torch.tensor(features, dtype=torch.float32)
+        if return_per_token:
+            token_ppl = torch.exp(valid_losses).cpu().float()
+            per_token_ppl_list.append(token_ppl)
+            real_ids = input_ids[i][attention_mask[i] == 1]
+            token_ids_list.append(real_ids.cpu())
+
+    aggregates = torch.tensor(features, dtype=torch.float32)
+
+    if return_per_token:
+        return aggregates, per_token_ppl_list, token_ids_list
+
+    return aggregates
 
 
 def extract_activations(
