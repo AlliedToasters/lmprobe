@@ -15,6 +15,7 @@ from sklearn.base import clone
 
 from .cache import (
     CachedExtractor,
+    evict,
     is_prompt_pooled_cached,
     load_prompt_pooled_activations,
 )
@@ -1137,6 +1138,7 @@ class Probe:
         self.classifier_.fit(X, labels)
         self.classes_ = getattr(self.classifier_, "classes_", None)
 
+        evict()
         return self
 
     def _fit_auto_layers(

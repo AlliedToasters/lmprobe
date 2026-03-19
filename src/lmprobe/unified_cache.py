@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from .backends import resolve_backend
 from .cache import (
+    evict,
     get_prompt_cached_pooled_layers,
     get_prompt_cached_raw_layers,
     is_prompt_fully_cached,
@@ -598,6 +599,7 @@ class UnifiedCache:
             f"{logits_extracted} logits extracted in {elapsed:.1f}s"
         )
 
+        evict()
         return stats
 
     def get_activations(
@@ -890,6 +892,7 @@ class UnifiedCache:
             computed += len(batch_prompts)
 
         logger.info("[LOGITS] Computed logits for %d prompts", computed)
+        evict()
         return computed
 
     def compute_perplexity_from_cache(
@@ -986,4 +989,5 @@ class UnifiedCache:
                 computed += 1
 
         logger.info("[PERPLEXITY] Computed perplexity for %d prompts", computed)
+        evict()
         return computed

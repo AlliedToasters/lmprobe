@@ -113,10 +113,10 @@ if _env_dtype is not None:
 
 
 def set_cache_limit(gb: float | None = None) -> None:
-    """Set maximum cache size in GB with LRU eviction.
+    """Set maximum cache size in GB for LRU eviction.
 
-    When the cache exceeds this limit after a write, least-recently-used
-    entries are evicted until the cache is under the cap.
+    This sets the target size cap. To actually enforce it, call
+    ``evict()`` — eviction is intentionally decoupled from writes.
 
     Parameters
     ----------
@@ -578,9 +578,6 @@ def _save_tensors_to_backend(key: str, tensors: dict[str, torch.Tensor]) -> None
             ) from e
         raise
 
-    # Run LRU eviction after successful write (local backend only)
-    _maybe_evict()
-
 
 def _load_tensors_from_backend(
     key: str, tensor_keys: list[str] | None = None
@@ -702,9 +699,6 @@ def _safe_save_file(tensors: dict[str, torch.Tensor], path: Path) -> None:
                 f"Current cache dir: {get_cache_dir()}"
             ) from e
         raise
-
-    # Run LRU eviction after successful write
-    _maybe_evict()
 
 
 def _load_sf_keys(path: Path) -> set[str]:
@@ -2237,11 +2231,16 @@ def _collect_cache_entries() -> list[tuple[Path, int, float]]:
     return entries
 
 
-def _maybe_evict() -> None:
+def evict() -> None:
     """Evict least-recently-used cache entries if over the size limit.
 
-    This is a no-op on non-local backends (S3 etc.) — S3 is designed
-    for accumulating large datasets, not ephemeral caching.
+    Call this explicitly when you want to enforce the cache size cap
+    (e.g. after a batch of writes, at session end, or on a schedule).
+    This is decoupled from writes for performance — scanning the full
+    cache is O(total_files) and should not run on every write.
+
+    No-op when no limit is set, caching is disabled, or on non-local
+    backends (S3 etc.).
     """
     if _CACHE_MAX_BYTES is None or _CACHE_MAX_BYTES <= 0:
         return

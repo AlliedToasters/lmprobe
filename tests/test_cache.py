@@ -365,12 +365,16 @@ class TestLRUEviction:
         set_cache_limit(gb=half / (1024**3))
 
         try:
-            # Trigger eviction by saving one more
+            # Save one more (eviction is decoupled from writes)
             save_prompt_activations(
                 "test-model", "prompt-trigger", [0],
                 torch.randn(1, 10, 64),
                 torch.ones(1, 10, dtype=torch.long),
             )
+
+            # Explicitly run eviction
+            from lmprobe.cache import evict
+            evict()
 
             # Cache should now be near the limit (allow for the trigger prompt)
             info_after = cache_info()
