@@ -9,9 +9,8 @@ import torch
 
 from lmprobe import LinearProbe
 from lmprobe.pooling import (
-    ParsedPooling,
-    parse_pooling_strategy,
     get_pooling_fn,
+    parse_pooling_strategy,
     pool_all,
     pool_first_token,
     pool_last_token,

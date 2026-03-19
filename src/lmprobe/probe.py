@@ -22,7 +22,6 @@ from .cache import (
 from .classifiers import resolve_classifier
 from .extraction import ActivationExtractor
 from .pooling import (
-    SCORE_POOLING_STRATEGIES,
     get_pooling_fn,
     parse_pooling_strategy,
     reduce_scores,
