@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from .backends import resolve_backend
 from .cache import (
+    evict,
     get_prompt_cached_pooled_layers,
     get_prompt_cached_raw_layers,
     is_prompt_fully_cached,
@@ -32,7 +33,6 @@ from .cache import (
     save_prompt_perplexity,
     save_prompt_pooled_activations,
     save_prompt_topk_logits,
-    evict,
 )
 from .extraction import (
     compute_perplexity_from_logits,
