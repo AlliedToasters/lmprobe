@@ -425,12 +425,12 @@ class TestGroupBootstrap:
         preds = ensemble.predict(TEST_PROMPTS)
         assert preds.shape == (2,)
 
-    def test_groups_ignored_without_bootstrap(self, two_probes):
-        """Non-bootstrap ensemble ignores groups silently."""
+    def test_groups_warns_without_bootstrap(self, two_probes):
+        """Non-bootstrap ensemble warns when groups is provided."""
         ensemble = ProbeEnsemble(two_probes)
         groups = [0] * len(POS) + [1] * len(NEG)
-        # Should not raise — groups is just ignored
-        ensemble.fit(POS, NEG, groups=groups)
+        with pytest.warns(UserWarning, match="groups parameter is ignored"):
+            ensemble.fit(POS, NEG, groups=groups)
         preds = ensemble.predict(TEST_PROMPTS)
         assert preds.shape == (2,)
 

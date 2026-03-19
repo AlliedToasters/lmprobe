@@ -277,6 +277,16 @@ class ProbeEnsemble:
                 sample_weight=sample_weight, groups=groups,
             )
         else:
+            if groups is not None:
+                import warnings
+
+                warnings.warn(
+                    "groups parameter is ignored in non-bootstrap mode. "
+                    "Use ProbeEnsemble.bootstrap() to create a bootstrap "
+                    "ensemble that supports group-balanced resampling.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             for probe in self.probes_:
                 kwargs = {}
                 if remote is not None:
