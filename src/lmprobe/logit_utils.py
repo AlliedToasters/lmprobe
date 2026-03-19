@@ -279,10 +279,10 @@ def compute_perplexity_from_activations(
         acts = acts_list[0].to(device=device, dtype=norm_weight.dtype)
         mask = masks_list[0]
 
-        # Truncate to real (non-padded) length using mask.
+        # Select real (non-padded) positions using mask.
         # Cached activations may be padded from batched extraction.
-        real_len = mask[0].sum().item()
-        acts = acts[:, :real_len, :]
+        # Use boolean indexing to handle both left- and right-padding.
+        acts = acts[:, mask[0].bool(), :]
 
         # Apply norm
         normed = apply_norm(
