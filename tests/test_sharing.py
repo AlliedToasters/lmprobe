@@ -649,6 +649,67 @@ class TestPushDataset:
 
     @patch("lmprobe.sharing._check_hub_deps")
     @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_push_commit_batch_size_overrides_scale(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """commit_batch_size monkey-patches COMMIT_SIZE_SCALE during upload."""
+        import huggingface_hub._upload_large_folder as _ulf
+
+        original_scale = _ulf.COMMIT_SIZE_SCALE
+
+        captured_scale = []
+
+        def capture_scale(**kwargs):
+            captured_scale.append(list(_ulf.COMMIT_SIZE_SCALE))
+
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+        mock_api.upload_large_folder.side_effect = capture_scale
+
+        push_dataset(
+            repo_id="user/test-dataset",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+            commit_batch_size=3,
+        )
+
+        # During upload, scale should have been overridden
+        assert captured_scale == [[3]]
+        # After upload, original scale should be restored
+        assert _ulf.COMMIT_SIZE_SCALE is original_scale
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_push_commit_batch_size_restored_on_error(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """COMMIT_SIZE_SCALE is restored even if upload raises."""
+        import huggingface_hub._upload_large_folder as _ulf
+
+        original_scale = _ulf.COMMIT_SIZE_SCALE
+
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+        mock_api.upload_large_folder.side_effect = RuntimeError("connection lost")
+
+        with pytest.raises(RuntimeError, match="connection lost"):
+            push_dataset(
+                repo_id="user/test-dataset",
+                model_name=TEST_MODEL,
+                prompts=populated_cache,
+                labels=[1, 1, 0],
+                exist_ok=True,
+                commit_batch_size=1,
+            )
+
+        assert _ulf.COMMIT_SIZE_SCALE is original_scale
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
     def test_push_labels_length_mismatch(
         self, mock_pyarrow, mock_deps, populated_cache,
     ):

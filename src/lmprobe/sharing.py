@@ -1187,6 +1187,7 @@ def push_dataset(
     license: str = "cc-by-4.0",
     token: str | None = None,
     num_workers: int | None = None,
+    commit_batch_size: int | None = None,
 ) -> str:
     """Push cached activations to a HuggingFace Dataset repo.
 
@@ -1225,6 +1226,12 @@ def push_dataset(
         Number of workers for parallel file uploads.  Passed directly to
         ``upload_large_folder``.  ``None`` (default) uses the
         ``huggingface_hub`` default (currently 16 workers).
+    commit_batch_size : int | None
+        Maximum number of files per commit during upload.  On unreliable
+        connections, setting this to a small value (e.g. ``1``) ensures
+        progress is committed frequently, so interrupted uploads lose
+        less work on restart.  ``None`` (default) uses the
+        ``huggingface_hub`` default scale.
 
     Returns
     -------
@@ -1370,12 +1377,26 @@ def push_dataset(
         "[SHARING] Uploading dataset (%.2f GB) via upload_large_folder",
         total_size / 1e9,
     )
-    api.upload_large_folder(
-        repo_id=repo_id,
-        folder_path=str(tmpdir),
-        repo_type="dataset",
-        num_workers=num_workers,
-    )
+    if commit_batch_size is not None:
+        import huggingface_hub._upload_large_folder as _ulf
+
+        _orig_scale = _ulf.COMMIT_SIZE_SCALE
+        _ulf.COMMIT_SIZE_SCALE = [commit_batch_size]
+        logger.info(
+            "[SHARING] commit_batch_size=%d — overriding COMMIT_SIZE_SCALE",
+            commit_batch_size,
+        )
+
+    try:
+        api.upload_large_folder(
+            repo_id=repo_id,
+            folder_path=str(tmpdir),
+            repo_type="dataset",
+            num_workers=num_workers,
+        )
+    finally:
+        if commit_batch_size is not None:
+            _ulf.COMMIT_SIZE_SCALE = _orig_scale
     url = f"https://huggingface.co/datasets/{repo_id}"
 
     # Cleanup
