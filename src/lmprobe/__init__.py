@@ -57,6 +57,7 @@ __all__ = [
     "plot_layer_importance_heatmap",
     "pull_dataset",
     "push_dataset",
+    "evict",
     "set_cache_backend",
     "set_cache_dtype",
     "set_cache_limit",
@@ -108,12 +109,13 @@ def __getattr__(name: str):
         return enable_cache_logging
     if name in (
         "cache_info", "CacheInfo", "ModelCacheInfo",
-        "set_cache_backend", "set_cache_limit", "set_cache_dtype",
+        "evict", "set_cache_backend", "set_cache_limit", "set_cache_dtype",
     ):
         from .cache import (
             CacheInfo,
             ModelCacheInfo,
             cache_info,
+            evict,
             set_cache_backend,
             set_cache_dtype,
             set_cache_limit,
@@ -123,6 +125,7 @@ def __getattr__(name: str):
             "cache_info": cache_info,
             "CacheInfo": CacheInfo,
             "ModelCacheInfo": ModelCacheInfo,
+            "evict": evict,
             "set_cache_backend": set_cache_backend,
             "set_cache_limit": set_cache_limit,
             "set_cache_dtype": set_cache_dtype,
