@@ -8,6 +8,7 @@ save/load and bootstrap stability analysis.
 from __future__ import annotations
 
 import copy
+import math
 import pickle
 from typing import TYPE_CHECKING
 
@@ -205,6 +206,8 @@ class ProbeEnsemble:
         positive_prompts: list[str],
         negative_prompts: list[str] | np.ndarray | list[int] | None = None,
         remote: bool | None = None,
+        sample_weight: np.ndarray | list[float] | None = None,
+        groups: np.ndarray | list | None = None,
     ) -> ProbeEnsemble:
         """Fit all probes in the ensemble.
 
@@ -222,6 +225,16 @@ class ProbeEnsemble:
             In standard mode: labels.
         remote : bool | None
             Override remote setting for all probes.
+        sample_weight : np.ndarray | list[float] | None
+            Per-sample weights passed to each probe's classifier ``fit()``.
+            Length must match the total number of training samples.
+            In bootstrap mode, weights are resampled along with the data.
+        groups : np.ndarray | list | None
+            Group labels for group-balanced bootstrap resampling.
+            Only used in bootstrap mode — each ensemble member draws an
+            equal number of samples from each group. Length must match
+            the total number of training samples. Ignored in non-bootstrap
+            mode.
 
         Returns
         -------
@@ -237,16 +250,39 @@ class ProbeEnsemble:
         else:
             all_prompts = list(positive_prompts) + list(negative_prompts)
 
+        # Validate sample_weight length
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight, dtype=float)
+            if len(sample_weight) != len(all_prompts):
+                raise ValueError(
+                    f"sample_weight length ({len(sample_weight)}) must match "
+                    f"the number of training samples ({len(all_prompts)})."
+                )
+
+        # Validate groups length
+        if groups is not None:
+            groups = np.asarray(groups)
+            if len(groups) != len(all_prompts):
+                raise ValueError(
+                    f"groups length ({len(groups)}) must match "
+                    f"the number of training samples ({len(all_prompts)})."
+                )
+
         # Single warmup extraction pass
         self._warmup_cache(all_prompts)
 
         if self._bootstrap_mode:
-            self._fit_bootstrap(positive_prompts, negative_prompts, remote)
+            self._fit_bootstrap(
+                positive_prompts, negative_prompts, remote,
+                sample_weight=sample_weight, groups=groups,
+            )
         else:
             for probe in self.probes_:
                 kwargs = {}
                 if remote is not None:
                     kwargs["remote"] = remote
+                if sample_weight is not None:
+                    kwargs["sample_weight"] = sample_weight
                 probe.fit(positive_prompts, negative_prompts, **kwargs)
 
         self._fitted = True
@@ -257,6 +293,8 @@ class ProbeEnsemble:
         positive_prompts: list[str],
         negative_prompts: list[str] | np.ndarray | list[int] | None,
         remote: bool | None,
+        sample_weight: np.ndarray | None = None,
+        groups: np.ndarray | None = None,
     ) -> None:
         """Fit each probe on a bootstrap resample of the training data."""
         # Build combined prompts and labels
@@ -278,9 +316,14 @@ class ProbeEnsemble:
         for probe in self.probes_:
             # Resample ensuring all classes are represented
             for _attempt in range(100):
-                indices = rng.choice(
-                    len(prompts), size=len(prompts), replace=True
-                )
+                if groups is not None:
+                    indices = self._group_balanced_resample(
+                        groups, labels, sample_weight, rng,
+                    )
+                else:
+                    indices = rng.choice(
+                        len(prompts), size=len(prompts), replace=True
+                    )
                 if len(np.unique(labels[indices])) == len(unique_classes):
                     break
             resampled_prompts = [prompts[i] for i in indices]
@@ -289,7 +332,39 @@ class ProbeEnsemble:
             kwargs = {}
             if remote is not None:
                 kwargs["remote"] = remote
+            if sample_weight is not None:
+                kwargs["sample_weight"] = sample_weight[indices]
             probe.fit(resampled_prompts, resampled_labels, **kwargs)
+
+    @staticmethod
+    def _group_balanced_resample(
+        groups: np.ndarray,
+        labels: np.ndarray,
+        sample_weight: np.ndarray | None,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        """Draw a balanced bootstrap resample across groups.
+
+        Draws ``ceil(total / n_groups)`` samples from each group
+        (with replacement). If ``sample_weight`` is provided, it is
+        used as within-group sampling probabilities.
+        """
+        unique_groups = np.unique(groups)
+        per_group_n = math.ceil(len(groups) / len(unique_groups))
+
+        parts = []
+        for g in unique_groups:
+            g_indices = np.where(groups == g)[0]
+            if sample_weight is not None:
+                g_weights = sample_weight[g_indices]
+                g_probs = g_weights / g_weights.sum()
+            else:
+                g_probs = None
+            drawn = rng.choice(
+                g_indices, size=per_group_n, replace=True, p=g_probs,
+            )
+            parts.append(drawn)
+        return np.concatenate(parts)
 
     def _check_fitted(self) -> None:
         """Check that the ensemble has been fitted."""

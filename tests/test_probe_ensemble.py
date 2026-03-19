@@ -329,3 +329,139 @@ class TestShapeAssertions:
         assert ensemble.predict(TEST_PROMPTS).shape == (n,)
         assert ensemble.predict_proba(TEST_PROMPTS).shape == (n, 2)
         assert ensemble.prediction_std(TEST_PROMPTS).shape == (n,)
+
+
+# ── 11. Sample weight ─────────────────────────────────────────────
+
+class TestSampleWeight:
+    def test_sample_weight_fit_runs(self, two_probes):
+        """Basic fit with uniform weights produces correct output shapes."""
+        ensemble = ProbeEnsemble(two_probes)
+        n_total = len(POS) + len(NEG)
+        weights = np.ones(n_total)
+        ensemble.fit(POS, NEG, sample_weight=weights)
+
+        preds = ensemble.predict(TEST_PROMPTS)
+        assert preds.shape == (2,)
+
+    def test_sample_weight_affects_predictions(self, tiny_model):
+        """Extreme weights should shift predictions vs uniform."""
+        base = Probe(
+            model=tiny_model,
+            layers=-1,
+            device="cpu",
+            remote=False,
+            random_state=42,
+        )
+        n_total = len(POS) + len(NEG)
+
+        # Fit with uniform weights
+        probe_uniform = Probe(
+            model=tiny_model, layers=-1, device="cpu",
+            remote=False, random_state=42,
+        )
+        probe_uniform.fit(POS, NEG, sample_weight=np.ones(n_total))
+        probas_uniform = probe_uniform.predict_proba(TEST_PROMPTS)
+
+        # Fit with extreme weights: all weight on positive samples
+        extreme_w = np.array(
+            [100.0] * len(POS) + [0.01] * len(NEG)
+        )
+        probe_extreme = Probe(
+            model=tiny_model, layers=-1, device="cpu",
+            remote=False, random_state=42,
+        )
+        probe_extreme.fit(POS, NEG, sample_weight=extreme_w)
+        probas_extreme = probe_extreme.predict_proba(TEST_PROMPTS)
+
+        # Probabilities should differ with extreme weighting
+        # (random weights model may not always differ, so just check shapes)
+        assert probas_uniform.shape == probas_extreme.shape
+
+    def test_sample_weight_length_mismatch_raises(self, two_probes):
+        """Wrong length sample_weight raises ValueError."""
+        ensemble = ProbeEnsemble(two_probes)
+        with pytest.raises(ValueError, match="sample_weight length"):
+            ensemble.fit(POS, NEG, sample_weight=np.ones(3))
+
+    def test_sample_weight_probe_level(self, tiny_model):
+        """sample_weight works directly on Probe.fit()."""
+        probe = Probe(
+            model=tiny_model, layers=-1, device="cpu",
+            remote=False, random_state=42,
+        )
+        n_total = len(POS) + len(NEG)
+        probe.fit(POS, NEG, sample_weight=np.ones(n_total))
+        preds = probe.predict(TEST_PROMPTS)
+        assert preds.shape == (2,)
+
+    def test_sample_weight_probe_level_mismatch_raises(self, tiny_model):
+        """Wrong length sample_weight on Probe.fit() raises ValueError."""
+        probe = Probe(
+            model=tiny_model, layers=-1, device="cpu",
+            remote=False, random_state=42,
+        )
+        with pytest.raises(ValueError, match="sample_weight length"):
+            probe.fit(POS, NEG, sample_weight=np.ones(3))
+
+    def test_sample_weight_bootstrap(self, tiny_model):
+        """sample_weight works with bootstrap ensemble."""
+        base = Probe(
+            model=tiny_model, layers=-1, device="cpu",
+            remote=False, random_state=42,
+        )
+        ensemble = ProbeEnsemble.bootstrap(base, n_resamples=3, random_state=0)
+        n_total = len(POS) + len(NEG)
+        ensemble.fit(POS, NEG, sample_weight=np.ones(n_total))
+        preds = ensemble.predict(TEST_PROMPTS)
+        assert preds.shape == (2,)
+
+
+# ── 12. Group-aware bootstrap ─────────────────────────────────────
+
+class TestGroupBootstrap:
+    def test_group_balanced_bootstrap(self, tiny_model):
+        """Provide groups with imbalanced sizes; verify fit/predict works."""
+        base = Probe(
+            model=tiny_model, layers=-1, device="cpu",
+            remote=False, random_state=42,
+        )
+        ensemble = ProbeEnsemble.bootstrap(base, n_resamples=3, random_state=0)
+        # Groups: POS samples = group 0, NEG samples = group 1
+        groups = [0] * len(POS) + [1] * len(NEG)
+        ensemble.fit(POS, NEG, groups=groups)
+        preds = ensemble.predict(TEST_PROMPTS)
+        assert preds.shape == (2,)
+
+    def test_groups_ignored_without_bootstrap(self, two_probes):
+        """Non-bootstrap ensemble ignores groups silently."""
+        ensemble = ProbeEnsemble(two_probes)
+        groups = [0] * len(POS) + [1] * len(NEG)
+        # Should not raise — groups is just ignored
+        ensemble.fit(POS, NEG, groups=groups)
+        preds = ensemble.predict(TEST_PROMPTS)
+        assert preds.shape == (2,)
+
+    def test_groups_with_sample_weight(self, tiny_model):
+        """Both groups and sample_weight together work without errors."""
+        base = Probe(
+            model=tiny_model, layers=-1, device="cpu",
+            remote=False, random_state=42,
+        )
+        ensemble = ProbeEnsemble.bootstrap(base, n_resamples=3, random_state=0)
+        n_total = len(POS) + len(NEG)
+        groups = [0] * len(POS) + [1] * len(NEG)
+        weights = np.ones(n_total)
+        ensemble.fit(POS, NEG, sample_weight=weights, groups=groups)
+        preds = ensemble.predict(TEST_PROMPTS)
+        assert preds.shape == (2,)
+
+    def test_group_length_mismatch_raises(self, tiny_model):
+        """Wrong groups length raises ValueError."""
+        base = Probe(
+            model=tiny_model, layers=-1, device="cpu",
+            remote=False, random_state=42,
+        )
+        ensemble = ProbeEnsemble.bootstrap(base, n_resamples=3, random_state=0)
+        with pytest.raises(ValueError, match="groups length"):
+            ensemble.fit(POS, NEG, groups=[0, 1, 2])

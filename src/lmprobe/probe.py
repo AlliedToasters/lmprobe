@@ -980,6 +980,7 @@ class Probe:
         invalidate_cache: bool = False,
         max_retries: int | None = None,
         batch_size: int | None = None,
+        sample_weight: np.ndarray | list[float] | None = None,
     ) -> Probe:
         """Fit the probe on training data.
 
@@ -1006,6 +1007,12 @@ class Probe:
             Override the instance-level batch_size for this call.
             Smaller values reduce memory usage; larger values may
             improve throughput on GPU.
+        sample_weight : np.ndarray | list[float] | None
+            Per-sample weights passed to the classifier's ``fit()`` method.
+            Length must match the total number of training samples
+            (``len(positive_prompts) + len(negative_prompts)`` in contrastive
+            mode, or ``len(prompts)`` in standard mode). If None, all samples
+            are weighted equally.
 
         Returns
         -------
@@ -1053,6 +1060,15 @@ class Probe:
             self._training_negative_ = list(negative_prompts)
             self._training_prompts_ = None
             self._training_labels_ = None
+
+        # Validate sample_weight length
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight, dtype=float)
+            if len(sample_weight) != len(prompts):
+                raise ValueError(
+                    f"sample_weight length ({len(sample_weight)}) must match "
+                    f"the number of training samples ({len(prompts)})."
+                )
 
         # Check if sweep mode
         if self._sweep_mode:
@@ -1135,7 +1151,15 @@ class Probe:
 
         # Clone and fit classifier
         self.classifier_ = clone(self._classifier_template)
-        self.classifier_.fit(X, labels)
+        fit_kwargs = {}
+        if sample_weight is not None:
+            # Handle "all" pooling expansion (labels are repeated per token)
+            if self._train_pooling == "all" and len(sample_weight) != len(labels):
+                sample_weight = np.repeat(
+                    sample_weight, X.shape[0] // len(sample_weight)
+                )
+            fit_kwargs["sample_weight"] = sample_weight
+        self.classifier_.fit(X, labels, **fit_kwargs)
         self.classes_ = getattr(self.classifier_, "classes_", None)
 
         evict()
@@ -2079,6 +2103,7 @@ class Probe:
         self,
         X,
         y,
+        sample_weight: np.ndarray | list[float] | None = None,
     ) -> Probe:
         """Fit the probe from pre-computed activation tensors.
 
@@ -2091,6 +2116,9 @@ class Probe:
             Pre-computed activations, shape (n_samples, n_features).
         y : np.ndarray | torch.Tensor
             Labels. int for classification, float for regression.
+        sample_weight : np.ndarray | list[float] | None
+            Per-sample weights passed to the classifier's ``fit()`` method.
+            If None, all samples are weighted equally.
 
         Returns
         -------
@@ -2107,7 +2135,16 @@ class Probe:
 
         # Clone and fit classifier
         self.classifier_ = clone(self._classifier_template)
-        self.classifier_.fit(X, y)
+        fit_kwargs = {}
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight, dtype=float)
+            if len(sample_weight) != len(y):
+                raise ValueError(
+                    f"sample_weight length ({len(sample_weight)}) must match "
+                    f"the number of training samples ({len(y)})."
+                )
+            fit_kwargs["sample_weight"] = sample_weight
+        self.classifier_.fit(X, y, **fit_kwargs)
 
         # Set classes_ for classification, None for regression
         if self.task == "classification":
