@@ -164,7 +164,7 @@ class TestRemoteExecution:
 
         # Check cache directory has files
         cache_dir = get_cache_dir()
-        cache_files = list(cache_dir.glob("*.pt"))
+        cache_files = list(cache_dir.glob("**/*.safetensors"))
         assert len(cache_files) > 0, "Expected cached activation files"
 
 
