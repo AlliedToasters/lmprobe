@@ -20,6 +20,7 @@ Example
 from .activation_baseline import ActivationBaseline
 from .baseline import BaselineProbe
 from .battery import BaselineBattery, BaselineResult, BaselineResults
+from .ensemble import ProbeEnsemble
 from .probe import LayerSweepResult, LinearProbe, Probe
 
 try:
@@ -40,6 +41,7 @@ __all__ = [
     "LayerSweepResult",
     "LinearProbe",
     "Probe",
+    "ProbeEnsemble",
     "load_layer_across_prompts",
     "load_layer_last_token",
     "ModelCacheInfo",
