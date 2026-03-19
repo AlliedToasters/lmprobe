@@ -547,8 +547,14 @@ class UnifiedCache:
 
                         # Save perplexity if needed
                         if self.compute_perplexity and prompt in need_perplexity_set:
-                            tok_ppl = ppl_token_ppl_list[j] if ppl_token_ppl_list is not None else None
-                            tok_ids = ppl_token_ids_list[j] if ppl_token_ids_list is not None else None
+                            tok_ppl = (
+                                ppl_token_ppl_list[j]
+                                if ppl_token_ppl_list is not None else None
+                            )
+                            tok_ids = (
+                                ppl_token_ids_list[j]
+                                if ppl_token_ids_list is not None else None
+                            )
                             save_prompt_perplexity(
                                 self.model_name, prompt, ppl_features[j],
                                 token_perplexity=tok_ppl,
