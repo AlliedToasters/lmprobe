@@ -81,3 +81,34 @@ See the [Quickstart](quickstart.md) for a complete walkthrough.
 - **Contrastive-first** — positive vs. negative prompts, following the RepE literature
 - **Sensible defaults** — simple cases are one-liners; complex cases are fully configurable
 - **Separation of concerns** — extraction, pooling, and classification are distinct and independently configurable
+
+---
+
+## Guides
+
+| Guide | Topic |
+|-------|-------|
+| [Quickstart](quickstart.md) | Install, train, evaluate, save |
+| [Contrastive Probing](guides/contrastive.md) | Contrast pair design, pooling, regression, classifiers |
+| [Layer Selection & Sweep](guides/layer-sweep.md) | Find the most informative layers |
+| [Preprocessing](guides/preprocessing.md) | StandardScaler, PCA, and chained pipelines |
+| [Ensembles](guides/ensemble.md) | Multi-probe ensembles and bootstrap stability |
+| [Baselines](guides/baselines.md) | Validate your probe against text and activation baselines |
+| [Caching](guides/caching.md) | Cache backends, eviction, introspection, env vars |
+| [Activation Datasets](guides/datasets.md) | Share pre-extracted activations via HuggingFace |
+| [Remote Execution](guides/remote.md) | Probe large models via NDIF without local GPU |
+| [Geometry of Truth Tutorial](guides/got-tutorial.md) | Reproduce truthfulness probes on pre-extracted data |
+
+## API Reference
+
+| Reference | Coverage |
+|-----------|----------|
+| [Probe](reference/probe.md) | `Probe`, `LayerSweepResult` |
+| [Ensemble](reference/ensemble.md) | `ProbeEnsemble` |
+| [Classifiers](reference/classifiers.md) | Built-in classifiers, `MassMeanClassifier`, `EnsembleClassifier` |
+| [Pooling](reference/pooling.md) | Pooling strategies and stage prefixes |
+| [Baseline](reference/baseline.md) | `BaselineProbe`, `ActivationBaseline`, `BaselineBattery` |
+| [Cache](reference/cache.md) | Cache configuration, inspection, eviction |
+| [Datasets](reference/datasets.md) | `UnifiedCache`, `push_dataset`, `pull_dataset` |
+| [Plotting](reference/plotting.md) | Layer importance visualization |
+| [Scaling](reference/scaling.md) | `PerLayerScaler` for multi-layer normalization |

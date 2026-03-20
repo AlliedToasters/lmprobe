@@ -224,6 +224,11 @@ probe = Probe(
 | `preprocessing` | `str \| None` | `None` | Pipeline before classifier: `"standard"`, `"pca"`, `"standard+pca"` |
 | `pca_components` | `int \| None` | `None` | Number of PCA components |
 | `classifier_kwargs` | `dict \| None` | `None` | Extra kwargs for classifier constructor |
+| `auto_candidates` | `list[int] \| list[float] \| None` | `None` | Candidate layers for `layers="auto"` (fractional = relative position) |
+| `auto_alpha` | `float` | `0.01` | Group Lasso regularization strength for `layers="auto"` |
+| `fast_auto_top_k` | `int \| None` | `None` | Number of layers to select with `layers="fast_auto"` |
+| `mass_mean_augment` | `bool` | `False` | Augment features with projection onto mass-mean direction |
+| `max_retries` | `int \| None` | `None` | Retry attempts with exponential backoff for transient failures |
 
 ### Layer Specifications
 
@@ -289,11 +294,13 @@ Explicit parameters override the base `pooling` value:
 | Classifier | Description |
 |------------|-------------|
 | `"logistic_regression"` | Standard logistic regression (default) |
+| `"logistic_regression_cv"` | Logistic regression with cross-validated regularization |
 | `"ridge"` | Ridge classifier - fast, no `predict_proba` |
 | `"svm"` | Support Vector Machine with probability calibration |
 | `"lda"` | Linear Discriminant Analysis |
 | `"mass_mean"` | Mass-Mean Probing - uses direction between class centroids |
 | `"sgd"` | Stochastic Gradient Descent classifier |
+| `"ensemble"` | Ensemble of LogisticRegression with different regularization strengths |
 
 ```python
 # Use Mass-Mean Probing (simple but effective)

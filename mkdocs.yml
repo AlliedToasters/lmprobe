@@ -49,6 +49,8 @@ nav:
   - Guides:
     - Contrastive Probing: guides/contrastive.md
     - Layer Selection & Sweep: guides/layer-sweep.md
+    - Preprocessing: guides/preprocessing.md
+    - Ensembles: guides/ensemble.md
     - HuggingFace Datasets: guides/datasets.md
     - 'Tutorial: Geometry of Truth': guides/got-tutorial.md
     - Baselines: guides/baselines.md
@@ -62,6 +64,8 @@ nav:
     - Pooling: reference/pooling.md
     - Classifiers: reference/classifiers.md
     - Cache: reference/cache.md
+    - Plotting: reference/plotting.md
+    - Scaling: reference/scaling.md
   - Design:
     - API Philosophy: design/001-api-philosophy.md
     - Pooling Strategies: design/002-pooling-strategies.md

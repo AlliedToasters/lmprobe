@@ -92,19 +92,65 @@ enable_cache_logging()
 
 ---
 
+## Evicting specific entries
+
+Manually trigger LRU eviction when you've set a cache limit:
+
+```python
+from lmprobe import evict
+
+evict()  # removes least-recently-used entries if over the size limit
+```
+
+This is decoupled from writes for performance. Call it at natural boundaries — after a batch of extractions, at session end, or on a schedule.
+
+---
+
+## Cache introspection
+
+Check what's cached for a specific model and prompt:
+
+```python
+from lmprobe import discover_cached
+
+info = discover_cached("meta-llama/Llama-3.1-8B-Instruct", "Who wants to go for a walk?")
+if info is not None:
+    print(info.raw_layers)           # [0, 1, ..., 31]
+    print(info.pooled)               # {"last_token": [0, 1, ..., 31]}
+    print(info.has_perplexity)       # True
+    print(info.has_logits)           # False
+```
+
+Returns `None` if nothing is cached for that combination.
+
+---
+
 ## Clearing the cache
 
 ```python
-from lmprobe import cache_info
-
 # Clear everything (irreversible)
 from lmprobe.cache import clear_cache
 clear_cache()
-
-# Clear only a specific model's cache
-from lmprobe import clear_model_cache
-clear_model_cache("meta-llama/Llama-3.1-8B-Instruct")
 ```
+
+!!! warning
+    `clear_cache()` deletes **all** cached activations for all models. This is irreversible.
+
+---
+
+## Environment variables
+
+All cache settings can be configured via environment variables, useful for CI/CD or containerized deployments:
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `LMPROBE_CACHE_DIR` | Cache directory (default: `~/.cache/lmprobe/`) | `/mnt/fast-ssd/lmprobe` |
+| `LMPROBE_CACHE_MAX_GB` | Max cache size in GB (LRU eviction) | `100` |
+| `LMPROBE_CACHE_DTYPE` | Storage dtype | `float16` |
+| `LMPROBE_CACHE_BACKEND` | Cache backend URI | `s3://my-bucket/prefix` |
+| `LMPROBE_CACHE_DEBUG` | Enable verbose cache logging | `1` or `debug` |
+
+Environment variables are read at import time and can be overridden programmatically via `set_cache_limit()`, `set_cache_dtype()`, and `set_cache_backend()`.
 
 ---
 
