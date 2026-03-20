@@ -134,6 +134,7 @@ class NnsightBackend(ExtractionBackend):
         super().__init__(model_name, device)
         self.remote = remote
         self._model = None
+        self._remote_model = None
 
     @property
     def model(self):
@@ -145,6 +146,25 @@ class NnsightBackend(ExtractionBackend):
                 self.model_name, self.device, remote=self.remote
             )
         return self._model
+
+    def _get_model_for_remote(self):
+        """Get a lightweight model stub for remote execution.
+
+        When the backend was created with remote=False but a call-time
+        remote=True is used, we need a model loaded with dispatch=False
+        (no weights) instead of the full local model.
+        """
+        if self.remote:
+            # Backend was created for remote use — main model is already lightweight
+            return self.model
+        # Backend was created for local use — need a separate remote stub
+        if self._remote_model is None:
+            from .extraction import get_cached_model
+
+            self._remote_model = get_cached_model(
+                self.model_name, self.device, remote=True
+            )
+        return self._remote_model
 
     @property
     def tokenizer(self) -> PreTrainedTokenizerBase:
@@ -159,7 +179,8 @@ class NnsightBackend(ExtractionBackend):
         from .extraction import _extract_batch
 
         remote = kwargs.get("remote", self.remote)
-        return _extract_batch(self.model, prompts, layer_indices, remote=remote)
+        model = self._get_model_for_remote() if remote else self.model
+        return _extract_batch(model, prompts, layer_indices, remote=remote)
 
     def extract_batch_with_logits(
         self,
@@ -171,8 +192,9 @@ class NnsightBackend(ExtractionBackend):
 
         remote = kwargs.get("remote", self.remote)
         logit_top_k = kwargs.get("logit_top_k")
+        model = self._get_model_for_remote() if remote else self.model
         return _extract_batch_with_logits(
-            self.model, prompts, layer_indices, remote=remote,
+            model, prompts, layer_indices, remote=remote,
             logit_top_k=logit_top_k,
         )
 

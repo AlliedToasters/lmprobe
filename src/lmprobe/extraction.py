@@ -332,6 +332,11 @@ def load_model(
         # This is critical for large models (405B) that would OOM locally.
         # See: https://nnsight.net/notebooks/features/remote_execution/
         model = LM(model_name, dispatch=False)
+        # Prevent nnsight's MetaMixin.interleave from auto-dispatching
+        # (which would download all weights via from_pretrained).
+        # Remote traces don't need local weights — the forward pass
+        # runs on the NDIF server.
+        model.dispatched = True
     else:
         # Fast-fail on CUDA compute capability mismatch
         from lmprobe._device_utils import check_cuda_compatibility
@@ -1014,8 +1019,12 @@ class ActivationExtractor:
             (activations, attention_mask)
         """
         layer_indices = layers if layers is not None else self.layer_indices
+        if remote and hasattr(self._backend, '_get_model_for_remote'):
+            model = self._backend._get_model_for_remote()
+        else:
+            model = self.model
         return extract_activations(
-            self.model,
+            model,
             prompts,
             layer_indices,
             remote=remote,
