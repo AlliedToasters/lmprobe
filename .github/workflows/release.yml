@@ -9,7 +9,8 @@ jobs:
   release:
     if: >-
       github.event.pull_request.merged == true &&
-      contains(github.event.pull_request.labels.*.name, 'release')
+      (contains(github.event.pull_request.labels.*.name, 'release') ||
+       contains(github.event.pull_request.labels.*.name, 'release-no-bump'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -24,6 +25,7 @@ jobs:
 
       - name: Bump patch version
         id: bump
+        if: contains(github.event.pull_request.labels.*.name, 'release')
         run: |
           # Read current version
           current=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
@@ -38,20 +40,32 @@ jobs:
           sed -i "s/^version = \"$current\"/version = \"$new_version\"/" pyproject.toml
           echo "version=$new_version" >> "$GITHUB_OUTPUT"
 
+      - name: Read current version
+        id: current
+        if: contains(github.event.pull_request.labels.*.name, 'release-no-bump')
+        run: |
+          version=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set release version
+        id: version
+        run: echo "version=${{ steps.bump.outputs.version || steps.current.outputs.version }}" >> "$GITHUB_OUTPUT"
+
       - name: Commit version bump
+        if: contains(github.event.pull_request.labels.*.name, 'release')
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add pyproject.toml
-          git commit -m "Bump version to ${{ steps.bump.outputs.version }}"
+          git commit -m "Bump version to ${{ steps.version.outputs.version }}"
           git push
 
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "v${{ steps.bump.outputs.version }}" \
-            --title "v${{ steps.bump.outputs.version }}" \
+          gh release create "v${{ steps.version.outputs.version }}" \
+            --title "v${{ steps.version.outputs.version }}" \
             --generate-notes
 
       - name: Set up Python
