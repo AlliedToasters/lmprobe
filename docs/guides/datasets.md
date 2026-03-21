@@ -69,7 +69,7 @@ cache = UnifiedCache(
     model="meta-llama/Llama-3.1-70B-Instruct",
     layers="all",
     backend="nnsight",
-    remote=True,             # requires NNSIGHT_API_KEY, US-based access
+    remote=True,             # requires NDIF_API_KEY, US-based access
     batch_size=4,            # smaller batches for remote
 )
 stats = cache.warmup(all_prompts)

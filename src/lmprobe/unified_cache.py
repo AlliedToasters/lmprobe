@@ -132,7 +132,7 @@ class UnifiedCache:
     device : str, default="auto"
         Device for model inference.
     remote : bool, default=False
-        Use nnsight remote execution (requires NNSIGHT_API_KEY).
+        Use nnsight remote execution (requires NDIF_API_KEY).
     batch_size : int, default=8
         Number of prompts to process at once.
     cache_pooled : bool, default=True

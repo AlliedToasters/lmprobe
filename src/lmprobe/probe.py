@@ -296,7 +296,7 @@ class Probe:
     device : str, default="auto"
         Device for model inference: "auto", "cpu", "cuda:0", etc.
     remote : bool, default=False
-        Use nnsight remote execution (requires NNSIGHT_API_KEY).
+        Use nnsight remote execution (requires NDIF_API_KEY).
     random_state : int | None, default=None
         Random seed for reproducibility. Propagates to classifier.
     batch_size : int, default=8

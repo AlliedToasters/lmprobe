@@ -18,7 +18,7 @@ pip install lmprobe[nnsight]
 Set your API key:
 
 ```bash
-export NNSIGHT_API_KEY="your-api-key-here"
+export NDIF_API_KEY="your-api-key-here"
 ```
 
 ---

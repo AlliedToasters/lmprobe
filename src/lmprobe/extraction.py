@@ -76,18 +76,18 @@ def clear_model_cache() -> None:
 def configure_remote() -> None:
     """Configure nnsight for remote execution.
 
-    Reads the API key from NNSIGHT_API_KEY environment variable.
+    Reads the API key from NDIF_API_KEY environment variable.
 
     Raises
     ------
     EnvironmentError
-        If NNSIGHT_API_KEY is not set.
+        If NDIF_API_KEY is not set.
     """
-    api_key = os.getenv("NNSIGHT_API_KEY")
+    api_key = os.getenv("NDIF_API_KEY")
     if not api_key:
         raise OSError(
-            "NNSIGHT_API_KEY environment variable is required for remote execution. "
-            "Set it with: export NNSIGHT_API_KEY='your-key-here'"
+            "NDIF_API_KEY environment variable is required for remote execution. "
+            "Set it with: export NDIF_API_KEY='your-key-here'"
         )
     nnsight = _require_nnsight()
     nnsight.CONFIG.API.APIKEY = api_key
