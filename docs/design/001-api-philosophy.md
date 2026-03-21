@@ -103,16 +103,16 @@ probe.predict(test, remote=False)
 **Authentication**: Remote execution requires an API key. Set via environment variable:
 
 ```bash
-export NNSIGHT_API_KEY="your-api-key-here"
+export NDIF_API_KEY="your-api-key-here"
 ```
 
 The library configures nnsight automatically:
 ```python
 from nnsight import CONFIG
-CONFIG.API.APIKEY = os.getenv("NNSIGHT_API_KEY")
+CONFIG.API.APIKEY = os.getenv("NDIF_API_KEY")
 ```
 
-**Error handling**: If `remote=True` and `NNSIGHT_API_KEY` is not set, raise a clear error at the point of remote access (not at init, since user might override to `remote=False`).
+**Error handling**: If `remote=True` and `NDIF_API_KEY` is not set, raise a clear error at the point of remote access (not at init, since user might override to `remote=False`).
 
 ### Global Random State
 

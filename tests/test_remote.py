@@ -3,10 +3,10 @@ Remote/NDIF tests for lmprobe.
 
 These tests require:
 1. US-based network access (NDIF restricts international access)
-2. NNSIGHT_API_KEY environment variable set
+2. NDIF_API_KEY environment variable set
 
 To run:
-    export NNSIGHT_API_KEY="your-key"
+    export NDIF_API_KEY="your-key"
     pytest tests/test_remote.py -v
 
 To skip these tests (they're slow, expensive, and may hit rate limits):
@@ -17,7 +17,7 @@ To skip these tests (they're slow, expensive, and may hit rate limits):
     export SKIP_REMOTE_TESTS=1
     pytest tests/test_remote.py
 
-These tests are skipped with a warning if NNSIGHT_API_KEY is not set.
+These tests are skipped with a warning if NDIF_API_KEY is not set.
 """
 
 import os
@@ -26,21 +26,21 @@ import warnings
 import pytest
 
 # Check skip conditions
-_api_key = os.getenv("NNSIGHT_API_KEY")
+_api_key = os.getenv("NDIF_API_KEY")
 _skip_remote = os.getenv("SKIP_REMOTE_TESTS", "").lower() in ("1", "true", "yes")
 
 # Determine skip reason
 if _skip_remote:
     _skip_reason = "SKIP_REMOTE_TESTS is set - skipping expensive remote tests"
 elif not _api_key:
-    _skip_reason = "NNSIGHT_API_KEY not set (required for remote/NDIF tests)"
+    _skip_reason = "NDIF_API_KEY not set (required for remote/NDIF tests)"
 else:
     _skip_reason = None
 
 # Issue warning when skipping due to missing API key
 if not _api_key and not _skip_remote:
     warnings.warn(
-        "Skipping remote tests: NNSIGHT_API_KEY environment variable not set. "
+        "Skipping remote tests: NDIF_API_KEY environment variable not set. "
         "Set it to run tests against NDIF, or use SKIP_REMOTE_TESTS=1 to suppress this warning.",
         UserWarning,
         stacklevel=1,
@@ -172,11 +172,11 @@ class TestRemoteErrorHandling:
     """Tests for error handling in remote mode."""
 
     def test_missing_api_key_error(self, monkeypatch, remote_model):
-        """Test clear error when NNSIGHT_API_KEY is missing."""
+        """Test clear error when NDIF_API_KEY is missing."""
         from lmprobe import LinearProbe
 
         # Temporarily remove the API key
-        monkeypatch.delenv("NNSIGHT_API_KEY", raising=False)
+        monkeypatch.delenv("NDIF_API_KEY", raising=False)
 
         probe = LinearProbe(
             model=remote_model,
@@ -185,5 +185,5 @@ class TestRemoteErrorHandling:
             backend="nnsight",
         )
 
-        with pytest.raises(EnvironmentError, match="NNSIGHT_API_KEY"):
+        with pytest.raises(EnvironmentError, match="NDIF_API_KEY"):
             probe.fit(["positive"], ["negative"])

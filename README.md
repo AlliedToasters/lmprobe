@@ -44,7 +44,7 @@ pip install lmprobe[auto]        # Automatic layer selection (Group Lasso)
 For remote execution (large models via nnsight/NDIF):
 
 ```bash
-export NNSIGHT_API_KEY="your-api-key-here"
+export NDIF_API_KEY="your-api-key-here"
 ```
 
 ### Example Usage
@@ -112,7 +112,7 @@ probe = Probe(
     model="meta-llama/Llama-3.1-70B-Instruct",
     layers="middle",
     backend="nnsight",
-    remote=True,  # Requires NNSIGHT_API_KEY
+    remote=True,  # Requires NDIF_API_KEY
 )
 
 probe.fit(positive_prompts, negative_prompts)
@@ -215,7 +215,7 @@ probe = Probe(
 | `classifier` | `str \| sklearn estimator` | `"logistic_regression"` | Classification model |
 | `task` | `str` | `"classification"` | `"classification"` or `"regression"` |
 | `device` | `str` | `"auto"` | `"auto"`, `"cuda:0"`, `"cpu"` |
-| `remote` | `bool` | `False` | Use nnsight remote execution (requires `NNSIGHT_API_KEY`) |
+| `remote` | `bool` | `False` | Use nnsight remote execution (requires `NDIF_API_KEY`) |
 | `random_state` | `int \| None` | `None` | Random seed for reproducibility (propagates to classifier) |
 | `batch_size` | `int` | `8` | Prompts per forward pass during extraction |
 | `backend` | `str` | `"local"` | `"local"` (HuggingFace) or `"nnsight"` |

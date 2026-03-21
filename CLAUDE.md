@@ -81,7 +81,7 @@ These decisions are **mandatory** and must not be changed without explicit discu
 | Activation caching | Always enabled | Remote/LLM inference is expensive |
 | Package layout | `src/lmprobe/` | Standard Python packaging |
 | nnsight for extraction | Required dependency | Supports remote execution |
-| API key | `NNSIGHT_API_KEY` env var | Standard credential handling |
+| API key | `NDIF_API_KEY` env var | Standard credential handling |
 | Cache location | `~/.cache/lmprobe/` (or `LMPROBE_CACHE_DIR`) | XDG-style default |
 
 ## Code Conventions
@@ -109,7 +109,7 @@ def tiny_model():
 
 **Test requirements:**
 - Tests must run without GPU (CPU-only)
-- Tests must not require `NNSIGHT_API_KEY` (use `remote=False`)
+- Tests must not require `NDIF_API_KEY` (use `remote=False`)
 - Tests should be fast (tiny model has ~few MB weights)
 - Integration tests verify full pipeline: extraction → pooling → classification
 
@@ -120,19 +120,19 @@ def tiny_model():
 The `remote=True` functionality uses nnsight to connect to NDIF (National Deep Inference Fabric), a US national research initiative. Remote testing has not been performed due to:
 
 1. **Geographic restriction**: NDIF restricts access to US-based users only
-2. **API key requirement**: Requires `NNSIGHT_API_KEY` environment variable
+2. **API key requirement**: Requires `NDIF_API_KEY` environment variable
 
 **What needs testing:**
 - `LinearProbe(..., remote=True)` connects successfully
 - `probe.fit(..., remote=True)` extracts activations from remote models
 - `probe.predict(..., remote=False)` override works (train remote, predict local)
 - Large models (e.g., `meta-llama/Llama-3.1-70B-Instruct`) work via remote
-- Error handling when `NNSIGHT_API_KEY` is missing/invalid
+- Error handling when `NDIF_API_KEY` is missing/invalid
 - Cache behavior with remote extractions
 
 **To test when US-based:**
 ```bash
-export NNSIGHT_API_KEY="your-key"
+export NDIF_API_KEY="your-key"
 pytest tests/test_remote.py -v  # (test file to be created)
 ```
 
