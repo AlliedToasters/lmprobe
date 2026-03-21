@@ -1526,9 +1526,20 @@ def fetch_dataset_metadata(
     with open(info_path) as f:
         lmprobe_info = json.load(f)
 
-    model_name = lmprobe_info["model"]["name"]
+    # Support both canonical format (model.name, tensors) and legacy
+    # format (model_name, tensor_types) written by custom staging scripts.
+    model_obj = lmprobe_info.get("model")
+    if isinstance(model_obj, dict):
+        model_name = model_obj["name"]
+    elif "model_name" in lmprobe_info:
+        model_name = lmprobe_info["model_name"]
+    else:
+        raise KeyError(
+            "lmprobe_info.json missing model name — expected 'model.name' "
+            "or top-level 'model_name'"
+        )
     format_version = lmprobe_info.get("format_version", "1.0")
-    tensor_descriptors = lmprobe_info.get("tensors", {})
+    tensor_descriptors = lmprobe_info.get("tensors") or lmprobe_info.get("tensor_types") or {}
 
     # Extract available layers from hidden_layers descriptor
     available_layers: list[int] = []
@@ -1639,8 +1650,17 @@ def pull_dataset(
             stacklevel=2,
         )
 
-    model_name = lmprobe_info["model"]["name"]
-    tensor_descriptors = lmprobe_info.get("tensors", {})
+    model_obj = lmprobe_info.get("model")
+    if isinstance(model_obj, dict):
+        model_name = model_obj["name"]
+    elif "model_name" in lmprobe_info:
+        model_name = lmprobe_info["model_name"]
+    else:
+        raise KeyError(
+            "lmprobe_info.json missing model name — expected 'model.name' "
+            "or top-level 'model_name'"
+        )
+    tensor_descriptors = lmprobe_info.get("tensors") or lmprobe_info.get("tensor_types") or {}
 
     # Read Parquet index
     _check_pyarrow()
@@ -2076,7 +2096,7 @@ def load_activation_dataset(
             f"Please upgrade lmprobe: pip install --upgrade lmprobe"
         )
 
-    tensor_descriptors = lmprobe_info.get("tensors", {})
+    tensor_descriptors = lmprobe_info.get("tensors") or lmprobe_info.get("tensor_types") or {}
 
     if tensors is not None:
         load_types = [k for k in tensor_descriptors if k in tensors]
