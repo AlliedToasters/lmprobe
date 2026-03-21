@@ -990,6 +990,14 @@ def _load_raw_from_shard(
             f"Shard index {shard_idx} out of range (have {len(shards)} shards)"
         )
 
+    # Convert global token offset to shard-local offset.
+    # The parquet index stores cumulative (global) token offsets, but each
+    # shard file only contains its own tokens.
+    shard_token_base = sum(
+        s.get("num_tokens", 0) for s in shards[:shard_idx]
+    )
+    tok_off -= shard_token_base
+
     layout = t_info.get("layout")
 
     if layout == "per_layer":
@@ -1085,6 +1093,11 @@ def _load_pooled_from_shard(
         if storage == "full_sequence":
             tok_off = entry.get("token_offset_hidden", entry.get("token_offset"))
             num_tok = entry["num_tokens"]
+            # Convert global token offset to shard-local offset
+            shard_token_base = sum(
+                s.get("num_tokens", 0) for s in shards[:shard_idx]
+            )
+            tok_off -= shard_token_base
             for layer in layers:
                 layer_path = per_layer_paths.get(
                     layer
