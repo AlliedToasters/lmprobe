@@ -12,6 +12,7 @@ from lmprobe.cache import (
     _prompt_cache_key,
     _prompt_logits_key,
     _prompt_perplexity_key,
+    batch_check_cache_status,
     cache_info,
     get_cached_layers,
     get_extraction_cache_dir,
@@ -1085,3 +1086,156 @@ class TestSidecarFiles:
         assert info.models[0].num_prompts == 1  # not 3
         assert info.models[0].has_logits is True
         assert info.models[0].has_perplexity is True
+
+
+class TestBatchCheckCacheStatus:
+    """Tests for batch_check_cache_status using LIST instead of per-prompt HEAD."""
+
+    @pytest.fixture(autouse=True)
+    def setup_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        from lmprobe.cache import set_cache_backend
+
+        set_cache_backend(None)
+        self.model = "test-model"
+        yield
+        set_cache_backend(None)
+
+    def test_all_uncached(self):
+        """All prompts reported as needing extraction when cache is empty."""
+        prompts = ["hello", "world", "foo"]
+        need_act, need_ppl, need_log, partial, _ = batch_check_cache_status(
+            self.model, prompts, required_layers={0, 1}
+        )
+        assert need_act == prompts
+        assert need_ppl == []
+        assert need_log == []
+        assert partial == 0
+
+    def test_all_cached(self):
+        """No prompts need extraction when all are fully cached."""
+        prompts = ["prompt A", "prompt B"]
+        for p in prompts:
+            acts = torch.randn(1, 5, 64)
+            mask = torch.ones(1, 5)
+            save_prompt_activations(self.model, p, [0, 1], acts, mask)
+
+        need_act, _, _, partial, _ = batch_check_cache_status(
+            self.model, prompts, required_layers={0, 1}
+        )
+        assert need_act == []
+        assert partial == 0
+
+    def test_partial_cached(self):
+        """Detects partial cache (some layers missing)."""
+        prompt = "partial prompt"
+        # Save only layer 0
+        acts = torch.randn(1, 5, 32)
+        mask = torch.ones(1, 5)
+        save_prompt_activations(self.model, prompt, [0], acts, mask)
+
+        need_act, _, _, partial, found = batch_check_cache_status(
+            self.model, [prompt], required_layers={0, 1}
+        )
+        assert need_act == [prompt]
+        assert partial == 1
+        assert found is not None
+        assert 0 in found
+
+    def test_mixed_cached_and_uncached(self):
+        """Correctly separates cached vs uncached prompts."""
+        cached_prompt = "cached"
+        uncached_prompt = "uncached"
+        acts = torch.randn(1, 5, 64)
+        mask = torch.ones(1, 5)
+        save_prompt_activations(self.model, cached_prompt, [0, 1], acts, mask)
+
+        need_act, _, _, _, _ = batch_check_cache_status(
+            self.model,
+            [cached_prompt, uncached_prompt],
+            required_layers={0, 1},
+        )
+        assert need_act == [uncached_prompt]
+
+    def test_perplexity_check(self):
+        """Detects missing perplexity cache."""
+        prompt = "ppl test"
+        acts = torch.randn(1, 5, 64)
+        mask = torch.ones(1, 5)
+        save_prompt_activations(self.model, prompt, [0, 1], acts, mask)
+
+        _, need_ppl, _, _, _ = batch_check_cache_status(
+            self.model,
+            [prompt],
+            required_layers={0, 1},
+            compute_perplexity=True,
+        )
+        assert need_ppl == [prompt]
+
+        # Now cache perplexity
+        save_prompt_perplexity(self.model, prompt, torch.tensor([1.0, 2.0, 3.0]))
+        _, need_ppl, _, _, _ = batch_check_cache_status(
+            self.model,
+            [prompt],
+            required_layers={0, 1},
+            compute_perplexity=True,
+        )
+        assert need_ppl == []
+
+    def test_logits_check(self):
+        """Detects missing logits cache."""
+        prompt = "logits test"
+        acts = torch.randn(1, 5, 64)
+        mask = torch.ones(1, 5)
+        save_prompt_activations(self.model, prompt, [0, 1], acts, mask)
+
+        _, _, need_log, _, _ = batch_check_cache_status(
+            self.model,
+            [prompt],
+            required_layers={0, 1},
+            cache_logits=True,
+        )
+        assert need_log == [prompt]
+
+        # Now cache logits
+        logits = torch.randn(1, 5, 100)
+        save_prompt_logits(self.model, prompt, logits, mask)
+        _, _, need_log, _, _ = batch_check_cache_status(
+            self.model,
+            [prompt],
+            required_layers={0, 1},
+            cache_logits=True,
+        )
+        assert need_log == []
+
+    def test_pooled_check(self):
+        """Works with pooled activations."""
+        prompt = "pooled test"
+        pooled = torch.randn(1, 64)
+        save_prompt_pooled_activations(
+            self.model, prompt, [0, 1], pooled, "last_token"
+        )
+
+        need_act, _, _, _, _ = batch_check_cache_status(
+            self.model,
+            [prompt],
+            required_layers={0, 1},
+            pooling="last_token",
+        )
+        assert need_act == []
+
+    def test_header_only_read(self):
+        """_get_tensor_keys_header_only correctly parses safetensors header."""
+        from lmprobe.cache import _get_tensor_keys_header_only, get_backend
+
+        prompt = "header test"
+        acts = torch.randn(1, 5, 64)
+        mask = torch.ones(1, 5)
+        save_prompt_activations(self.model, prompt, [0, 1], acts, mask)
+
+        backend = get_backend()
+        key = _prompt_cache_key(self.model, prompt)
+        keys = _get_tensor_keys_header_only(backend, key)
+        assert "layer_0" in keys
+        assert "layer_1" in keys
+        assert "attention_mask" in keys

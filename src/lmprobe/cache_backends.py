@@ -64,6 +64,29 @@ class CacheBackend(ABC):
         """Update the last-modified time (for LRU tracking)."""
         ...
 
+    def read_range(self, key: str, start: int, end: int) -> bytes:
+        """Read a byte range from a key.
+
+        Parameters
+        ----------
+        start : int
+            Start byte offset (inclusive).
+        end : int
+            End byte offset (exclusive).
+
+        Returns
+        -------
+        bytes
+            The requested byte range.
+
+        Notes
+        -----
+        Default implementation reads the full object and slices.
+        Backends with native range-read support (e.g. S3) should override.
+        """
+        data = self.read_bytes(key)
+        return data[start:end]
+
     @abstractmethod
     def read_text(self, key: str) -> str:
         """Read a text entry."""
@@ -112,6 +135,12 @@ class LocalCacheBackend(CacheBackend):
 
     def read_bytes(self, key: str) -> bytes:
         return self._path(key).read_bytes()
+
+    def read_range(self, key: str, start: int, end: int) -> bytes:
+        path = self._path(key)
+        with open(path, "rb") as f:
+            f.seek(start)
+            return f.read(end - start)
 
     def write_bytes(self, key: str, data: bytes) -> None:
         path = self._path(key)
@@ -266,6 +295,14 @@ class S3CacheBackend(CacheBackend):
 
     def read_bytes(self, key: str) -> bytes:
         resp = self._s3.get_object(Bucket=self.bucket, Key=self._full_key(key))
+        return resp["Body"].read()
+
+    def read_range(self, key: str, start: int, end: int) -> bytes:
+        resp = self._s3.get_object(
+            Bucket=self.bucket,
+            Key=self._full_key(key),
+            Range=f"bytes={start}-{end - 1}",
+        )
         return resp["Body"].read()
 
     def write_bytes(self, key: str, data: bytes) -> None:

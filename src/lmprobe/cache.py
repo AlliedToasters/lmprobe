@@ -659,10 +659,201 @@ def _get_tensor_keys_from_backend(key: str) -> set[str]:
         with safe_open(path, framework="pt") as f:
             return set(f.keys())
     else:
+        return _get_tensor_keys_header_only(backend, key)
+
+
+def _get_tensor_keys_header_only(backend: CacheBackend, key: str) -> set[str]:
+    """Get tensor key names by reading only the safetensors header.
+
+    Safetensors files start with an 8-byte little-endian header size,
+    followed by a JSON header that lists all tensor names and metadata.
+    This avoids downloading the full file (which can be GBs).
+    """
+    import struct
+
+    header_size_bytes = backend.read_range(key, 0, 8)
+    (header_size,) = struct.unpack("<Q", header_size_bytes)
+
+    # Sanity check: header should be < 100 MB
+    if header_size > 100_000_000:
         from safetensors.torch import load
 
         data = backend.read_bytes(key)
         return set(load(data).keys())
+
+    header_bytes = backend.read_range(key, 8, 8 + header_size)
+    header = json.loads(header_bytes)
+    # The header is a dict of tensor_name -> {dtype, shape, data_offsets}
+    # plus an optional "__metadata__" key
+    return {k for k in header if k != "__metadata__"}
+
+
+def _list_model_cache_keys(model_name: str) -> set[str]:
+    """List all cache keys for a model using a single LIST call.
+
+    Returns a set of backend keys (e.g. "abc123/def456.safetensors").
+    Much faster than per-prompt HEAD requests for large prompt sets.
+    """
+    backend = get_backend()
+    model_hash = _hash_string(model_name)
+    return set(backend.list_keys(model_hash))
+
+
+def batch_check_cache_status(
+    model_name: str,
+    prompts: list[str],
+    required_layers: set[int],
+    pooling: str | None = None,
+    compute_perplexity: bool = False,
+    cache_logits: bool = False,
+    logit_top_k: int | None = None,
+) -> tuple[list[str], list[str], list[str], int, set[int] | None]:
+    """Check cache status for many prompts using batch operations.
+
+    Uses a single LIST call to discover existing keys, then reads
+    safetensors headers (not full files) when needed to check layer
+    coverage. This is O(1) LIST + O(cached) header reads instead
+    of O(N) HEAD requests.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    prompts : list[str]
+        Prompts to check.
+    required_layers : set[int]
+        Layer indices that must be cached.
+    pooling : str or None
+        Pooling strategy. If None, checks raw layers.
+    compute_perplexity : bool
+        Whether perplexity features are needed.
+    cache_logits : bool
+        Whether logits need to be cached.
+    logit_top_k : int or None
+        Top-k for logit caching.
+
+    Returns
+    -------
+    tuple
+        - need_activations: prompts needing activation extraction
+        - need_perplexity: prompts needing perplexity extraction
+        - need_logits: prompts needing logit extraction
+        - partial_cache_count: number of prompts with partial layer cache
+        - partial_cache_found_layers: example set of cached layers (or None)
+    """
+    backend = get_backend()
+    model_hash = _hash_string(model_name)
+
+    # Single LIST call to get all existing keys for this model
+    existing_keys = _list_model_cache_keys(model_name)
+
+    # Local cache for tensor keys to avoid re-reading the same file
+    _tensor_keys_cache: dict[str, set[str]] = {}
+
+    def _cached_tensor_keys(key: str) -> set[str]:
+        if key not in _tensor_keys_cache:
+            _tensor_keys_cache[key] = _get_tensor_keys_from_backend(key)
+        return _tensor_keys_cache[key]
+
+    need_activations: list[str] = []
+    need_perplexity: list[str] = []
+    need_logits: list[str] = []
+    partial_cache_count = 0
+    partial_cache_found_layers: set[int] | None = None
+
+    for prompt in prompts:
+        prompt_hash = _hash_string(prompt)
+        main_key = f"{model_hash}/{prompt_hash}.safetensors"
+        logits_key = f"{model_hash}/{prompt_hash}.logits.safetensors"
+        ppl_key = f"{model_hash}/{prompt_hash}.perplexity.safetensors"
+
+        # --- Activation check ---
+        act_cached = False
+        cached_layers: set[int] | None = None
+        if main_key in existing_keys:
+            tensor_keys = _cached_tensor_keys(main_key)
+            if pooling is not None:
+                cached_layers = _parse_pooled_layer_keys(tensor_keys, pooling)
+                act_cached = required_layers.issubset(cached_layers)
+            else:
+                cached_layers = _parse_raw_layer_keys(tensor_keys)
+                act_cached = (
+                    required_layers.issubset(cached_layers)
+                    and _ATTENTION_MASK_KEY in tensor_keys
+                )
+        elif isinstance(backend, LocalCacheBackend):
+            # v1 fallback for local backend
+            if pooling is not None:
+                act_cached = is_prompt_pooled_cached(
+                    model_name, prompt, required_layers, pooling
+                )
+            else:
+                act_cached = is_prompt_fully_cached(
+                    model_name, prompt, required_layers
+                )
+        else:
+            # Shard registry fallback
+            shard_info = _discover_from_shard(model_name, prompt)
+            if shard_info is not None:
+                if pooling is not None and pooling in shard_info.pooled:
+                    act_cached = required_layers.issubset(
+                        set(shard_info.pooled[pooling])
+                    )
+                elif pooling is None and shard_info.raw_layers:
+                    act_cached = required_layers.issubset(
+                        set(shard_info.raw_layers)
+                    )
+
+        if not act_cached:
+            need_activations.append(prompt)
+            # Check for partial cache (reuse cached_layers from above)
+            if cached_layers and len(cached_layers) > 0:
+                partial_cache_count += 1
+                if partial_cache_found_layers is None:
+                    partial_cache_found_layers = cached_layers
+
+        # --- Perplexity check ---
+        if compute_perplexity:
+            ppl_cached = ppl_key in existing_keys
+            if not ppl_cached and main_key in existing_keys:
+                tensor_keys = _cached_tensor_keys(main_key)
+                ppl_cached = _PERPLEXITY_KEY in tensor_keys
+            if not ppl_cached and isinstance(backend, LocalCacheBackend):
+                ppl_cached = is_prompt_perplexity_cached(model_name, prompt)
+            if not ppl_cached:
+                need_perplexity.append(prompt)
+
+        # --- Logits check ---
+        if cache_logits:
+            logits_cached = False
+            if logits_key in existing_keys:
+                tensor_keys = _cached_tensor_keys(logits_key)
+                if logit_top_k is not None:
+                    logits_cached = (
+                        _LOGITS_TOP_K_VALUES_KEY in tensor_keys
+                        and _LOGITS_TOP_K_INDICES_KEY in tensor_keys
+                    )
+                else:
+                    logits_cached = _LOGITS_KEY in tensor_keys
+            if not logits_cached and main_key in existing_keys:
+                tensor_keys = _cached_tensor_keys(main_key)
+                if logit_top_k is not None:
+                    logits_cached = (
+                        _LOGITS_TOP_K_VALUES_KEY in tensor_keys
+                        and _LOGITS_TOP_K_INDICES_KEY in tensor_keys
+                    )
+                else:
+                    logits_cached = _LOGITS_KEY in tensor_keys
+            if not logits_cached:
+                need_logits.append(prompt)
+
+    return (
+        need_activations,
+        need_perplexity,
+        need_logits,
+        partial_cache_count,
+        partial_cache_found_layers,
+    )
 
 
 def _merge_save_backend(key: str, new_tensors: dict[str, torch.Tensor]) -> None:
