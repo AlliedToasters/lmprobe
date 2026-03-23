@@ -18,13 +18,10 @@ from tqdm import tqdm
 
 from .backends import resolve_backend
 from .cache import (
+    batch_check_cache_status,
     evict,
-    get_prompt_cached_pooled_layers,
-    get_prompt_cached_raw_layers,
-    is_prompt_fully_cached,
     is_prompt_logits_cached,
     is_prompt_perplexity_cached,
-    is_prompt_pooled_cached,
     load_prompt_activations,
     load_prompt_logits,
     load_prompt_perplexity,
@@ -290,6 +287,11 @@ class UnifiedCache:
     ) -> tuple[list[str], list[str], list[str]]:
         """Check which prompts need extraction.
 
+        Uses batch_check_cache_status which does a single LIST call
+        instead of per-prompt HEAD requests. For large prompt sets
+        (e.g. 3000 prompts), this reduces S3 latency from minutes
+        to seconds.
+
         Returns
         -------
         tuple
@@ -299,58 +301,21 @@ class UnifiedCache:
         """
         required_layers = set(self.layer_indices)
 
-        need_activations = []
-        need_perplexity = []
-        need_logits = []
-        partial_cache_count = 0
-        partial_cache_found_layers: set[int] | None = None
-
-        for prompt in prompts:
-            # Check appropriate cache based on cache_pooled setting
-            if self.cache_pooled:
-                act_cached = is_prompt_pooled_cached(
-                    self.model_name, prompt, required_layers, self.pooling
-                )
-            else:
-                act_cached = is_prompt_fully_cached(
-                    self.model_name, prompt, required_layers
-                )
-
-            ppl_cached = (
-                is_prompt_perplexity_cached(self.model_name, prompt)
-                if self.compute_perplexity
-                else True
-            )
-
-            logits_cached = (
-                is_prompt_logits_cached(
-                    self.model_name, prompt, self.logit_top_k
-                )
-                if self.cache_logits
-                else True
-            )
-
-            if not act_cached:
-                need_activations.append(prompt)
-                # Check if cache file exists but is missing requested layers
-                if self.cache_pooled:
-                    cached_layers = get_prompt_cached_pooled_layers(
-                        self.model_name, prompt, self.pooling
-                    )
-                else:
-                    cached_layers = get_prompt_cached_raw_layers(
-                        self.model_name, prompt
-                    )
-                if cached_layers is not None and len(cached_layers) > 0:
-                    partial_cache_count += 1
-                    if partial_cache_found_layers is None:
-                        partial_cache_found_layers = cached_layers
-
-            if not ppl_cached:
-                need_perplexity.append(prompt)
-
-            if not logits_cached:
-                need_logits.append(prompt)
+        (
+            need_activations,
+            need_perplexity,
+            need_logits,
+            partial_cache_count,
+            partial_cache_found_layers,
+        ) = batch_check_cache_status(
+            model_name=self.model_name,
+            prompts=prompts,
+            required_layers=required_layers,
+            pooling=self.pooling if self.cache_pooled else None,
+            compute_perplexity=self.compute_perplexity,
+            cache_logits=self.cache_logits,
+            logit_top_k=self.logit_top_k,
+        )
 
         if partial_cache_count > 0:
             missing = sorted(required_layers - (partial_cache_found_layers or set()))
