@@ -1239,3 +1239,97 @@ class TestBatchCheckCacheStatus:
         assert "layer_0" in keys
         assert "layer_1" in keys
         assert "attention_mask" in keys
+
+
+class TestSyncCache:
+    """Tests for sync_cache()."""
+
+    def test_copies_entries(self, tmp_path):
+        """sync_cache copies entries from source to dest."""
+        from lmprobe.cache_backends import LocalCacheBackend
+        from lmprobe.cache import sync_cache
+
+        src = LocalCacheBackend(tmp_path / "src")
+        dst = LocalCacheBackend(tmp_path / "dst")
+
+        src.write_bytes("modelhash/prompt1.safetensors", b"data1")
+        src.write_bytes("modelhash/prompt2.safetensors", b"data2")
+        src.write_text("modelhash/_model_name.txt", "test-model")
+
+        count = sync_cache(source=src, dest=dst)
+        assert count == 3
+        assert dst.read_bytes("modelhash/prompt1.safetensors") == b"data1"
+        assert dst.read_bytes("modelhash/prompt2.safetensors") == b"data2"
+        assert dst.read_text("modelhash/_model_name.txt") == "test-model"
+
+    def test_skips_existing(self, tmp_path):
+        """sync_cache does not overwrite entries that already exist in dest."""
+        from lmprobe.cache_backends import LocalCacheBackend
+        from lmprobe.cache import sync_cache
+
+        src = LocalCacheBackend(tmp_path / "src")
+        dst = LocalCacheBackend(tmp_path / "dst")
+
+        src.write_bytes("modelhash/prompt1.safetensors", b"new-data")
+        dst.write_bytes("modelhash/prompt1.safetensors", b"old-data")
+
+        count = sync_cache(source=src, dest=dst)
+        assert count == 0
+        # Original data preserved
+        assert dst.read_bytes("modelhash/prompt1.safetensors") == b"old-data"
+
+    def test_model_filter(self, tmp_path):
+        """sync_cache with model filter only copies matching model's entries."""
+        from lmprobe.cache_backends import LocalCacheBackend
+        from lmprobe.cache import sync_cache, _hash_string
+
+        src = LocalCacheBackend(tmp_path / "src")
+        dst = LocalCacheBackend(tmp_path / "dst")
+
+        target_model = "target-model"
+        other_model = "other-model"
+        target_hash = _hash_string(target_model)
+        other_hash = _hash_string(other_model)
+
+        src.write_bytes(f"{target_hash}/prompt1.safetensors", b"target")
+        src.write_bytes(f"{other_hash}/prompt2.safetensors", b"other")
+
+        count = sync_cache(source=src, dest=dst, model=target_model)
+        assert count == 1
+        assert dst.exists(f"{target_hash}/prompt1.safetensors")
+        assert not dst.exists(f"{other_hash}/prompt2.safetensors")
+
+    def test_string_uris(self, tmp_path):
+        """sync_cache accepts filesystem path strings."""
+        from lmprobe.cache_backends import LocalCacheBackend
+        from lmprobe.cache import sync_cache
+
+        src_dir = tmp_path / "src"
+        dst_dir = tmp_path / "dst"
+        src_dir.mkdir()
+
+        # Write via backend, then sync via string paths
+        src = LocalCacheBackend(src_dir)
+        src.write_bytes("modelhash/prompt.safetensors", b"data")
+
+        count = sync_cache(source=str(src_dir), dest=str(dst_dir))
+        assert count == 1
+        dst = LocalCacheBackend(dst_dir)
+        assert dst.read_bytes("modelhash/prompt.safetensors") == b"data"
+
+    def test_returns_count(self, tmp_path):
+        """sync_cache returns exact count of entries copied."""
+        from lmprobe.cache_backends import LocalCacheBackend
+        from lmprobe.cache import sync_cache
+
+        src = LocalCacheBackend(tmp_path / "src")
+        dst = LocalCacheBackend(tmp_path / "dst")
+
+        src.write_bytes("m/a.safetensors", b"a")
+        src.write_bytes("m/b.safetensors", b"b")
+        src.write_bytes("m/c.safetensors", b"c")
+        # Pre-populate one in dest
+        dst.write_bytes("m/b.safetensors", b"b")
+
+        count = sync_cache(source=src, dest=dst)
+        assert count == 2  # a and c copied, b skipped

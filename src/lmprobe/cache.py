@@ -2641,6 +2641,92 @@ def save_perplexity_cache(cache_path: Path, features: torch.Tensor) -> None:
     torch.save(features.cpu(), cache_path)
 
 
+def sync_cache(
+    source: CacheBackend | str,
+    dest: CacheBackend | str | None = None,
+    model: str | None = None,
+) -> int:
+    """Copy cache entries from one backend to another.
+
+    Useful for pulling S3 activations to local disk before training,
+    avoiding repeated S3 GET costs during probe fitting.
+
+    Parameters
+    ----------
+    source : CacheBackend | str
+        Source backend or URI string (e.g. ``"s3://bucket/prefix"``).
+    dest : CacheBackend | str | None
+        Destination backend or URI string. ``None`` uses the default
+        local cache directory (``~/.cache/lmprobe/``).
+    model : str | None
+        If given, only sync entries for this model. If ``None``, sync all.
+
+    Returns
+    -------
+    int
+        Number of entries copied (existing entries are skipped).
+
+    Examples
+    --------
+    >>> from lmprobe.cache import sync_cache
+    >>> sync_cache(
+    ...     source="s3://my-bucket/activations",
+    ...     dest="~/.cache/lmprobe/",
+    ...     model="meta-llama/Llama-3.1-8B-Instruct",
+    ... )
+    """
+    from tqdm import tqdm
+
+    # Resolve backends
+    if isinstance(source, str):
+        src_backend = _parse_backend_uri(source)
+    elif isinstance(source, CacheBackend):
+        src_backend = source
+    else:
+        raise TypeError(
+            f"Expected CacheBackend or str for source, got {type(source).__name__}"
+        )
+
+    if dest is None:
+        dst_backend = LocalCacheBackend(get_cache_dir())
+    elif isinstance(dest, str):
+        dst_backend = _parse_backend_uri(dest)
+    elif isinstance(dest, CacheBackend):
+        dst_backend = dest
+    else:
+        raise TypeError(
+            f"Expected CacheBackend, str, or None for dest, got {type(dest).__name__}"
+        )
+
+    # Build prefix filter for model
+    prefix = ""
+    if model is not None:
+        prefix = _hash_string(model) + "/"
+
+    # List source keys
+    source_keys = src_backend.list_keys(prefix)
+    if not source_keys:
+        logger.info("[CACHE] No entries found in source%s", f" for {model}" if model else "")
+        return 0
+
+    copied = 0
+    skipped = 0
+    for key in tqdm(source_keys, desc="Syncing cache", unit="file"):
+        if dst_backend.exists(key):
+            skipped += 1
+            continue
+        data = src_backend.read_bytes(key)
+        dst_backend.write_bytes(key, data)
+        copied += 1
+
+    logger.info(
+        "[CACHE] Synced %d entries (%d skipped, already present)",
+        copied,
+        skipped,
+    )
+    return copied
+
+
 def clear_cache() -> int:
     """Clear all cached activations (both v1 and v2 formats).
 

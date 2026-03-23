@@ -64,6 +64,7 @@ __all__ = [
     "set_cache_dtype",
     "set_cache_limit",
     "set_max_threads",
+    "sync_cache",
 ]
 
 
@@ -112,6 +113,7 @@ def __getattr__(name: str):
     if name in (
         "cache_info", "CacheInfo", "ModelCacheInfo",
         "evict", "set_cache_backend", "set_cache_limit", "set_cache_dtype",
+        "sync_cache",
     ):
         from .cache import (
             CacheInfo,
@@ -121,6 +123,7 @@ def __getattr__(name: str):
             set_cache_backend,
             set_cache_dtype,
             set_cache_limit,
+            sync_cache,
         )
 
         return {
@@ -131,6 +134,7 @@ def __getattr__(name: str):
             "set_cache_backend": set_cache_backend,
             "set_cache_limit": set_cache_limit,
             "set_cache_dtype": set_cache_dtype,
+            "sync_cache": sync_cache,
         }[name]
     if name in ("UnifiedCache", "WarmupStats", "CachedLogits"):
         from .unified_cache import CachedLogits, UnifiedCache, WarmupStats
