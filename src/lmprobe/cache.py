@@ -655,10 +655,18 @@ _SAFETENSORS_DTYPE_MAP = {
 }
 
 
+_header_cache: dict[tuple[int, str], tuple[dict, int]] = {}
+_HEADER_CACHE_MAXSIZE = 8192
+
+
 def _parse_safetensors_header(
     backend: CacheBackend, key: str
 ) -> tuple[dict, int]:
     """Parse the safetensors header from a backend entry.
+
+    Results are cached by ``(id(backend), key)`` to avoid redundant
+    range reads when the same file is accessed multiple times (e.g.
+    once per layer during ``push_dataset`` consolidation).
 
     Returns
     -------
@@ -668,6 +676,11 @@ def _parse_safetensors_header(
     data_offset : int
         Byte offset where the tensor data begins (8 + header_size).
     """
+    cache_key = (id(backend), key)
+    cached = _header_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     import struct
 
     header_size_bytes = backend.read_range(key, 0, 8)
@@ -681,7 +694,21 @@ def _parse_safetensors_header(
 
     header_bytes = backend.read_range(key, 8, 8 + header_size)
     header = json.loads(header_bytes)
-    return header, 8 + header_size
+    result = (header, 8 + header_size)
+
+    if len(_header_cache) >= _HEADER_CACHE_MAXSIZE:
+        _header_cache.pop(next(iter(_header_cache)))
+    _header_cache[cache_key] = result
+    return result
+
+
+def clear_header_cache() -> None:
+    """Clear the safetensors header cache."""
+    _header_cache.clear()
+
+
+_mask_cache: dict[tuple[int, str], torch.Tensor] = {}
+_MASK_CACHE_MAXSIZE = 8192
 
 
 def _load_tensors_selective(
@@ -694,6 +721,9 @@ def _load_tensors_selective(
     Instead of downloading the entire safetensors file, this reads only
     the header (to get byte offsets) and then fetches each requested
     tensor individually via range reads.
+
+    Attention masks are cached by ``(id(backend), key)`` since they are
+    identical across all layer loads for the same prompt file.
     """
     header, data_start = _parse_safetensors_header(backend, key)
     available = {k for k in header if k != "__metadata__"}
@@ -707,6 +737,15 @@ def _load_tensors_selective(
                 f"Available keys: {sorted(available)}. "
                 f"Delete this entry and re-run to rebuild the cache."
             )
+
+        # Check mask cache for attention_mask tensors
+        if tensor_name == _ATTENTION_MASK_KEY:
+            mask_cache_key = (id(backend), key)
+            cached_mask = _mask_cache.get(mask_cache_key)
+            if cached_mask is not None:
+                result[tensor_name] = cached_mask.clone()
+                continue
+
         meta = header[tensor_name]
         dtype_str = meta["dtype"]
         shape = meta["shape"]
@@ -723,7 +762,24 @@ def _load_tensors_selective(
         tensor = torch.frombuffer(bytearray(raw_bytes), dtype=torch_dtype)
         result[tensor_name] = tensor.reshape(shape)
 
+        # Cache attention masks for reuse across layer iterations
+        if tensor_name == _ATTENTION_MASK_KEY:
+            if len(_mask_cache) >= _MASK_CACHE_MAXSIZE:
+                _mask_cache.pop(next(iter(_mask_cache)))
+            _mask_cache[(id(backend), key)] = tensor.reshape(shape).clone()
+
     return result
+
+
+def clear_mask_cache() -> None:
+    """Clear the attention mask cache."""
+    _mask_cache.clear()
+
+
+def _clear_selective_caches() -> None:
+    """Clear both the header and attention mask caches."""
+    clear_header_cache()
+    clear_mask_cache()
 
 
 def _get_tensor_keys_from_backend(key: str) -> set[str]:
