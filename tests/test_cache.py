@@ -1239,3 +1239,139 @@ class TestBatchCheckCacheStatus:
         assert "layer_0" in keys
         assert "layer_1" in keys
         assert "attention_mask" in keys
+
+
+class _RangeReadTrackingBackend:
+    """Wraps a LocalCacheBackend but is NOT an instance of it.
+
+    This forces _load_tensors_from_backend to take the non-local path
+    (selective range reads). Tracks read_range calls for assertions.
+    """
+
+    def __init__(self, local_backend):
+        self._inner = local_backend
+        self.read_range_calls = []
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def read_range(self, key, start, end):
+        self.read_range_calls.append((key, start, end))
+        return self._inner.read_range(key, start, end)
+
+    def read_bytes(self, key):
+        return self._inner.read_bytes(key)
+
+
+class TestSelectiveTensorLoading:
+    """Tests for selective tensor loading via range reads (#146)."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path, monkeypatch):
+        self.model = "test-model-selective"
+        self.cache_dir = tmp_path
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        import lmprobe.cache as cache_mod
+
+        cache_mod._backend = None
+
+        # Save some test data (hidden_dim=48 splits evenly across 3 layers → 16 each)
+        acts = torch.randn(1, 5, 48)
+        mask = torch.ones(1, 5)
+        save_prompt_activations(self.model, "prompt1", [0, 1, 2], acts, mask)
+
+        self.key = _prompt_cache_key(self.model, "prompt1")
+
+    def test_selective_load_returns_correct_tensors(self):
+        """Selective loading returns the same tensors as full loading."""
+        from lmprobe.cache import _load_tensors_selective, get_backend
+
+        backend = get_backend()
+        wrapper = _RangeReadTrackingBackend(backend)
+
+        result = _load_tensors_selective(wrapper, self.key, ["layer_0", "layer_2"])
+
+        assert set(result.keys()) == {"layer_0", "layer_2"}
+        assert result["layer_0"].shape == (1, 5, 16)
+        assert result["layer_2"].shape == (1, 5, 16)
+
+    def test_selective_load_matches_full_load(self):
+        """Selective loading produces identical tensors to full loading."""
+        from lmprobe.cache import (
+            _load_tensors_from_backend,
+            _load_tensors_selective,
+            get_backend,
+        )
+
+        backend = get_backend()
+        wrapper = _RangeReadTrackingBackend(backend)
+
+        full = _load_tensors_from_backend(self.key)
+        selective = _load_tensors_selective(
+            wrapper, self.key, ["layer_0", "layer_1", "attention_mask"]
+        )
+
+        for k in selective:
+            assert torch.equal(full[k], selective[k]), f"Mismatch for {k}"
+
+    def test_selective_load_uses_range_reads(self):
+        """Selective loading uses read_range, not read_bytes."""
+        from lmprobe.cache import _load_tensors_selective, get_backend
+
+        backend = get_backend()
+        wrapper = _RangeReadTrackingBackend(backend)
+
+        _load_tensors_selective(wrapper, self.key, ["layer_1"])
+
+        # Should have range reads: 2 for header (size + json) + 1 for tensor data
+        assert len(wrapper.read_range_calls) == 3
+
+    def test_selective_load_missing_key_raises(self):
+        """Requesting a non-existent tensor key raises KeyError."""
+        from lmprobe.cache import _load_tensors_selective, get_backend
+
+        backend = get_backend()
+        wrapper = _RangeReadTrackingBackend(backend)
+
+        with pytest.raises(KeyError, match="missing key 'layer_99'"):
+            _load_tensors_selective(wrapper, self.key, ["layer_99"])
+
+    def test_parse_safetensors_header(self):
+        """_parse_safetensors_header returns valid header with offsets."""
+        from lmprobe.cache import _parse_safetensors_header, get_backend
+
+        backend = get_backend()
+        header, data_start = _parse_safetensors_header(backend, self.key)
+
+        assert "layer_0" in header
+        assert "attention_mask" in header
+        assert "__metadata__" not in header or isinstance(
+            header["__metadata__"], dict
+        )
+        # Each tensor entry has dtype, shape, data_offsets
+        meta = header["layer_0"]
+        assert "dtype" in meta
+        assert "shape" in meta
+        assert "data_offsets" in meta
+        assert data_start > 8
+
+    def test_load_tensors_from_backend_uses_selective_for_nonlocal(self):
+        """_load_tensors_from_backend uses range reads for non-local backends."""
+        import lmprobe.cache as cache_mod
+        from lmprobe.cache import _load_tensors_from_backend, get_backend
+
+        backend = get_backend()
+        wrapper = _RangeReadTrackingBackend(backend)
+
+        # Temporarily replace the backend
+        old_backend = cache_mod._backend
+        cache_mod._backend = wrapper
+        try:
+            result = _load_tensors_from_backend(self.key, ["layer_0"])
+        finally:
+            cache_mod._backend = old_backend
+
+        assert "layer_0" in result
+        # Verify range reads were used (not read_bytes for full file)
+        assert len(wrapper.read_range_calls) >= 3
