@@ -1246,8 +1246,8 @@ class TestSyncCache:
 
     def test_copies_entries(self, tmp_path):
         """sync_cache copies entries from source to dest."""
-        from lmprobe.cache_backends import LocalCacheBackend
         from lmprobe.cache import sync_cache
+        from lmprobe.cache_backends import LocalCacheBackend
 
         src = LocalCacheBackend(tmp_path / "src")
         dst = LocalCacheBackend(tmp_path / "dst")
@@ -1264,8 +1264,8 @@ class TestSyncCache:
 
     def test_skips_existing(self, tmp_path):
         """sync_cache does not overwrite entries that already exist in dest."""
-        from lmprobe.cache_backends import LocalCacheBackend
         from lmprobe.cache import sync_cache
+        from lmprobe.cache_backends import LocalCacheBackend
 
         src = LocalCacheBackend(tmp_path / "src")
         dst = LocalCacheBackend(tmp_path / "dst")
@@ -1280,8 +1280,8 @@ class TestSyncCache:
 
     def test_model_filter(self, tmp_path):
         """sync_cache with model filter only copies matching model's entries."""
+        from lmprobe.cache import _hash_string, sync_cache
         from lmprobe.cache_backends import LocalCacheBackend
-        from lmprobe.cache import sync_cache, _hash_string
 
         src = LocalCacheBackend(tmp_path / "src")
         dst = LocalCacheBackend(tmp_path / "dst")
@@ -1301,8 +1301,8 @@ class TestSyncCache:
 
     def test_string_uris(self, tmp_path):
         """sync_cache accepts filesystem path strings."""
-        from lmprobe.cache_backends import LocalCacheBackend
         from lmprobe.cache import sync_cache
+        from lmprobe.cache_backends import LocalCacheBackend
 
         src_dir = tmp_path / "src"
         dst_dir = tmp_path / "dst"
@@ -1319,8 +1319,8 @@ class TestSyncCache:
 
     def test_returns_count(self, tmp_path):
         """sync_cache returns exact count of entries copied."""
-        from lmprobe.cache_backends import LocalCacheBackend
         from lmprobe.cache import sync_cache
+        from lmprobe.cache_backends import LocalCacheBackend
 
         src = LocalCacheBackend(tmp_path / "src")
         dst = LocalCacheBackend(tmp_path / "dst")
