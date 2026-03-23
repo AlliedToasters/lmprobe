@@ -34,10 +34,10 @@ import logging
 import re
 import tempfile
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any
 
 import torch
