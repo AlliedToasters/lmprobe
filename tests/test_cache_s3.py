@@ -443,6 +443,53 @@ class TestS3Integration:
         full = _load_tensors_from_backend(key)
         assert torch.equal(result["layer_1"], full["layer_1"])
 
+    def test_header_cache_avoids_redundant_s3_reads(self):
+        """Header caching eliminates redundant S3 range reads (#148)."""
+        import torch
+
+        from lmprobe.cache import (
+            _clear_selective_caches,
+            _load_tensors_from_backend,
+            _prompt_cache_key,
+            save_prompt_activations,
+        )
+
+        _clear_selective_caches()
+
+        model = "test-model"
+        prompt = "header cache test"
+        layers = [0, 1, 2]
+        acts = torch.randn(1, 5, 192)
+        mask = torch.ones(1, 5, dtype=torch.long)
+
+        save_prompt_activations(model, prompt, layers, acts, mask)
+        key = _prompt_cache_key(model, prompt)
+
+        # Load layer_0 — first call parses header
+        r0 = _load_tensors_from_backend(key, ["layer_0"])
+        assert r0["layer_0"].shape == (1, 5, 64)
+
+        # Load layer_1 — header should be cached, mask should be fetched fresh
+        r1 = _load_tensors_from_backend(key, ["layer_1"])
+        assert r1["layer_1"].shape == (1, 5, 64)
+
+        # Load layer_2 + attention_mask — mask fetched, then cached
+        r2 = _load_tensors_from_backend(key, ["layer_2", "attention_mask"])
+        assert r2["layer_2"].shape == (1, 5, 64)
+        assert "attention_mask" in r2
+
+        # Load layer_0 + attention_mask again — both header and mask cached
+        r3 = _load_tensors_from_backend(key, ["layer_0", "attention_mask"])
+        assert torch.equal(r3["attention_mask"], r2["attention_mask"])
+
+        # Verify all layer values match full load
+        full = _load_tensors_from_backend(key)
+        assert torch.equal(r0["layer_0"], full["layer_0"])
+        assert torch.equal(r1["layer_1"], full["layer_1"])
+        assert torch.equal(r2["layer_2"], full["layer_2"])
+
+        _clear_selective_caches()
+
     def test_incremental_layer_save(self):
         import torch
 

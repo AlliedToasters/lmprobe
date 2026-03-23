@@ -1375,3 +1375,190 @@ class TestSelectiveTensorLoading:
         assert "layer_0" in result
         # Verify range reads were used (not read_bytes for full file)
         assert len(wrapper.read_range_calls) >= 3
+
+
+class TestHeaderCache:
+    """Tests for safetensors header caching (#148)."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path, monkeypatch):
+        self.model = "test-model-header-cache"
+        self.cache_dir = tmp_path
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        import lmprobe.cache as cache_mod
+
+        cache_mod._backend = None
+
+        acts = torch.randn(1, 5, 48)
+        mask = torch.ones(1, 5)
+        save_prompt_activations(self.model, "prompt1", [0, 1, 2], acts, mask)
+
+        self.key = _prompt_cache_key(self.model, "prompt1")
+
+        # Clear caches before each test
+        from lmprobe.cache import _clear_selective_caches
+
+        _clear_selective_caches()
+
+    def test_header_cache_eliminates_redundant_reads(self):
+        """Repeated selective loads for the same key reuse cached header."""
+        from lmprobe.cache import _load_tensors_selective, get_backend
+
+        backend = get_backend()
+        wrapper = _RangeReadTrackingBackend(backend)
+
+        # First call: 2 range reads for header + 1 for tensor data = 3
+        _load_tensors_selective(wrapper, self.key, ["layer_0"])
+        first_call_reads = len(wrapper.read_range_calls)
+        assert first_call_reads == 3
+
+        # Second call: header is cached, so only 1 range read for tensor data
+        _load_tensors_selective(wrapper, self.key, ["layer_1"])
+        second_call_reads = len(wrapper.read_range_calls) - first_call_reads
+        assert second_call_reads == 1
+
+        # Third call: still cached
+        _load_tensors_selective(wrapper, self.key, ["layer_2"])
+        third_call_reads = (
+            len(wrapper.read_range_calls) - first_call_reads - second_call_reads
+        )
+        assert third_call_reads == 1
+
+    def test_clear_header_cache(self):
+        """Clearing the header cache forces re-reading on next call."""
+        from lmprobe.cache import (
+            _load_tensors_selective,
+            clear_header_cache,
+            get_backend,
+        )
+
+        backend = get_backend()
+        wrapper = _RangeReadTrackingBackend(backend)
+
+        # Populate cache
+        _load_tensors_selective(wrapper, self.key, ["layer_0"])
+        assert len(wrapper.read_range_calls) == 3
+
+        # Clear and re-load: should re-read header
+        clear_header_cache()
+        _load_tensors_selective(wrapper, self.key, ["layer_0"])
+        assert len(wrapper.read_range_calls) == 6  # 3 + 3
+
+    def test_header_cache_bounded(self):
+        """Header cache does not grow beyond _HEADER_CACHE_MAXSIZE."""
+        from lmprobe.cache import _header_cache, _parse_safetensors_header, get_backend
+
+        backend = get_backend()
+
+        # Fill cache with fake entries
+        for i in range(_HEADER_CACHE_MAXSIZE := 8192):
+            _header_cache[(id(backend), f"fake_key_{i}")] = ({"fake": True}, 8)
+
+        assert len(_header_cache) == 8192
+
+        # Parsing a real header should evict one entry and stay at maxsize
+        wrapper = _RangeReadTrackingBackend(backend)
+        _parse_safetensors_header(wrapper, self.key)
+        assert len(_header_cache) <= 8192
+
+
+class TestMaskCache:
+    """Tests for attention mask caching (#148)."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path, monkeypatch):
+        self.model = "test-model-mask-cache"
+        self.cache_dir = tmp_path
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        import lmprobe.cache as cache_mod
+
+        cache_mod._backend = None
+
+        acts = torch.randn(1, 5, 48)
+        mask = torch.ones(1, 5)
+        save_prompt_activations(self.model, "prompt1", [0, 1, 2], acts, mask)
+
+        self.key = _prompt_cache_key(self.model, "prompt1")
+
+        from lmprobe.cache import _clear_selective_caches
+
+        _clear_selective_caches()
+
+    def test_mask_cache_eliminates_redundant_reads(self):
+        """Attention mask is only fetched once across multiple layer loads."""
+        from lmprobe.cache import _load_tensors_selective, get_backend
+
+        backend = get_backend()
+        wrapper = _RangeReadTrackingBackend(backend)
+
+        # First call: header(2) + layer(1) + mask(1) = 4 range reads
+        result1 = _load_tensors_selective(
+            wrapper, self.key, ["layer_0", "attention_mask"]
+        )
+        first_call_reads = len(wrapper.read_range_calls)
+        assert first_call_reads == 4
+        assert "attention_mask" in result1
+
+        # Second call: header cached, mask cached → only layer data = 1 range read
+        result2 = _load_tensors_selective(
+            wrapper, self.key, ["layer_1", "attention_mask"]
+        )
+        second_call_reads = len(wrapper.read_range_calls) - first_call_reads
+        assert second_call_reads == 1
+        assert "attention_mask" in result2
+
+        # Verify mask values are identical
+        assert torch.equal(result1["attention_mask"], result2["attention_mask"])
+
+    def test_clear_mask_cache(self):
+        """Clearing the mask cache forces re-reading on next call."""
+        from lmprobe.cache import (
+            _load_tensors_selective,
+            clear_mask_cache,
+            get_backend,
+        )
+
+        backend = get_backend()
+        wrapper = _RangeReadTrackingBackend(backend)
+
+        # Populate mask cache
+        _load_tensors_selective(
+            wrapper, self.key, ["layer_0", "attention_mask"]
+        )
+        reads_after_first = len(wrapper.read_range_calls)
+
+        # Clear mask cache (but not header cache)
+        clear_mask_cache()
+
+        # Should re-read mask but not header
+        _load_tensors_selective(
+            wrapper, self.key, ["layer_0", "attention_mask"]
+        )
+        reads_after_second = len(wrapper.read_range_calls) - reads_after_first
+        # header cached (0) + layer(1) + mask re-read(1) = 2
+        assert reads_after_second == 2
+
+    def test_clear_selective_caches(self):
+        """_clear_selective_caches clears both header and mask caches."""
+        from lmprobe.cache import (
+            _clear_selective_caches,
+            _header_cache,
+            _load_tensors_selective,
+            _mask_cache,
+            get_backend,
+        )
+
+        backend = get_backend()
+        wrapper = _RangeReadTrackingBackend(backend)
+
+        _load_tensors_selective(
+            wrapper, self.key, ["layer_0", "attention_mask"]
+        )
+        assert len(_header_cache) > 0
+        assert len(_mask_cache) > 0
+
+        _clear_selective_caches()
+        assert len(_header_cache) == 0
+        assert len(_mask_cache) == 0
