@@ -20,6 +20,7 @@ from lmprobe.cache import (
 )
 from lmprobe.sharing import (
     _STAGE_SENTINEL,
+    _STREAM_MANIFEST,
     FORMAT_VERSION,
     INFO_FILENAME,
     PARQUET_PATH,
@@ -30,6 +31,9 @@ from lmprobe.sharing import (
     _consolidate_and_shard,
     _discover_prompts,
     _filter_tensor_types,
+    _load_manifest,
+    _new_manifest,
+    _save_manifest,
     _staging_dir_path,
     _write_parquet_index,
     load_activation_dataset,
@@ -732,6 +736,271 @@ class TestPushDataset:
                 model_name=TEST_MODEL,
                 prompts=[],
             )
+
+
+class TestPushDatasetStreaming:
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_stream_uploads_individual_files(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """stream=True uses upload_file per shard, not upload_large_folder."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        url = push_dataset(
+            repo_id="user/stream-test",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+            stream=True,
+        )
+
+        assert "user/stream-test" in url
+        mock_api.create_repo.assert_called_once()
+        mock_api.upload_large_folder.assert_not_called()
+        assert mock_api.upload_file.call_count > 0
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_stream_produces_correct_repo_paths(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """Streaming uploads all expected tensor and metadata paths."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        uploaded_paths = []
+
+        def capture_upload_file(*, path_or_fileobj, path_in_repo, **kwargs):
+            uploaded_paths.append(path_in_repo)
+
+        mock_api.upload_file.side_effect = capture_upload_file
+
+        push_dataset(
+            repo_id="user/stream-paths",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+            stream=True,
+        )
+
+        # Should have tensor shards for layers 0 and 1
+        tensor_paths = [p for p in uploaded_paths if p.startswith("tensors/")]
+        assert len(tensor_paths) >= 2  # at least one shard per layer
+
+        # Should have metadata files
+        assert INFO_FILENAME in uploaded_paths
+        assert PARQUET_PATH in uploaded_paths
+        assert "README.md" in uploaded_paths
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_stream_manifest_tracks_progress(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """Manifest tracks completed shards; survives partial upload failure."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        call_count = 0
+
+        def fail_after_first(*, path_or_fileobj, path_in_repo, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                raise ConnectionError("simulated network failure")
+
+        mock_api.upload_file.side_effect = fail_after_first
+
+        staging_dir = _staging_dir_path(
+            "user/manifest-test", TEST_MODEL, populated_cache,
+            labels=[1, 1, 0], stream=True,
+        )
+
+        with pytest.raises(ConnectionError):
+            push_dataset(
+                repo_id="user/manifest-test",
+                model_name=TEST_MODEL,
+                prompts=populated_cache,
+                labels=[1, 1, 0],
+                exist_ok=True,
+                stream=True,
+            )
+
+        # Manifest should exist with at least one completed shard
+        manifest = _load_manifest(staging_dir)
+        assert manifest is not None
+        assert len(manifest["completed_shards"]) == 1
+        assert manifest["metadata_uploaded"] is False
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_stream_resume_skips_completed(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """Resume skips already-uploaded shards."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        staging_dir = _staging_dir_path(
+            "user/resume-test", TEST_MODEL, populated_cache,
+            labels=[1, 1, 0], stream=True,
+        )
+
+        # Pre-populate manifest with shard paths (simulating partial completion)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        (staging_dir / "tensors").mkdir(parents=True, exist_ok=True)
+        (staging_dir / "index").mkdir(parents=True, exist_ok=True)
+        shard_paths = [
+            "tensors/hidden_layer000_shard000.safetensors",
+            "tensors/hidden_layer001_shard000.safetensors",
+        ]
+        manifest = _new_manifest("user/resume-test")
+        manifest["completed_shards"] = shard_paths
+        _save_manifest(staging_dir, manifest)
+
+        resume_paths = []
+
+        def capture_resume(*, path_or_fileobj, path_in_repo, **kwargs):
+            resume_paths.append(path_in_repo)
+
+        mock_api.upload_file.side_effect = capture_resume
+
+        push_dataset(
+            repo_id="user/resume-test",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+            stream=True,
+        )
+
+        # Only metadata files should be uploaded (not tensor shards)
+        for path in resume_paths:
+            assert not path.startswith("tensors/"), (
+                f"Shard {path} should have been skipped on resume"
+            )
+        # Should have uploaded metadata files only
+        assert INFO_FILENAME in resume_paths
+        assert PARQUET_PATH in resume_paths
+        assert "README.md" in resume_paths
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_stream_cleanup_on_success(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """Staging dir is removed after successful streaming upload."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        staging_dir = _staging_dir_path(
+            "user/cleanup-stream", TEST_MODEL, populated_cache,
+            stream=True,
+        )
+
+        push_dataset(
+            repo_id="user/cleanup-stream",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            exist_ok=True,
+            stream=True,
+        )
+
+        assert not staging_dir.exists()
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_stream_raw_cache(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_raw_cache,
+    ):
+        """Streaming works with raw (full-sequence) activations."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        prompts, seq_lens, layers, _ = populated_raw_cache
+        uploaded_paths = []
+
+        def capture(*, path_or_fileobj, path_in_repo, **kwargs):
+            uploaded_paths.append(path_in_repo)
+
+        mock_api.upload_file.side_effect = capture
+
+        push_dataset(
+            repo_id="user/stream-raw",
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            exist_ok=True,
+            stream=True,
+        )
+
+        mock_api.upload_large_folder.assert_not_called()
+        tensor_paths = [p for p in uploaded_paths if p.startswith("tensors/")]
+        assert len(tensor_paths) >= 2  # at least one shard per layer
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_stream_warns_ignored_params(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache, caplog,
+    ):
+        """num_workers and commit_batch_size produce warnings in stream mode."""
+        import logging
+
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        with caplog.at_level(logging.WARNING, logger="lmprobe.sharing"):
+            push_dataset(
+                repo_id="user/stream-warn",
+                model_name=TEST_MODEL,
+                prompts=populated_cache,
+                exist_ok=True,
+                stream=True,
+                num_workers=8,
+                commit_batch_size=5,
+            )
+
+        assert "num_workers is ignored" in caplog.text
+        assert "commit_batch_size is ignored" in caplog.text
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_nonstream_still_uses_upload_large_folder(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """stream=False (default) still uses upload_large_folder."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        push_dataset(
+            repo_id="user/no-stream",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            exist_ok=True,
+            stream=False,
+        )
+
+        mock_api.upload_large_folder.assert_called_once()
+        mock_api.upload_file.assert_not_called()
 
 
 class TestLoadActivationDataset:

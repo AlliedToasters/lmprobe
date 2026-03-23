@@ -37,7 +37,7 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -62,6 +62,7 @@ DEFAULT_SHARD_BYTES = 1_073_741_824  # 1 GB
 INFO_FILENAME = "lmprobe_info.json"
 PARQUET_PATH = "index/train-00000-of-00001.parquet"
 _STAGE_SENTINEL = "_stage_complete"
+_STREAM_MANIFEST = "_stream_manifest.json"
 _tokenizer_cache: dict[str, Any] = {}
 
 
@@ -115,6 +116,7 @@ def _staging_dir_path(
     labels: list[int | str | None] | None = None,
     metadata: list[dict] | None = None,
     tensors: list[str] | None = None,
+    stream: bool = False,
 ) -> Path:
     """Deterministic staging directory for resumable uploads.
 
@@ -131,9 +133,44 @@ def _staging_dir_path(
         key_parts.append(["metadata", metadata])
     if tensors is not None:
         key_parts.append(["tensors", sorted(tensors)])
+    if stream:
+        key_parts.append(["stream", True])
     content = json.dumps(key_parts, sort_keys=True)
     key = hashlib.sha256(content.encode()).hexdigest()[:16]
     return get_cache_dir() / "staging" / key
+
+
+# =============================================================================
+# Streaming manifest helpers
+# =============================================================================
+
+
+def _new_manifest(repo_id: str) -> dict:
+    """Create a fresh streaming manifest."""
+    return {
+        "format": "stream_manifest_v1",
+        "repo_id": repo_id,
+        "completed_shards": [],
+        "metadata_uploaded": False,
+    }
+
+
+def _load_manifest(staging_dir: Path) -> dict | None:
+    """Load streaming manifest, or None if not present."""
+    manifest_path = staging_dir / _STREAM_MANIFEST
+    if not manifest_path.exists():
+        return None
+    with open(manifest_path) as f:
+        return json.load(f)
+
+
+def _save_manifest(staging_dir: Path, manifest: dict) -> None:
+    """Atomically write the streaming manifest via rename."""
+    manifest_path = staging_dir / _STREAM_MANIFEST
+    tmp_path = manifest_path.with_suffix(".tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    tmp_path.rename(manifest_path)
 
 
 # =============================================================================
@@ -511,6 +548,7 @@ def _consolidate_and_shard(
     repo_id: str,
     metadata: list[dict] | None = None,
     tmpdir: Path | None = None,
+    on_shard_written: "Callable[[Path, str], None] | None" = None,
 ) -> tuple[Path, dict, list[dict]]:
     """Consolidate cached tensors into sharded safetensors files.
 
@@ -777,6 +815,8 @@ def _consolidate_and_shard(
                             f"_shard{shard_idx:03d}.safetensors"
                         )
                         save_file(layer_tensor, str(tmpdir / fname))
+                        if on_shard_written is not None:
+                            on_shard_written(tmpdir / fname, fname)
                         del layer_tensor
                     del rows
                     offset += shard_size
@@ -836,6 +876,8 @@ def _consolidate_and_shard(
                 }
                 fname = f"tensors/logits_topk_{shard_idx:03d}.safetensors"
                 save_file(logits_tensors_out, str(tmpdir / fname))
+                if on_shard_written is not None:
+                    on_shard_written(tmpdir / fname, fname)
                 del logits_tensors_out
 
             del shard_data_logits
@@ -1253,6 +1295,7 @@ def push_dataset(
     token: str | None = None,
     num_workers: int | None = None,
     commit_batch_size: int | None = None,
+    stream: bool = False,
 ) -> str:
     """Push cached activations to a HuggingFace Dataset repo.
 
@@ -1291,12 +1334,19 @@ def push_dataset(
         Number of workers for parallel file uploads.  Passed directly to
         ``upload_large_folder``.  ``None`` (default) uses the
         ``huggingface_hub`` default (currently 16 workers).
+        Ignored when ``stream=True``.
     commit_batch_size : int | None
         Maximum number of files per commit during upload.  On unreliable
         connections, setting this to a small value (e.g. ``1``) ensures
         progress is committed frequently, so interrupted uploads lose
         less work on restart.  ``None`` (default) uses the
         ``huggingface_hub`` default scale.
+        Ignored when ``stream=True``.
+    stream : bool
+        If True, upload each shard immediately after writing it, then
+        delete the local copy.  This reduces peak disk usage from the
+        full dataset size to a single shard (~1 GB).  Resumable via a
+        shard completion manifest.  Default False.
 
     Returns
     -------
@@ -1364,7 +1414,30 @@ def push_dataset(
         repo_id, model_name, prompts,
         shard_max_bytes=shard_max_bytes, labels=labels,
         metadata=metadata, tensors=tensors,
+        stream=stream,
     )
+
+    if stream:
+        return _push_dataset_streaming(
+            repo_id=repo_id,
+            model_name=model_name,
+            prompts=prompts,
+            kept_indices=kept_indices,
+            tensor_types=tensor_types,
+            labels=labels,
+            metadata=metadata,
+            shard_max_bytes=shard_max_bytes,
+            private=private,
+            exist_ok=exist_ok,
+            description=description,
+            license=license,
+            token=token,
+            num_workers=num_workers,
+            commit_batch_size=commit_batch_size,
+            staging_dir=staging_dir,
+        )
+
+    # --- Non-streaming path (unchanged) ---
     sentinel = staging_dir / _STAGE_SENTINEL
 
     resuming = sentinel.exists()
@@ -1468,6 +1541,146 @@ def push_dataset(
     import shutil
 
     shutil.rmtree(tmpdir, ignore_errors=True)
+
+    logger.info(f"[SHARING] Pushed {num_prompts} prompts to {url}")
+    return url
+
+
+def _push_dataset_streaming(
+    *,
+    repo_id: str,
+    model_name: str,
+    prompts: list[str],
+    kept_indices: list[int],
+    tensor_types: dict[str, Any],
+    labels: list[int | str | None] | None,
+    metadata: list[dict] | None,
+    shard_max_bytes: int,
+    private: bool,
+    exist_ok: bool,
+    description: str | None,
+    license: str,
+    token: str | None,
+    num_workers: int | None,
+    commit_batch_size: int | None,
+    staging_dir: Path,
+) -> str:
+    """Streaming upload: write → upload → delete each shard."""
+    import shutil
+
+    from huggingface_hub import HfApi
+
+    if num_workers is not None:
+        logger.warning(
+            "[SHARING] num_workers is ignored in streaming mode"
+        )
+    if commit_batch_size is not None:
+        logger.warning(
+            "[SHARING] commit_batch_size is ignored in streaming mode"
+        )
+
+    # Load or create manifest for resumability
+    manifest = _load_manifest(staging_dir)
+    resuming = manifest is not None
+    if manifest is None:
+        manifest = _new_manifest(repo_id)
+
+    if resuming:
+        logger.info(
+            "[SHARING] Resuming streaming upload: %d shards already uploaded",
+            len(manifest["completed_shards"]),
+        )
+
+    # Create repo early (need it for upload_file calls)
+    api = HfApi(token=token)
+    api.create_repo(
+        repo_id,
+        exist_ok=True if resuming else exist_ok,
+        private=private,
+        repo_type="dataset",
+    )
+
+    # Build the on_shard_written callback
+    completed_set = set(manifest["completed_shards"])
+
+    def _on_shard_written(local_path: Path, repo_path: str) -> None:
+        if repo_path in completed_set:
+            logger.debug(
+                "[SHARING] Skipping already-uploaded shard: %s", repo_path,
+            )
+            local_path.unlink(missing_ok=True)
+            return
+        logger.info("[SHARING] Uploading shard: %s", repo_path)
+        api.upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo=repo_path,
+            repo_id=repo_id,
+            repo_type="dataset",
+        )
+        local_path.unlink()
+        manifest["completed_shards"].append(repo_path)
+        completed_set.add(repo_path)
+        _save_manifest(staging_dir, manifest)
+
+    # Consolidate with streaming callback
+    logger.info("[SHARING] Consolidating and streaming shards...")
+    tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+        model_name=model_name,
+        prompts=prompts,
+        kept_indices=kept_indices,
+        tensor_types=tensor_types,
+        labels=labels,
+        shard_max_bytes=shard_max_bytes,
+        repo_id=repo_id,
+        metadata=metadata,
+        tmpdir=staging_dir,
+        on_shard_written=_on_shard_written,
+    )
+
+    # Upload metadata files (parquet, info, README)
+    if not manifest.get("metadata_uploaded", False):
+        _write_parquet_index(tmpdir, prompt_metadata)
+
+        num_prompts = len(prompt_metadata)
+        lmprobe_info = _build_lmprobe_info(
+            model_name, num_prompts, tensor_descriptors,
+        )
+        with open(tmpdir / INFO_FILENAME, "w") as f:
+            json.dump(lmprobe_info, f, indent=2)
+
+        readme = _build_readme(
+            model_name=model_name,
+            lmprobe_info=lmprobe_info,
+            num_prompts=num_prompts,
+            repo_id=repo_id,
+            description=description,
+            license=license,
+        )
+        with open(tmpdir / "README.md", "w") as f:
+            f.write(readme)
+
+        for meta_file, repo_path in [
+            (tmpdir / "index" / "train-00000-of-00001.parquet", PARQUET_PATH),
+            (tmpdir / INFO_FILENAME, INFO_FILENAME),
+            (tmpdir / "README.md", "README.md"),
+        ]:
+            logger.info("[SHARING] Uploading %s", repo_path)
+            api.upload_file(
+                path_or_fileobj=str(meta_file),
+                path_in_repo=repo_path,
+                repo_id=repo_id,
+                repo_type="dataset",
+            )
+
+        manifest["metadata_uploaded"] = True
+        _save_manifest(staging_dir, manifest)
+    else:
+        num_prompts = len(prompt_metadata)
+
+    url = f"https://huggingface.co/datasets/{repo_id}"
+
+    # Cleanup
+    shutil.rmtree(staging_dir, ignore_errors=True)
 
     logger.info(f"[SHARING] Pushed {num_prompts} prompts to {url}")
     return url
