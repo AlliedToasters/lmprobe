@@ -414,6 +414,35 @@ class TestS3Integration:
         assert backend.exists(name_key)
         assert backend.read_text(name_key) == "org/my-model"
 
+    def test_selective_tensor_loading_uses_range_reads(self):
+        """Selective loading via range reads works end-to-end on S3 (#146)."""
+        import torch
+
+        from lmprobe.cache import (
+            _load_tensors_from_backend,
+            _prompt_cache_key,
+            save_prompt_activations,
+        )
+
+        model = "test-model"
+        prompt = "selective test"
+        layers = [0, 1, 2]
+        acts = torch.randn(1, 5, 192)  # 3 layers × 64 hidden_dim
+        mask = torch.ones(1, 5, dtype=torch.long)
+
+        save_prompt_activations(model, prompt, layers, acts, mask)
+
+        key = _prompt_cache_key(model, prompt)
+
+        # Load only layer_1 — should NOT download the full file
+        result = _load_tensors_from_backend(key, ["layer_1"])
+        assert set(result.keys()) == {"layer_1"}
+        assert result["layer_1"].shape == (1, 5, 64)
+
+        # Load subset and verify values match full load
+        full = _load_tensors_from_backend(key)
+        assert torch.equal(result["layer_1"], full["layer_1"])
+
     def test_incremental_layer_save(self):
         import torch
 
