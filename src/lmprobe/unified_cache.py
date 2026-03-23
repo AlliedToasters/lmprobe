@@ -6,6 +6,7 @@ both layer activations and logits (for perplexity) in a single nnsight trace.
 
 from __future__ import annotations
 
+import gc
 import logging
 import time
 from dataclasses import dataclass
@@ -46,6 +47,26 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _release_memory() -> None:
+    """Release freed memory back to the OS.
+
+    On Linux, glibc malloc holds freed pages in its arena by default,
+    causing RSS to grow monotonically even after gc.collect(). This
+    calls malloc_trim(0) to return unused pages to the OS, and also
+    clears the CUDA cache if available.
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # Not Linux or libc unavailable
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 @dataclass
@@ -497,9 +518,18 @@ class UnifiedCache:
                             continue
                         raise
 
+                    # Move batch tensors to CPU to free any GPU memory
+                    batch_acts = batch_acts.cpu()
+                    batch_mask = batch_mask.cpu()
+                    batch_logits = batch_logits.cpu() if batch_logits is not None else None
+                    if batch_logits_indices is not None:
+                        batch_logits_indices = batch_logits_indices.cpu()
+
                     # Compute perplexity features from logits
                     ppl_token_ppl_list = None
                     ppl_token_ids_list = None
+                    ppl_features = None
+                    tokenized = None
                     if self.compute_perplexity:
                         # Get input_ids for perplexity computation
                         tokenized = backend.tokenizer(
@@ -514,19 +544,43 @@ class UnifiedCache:
                             return_per_token=True,
                         )
                         ppl_features, ppl_token_ppl_list, ppl_token_ids_list = ppl_result
+                        del ppl_result
+
+                    # Split batch tensors into per-prompt copies so the
+                    # large batch tensor can be freed before saving.
+                    # Slicing creates views that keep the original alive;
+                    # .clone() breaks that reference.
+                    prompt_acts_list = [
+                        batch_acts[j : j + 1].clone()
+                        for j in range(len(batch_prompts))
+                    ]
+                    prompt_mask_list = [
+                        batch_mask[j : j + 1].clone()
+                        for j in range(len(batch_prompts))
+                    ]
+                    prompt_logits_list = (
+                        [batch_logits[j : j + 1].clone()
+                         for j in range(len(batch_prompts))]
+                        if batch_logits is not None else None
+                    )
+                    prompt_logits_idx_list = (
+                        [batch_logits_indices[j : j + 1].clone()
+                         for j in range(len(batch_prompts))]
+                        if batch_logits_indices is not None else None
+                    )
+
+                    # Free batch tensors now — per-prompt copies are independent
+                    del batch_acts, batch_mask, batch_logits, batch_logits_indices
 
                     # Save each prompt's data
                     for j, prompt in enumerate(batch_prompts):
+                        prompt_acts = prompt_acts_list[j]
+                        prompt_mask = prompt_mask_list[j]
+
                         # Save activations if needed
                         if prompt in need_activations_set:
-                            prompt_acts = batch_acts[j : j + 1]
-                            prompt_mask = batch_mask[j : j + 1]
-
                             if self.cache_pooled:
-                                # Pool before saving - ~100x less disk space!
-                                # prompt_acts shape: (1, seq_len, n_layers * hidden_dim)
                                 pooled_acts = self._pooling_fn(prompt_acts, prompt_mask)
-                                # pooled_acts shape: (1, n_layers * hidden_dim)
                                 save_prompt_pooled_activations(
                                     self.model_name,
                                     prompt,
@@ -535,7 +589,6 @@ class UnifiedCache:
                                     self.pooling,
                                 )
                             else:
-                                # Save full sequence (original behavior)
                                 save_prompt_activations(
                                     self.model_name,
                                     prompt,
@@ -564,28 +617,49 @@ class UnifiedCache:
 
                         # Save logits if needed
                         if self.cache_logits and prompt in need_logits_set:
-                            if batch_logits_indices is not None:
-                                # Pre-compressed from server-side top-k:
-                                # save values+indices directly, skip local topk
+                            p_logits = (
+                                prompt_logits_list[j]
+                                if prompt_logits_list is not None else None
+                            )
+                            p_logits_idx = (
+                                prompt_logits_idx_list[j]
+                                if prompt_logits_idx_list is not None else None
+                            )
+                            if p_logits_idx is not None:
                                 save_prompt_topk_logits(
                                     self.model_name,
                                     prompt,
-                                    batch_logits[j : j + 1],
-                                    batch_logits_indices[j : j + 1],
-                                    batch_mask[j : j + 1],
+                                    p_logits,
+                                    p_logits_idx,
+                                    prompt_mask,
                                     self.logit_positions,
                                 )
                             else:
-                                # Full logits: existing path applies local topk
                                 save_prompt_logits(
                                     self.model_name,
                                     prompt,
-                                    batch_logits[j : j + 1],
-                                    batch_mask[j : j + 1],
+                                    p_logits,
+                                    prompt_mask,
                                     self.logit_top_k,
                                     self.logit_positions,
                                 )
                             logits_extracted += 1
+
+                        # Release per-prompt data as we go
+                        prompt_acts_list[j] = None
+                        prompt_mask_list[j] = None
+                        if prompt_logits_list is not None:
+                            prompt_logits_list[j] = None
+                        if prompt_logits_idx_list is not None:
+                            prompt_logits_idx_list[j] = None
+
+                    # Free remaining references and return memory to OS
+                    del prompt_acts_list, prompt_mask_list
+                    del prompt_logits_list, prompt_logits_idx_list
+                    del ppl_features, ppl_token_ppl_list, ppl_token_ids_list
+                    del tokenized
+                    gc.collect()
+                    _release_memory()
 
         if need_unified_list and failed_count > 0:
             logger.warning(
