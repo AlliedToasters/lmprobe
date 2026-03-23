@@ -629,23 +629,101 @@ def _load_tensors_from_backend(
                     result[k] = f.get_tensor(k)
         return result
     else:
-        # Load full bytes for non-local backends
-        from safetensors.torch import load
+        if tensor_keys is not None:
+            # Selective loading via range reads — only download requested tensors
+            return _load_tensors_selective(backend, key, tensor_keys)
+        else:
+            # No filter — download full file
+            from safetensors.torch import load
 
-        data = backend.read_bytes(key)
-        all_tensors = load(data)
-        if tensor_keys is None:
-            return all_tensors
-        result = {}
-        for k in tensor_keys:
-            if k not in all_tensors:
-                raise KeyError(
-                    f"Corrupted or incomplete cache entry {key}: "
-                    f"missing key {k!r}. Available keys: {sorted(all_tensors.keys())}. "
-                    f"Delete this entry and re-run to rebuild the cache."
-                )
-            result[k] = all_tensors[k]
-        return result
+            data = backend.read_bytes(key)
+            return load(data)
+
+
+# Safetensors dtype string → torch dtype mapping
+_SAFETENSORS_DTYPE_MAP = {
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "I8": torch.int8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
+
+def _parse_safetensors_header(
+    backend: CacheBackend, key: str
+) -> tuple[dict, int]:
+    """Parse the safetensors header from a backend entry.
+
+    Returns
+    -------
+    header : dict
+        Parsed JSON header mapping tensor names to metadata
+        (dtype, shape, data_offsets).
+    data_offset : int
+        Byte offset where the tensor data begins (8 + header_size).
+    """
+    import struct
+
+    header_size_bytes = backend.read_range(key, 0, 8)
+    (header_size,) = struct.unpack("<Q", header_size_bytes)
+
+    if header_size > 100_000_000:
+        raise ValueError(
+            f"Safetensors header too large ({header_size} bytes) for {key}. "
+            f"File may be corrupted."
+        )
+
+    header_bytes = backend.read_range(key, 8, 8 + header_size)
+    header = json.loads(header_bytes)
+    return header, 8 + header_size
+
+
+def _load_tensors_selective(
+    backend: CacheBackend,
+    key: str,
+    tensor_keys: list[str],
+) -> dict[str, torch.Tensor]:
+    """Load specific tensors from a remote backend using range reads.
+
+    Instead of downloading the entire safetensors file, this reads only
+    the header (to get byte offsets) and then fetches each requested
+    tensor individually via range reads.
+    """
+    header, data_start = _parse_safetensors_header(backend, key)
+    available = {k for k in header if k != "__metadata__"}
+
+    result = {}
+    for tensor_name in tensor_keys:
+        if tensor_name not in available:
+            raise KeyError(
+                f"Corrupted or incomplete cache entry {key}: "
+                f"missing key {tensor_name!r}. "
+                f"Available keys: {sorted(available)}. "
+                f"Delete this entry and re-run to rebuild the cache."
+            )
+        meta = header[tensor_name]
+        dtype_str = meta["dtype"]
+        shape = meta["shape"]
+        start, end = meta["data_offsets"]
+
+        torch_dtype = _SAFETENSORS_DTYPE_MAP.get(dtype_str)
+        if torch_dtype is None:
+            raise ValueError(
+                f"Unsupported safetensors dtype {dtype_str!r} "
+                f"for tensor {tensor_name!r} in {key}"
+            )
+
+        raw_bytes = backend.read_range(key, data_start + start, data_start + end)
+        tensor = torch.frombuffer(bytearray(raw_bytes), dtype=torch_dtype)
+        result[tensor_name] = tensor.reshape(shape)
+
+    return result
 
 
 def _get_tensor_keys_from_backend(key: str) -> set[str]:
@@ -669,22 +747,7 @@ def _get_tensor_keys_header_only(backend: CacheBackend, key: str) -> set[str]:
     followed by a JSON header that lists all tensor names and metadata.
     This avoids downloading the full file (which can be GBs).
     """
-    import struct
-
-    header_size_bytes = backend.read_range(key, 0, 8)
-    (header_size,) = struct.unpack("<Q", header_size_bytes)
-
-    # Sanity check: header should be < 100 MB
-    if header_size > 100_000_000:
-        from safetensors.torch import load
-
-        data = backend.read_bytes(key)
-        return set(load(data).keys())
-
-    header_bytes = backend.read_range(key, 8, 8 + header_size)
-    header = json.loads(header_bytes)
-    # The header is a dict of tensor_name -> {dtype, shape, data_offsets}
-    # plus an optional "__metadata__" key
+    header, _ = _parse_safetensors_header(backend, key)
     return {k for k in header if k != "__metadata__"}
 
 
