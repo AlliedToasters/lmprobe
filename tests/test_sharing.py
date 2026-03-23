@@ -20,7 +20,6 @@ from lmprobe.cache import (
 )
 from lmprobe.sharing import (
     _STAGE_SENTINEL,
-    _STREAM_MANIFEST,
     FORMAT_VERSION,
     INFO_FILENAME,
     PARQUET_PATH,

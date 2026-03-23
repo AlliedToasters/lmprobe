@@ -37,7 +37,8 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -548,7 +549,7 @@ def _consolidate_and_shard(
     repo_id: str,
     metadata: list[dict] | None = None,
     tmpdir: Path | None = None,
-    on_shard_written: "Callable[[Path, str], None] | None" = None,
+    on_shard_written: Callable[[Path, str], None] | None = None,
 ) -> tuple[Path, dict, list[dict]]:
     """Consolidate cached tensors into sharded safetensors files.
 
