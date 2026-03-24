@@ -4157,7 +4157,6 @@ class TestMigrateDataset:
         assert "huggingface.co" in result
 
         # Verify metadata in parquet schema
-        import pyarrow.parquet as pq
         schema_meta = pq.read_schema(
             str(migrated_dir / PARQUET_PATH)
         ).metadata
