@@ -1,5 +1,6 @@
 """Tests for activation caching (v1 legacy + v2 safetensors)."""
 
+import json
 import os
 
 import pytest
@@ -7,7 +8,9 @@ import torch
 
 from lmprobe.cache import (
     CacheInfo,
+    ManifestEntry,
     _hash_string,
+    _manifest_key,
     _merge_save_backend,
     _prompt_cache_key,
     _prompt_logits_key,
@@ -24,12 +27,14 @@ from lmprobe.cache import (
     is_prompt_logits_cached,
     is_prompt_perplexity_cached,
     is_prompt_pooled_cached,
+    list_cached_prompts,
     load_attention_mask,
     load_layer,
     load_prompt_activations,
     load_prompt_logits,
     load_prompt_perplexity,
     load_prompt_pooled_activations,
+    read_manifest,
     save_attention_mask,
     save_layer,
     save_prompt_activations,
@@ -1568,13 +1573,6 @@ class TestMaskCache:
 # Prompt manifest sidecar (#162)
 # =============================================================================
 
-from lmprobe.cache import (
-    ManifestEntry,
-    _manifest_key,
-    list_cached_prompts,
-    read_manifest,
-)
-
 TEST_MODEL = "stas/tiny-random-llama-2"
 
 
@@ -1746,13 +1744,12 @@ class TestManifestBackwardCompat:
 
     def test_manifest_with_mixed_valid_invalid_lines(self, cache_dir):
         """read_manifest skips invalid lines and keeps valid ones."""
-        import json as _json
         from lmprobe.cache import get_backend
 
         backend = get_backend()
         key = _manifest_key(TEST_MODEL)
 
-        valid_line = _json.dumps({
+        valid_line = json.dumps({
             "hash": "abcdef1234567890",
             "prompt": "valid prompt",
             "num_tokens": 5,
