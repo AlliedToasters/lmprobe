@@ -742,10 +742,10 @@ class TestPushDatasetStreaming:
     @patch("lmprobe.sharing._check_hub_deps")
     @patch("lmprobe.sharing._check_pyarrow")
     @patch("huggingface_hub.HfApi")
-    def test_stream_uploads_individual_files(
+    def test_stream_uses_create_commit(
         self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
     ):
-        """stream=True uses upload_file per shard, not upload_large_folder."""
+        """stream=True uses create_commit, not upload_large_folder."""
         mock_api = MagicMock()
         MockHfApi.return_value = mock_api
 
@@ -761,7 +761,8 @@ class TestPushDatasetStreaming:
         assert "user/stream-test" in url
         mock_api.create_repo.assert_called_once()
         mock_api.upload_large_folder.assert_not_called()
-        assert mock_api.upload_file.call_count > 0
+        mock_api.upload_file.assert_not_called()
+        assert mock_api.create_commit.call_count > 0
 
     @requires_pyarrow
     @patch("lmprobe.sharing._check_hub_deps")
@@ -776,10 +777,11 @@ class TestPushDatasetStreaming:
 
         uploaded_paths = []
 
-        def capture_upload_file(*, path_or_fileobj, path_in_repo, **kwargs):
-            uploaded_paths.append(path_in_repo)
+        def capture_commit(*, repo_id, operations, **kwargs):
+            for op in operations:
+                uploaded_paths.append(op.path_in_repo)
 
-        mock_api.upload_file.side_effect = capture_upload_file
+        mock_api.create_commit.side_effect = capture_commit
 
         push_dataset(
             repo_id="user/stream-paths",
@@ -812,17 +814,18 @@ class TestPushDatasetStreaming:
 
         call_count = 0
 
-        def fail_after_first(*, path_or_fileobj, path_in_repo, **kwargs):
+        def fail_on_second_commit(*, repo_id, operations, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count > 1:
                 raise ConnectionError("simulated network failure")
 
-        mock_api.upload_file.side_effect = fail_after_first
+        mock_api.create_commit.side_effect = fail_on_second_commit
 
+        # Use stream_batch_size=1 so each shard gets its own commit
         staging_dir = _staging_dir_path(
             "user/manifest-test", TEST_MODEL, populated_cache,
-            labels=[1, 1, 0], stream=True,
+            labels=[1, 1, 0], stream=True, stream_batch_size=1,
         )
 
         with pytest.raises(ConnectionError):
@@ -833,6 +836,7 @@ class TestPushDatasetStreaming:
                 labels=[1, 1, 0],
                 exist_ok=True,
                 stream=True,
+                stream_batch_size=1,
             )
 
         # Manifest should exist with at least one completed shard
@@ -854,7 +858,7 @@ class TestPushDatasetStreaming:
 
         staging_dir = _staging_dir_path(
             "user/resume-test", TEST_MODEL, populated_cache,
-            labels=[1, 1, 0], stream=True,
+            labels=[1, 1, 0], stream=True, stream_batch_size=10,
         )
 
         # Pre-populate manifest with shard paths (simulating partial completion)
@@ -869,12 +873,13 @@ class TestPushDatasetStreaming:
         manifest["completed_shards"] = shard_paths
         _save_manifest(staging_dir, manifest)
 
-        resume_paths = []
+        commit_paths = []
 
-        def capture_resume(*, path_or_fileobj, path_in_repo, **kwargs):
-            resume_paths.append(path_in_repo)
+        def capture_commit(*, repo_id, operations, **kwargs):
+            for op in operations:
+                commit_paths.append(op.path_in_repo)
 
-        mock_api.upload_file.side_effect = capture_resume
+        mock_api.create_commit.side_effect = capture_commit
 
         push_dataset(
             repo_id="user/resume-test",
@@ -886,14 +891,14 @@ class TestPushDatasetStreaming:
         )
 
         # Only metadata files should be uploaded (not tensor shards)
-        for path in resume_paths:
+        for path in commit_paths:
             assert not path.startswith("tensors/"), (
                 f"Shard {path} should have been skipped on resume"
             )
         # Should have uploaded metadata files only
-        assert INFO_FILENAME in resume_paths
-        assert PARQUET_PATH in resume_paths
-        assert "README.md" in resume_paths
+        assert INFO_FILENAME in commit_paths
+        assert PARQUET_PATH in commit_paths
+        assert "README.md" in commit_paths
 
     @requires_pyarrow
     @patch("lmprobe.sharing._check_hub_deps")
@@ -908,7 +913,7 @@ class TestPushDatasetStreaming:
 
         staging_dir = _staging_dir_path(
             "user/cleanup-stream", TEST_MODEL, populated_cache,
-            stream=True,
+            stream=True, stream_batch_size=10,
         )
 
         push_dataset(
@@ -935,10 +940,11 @@ class TestPushDatasetStreaming:
         prompts, seq_lens, layers, _ = populated_raw_cache
         uploaded_paths = []
 
-        def capture(*, path_or_fileobj, path_in_repo, **kwargs):
-            uploaded_paths.append(path_in_repo)
+        def capture_commit(*, repo_id, operations, **kwargs):
+            for op in operations:
+                uploaded_paths.append(op.path_in_repo)
 
-        mock_api.upload_file.side_effect = capture
+        mock_api.create_commit.side_effect = capture_commit
 
         push_dataset(
             repo_id="user/stream-raw",
@@ -999,7 +1005,131 @@ class TestPushDatasetStreaming:
         )
 
         mock_api.upload_large_folder.assert_called_once()
-        mock_api.upload_file.assert_not_called()
+        mock_api.create_commit.assert_not_called()
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_stream_retries_pending_batch_on_resume(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """Resume retries a pending batch from a prior failed create_commit."""
+        from safetensors.torch import save_file
+
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        staging_dir = _staging_dir_path(
+            "user/retry-batch", TEST_MODEL, populated_cache,
+            labels=[1, 1, 0], stream=True, stream_batch_size=10,
+        )
+
+        # Simulate a prior failed run: manifest has a pending_batch
+        # with local files that still exist on disk.
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        (staging_dir / "tensors").mkdir(parents=True, exist_ok=True)
+        (staging_dir / "index").mkdir(parents=True, exist_ok=True)
+
+        shard_file = staging_dir / "tensors" / "hidden_layer000_shard000.safetensors"
+        save_file(
+            {"hidden.layer_0": torch.randn(3, HIDDEN_DIM)},
+            str(shard_file),
+        )
+
+        manifest = _new_manifest("user/retry-batch")
+        manifest["pending_batch"] = [
+            [str(shard_file), "tensors/hidden_layer000_shard000.safetensors"],
+        ]
+        _save_manifest(staging_dir, manifest)
+
+        commit_messages = []
+
+        def track_commits(*, repo_id, operations, commit_message="", **kw):
+            commit_messages.append(commit_message)
+
+        mock_api.create_commit.side_effect = track_commits
+
+        push_dataset(
+            repo_id="user/retry-batch",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+            stream=True,
+        )
+
+        # First commit should be the retry of the pending batch
+        assert any("retry" in m.lower() for m in commit_messages), (
+            f"Expected a retry commit, got: {commit_messages}"
+        )
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_stream_batch_size_controls_commit_grouping(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """stream_batch_size=1 produces one commit per shard."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        shard_commit_count = 0
+
+        def count_commits(*, repo_id, operations, commit_message="", **kw):
+            nonlocal shard_commit_count
+            if "shard" in commit_message.lower():
+                shard_commit_count += 1
+
+        mock_api.create_commit.side_effect = count_commits
+
+        push_dataset(
+            repo_id="user/batch1",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+            stream=True,
+            stream_batch_size=1,
+        )
+
+        # With batch_size=1, each shard gets its own commit.
+        # 2 layers × 1 shard each = 2 shard commits
+        assert shard_commit_count >= 2
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_stream_large_batch_fewer_commits(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """Large batch_size groups all shards into fewer commits."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        shard_commits = []
+
+        def track_commits(*, repo_id, operations, commit_message="", **kw):
+            if "shard" in commit_message.lower():
+                shard_commits.append(len(operations))
+
+        mock_api.create_commit.side_effect = track_commits
+
+        push_dataset(
+            repo_id="user/batch-large",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+            stream=True,
+            stream_batch_size=100,  # larger than total shards
+        )
+
+        # All shards fit in one batch → single shard commit
+        assert len(shard_commits) == 1
+        assert shard_commits[0] >= 2  # at least 2 shards in the batch
 
 
 class TestLoadActivationDataset:

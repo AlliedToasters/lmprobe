@@ -118,6 +118,7 @@ def _staging_dir_path(
     metadata: list[dict] | None = None,
     tensors: list[str] | None = None,
     stream: bool = False,
+    stream_batch_size: int | None = None,
 ) -> Path:
     """Deterministic staging directory for resumable uploads.
 
@@ -136,6 +137,8 @@ def _staging_dir_path(
         key_parts.append(["tensors", sorted(tensors)])
     if stream:
         key_parts.append(["stream", True])
+    if stream_batch_size is not None:
+        key_parts.append(["stream_batch_size", stream_batch_size])
     content = json.dumps(key_parts, sort_keys=True)
     key = hashlib.sha256(content.encode()).hexdigest()[:16]
     return get_cache_dir() / "staging" / key
@@ -1297,6 +1300,7 @@ def push_dataset(
     num_workers: int | None = None,
     commit_batch_size: int | None = None,
     stream: bool = False,
+    stream_batch_size: int = 10,
 ) -> str:
     """Push cached activations to a HuggingFace Dataset repo.
 
@@ -1344,10 +1348,15 @@ def push_dataset(
         ``huggingface_hub`` default scale.
         Ignored when ``stream=True``.
     stream : bool
-        If True, upload each shard immediately after writing it, then
-        delete the local copy.  This reduces peak disk usage from the
-        full dataset size to a single shard (~1 GB).  Resumable via a
-        shard completion manifest.  Default False.
+        If True, upload shards in batches after writing them, then
+        delete local copies.  This reduces peak disk usage from the
+        full dataset size to ``stream_batch_size`` shards (~N GB).
+        Resumable via a shard completion manifest.  Default False.
+    stream_batch_size : int
+        Number of shards to buffer before uploading as a single commit
+        in streaming mode.  Higher values improve throughput (fewer
+        commits, parallel LFS uploads) at the cost of more peak disk.
+        Default 10.  Ignored when ``stream=False``.
 
     Returns
     -------
@@ -1416,6 +1425,7 @@ def push_dataset(
         shard_max_bytes=shard_max_bytes, labels=labels,
         metadata=metadata, tensors=tensors,
         stream=stream,
+        stream_batch_size=stream_batch_size if stream else None,
     )
 
     if stream:
@@ -1436,6 +1446,7 @@ def push_dataset(
             num_workers=num_workers,
             commit_batch_size=commit_batch_size,
             staging_dir=staging_dir,
+            stream_batch_size=stream_batch_size,
         )
 
     # --- Non-streaming path (unchanged) ---
@@ -1565,11 +1576,12 @@ def _push_dataset_streaming(
     num_workers: int | None,
     commit_batch_size: int | None,
     staging_dir: Path,
+    stream_batch_size: int = 10,
 ) -> str:
-    """Streaming upload: write → upload → delete each shard."""
+    """Streaming upload: write shards, batch-upload via create_commit."""
     import shutil
 
-    from huggingface_hub import HfApi
+    from huggingface_hub import CommitOperationAdd, HfApi
 
     if num_workers is not None:
         logger.warning(
@@ -1592,7 +1604,7 @@ def _push_dataset_streaming(
             len(manifest["completed_shards"]),
         )
 
-    # Create repo early (need it for upload_file calls)
+    # Create repo early (need it for create_commit calls)
     api = HfApi(token=token)
     api.create_repo(
         repo_id,
@@ -1601,8 +1613,86 @@ def _push_dataset_streaming(
         repo_type="dataset",
     )
 
-    # Build the on_shard_written callback
+    # Retry any pending batch from a prior failed create_commit.
+    # These files are already consolidated locally — skip re-reading from S3.
+    prior_batch = manifest.get("pending_batch", [])
+    if prior_batch:
+        local_files_exist = all(Path(lp).exists() for lp, _ in prior_batch)
+        if local_files_exist:
+            logger.info(
+                "[SHARING] Retrying pending batch of %d shards from "
+                "prior run", len(prior_batch),
+            )
+            operations = [
+                CommitOperationAdd(
+                    path_in_repo=rp,
+                    path_or_fileobj=lp,
+                )
+                for lp, rp in prior_batch
+            ]
+            api.create_commit(
+                repo_id=repo_id,
+                operations=operations,
+                commit_message=f"Add {len(prior_batch)} shards (retry)",
+                repo_type="dataset",
+            )
+            for lp, rp in prior_batch:
+                Path(lp).unlink(missing_ok=True)
+                manifest["completed_shards"].append(rp)
+            manifest.pop("pending_batch", None)
+            _save_manifest(staging_dir, manifest)
+        else:
+            # Files gone — clear pending_batch; re-consolidation will handle
+            logger.debug(
+                "[SHARING] Pending batch files missing, will re-consolidate"
+            )
+            manifest.pop("pending_batch", None)
+            _save_manifest(staging_dir, manifest)
+
+    # Build the batched on_shard_written callback
     completed_set = set(manifest["completed_shards"])
+    pending_shards: list[tuple[Path, str]] = []
+
+    def _flush_batch() -> None:
+        """Upload buffered shards as a single commit, then cleanup."""
+        if not pending_shards:
+            return
+        paths_in_batch = [rp for _, rp in pending_shards]
+        logger.info(
+            "[SHARING] Uploading batch of %d shards: %s",
+            len(pending_shards),
+            ", ".join(paths_in_batch),
+        )
+        # Save pending paths to manifest before commit so resume can
+        # find them if create_commit fails (avoids re-consolidation).
+        manifest["pending_batch"] = [
+            [str(lp), rp] for lp, rp in pending_shards
+        ]
+        _save_manifest(staging_dir, manifest)
+
+        operations = [
+            CommitOperationAdd(
+                path_in_repo=repo_path,
+                path_or_fileobj=str(local_path),
+            )
+            for local_path, repo_path in pending_shards
+        ]
+        api.create_commit(
+            repo_id=repo_id,
+            operations=operations,
+            commit_message=(
+                f"Add {len(pending_shards)} shards"
+            ),
+            repo_type="dataset",
+        )
+        # Delete local copies and update manifest
+        for local_path, repo_path in pending_shards:
+            local_path.unlink(missing_ok=True)
+            manifest["completed_shards"].append(repo_path)
+            completed_set.add(repo_path)
+        manifest.pop("pending_batch", None)
+        _save_manifest(staging_dir, manifest)
+        pending_shards.clear()
 
     def _on_shard_written(local_path: Path, repo_path: str) -> None:
         if repo_path in completed_set:
@@ -1611,20 +1701,15 @@ def _push_dataset_streaming(
             )
             local_path.unlink(missing_ok=True)
             return
-        logger.info("[SHARING] Uploading shard: %s", repo_path)
-        api.upload_file(
-            path_or_fileobj=str(local_path),
-            path_in_repo=repo_path,
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
-        local_path.unlink()
-        manifest["completed_shards"].append(repo_path)
-        completed_set.add(repo_path)
-        _save_manifest(staging_dir, manifest)
+        pending_shards.append((local_path, repo_path))
+        if len(pending_shards) >= stream_batch_size:
+            _flush_batch()
 
     # Consolidate with streaming callback
-    logger.info("[SHARING] Consolidating and streaming shards...")
+    logger.info(
+        "[SHARING] Consolidating and streaming shards "
+        "(batch_size=%d)...", stream_batch_size,
+    )
     tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
         model_name=model_name,
         prompts=prompts,
@@ -1637,6 +1722,9 @@ def _push_dataset_streaming(
         tmpdir=staging_dir,
         on_shard_written=_on_shard_written,
     )
+
+    # Flush any remaining buffered shards
+    _flush_batch()
 
     # Upload metadata files (parquet, info, README)
     if not manifest.get("metadata_uploaded", False):
@@ -1660,18 +1748,25 @@ def _push_dataset_streaming(
         with open(tmpdir / "README.md", "w") as f:
             f.write(readme)
 
-        for meta_file, repo_path in [
-            (tmpdir / "index" / "train-00000-of-00001.parquet", PARQUET_PATH),
-            (tmpdir / INFO_FILENAME, INFO_FILENAME),
-            (tmpdir / "README.md", "README.md"),
-        ]:
-            logger.info("[SHARING] Uploading %s", repo_path)
-            api.upload_file(
-                path_or_fileobj=str(meta_file),
+        meta_operations = [
+            CommitOperationAdd(
                 path_in_repo=repo_path,
-                repo_id=repo_id,
-                repo_type="dataset",
+                path_or_fileobj=str(meta_file),
             )
+            for meta_file, repo_path in [
+                (tmpdir / "index" / "train-00000-of-00001.parquet",
+                 PARQUET_PATH),
+                (tmpdir / INFO_FILENAME, INFO_FILENAME),
+                (tmpdir / "README.md", "README.md"),
+            ]
+        ]
+        logger.info("[SHARING] Uploading metadata files")
+        api.create_commit(
+            repo_id=repo_id,
+            operations=meta_operations,
+            commit_message="Add dataset metadata",
+            repo_type="dataset",
+        )
 
         manifest["metadata_uploaded"] = True
         _save_manifest(staging_dir, manifest)
