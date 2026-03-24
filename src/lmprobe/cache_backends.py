@@ -354,6 +354,8 @@ class S3CacheBackend(CacheBackend):
                 # Skip metadata files
                 if rel_key.endswith("/_model_name.txt"):
                     continue
+                if rel_key.endswith("/_manifest.jsonl"):
+                    continue
                 entries.append((
                     rel_key,
                     obj["Size"],

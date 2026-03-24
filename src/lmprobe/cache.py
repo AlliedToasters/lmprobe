@@ -2676,12 +2676,13 @@ def _cache_info_backend(backend: CacheBackend, model: str | None = None) -> Cach
         for entry_key, size, mtime in m_entries:
             model_size += size
 
-            # Sidecar files don't count as separate prompts (#120)
+            # Only .safetensors files count; skip sidecars and metadata
             is_sidecar = (
                 entry_key.endswith(".logits.safetensors")
                 or entry_key.endswith(".perplexity.safetensors")
             )
-            if not is_sidecar:
+            is_metadata = entry_key.endswith("/_manifest.jsonl")
+            if not is_sidecar and not is_metadata and entry_key.endswith(".safetensors"):
                 num_prompts += 1
 
             if oldest_mtime is None or mtime < oldest_mtime:
