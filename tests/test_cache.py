@@ -1,5 +1,6 @@
 """Tests for activation caching (v1 legacy + v2 safetensors)."""
 
+import json
 import os
 
 import pytest
@@ -7,7 +8,9 @@ import torch
 
 from lmprobe.cache import (
     CacheInfo,
+    ManifestEntry,
     _hash_string,
+    _manifest_key,
     _merge_save_backend,
     _prompt_cache_key,
     _prompt_logits_key,
@@ -24,12 +27,14 @@ from lmprobe.cache import (
     is_prompt_logits_cached,
     is_prompt_perplexity_cached,
     is_prompt_pooled_cached,
+    list_cached_prompts,
     load_attention_mask,
     load_layer,
     load_prompt_activations,
     load_prompt_logits,
     load_prompt_perplexity,
     load_prompt_pooled_activations,
+    read_manifest,
     save_attention_mask,
     save_layer,
     save_prompt_activations,
@@ -1562,3 +1567,226 @@ class TestMaskCache:
         _clear_selective_caches()
         assert len(_header_cache) == 0
         assert len(_mask_cache) == 0
+
+
+# =============================================================================
+# Prompt manifest sidecar (#162)
+# =============================================================================
+
+TEST_MODEL = "stas/tiny-random-llama-2"
+
+
+class TestPromptManifest:
+    """Tests for the _manifest.jsonl sidecar file."""
+
+    @pytest.fixture(autouse=True)
+    def cache_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        return tmp_path
+
+    def test_manifest_created_on_save(self):
+        """save_prompt_activations appends a manifest entry."""
+        prompt = "Hello world"
+        acts = torch.randn(1, 5, 32)
+        mask = torch.ones(1, 5)
+        save_prompt_activations(TEST_MODEL, prompt, [0], acts, mask)
+
+        entries = read_manifest(TEST_MODEL)
+        assert len(entries) == 1
+        assert entries[0].prompt == prompt
+        assert entries[0].num_tokens == 5
+        assert entries[0].hash == _hash_string(prompt)
+        assert entries[0].cached_at != ""
+
+    def test_manifest_accumulates(self):
+        """Multiple saves append multiple entries."""
+        prompts = ["prompt one", "prompt two", "prompt three"]
+        for p in prompts:
+            acts = torch.randn(1, 3, 32)
+            mask = torch.ones(1, 3)
+            save_prompt_activations(TEST_MODEL, p, [0], acts, mask)
+
+        entries = read_manifest(TEST_MODEL)
+        assert len(entries) == 3
+        assert [e.prompt for e in entries] == prompts
+
+    def test_manifest_duplicate_entries_deduplicated_by_list(self):
+        """Re-saving the same prompt creates duplicate raw entries but
+        list_cached_prompts deduplicates them."""
+        prompt = "duplicate me"
+        for _ in range(3):
+            acts = torch.randn(1, 4, 32)
+            mask = torch.ones(1, 4)
+            save_prompt_activations(TEST_MODEL, prompt, [0], acts, mask)
+
+        raw = read_manifest(TEST_MODEL)
+        assert len(raw) == 3  # Raw has all entries
+
+        deduped = list_cached_prompts(TEST_MODEL)
+        assert len(deduped) == 1
+        assert deduped[0].prompt == prompt
+
+    def test_manifest_empty_when_no_saves(self):
+        """read_manifest returns empty list for unknown model."""
+        entries = read_manifest("nonexistent/model")
+        assert entries == []
+
+    def test_list_cached_prompts_verify(self, cache_dir):
+        """verify=True filters out stale entries."""
+        prompt = "will be deleted"
+        acts = torch.randn(1, 3, 32)
+        mask = torch.ones(1, 3)
+        save_prompt_activations(TEST_MODEL, prompt, [0], acts, mask)
+
+        # Confirm entry exists
+        assert len(list_cached_prompts(TEST_MODEL, verify=True)) == 1
+
+        # Delete the safetensors file directly
+        model_hash = _hash_string(TEST_MODEL)
+        prompt_hash = _hash_string(prompt)
+        sf_path = cache_dir / model_hash / f"{prompt_hash}.safetensors"
+        sf_path.unlink()
+
+        # Without verify, entry still shows
+        assert len(list_cached_prompts(TEST_MODEL, verify=False)) == 1
+        # With verify, entry is filtered out
+        assert len(list_cached_prompts(TEST_MODEL, verify=True)) == 0
+
+    def test_manifest_num_tokens_with_padding(self):
+        """num_tokens reflects actual tokens (not padding)."""
+        prompt = "padded prompt"
+        acts = torch.randn(1, 8, 32)
+        mask = torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0]])  # 5 real tokens
+        save_prompt_activations(TEST_MODEL, prompt, [0], acts, mask)
+
+        entries = read_manifest(TEST_MODEL)
+        assert entries[0].num_tokens == 5
+
+    def test_manifest_isolated_per_model(self):
+        """Each model has its own manifest."""
+        acts = torch.randn(1, 3, 32)
+        mask = torch.ones(1, 3)
+        save_prompt_activations("model-a", "prompt a", [0], acts, mask)
+        save_prompt_activations("model-b", "prompt b", [0], acts, mask)
+
+        entries_a = read_manifest("model-a")
+        entries_b = read_manifest("model-b")
+        assert len(entries_a) == 1
+        assert len(entries_b) == 1
+        assert entries_a[0].prompt == "prompt a"
+        assert entries_b[0].prompt == "prompt b"
+
+    def test_manifest_entry_is_dataclass(self):
+        """ManifestEntry fields are accessible."""
+        acts = torch.randn(1, 3, 32)
+        mask = torch.ones(1, 3)
+        save_prompt_activations(TEST_MODEL, "test", [0], acts, mask)
+
+        entry = read_manifest(TEST_MODEL)[0]
+        assert isinstance(entry, ManifestEntry)
+        assert hasattr(entry, "hash")
+        assert hasattr(entry, "prompt")
+        assert hasattr(entry, "num_tokens")
+        assert hasattr(entry, "cached_at")
+
+
+class TestManifestBackwardCompat:
+    """Backward compatibility: pre-feature caches have no _manifest.jsonl."""
+
+    @pytest.fixture(autouse=True)
+    def cache_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        return tmp_path
+
+    def test_pre_feature_cache_has_no_manifest(self, cache_dir):
+        """Simulate a pre-feature cache by writing a safetensors file
+        without going through save_prompt_activations's manifest hook."""
+        from lmprobe.cache import _merge_save_backend, _prepare_tensor, _register_model
+
+        model_hash = _hash_string(TEST_MODEL)
+        prompt_hash = _hash_string("old prompt")
+        key = f"{model_hash}/{prompt_hash}.safetensors"
+
+        # Write model name but NOT through save_prompt_activations
+        _register_model(TEST_MODEL)
+
+        # Write activation file directly (simulating old lmprobe version)
+        tensors = {"layer_0": _prepare_tensor(torch.randn(1, 5, 32))}
+        _merge_save_backend(key, tensors)
+
+        # Manifest should be empty (not error)
+        entries = read_manifest(TEST_MODEL)
+        assert entries == []
+
+        # list_cached_prompts should also be empty
+        assert list_cached_prompts(TEST_MODEL) == []
+
+        # discover_cached should still work (it doesn't depend on manifest)
+        from lmprobe.cache import discover_cached
+
+        info = discover_cached(TEST_MODEL, "old prompt")
+        assert info is not None
+        assert 0 in info.raw_layers
+
+    def test_manifest_corruption_handled_gracefully(self, cache_dir):
+        """Corrupt _manifest.jsonl doesn't crash read_manifest."""
+        from lmprobe.cache import get_backend
+
+        backend = get_backend()
+        key = _manifest_key(TEST_MODEL)
+
+        # Write garbage
+        backend.write_text(key, "not valid json\n{\"hash\": \"abc\"}\n")
+
+        # Should skip bad lines, skip incomplete entries
+        entries = read_manifest(TEST_MODEL)
+        assert entries == []  # Both lines are invalid (missing required fields or bad JSON)
+
+    def test_manifest_with_mixed_valid_invalid_lines(self, cache_dir):
+        """read_manifest skips invalid lines and keeps valid ones."""
+        from lmprobe.cache import get_backend
+
+        backend = get_backend()
+        key = _manifest_key(TEST_MODEL)
+
+        valid_line = json.dumps({
+            "hash": "abcdef1234567890",
+            "prompt": "valid prompt",
+            "num_tokens": 5,
+            "cached_at": "2026-03-24T12:00:00+00:00",
+        })
+        content = f"corrupt line\n{valid_line}\nalso bad\n"
+        backend.write_text(key, content)
+
+        entries = read_manifest(TEST_MODEL)
+        assert len(entries) == 1
+        assert entries[0].prompt == "valid prompt"
+
+    def test_save_still_works_if_manifest_write_fails(self, cache_dir, monkeypatch):
+        """Even if manifest write fails, the activation cache write succeeds."""
+        from lmprobe.cache import get_backend
+
+        backend = get_backend()
+        orig_write_text = backend.write_text
+        manifest_key = _manifest_key(TEST_MODEL)
+
+        def broken_write_text(key, text):
+            if key == manifest_key:
+                raise OSError("Simulated disk error")
+            return orig_write_text(key, text)
+
+        monkeypatch.setattr(backend, "write_text", broken_write_text)
+
+        prompt = "should still cache"
+        acts = torch.randn(1, 3, 32)
+        mask = torch.ones(1, 3)
+
+        # This should NOT raise even though manifest append fails
+        save_prompt_activations(TEST_MODEL, prompt, [0], acts, mask)
+
+        # The activation file should still exist
+        from lmprobe.cache import discover_cached
+
+        info = discover_cached(TEST_MODEL, prompt)
+        assert info is not None
+        assert 0 in info.raw_layers

@@ -40,6 +40,7 @@ __all__ = [
     "DatasetMetadata",
     "LayerSweepResult",
     "LinearProbe",
+    "ManifestEntry",
     "Probe",
     "ProbeEnsemble",
     "load_layer_across_prompts",
@@ -53,6 +54,7 @@ __all__ = [
     "clear_model_cache",
     "discover_cached",
     "enable_cache_logging",
+    "list_cached_prompts",
     "fetch_dataset_metadata",
     "load_activation_dataset",
     "plot_layer_importance",
@@ -151,12 +153,19 @@ def __getattr__(name: str):
             "load_layer_across_prompts": load_layer_across_prompts,
             "load_layer_last_token": load_layer_last_token,
         }[name]
-    if name in ("CachedPromptInfo", "discover_cached"):
-        from .cache import CachedPromptInfo, discover_cached
+    if name in ("CachedPromptInfo", "discover_cached", "ManifestEntry", "list_cached_prompts"):
+        from .cache import (
+            CachedPromptInfo,
+            ManifestEntry,
+            discover_cached,
+            list_cached_prompts,
+        )
 
         return {
             "CachedPromptInfo": CachedPromptInfo,
+            "ManifestEntry": ManifestEntry,
             "discover_cached": discover_cached,
+            "list_cached_prompts": list_cached_prompts,
         }[name]
     if name in (
         "push_dataset", "pull_dataset", "load_activation_dataset",
