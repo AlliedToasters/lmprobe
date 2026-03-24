@@ -3858,3 +3858,361 @@ class TestLastTokenShardSplitting:
             assert (tmpdir / f).exists(), f"Expected shard file {f} not found"
 
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# =============================================================================
+# Migration tests
+# =============================================================================
+
+
+@requires_pyarrow
+class TestMigrateDataset:
+    """Tests for migrate_dataset: converting old full_sequence datasets
+    to use last-token shard splitting."""
+
+    @staticmethod
+    def _build_old_format_dataset(dest: Path) -> dict:
+        """Create an old-format full_sequence dataset without lt splitting."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from safetensors.torch import save_file
+
+        prompts = ["alpha", "beta", "gamma"]
+        seq_lens = [3, 5, 4]
+        layers_list = [0, 1]
+        n_prompts = len(prompts)
+
+        (dest / "tensors").mkdir(parents=True, exist_ok=True)
+        (dest / "index").mkdir(parents=True, exist_ok=True)
+
+        gen = torch.Generator().manual_seed(42)
+        original_tensors: dict[str, dict[int, torch.Tensor]] = {}
+        for prompt, sl in zip(prompts, seq_lens):
+            original_tensors[prompt] = {}
+            for layer in layers_list:
+                original_tensors[prompt][layer] = torch.randn(
+                    sl, HIDDEN_DIM, generator=gen,
+                )
+
+        for layer in layers_list:
+            rows = [original_tensors[p][layer] for p in prompts]
+            tensor = torch.cat(rows, dim=0)
+            key = f"hidden.layer_{layer}"
+            fname = (
+                f"tensors/hidden_layer{layer:03d}"
+                f"_shard000.safetensors"
+            )
+            save_file({key: tensor}, str(dest / fname))
+
+        tok_offset = 0
+        token_offsets = []
+        for sl in seq_lens:
+            token_offsets.append(tok_offset)
+            tok_offset += sl
+
+        columns = {
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([0, 1, 0], type=pa.int32()),
+            "num_tokens": pa.array(seq_lens, type=pa.int32()),
+            "shard_index": pa.array(
+                [0] * n_prompts, type=pa.int32(),
+            ),
+            "row_offset": pa.array(
+                list(range(n_prompts)), type=pa.int32(),
+            ),
+            "shard_index_hidden": pa.array(
+                [0] * n_prompts, type=pa.int32(),
+            ),
+            "row_offset_hidden": pa.array(
+                list(range(n_prompts)), type=pa.int32(),
+            ),
+            "token_offset_hidden": pa.array(
+                token_offsets, type=pa.int64(),
+            ),
+            "token_offset": pa.array(
+                token_offsets, type=pa.int64(),
+            ),
+        }
+        table = pa.table(columns)
+        pq.write_table(table, str(dest / PARQUET_PATH))
+
+        total_tokens = sum(seq_lens)
+        lmprobe_info = {
+            "format_version": FORMAT_VERSION,
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": n_prompts,
+            "prompt_ordering": "random",
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": layers_list,
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "layout": "per_layer",
+                    "storage": "full_sequence",
+                    "shards": [{
+                        "num_prompts": n_prompts,
+                        "num_tokens": total_tokens,
+                    }],
+                },
+            },
+            "provenance": {
+                "lmprobe_version": "0.8.0",
+                "created_at": "2024-01-01T00:00:00+00:00",
+            },
+        }
+        with open(dest / INFO_FILENAME, "w") as f:
+            json.dump(lmprobe_info, f, indent=2)
+
+        return {
+            "prompts": prompts,
+            "seq_lens": seq_lens,
+            "layers": layers_list,
+            "original_tensors": original_tensors,
+        }
+
+    def test_migrate_rejects_non_full_sequence(self, tmp_path):
+        """migrate_dataset raises on pooled datasets."""
+        from lmprobe.sharing import migrate_dataset
+
+        old_dir = tmp_path / "old"
+        old_dir.mkdir()
+        (old_dir / "index").mkdir(parents=True)
+
+        info = {
+            "format_version": FORMAT_VERSION,
+            "model": {"name": TEST_MODEL},
+            "num_prompts": 1,
+            "tensors": {
+                "hidden_layers": {
+                    "storage": "pooled",
+                    "layers": [0],
+                    "dim": HIDDEN_DIM,
+                    "shards": [],
+                },
+            },
+        }
+        with open(old_dir / INFO_FILENAME, "w") as f:
+            json.dump(info, f)
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = pa.table({
+            "text": ["a"], "label": [0], "num_tokens": [1],
+            "shard_index": [0], "row_offset": [0],
+        })
+        pq.write_table(table, str(old_dir / PARQUET_PATH))
+
+        def mock_dl(repo_id, filename, **kwargs):
+            return str(old_dir / filename)
+
+        with (
+            patch("lmprobe.sharing._check_hub_deps"),
+            patch("lmprobe.sharing._check_pyarrow"),
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=mock_dl,
+            ),
+        ):
+            with pytest.raises(ValueError, match="not full_sequence"):
+                migrate_dataset("user/pooled-ds")
+
+    def test_migrate_rejects_already_migrated(self, tmp_path):
+        """migrate_dataset raises on already-migrated datasets."""
+        from lmprobe.sharing import migrate_dataset
+
+        old_dir = tmp_path / "old"
+        old_dir.mkdir()
+        (old_dir / "index").mkdir(parents=True)
+
+        info = {
+            "format_version": FORMAT_VERSION,
+            "model": {"name": TEST_MODEL},
+            "num_prompts": 1,
+            "tensors": {
+                "hidden_layers": {
+                    "storage": "full_sequence",
+                    "last_token_shards": 1,
+                    "layers": [0],
+                    "dim": HIDDEN_DIM,
+                    "shards": [],
+                },
+            },
+        }
+        with open(old_dir / INFO_FILENAME, "w") as f:
+            json.dump(info, f)
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = pa.table({
+            "text": ["a"], "label": [0], "num_tokens": [1],
+            "shard_index": [0], "row_offset": [0],
+        })
+        pq.write_table(table, str(old_dir / PARQUET_PATH))
+
+        def mock_dl(repo_id, filename, **kwargs):
+            return str(old_dir / filename)
+
+        with (
+            patch("lmprobe.sharing._check_hub_deps"),
+            patch("lmprobe.sharing._check_pyarrow"),
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=mock_dl,
+            ),
+        ):
+            with pytest.raises(ValueError, match="already has"):
+                migrate_dataset("user/already-migrated")
+
+    def test_migrate_dry_run(self, tmp_path):
+        """dry_run computes plan without uploading."""
+        from lmprobe.sharing import migrate_dataset
+
+        old_dir = tmp_path / "old"
+        old_dir.mkdir()
+        self._build_old_format_dataset(old_dir)
+
+        def mock_dl(repo_id, filename, **kwargs):
+            return str(old_dir / filename)
+
+        with (
+            patch("lmprobe.sharing._check_hub_deps"),
+            patch("lmprobe.sharing._check_pyarrow"),
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=mock_dl,
+            ),
+        ):
+            result = migrate_dataset("user/test-ds", dry_run=True)
+
+        assert "[DRY RUN]" in result
+        assert "3 prompts" in result
+        assert "2 layers" in result
+
+    def test_migrate_roundtrip(self, tmp_path):
+        """Full migration: old format -> migrate -> verify."""
+        import pyarrow.parquet as pq
+        from safetensors import safe_open
+
+        from lmprobe.sharing import migrate_dataset
+
+        old_dir = tmp_path / "old"
+        old_dir.mkdir()
+        data = self._build_old_format_dataset(old_dir)
+        prompts = data["prompts"]
+        seq_lens = data["seq_lens"]
+        layers_list = data["layers"]
+        original_tensors = data["original_tensors"]
+
+        migrated_dir = tmp_path / "migrated"
+        migrated_dir.mkdir()
+        mock_api = MagicMock()
+
+        def capture_upload(repo_id, folder_path, **kwargs):
+            src = Path(folder_path)
+            for f in src.rglob("*"):
+                if f.is_file():
+                    rel = f.relative_to(src)
+                    d = migrated_dir / rel
+                    d.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(f), str(d))
+
+        mock_api.upload_large_folder.side_effect = capture_upload
+
+        def mock_dl(repo_id, filename, **kwargs):
+            return str(old_dir / filename)
+
+        with (
+            patch("lmprobe.sharing._check_hub_deps"),
+            patch("lmprobe.sharing._check_pyarrow"),
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=mock_dl,
+            ),
+            patch(
+                "huggingface_hub.HfApi",
+                return_value=mock_api,
+            ),
+        ):
+            result = migrate_dataset("user/test-ds")
+
+        assert "huggingface.co" in result
+
+        # Verify lmprobe_info.json
+        with open(migrated_dir / INFO_FILENAME) as f:
+            info = json.load(f)
+
+        hidden_desc = info["tensors"]["hidden_layers"]
+        assert hidden_desc["storage"] == "full_sequence"
+        assert "last_token_shards" in hidden_desc
+        lt_count = hidden_desc["last_token_shards"]
+        assert lt_count >= 1
+
+        lt_shards = hidden_desc["shards"][:lt_count]
+        assert sum(
+            s["num_tokens"] for s in lt_shards
+        ) == len(prompts)
+
+        rest_shards = hidden_desc["shards"][lt_count:]
+        assert sum(
+            s["num_tokens"] for s in rest_shards
+        ) == sum(seq_lens) - len(prompts)
+
+        # Verify parquet index
+        idx = pq.read_table(
+            str(migrated_dir / PARQUET_PATH),
+        ).to_pydict()
+        assert "token_shard_ids" in idx
+        assert "token_shard_offsets" in idx
+
+        for i in range(len(prompts)):
+            sids = idx["token_shard_ids"][i]
+            soffs = idx["token_shard_offsets"][i]
+            num_tok = seq_lens[i]
+
+            assert len(sids) == num_tok
+            assert len(soffs) == num_tok
+            assert sids[-1] < lt_count
+            if num_tok > 1:
+                for sid in sids[:-1]:
+                    assert sid >= lt_count
+
+        # Verify shard data integrity
+        for layer in layers_list:
+            lt_fname = (
+                f"tensors/hidden_layer{layer:03d}"
+                f"_shard000.safetensors"
+            )
+            with safe_open(
+                str(migrated_dir / lt_fname), framework="pt",
+            ) as sf:
+                lt_t = sf.get_tensor(f"hidden.layer_{layer}")
+            assert lt_t.shape == (len(prompts), HIDDEN_DIM)
+
+            for i, prompt in enumerate(prompts):
+                orig_last = original_tensors[prompt][layer][-1]
+                assert torch.allclose(lt_t[i], orig_last, atol=1e-6)
+
+            rest_fname = (
+                f"tensors/hidden_layer{layer:03d}"
+                f"_shard{lt_count:03d}.safetensors"
+            )
+            with safe_open(
+                str(migrated_dir / rest_fname), framework="pt",
+            ) as sf:
+                rest_t = sf.get_tensor(f"hidden.layer_{layer}")
+
+            expected_rest = sum(sl - 1 for sl in seq_lens)
+            assert rest_t.shape == (expected_rest, HIDDEN_DIM)
+
+            offset = 0
+            for i, prompt in enumerate(prompts):
+                n_rest = seq_lens[i] - 1
+                orig_rest = original_tensors[prompt][layer][:-1]
+                assert torch.allclose(
+                    rest_t[offset:offset + n_rest],
+                    orig_rest, atol=1e-6,
+                )
+                offset += n_rest
