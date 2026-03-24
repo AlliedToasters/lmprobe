@@ -489,6 +489,119 @@ def _load_hidden_raw_for_prompt(
 
 
 # =============================================================================
+# Preloading helpers (parallel S3 reads)
+# =============================================================================
+
+
+def _preload_layer(
+    model_name: str,
+    prompts: list[str],
+    layer: int,
+    use_raw: bool,
+    hidden_strategy: str | None,
+    workers: int,
+) -> list[torch.Tensor | None]:
+    """Preload one layer's hidden states for all prompts in parallel.
+
+    Returns a list indexed by prompt position.  Each entry is the tensor
+    for that prompt/layer or ``None`` on load failure.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from tqdm import tqdm
+
+    key = f"hidden.layer_{layer}"
+
+    def _load_one(idx: int, prompt: str) -> tuple[int, torch.Tensor | None]:
+        try:
+            if use_raw:
+                tensors, _ = _load_hidden_raw_for_prompt(
+                    model_name, prompt, [layer],
+                )
+            elif hidden_strategy:
+                tensors = _load_hidden_for_prompt(
+                    model_name, prompt, [layer], hidden_strategy,
+                )
+            else:
+                return idx, None
+            return idx, tensors.get(key)
+        except (FileNotFoundError, KeyError, OSError) as e:
+            raise OSError(
+                f"Prompt passed metadata scan but failed to load during "
+                f"preload (cache may have been modified concurrently): {e}"
+            ) from e
+
+    result: list[torch.Tensor | None] = [None] * len(prompts)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_load_one, i, p): i
+            for i, p in enumerate(prompts)
+        }
+        for fut in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc=f"Preloading layer {layer}",
+            unit="prompt",
+        ):
+            idx, tensor = fut.result()
+            result[idx] = tensor
+    return result
+
+
+def _preload_full(
+    model_name: str,
+    prompts: list[str],
+    layers: list[int],
+    use_raw: bool,
+    hidden_strategy: str | None,
+    workers: int,
+) -> list[dict[str, torch.Tensor]]:
+    """Preload all layers for all prompts in parallel.
+
+    Returns a list indexed by prompt position.  Each entry is a dict
+    mapping ``"hidden.layer_N"`` to the corresponding tensor.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from tqdm import tqdm
+
+    def _load_one(idx: int, prompt: str) -> tuple[int, dict[str, torch.Tensor]]:
+        try:
+            if use_raw:
+                tensors, _ = _load_hidden_raw_for_prompt(
+                    model_name, prompt, layers,
+                )
+            elif hidden_strategy:
+                tensors = _load_hidden_for_prompt(
+                    model_name, prompt, layers, hidden_strategy,
+                )
+            else:
+                return idx, {}
+            return idx, tensors
+        except (FileNotFoundError, KeyError, OSError) as e:
+            raise OSError(
+                f"Prompt passed metadata scan but failed to load during "
+                f"preload (cache may have been modified concurrently): {e}"
+            ) from e
+
+    result: list[dict[str, torch.Tensor]] = [{} for _ in prompts]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_load_one, i, p): i
+            for i, p in enumerate(prompts)
+        }
+        for fut in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="Preloading all layers",
+            unit="prompt",
+        ):
+            idx, tensors = fut.result()
+            result[idx] = tensors
+    return result
+
+
+# =============================================================================
 # Consolidation engine
 # =============================================================================
 
@@ -553,6 +666,8 @@ def _consolidate_and_shard(
     metadata: list[dict] | None = None,
     tmpdir: Path | None = None,
     on_shard_written: Callable[[Path, str], None] | None = None,
+    preload: str = "none",
+    preload_workers: int = 8,
 ) -> tuple[Path, dict, list[dict]]:
     """Consolidate cached tensors into sharded safetensors files.
 
@@ -573,6 +688,12 @@ def _consolidate_and_shard(
     prompt_metadata : list[dict]
         Per-prompt metadata for the Parquet index.
     """
+    _VALID_PRELOAD = ("none", "per_layer", "full")
+    if preload not in _VALID_PRELOAD:
+        raise ValueError(
+            f"preload must be one of {_VALID_PRELOAD!r}, got {preload!r}"
+        )
+
     from safetensors.torch import save_file
 
     if tmpdir is None:
@@ -780,51 +901,124 @@ def _consolidate_and_shard(
             offset += shard_size
 
         # Phase 4b: Write per-layer shard files one layer at a time.
-        # Loop order: layer → shard, so peak RAM = one shard's worth of one layer
-        # (not all layers × all prompts as the old order required).
         total_layer_shards = len(hidden_layers) * len(hidden_boundaries)
-        with tqdm(
-            total=total_layer_shards, desc="Writing hidden shards", unit="shard"
-        ) as pbar:
-            for layer in hidden_layers:
-                key = f"hidden.layer_{layer}"
-                offset = 0
-                for shard_idx, shard_size in enumerate(hidden_boundaries):
-                    shard_prompts_text = valid_prompts[offset : offset + shard_size]
-                    rows: list[torch.Tensor] = []
-                    for prompt in shard_prompts_text:
-                        try:
-                            if use_raw:
-                                layer_tensors, _ = _load_hidden_raw_for_prompt(
-                                    model_name, prompt, [layer],
-                                )
-                            elif hidden_strategy:
-                                layer_tensors = _load_hidden_for_prompt(
-                                    model_name, prompt, [layer], hidden_strategy,
-                                )
-                            else:
-                                layer_tensors = {}
-                            if key in layer_tensors:
-                                rows.append(layer_tensors[key])
-                        except (FileNotFoundError, KeyError, OSError) as e:
-                            raise OSError(
-                                f"Prompt passed metadata scan but failed to load during "
-                                f"shard write (cache may have been modified concurrently): "
-                                f"{e}"
-                            ) from e
-                    if rows:
-                        layer_tensor = {key: torch.cat(rows, dim=0)}
-                        fname = (
-                            f"tensors/hidden_layer{layer:03d}"
-                            f"_shard{shard_idx:03d}.safetensors"
-                        )
-                        save_file(layer_tensor, str(tmpdir / fname))
-                        if on_shard_written is not None:
-                            on_shard_written(tmpdir / fname, fname)
-                        del layer_tensor
-                    del rows
-                    offset += shard_size
-                    pbar.update(1)
+
+        def _write_layer_shards(
+            layer: int,
+            data: list[torch.Tensor | None],
+            pbar: Any,
+        ) -> None:
+            """Write all shards for one layer from preloaded data."""
+            key = f"hidden.layer_{layer}"
+            offset = 0
+            for shard_idx, shard_size in enumerate(hidden_boundaries):
+                rows = [
+                    data[offset + j]
+                    for j in range(shard_size)
+                    if data[offset + j] is not None
+                ]
+                if rows:
+                    layer_tensor = {key: torch.cat(rows, dim=0)}
+                    fname = (
+                        f"tensors/hidden_layer{layer:03d}"
+                        f"_shard{shard_idx:03d}.safetensors"
+                    )
+                    save_file(layer_tensor, str(tmpdir / fname))
+                    if on_shard_written is not None:
+                        on_shard_written(tmpdir / fname, fname)
+                    del layer_tensor
+                del rows
+                offset += shard_size
+                pbar.update(1)
+
+        if preload == "full":
+            # Preload ALL layers for ALL prompts, then write shards
+            # from memory.  Highest memory, fastest I/O.
+            all_data = _preload_full(
+                model_name, valid_prompts, hidden_layers,
+                use_raw, hidden_strategy, preload_workers,
+            )
+            with tqdm(
+                total=total_layer_shards, desc="Writing hidden shards",
+                unit="shard",
+            ) as pbar:
+                for layer in hidden_layers:
+                    key = f"hidden.layer_{layer}"
+                    layer_data = [d.get(key) for d in all_data]
+                    _write_layer_shards(layer, layer_data, pbar)
+                    del layer_data
+            del all_data
+
+        elif preload == "per_layer":
+            # Preload one layer at a time across all prompts (parallel
+            # reads), then write shards from memory before moving to
+            # the next layer.
+            with tqdm(
+                total=total_layer_shards, desc="Writing hidden shards",
+                unit="shard",
+            ) as pbar:
+                for layer in hidden_layers:
+                    layer_data = _preload_layer(
+                        model_name, valid_prompts, layer,
+                        use_raw, hidden_strategy, preload_workers,
+                    )
+                    _write_layer_shards(layer, layer_data, pbar)
+                    del layer_data
+
+        else:
+            # preload == "none": original sequential behaviour.
+            # Peak RAM = one shard's worth of one layer.
+            with tqdm(
+                total=total_layer_shards, desc="Writing hidden shards",
+                unit="shard",
+            ) as pbar:
+                for layer in hidden_layers:
+                    key = f"hidden.layer_{layer}"
+                    offset = 0
+                    for shard_idx, shard_size in enumerate(hidden_boundaries):
+                        shard_prompts_text = valid_prompts[
+                            offset : offset + shard_size
+                        ]
+                        rows: list[torch.Tensor] = []
+                        for prompt in shard_prompts_text:
+                            try:
+                                if use_raw:
+                                    layer_tensors, _ = (
+                                        _load_hidden_raw_for_prompt(
+                                            model_name, prompt, [layer],
+                                        )
+                                    )
+                                elif hidden_strategy:
+                                    layer_tensors = _load_hidden_for_prompt(
+                                        model_name, prompt, [layer],
+                                        hidden_strategy,
+                                    )
+                                else:
+                                    layer_tensors = {}
+                                if key in layer_tensors:
+                                    rows.append(layer_tensors[key])
+                            except (
+                                FileNotFoundError, KeyError, OSError,
+                            ) as e:
+                                raise OSError(
+                                    f"Prompt passed metadata scan but "
+                                    f"failed to load during shard write "
+                                    f"(cache may have been modified "
+                                    f"concurrently): {e}"
+                                ) from e
+                        if rows:
+                            layer_tensor = {key: torch.cat(rows, dim=0)}
+                            fname = (
+                                f"tensors/hidden_layer{layer:03d}"
+                                f"_shard{shard_idx:03d}.safetensors"
+                            )
+                            save_file(layer_tensor, str(tmpdir / fname))
+                            if on_shard_written is not None:
+                                on_shard_written(tmpdir / fname, fname)
+                            del layer_tensor
+                        del rows
+                        offset += shard_size
+                        pbar.update(1)
 
     # --- Logits pass ---
     if want_logits and logits_boundaries:
@@ -1301,6 +1495,8 @@ def push_dataset(
     commit_batch_size: int | None = None,
     stream: bool = False,
     stream_batch_size: int = 10,
+    preload: str = "none",
+    preload_workers: int = 8,
 ) -> str:
     """Push cached activations to a HuggingFace Dataset repo.
 
@@ -1357,6 +1553,16 @@ def push_dataset(
         in streaming mode.  Higher values improve throughput (fewer
         commits, parallel LFS uploads) at the cost of more peak disk.
         Default 10.  Ignored when ``stream=False``.
+    preload : str
+        Strategy for preloading cached tensors during consolidation.
+        ``"none"`` (default) reads each prompt sequentially per layer/shard.
+        ``"per_layer"`` preloads one layer across all prompts in parallel
+        before writing shards — best trade-off for most cases.
+        ``"full"`` preloads all layers for all prompts into memory — fastest
+        but requires enough RAM to hold the entire dataset.
+    preload_workers : int
+        Number of parallel threads for preloading cache reads.
+        Only used when ``preload`` is not ``"none"``.  Default 8.
 
     Returns
     -------
@@ -1447,6 +1653,8 @@ def push_dataset(
             commit_batch_size=commit_batch_size,
             staging_dir=staging_dir,
             stream_batch_size=stream_batch_size,
+            preload=preload,
+            preload_workers=preload_workers,
         )
 
     # --- Non-streaming path (unchanged) ---
@@ -1484,6 +1692,8 @@ def push_dataset(
             repo_id=repo_id,
             metadata=metadata,
             tmpdir=staging_dir,
+            preload=preload,
+            preload_workers=preload_workers,
         )
 
         # Step 5: Write Parquet index
@@ -1577,6 +1787,8 @@ def _push_dataset_streaming(
     commit_batch_size: int | None,
     staging_dir: Path,
     stream_batch_size: int = 10,
+    preload: str = "none",
+    preload_workers: int = 8,
 ) -> str:
     """Streaming upload: write shards, batch-upload via create_commit."""
     import shutil
@@ -1721,6 +1933,8 @@ def _push_dataset_streaming(
         metadata=metadata,
         tmpdir=staging_dir,
         on_shard_written=_on_shard_written,
+        preload=preload,
+        preload_workers=preload_workers,
     )
 
     # Flush any remaining buffered shards
