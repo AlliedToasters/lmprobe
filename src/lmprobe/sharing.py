@@ -500,15 +500,23 @@ def _preload_layer(
     use_raw: bool,
     hidden_strategy: str | None,
     workers: int,
+    executor: Any | None = None,
+    pbar: Any | None = None,
 ) -> list[torch.Tensor | None]:
     """Preload one layer's hidden states for all prompts in parallel.
+
+    Parameters
+    ----------
+    executor : ThreadPoolExecutor, optional
+        Reusable thread pool.  If ``None``, a temporary pool is created.
+    pbar : tqdm bar, optional
+        Shared progress bar to update.  If ``None``, a per-call bar is
+        created (noisy when called in a loop).
 
     Returns a list indexed by prompt position.  Each entry is the tensor
     for that prompt/layer or ``None`` on load failure.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    from tqdm import tqdm
 
     key = f"hidden.layer_{layer}"
 
@@ -531,21 +539,23 @@ def _preload_layer(
                 f"preload (cache may have been modified concurrently): {e}"
             ) from e
 
-    result: list[torch.Tensor | None] = [None] * len(prompts)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    def _run(pool: Any) -> list[torch.Tensor | None]:
+        result: list[torch.Tensor | None] = [None] * len(prompts)
         futures = {
-            executor.submit(_load_one, i, p): i
+            pool.submit(_load_one, i, p): i
             for i, p in enumerate(prompts)
         }
-        for fut in tqdm(
-            as_completed(futures),
-            total=len(futures),
-            desc=f"Preloading layer {layer}",
-            unit="prompt",
-        ):
+        for fut in as_completed(futures):
             idx, tensor = fut.result()
             result[idx] = tensor
-    return result
+            if pbar is not None:
+                pbar.update(1)
+        return result
+
+    if executor is not None:
+        return _run(executor)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return _run(pool)
 
 
 def _preload_full(
@@ -952,17 +962,32 @@ def _consolidate_and_shard(
         elif preload == "per_layer":
             # Preload one layer at a time across all prompts (parallel
             # reads), then write shards from memory before moving to
-            # the next layer.
-            with tqdm(
-                total=total_layer_shards, desc="Writing hidden shards",
-                unit="shard",
-            ) as pbar:
+            # the next layer.  A single ThreadPoolExecutor and progress
+            # bar are reused across all layers to avoid overhead and
+            # log noise.
+            from concurrent.futures import ThreadPoolExecutor
+
+            total_preload = len(hidden_layers) * len(valid_prompts)
+            with (
+                ThreadPoolExecutor(max_workers=preload_workers) as pool,
+                tqdm(
+                    total=total_preload,
+                    desc="Preloading hidden layers",
+                    unit="prompt",
+                ) as preload_pbar,
+                tqdm(
+                    total=total_layer_shards,
+                    desc="Writing hidden shards",
+                    unit="shard",
+                ) as write_pbar,
+            ):
                 for layer in hidden_layers:
                     layer_data = _preload_layer(
                         model_name, valid_prompts, layer,
                         use_raw, hidden_strategy, preload_workers,
+                        executor=pool, pbar=preload_pbar,
                     )
-                    _write_layer_shards(layer, layer_data, pbar)
+                    _write_layer_shards(layer, layer_data, write_pbar)
                     del layer_data
 
         else:
