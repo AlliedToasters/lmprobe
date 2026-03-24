@@ -59,6 +59,9 @@ _shard_indices: dict[str, dict] = {}
 
 logger = logging.getLogger(__name__)
 
+# Track first shard access per (model, layer, shard_idx) for progress logging
+_shard_first_access: set[tuple[str, int, int]] = set()
+
 
 def enable_cache_logging(level: int = logging.INFO) -> None:
     """Enable cache logging to see cache hit/miss information.
@@ -1458,11 +1461,19 @@ def _load_raw_from_shard(
     tok_off -= shard_token_base
 
     layout = t_info.get("layout")
+    n_shards = len(shards)
 
     if layout == "per_layer":
         # v1.1+ per-layer layout: each layer in its own file
         layer_slices = []
         for layer in layers:
+            _key = (model_name, layer, shard_idx)
+            if _key not in _shard_first_access:
+                _shard_first_access.add(_key)
+                logger.info(
+                    "[CACHE] Loading shard %d/%d for layer %d (first access)",
+                    shard_idx + 1, n_shards, layer,
+                )
             per_layer_paths = shards[shard_idx].get("per_layer_paths", {})
             # per_layer_paths keys may be strings (from JSON) or ints
             layer_path = per_layer_paths.get(layer) or per_layer_paths.get(
@@ -1481,6 +1492,13 @@ def _load_raw_from_shard(
                 layer_slices.append((layer, chunk))
     else:
         # v1.0 co-located layout
+        _colocated_key = (model_name, -1, shard_idx)
+        if _colocated_key not in _shard_first_access:
+            _shard_first_access.add(_colocated_key)
+            logger.info(
+                "[CACHE] Loading shard %d/%d (first access)",
+                shard_idx + 1, n_shards,
+            )
         shard_path = shards[shard_idx].get("local_path")
         if shard_path is None or not Path(shard_path).exists():
             raise FileNotFoundError(
@@ -1544,6 +1562,8 @@ def _load_pooled_from_shard(
             f"Shard index {shard_idx} out of range (have {len(shards)} shards)"
         )
 
+    n_shards = len(shards)
+
     if layout == "per_layer":
         # v1.1+ per-layer layout
         per_layer_paths = shards[shard_idx].get("per_layer_paths", {})
@@ -1558,6 +1578,13 @@ def _load_pooled_from_shard(
             )
             tok_off -= shard_token_base
             for layer in layers:
+                _key = (model_name, layer, shard_idx)
+                if _key not in _shard_first_access:
+                    _shard_first_access.add(_key)
+                    logger.info(
+                        "[CACHE] Loading shard %d/%d for layer %d (first access)",
+                        shard_idx + 1, n_shards, layer,
+                    )
                 layer_path = per_layer_paths.get(
                     layer
                 ) or per_layer_paths.get(str(layer))
@@ -1577,6 +1604,13 @@ def _load_pooled_from_shard(
         else:
             row_offset = entry.get("row_offset_hidden", entry.get("row_offset"))
             for layer in layers:
+                _key = (model_name, layer, shard_idx)
+                if _key not in _shard_first_access:
+                    _shard_first_access.add(_key)
+                    logger.info(
+                        "[CACHE] Loading shard %d/%d for layer %d (first access)",
+                        shard_idx + 1, n_shards, layer,
+                    )
                 layer_path = per_layer_paths.get(
                     layer
                 ) or per_layer_paths.get(str(layer))
@@ -1593,6 +1627,13 @@ def _load_pooled_from_shard(
                     layer_slices.append((layer, row))
     else:
         # v1.0 co-located layout
+        _colocated_key = (model_name, -1, shard_idx)
+        if _colocated_key not in _shard_first_access:
+            _shard_first_access.add(_colocated_key)
+            logger.info(
+                "[CACHE] Loading shard %d/%d (first access)",
+                shard_idx + 1, n_shards,
+            )
         shard_path = shards[shard_idx].get("local_path")
         if shard_path is None or not Path(shard_path).exists():
             raise FileNotFoundError(

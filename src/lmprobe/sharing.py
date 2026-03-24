@@ -2393,6 +2393,7 @@ def pull_dataset(
     from huggingface_hub import hf_hub_download
 
     # Download metadata
+    logger.info("[SHARING] Downloading dataset metadata from %s...", repo_id)
     info_path = hf_hub_download(
         repo_id, INFO_FILENAME, repo_type="dataset", token=token,
     )
@@ -2495,6 +2496,23 @@ def pull_dataset(
     # Per-layer: t_type -> shard_idx -> {layer: path}
     per_layer_paths: dict[str, dict[int, dict[int, str]]] = {}
 
+    # Count total files to download for progress
+    _total_shard_files = 0
+    for t_type in pull_types:
+        t_info = tensor_descriptors[t_type]
+        layout = t_info.get("layout")
+        n_shards = len(needed_shards.get(t_type, []))
+        if layout == "per_layer":
+            all_layers = t_info.get("layers", [])
+            dl_layers = all_layers if layers is None else [ly for ly in all_layers if ly in layers]
+            _total_shard_files += n_shards * len(dl_layers)
+        else:
+            _total_shard_files += n_shards
+    logger.info(
+        "[SHARING] Downloading %d shard files from HF...", _total_shard_files
+    )
+    _downloaded_count = 0
+
     for t_type in pull_types:
         t_info = tensor_descriptors[t_type]
         shards = t_info["shards"]
@@ -2521,6 +2539,13 @@ def pull_dataset(
                         repo_id, fname,
                         repo_type="dataset", token=token,
                     )
+                    _downloaded_count += 1
+                    _step = max(1, _total_shard_files // 10)
+                    if _total_shard_files > 10 and _downloaded_count % _step == 0:
+                        logger.info(
+                            "[SHARING] Downloaded %d/%d shard files...",
+                            _downloaded_count, _total_shard_files,
+                        )
                     per_layer_paths[t_type][shard_idx][layer] = shard_path
         else:
             # v1.0 co-located layout
@@ -2539,9 +2564,17 @@ def pull_dataset(
                     repo_id, shard["file"],
                     repo_type="dataset", token=token,
                 )
+                _downloaded_count += 1
                 shard_local_paths[t_type][shard_idx] = shard_path
 
+    if _total_shard_files > 0:
+        logger.info(
+            "[SHARING] Downloaded %d/%d shard files",
+            _downloaded_count, _total_shard_files,
+        )
+
     # ---- Build shard registry (manifest + index) ----
+    logger.info("[SHARING] Building shard registry...")
     # Manifest: tensor descriptors with local shard paths
     manifest_tensors = {}
     for t_type in pull_types:
@@ -2597,6 +2630,12 @@ def pull_dataset(
         shard_index[prompt_hash] = entry
 
     write_shard_registry(model_name, manifest, shard_index)
+    _n_layers = len(tensor_descriptors.get("hidden_layers", {}).get("layers", []))
+    logger.info(
+        "[SHARING] Shard registry ready (%d prompts%s)",
+        len(prompt_indices),
+        f", {_n_layers} layers" if _n_layers > 0 else "",
+    )
 
     total_prompts = len(prompt_indices)
 

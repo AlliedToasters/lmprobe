@@ -5,7 +5,9 @@ This is the main user-facing class for lmprobe.
 
 from __future__ import annotations
 
+import logging
 import pickle
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -32,6 +34,8 @@ if TYPE_CHECKING:
     from sklearn.base import BaseEstimator
 
     from .scaling import PerLayerScaler
+
+logger = logging.getLogger(__name__)
 
 def _parse_sweep_spec(spec: str) -> tuple[bool, int | list[int] | str]:
     """Parse a sweep layer specification.
@@ -1088,6 +1092,7 @@ class Probe:
             return self._fit_fast_auto_layers(prompts, labels, remote, invalidate_cache)
 
         # Extract and pool activations
+        _t_extract_start = time.monotonic()
         X, _ = self._extract_and_pool(
             prompts,
             self._train_pooling,
@@ -1096,6 +1101,7 @@ class Probe:
             max_retries=max_retries,
             batch_size=batch_size,
         )
+        _t_extract_elapsed = time.monotonic() - _t_extract_start
 
         # Handle "all" pooling for training (expand to per-token examples)
         if self._train_pooling == "all" and X.ndim == 3:
@@ -1155,6 +1161,7 @@ class Probe:
             X = self._augment_mass_mean(X, X_pre_preprocessing)
 
         # Clone and fit classifier
+        _t_train_start = time.monotonic()
         self.classifier_ = clone(self._classifier_template)
         fit_kwargs = {}
         if sample_weight is not None:
@@ -1166,6 +1173,20 @@ class Probe:
             fit_kwargs["sample_weight"] = sample_weight
         self.classifier_.fit(X, labels, **fit_kwargs)
         self.classes_ = getattr(self.classifier_, "classes_", None)
+        _t_train_elapsed = time.monotonic() - _t_train_start
+
+        # Log timing breakdown
+        def _fmt_time(seconds: float) -> str:
+            if seconds >= 60:
+                return f"{seconds / 60:.1f}min"
+            return f"{seconds:.1f}s"
+
+        logger.info(
+            "[PROBE] Activation loading: %s, Training: %s (%s)",
+            _fmt_time(_t_extract_elapsed),
+            _fmt_time(_t_train_elapsed),
+            type(self.classifier_).__name__,
+        )
 
         evict()
         return self
