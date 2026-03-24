@@ -1011,6 +1011,63 @@ class TestPushDatasetStreaming:
     @patch("lmprobe.sharing._check_hub_deps")
     @patch("lmprobe.sharing._check_pyarrow")
     @patch("huggingface_hub.HfApi")
+    def test_stream_retries_pending_batch_on_resume(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """Resume retries a pending batch from a prior failed create_commit."""
+        from safetensors.torch import save_file
+
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        staging_dir = _staging_dir_path(
+            "user/retry-batch", TEST_MODEL, populated_cache,
+            labels=[1, 1, 0], stream=True, stream_batch_size=10,
+        )
+
+        # Simulate a prior failed run: manifest has a pending_batch
+        # with local files that still exist on disk.
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        (staging_dir / "tensors").mkdir(parents=True, exist_ok=True)
+        (staging_dir / "index").mkdir(parents=True, exist_ok=True)
+
+        shard_file = staging_dir / "tensors" / "hidden_layer000_shard000.safetensors"
+        save_file(
+            {"hidden.layer_0": torch.randn(3, HIDDEN_DIM)},
+            str(shard_file),
+        )
+
+        manifest = _new_manifest("user/retry-batch")
+        manifest["pending_batch"] = [
+            [str(shard_file), "tensors/hidden_layer000_shard000.safetensors"],
+        ]
+        _save_manifest(staging_dir, manifest)
+
+        commit_messages = []
+
+        def track_commits(*, repo_id, operations, commit_message="", **kw):
+            commit_messages.append(commit_message)
+
+        mock_api.create_commit.side_effect = track_commits
+
+        push_dataset(
+            repo_id="user/retry-batch",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+            stream=True,
+        )
+
+        # First commit should be the retry of the pending batch
+        assert any("retry" in m.lower() for m in commit_messages), (
+            f"Expected a retry commit, got: {commit_messages}"
+        )
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
     def test_stream_batch_size_controls_commit_grouping(
         self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
     ):

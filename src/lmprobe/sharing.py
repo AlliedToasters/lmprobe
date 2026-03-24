@@ -1613,6 +1613,42 @@ def _push_dataset_streaming(
         repo_type="dataset",
     )
 
+    # Retry any pending batch from a prior failed create_commit.
+    # These files are already consolidated locally — skip re-reading from S3.
+    prior_batch = manifest.get("pending_batch", [])
+    if prior_batch:
+        local_files_exist = all(Path(lp).exists() for lp, _ in prior_batch)
+        if local_files_exist:
+            logger.info(
+                "[SHARING] Retrying pending batch of %d shards from "
+                "prior run", len(prior_batch),
+            )
+            operations = [
+                CommitOperationAdd(
+                    path_in_repo=rp,
+                    path_or_fileobj=lp,
+                )
+                for lp, rp in prior_batch
+            ]
+            api.create_commit(
+                repo_id=repo_id,
+                operations=operations,
+                commit_message=f"Add {len(prior_batch)} shards (retry)",
+                repo_type="dataset",
+            )
+            for lp, rp in prior_batch:
+                Path(lp).unlink(missing_ok=True)
+                manifest["completed_shards"].append(rp)
+            manifest.pop("pending_batch", None)
+            _save_manifest(staging_dir, manifest)
+        else:
+            # Files gone — clear pending_batch; re-consolidation will handle
+            logger.debug(
+                "[SHARING] Pending batch files missing, will re-consolidate"
+            )
+            manifest.pop("pending_batch", None)
+            _save_manifest(staging_dir, manifest)
+
     # Build the batched on_shard_written callback
     completed_set = set(manifest["completed_shards"])
     pending_shards: list[tuple[Path, str]] = []
@@ -1627,6 +1663,13 @@ def _push_dataset_streaming(
             len(pending_shards),
             ", ".join(paths_in_batch),
         )
+        # Save pending paths to manifest before commit so resume can
+        # find them if create_commit fails (avoids re-consolidation).
+        manifest["pending_batch"] = [
+            [str(lp), rp] for lp, rp in pending_shards
+        ]
+        _save_manifest(staging_dir, manifest)
+
         operations = [
             CommitOperationAdd(
                 path_in_repo=repo_path,
@@ -1647,6 +1690,7 @@ def _push_dataset_streaming(
             local_path.unlink(missing_ok=True)
             manifest["completed_shards"].append(repo_path)
             completed_set.add(repo_path)
+        manifest.pop("pending_batch", None)
         _save_manifest(staging_dir, manifest)
         pending_shards.clear()
 
