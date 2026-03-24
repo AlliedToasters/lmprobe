@@ -3236,3 +3236,481 @@ def load_activation_dataset(
             result[sf_key] = torch.cat(parts, dim=0)
 
     return result, lmprobe_info
+
+
+# =============================================================================
+# Dataset migration
+# =============================================================================
+
+
+def migrate_dataset(
+    repo_id: str,
+    *,
+    shard_max_bytes: int = DEFAULT_SHARD_BYTES,
+    token: str | None = None,
+    private: bool | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Migrate a full_sequence dataset to use last-token shard splitting.
+
+    Downloads the existing dataset from HuggingFace, re-shards the hidden
+    layer tensors so that last-token vectors land in dedicated small shards,
+    rebuilds the parquet index with per-token shard mapping arrays
+    (``token_shard_ids``, ``token_shard_offsets``), and re-uploads.
+
+    Processing is done one layer at a time to limit memory usage.
+
+    Parameters
+    ----------
+    repo_id : str
+        HuggingFace repo ID of the dataset to migrate.
+    shard_max_bytes : int
+        Max bytes per shard file for the new sharding. Default 1 GB.
+    token : str | None
+        HuggingFace API token.
+    private : bool | None
+        If set, update the repo visibility. None keeps the current setting.
+    dry_run : bool
+        If True, download and compute the new plan but do not upload.
+
+    Returns
+    -------
+    str
+        URL of the migrated dataset (or a summary string if dry_run).
+    """
+    _check_hub_deps()
+    _check_pyarrow()
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+    from tqdm import tqdm
+
+    # ------------------------------------------------------------------
+    # Step 1: Download metadata
+    # ------------------------------------------------------------------
+    logger.info("[MIGRATE] Downloading metadata from %s...", repo_id)
+    info_path = hf_hub_download(
+        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
+    )
+    parquet_path = hf_hub_download(
+        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
+    )
+
+    with open(info_path) as f:
+        lmprobe_info = json.load(f)
+
+    tensor_descriptors = (
+        lmprobe_info.get("tensors")
+        or lmprobe_info.get("tensor_types")
+        or {}
+    )
+
+    hidden_info = tensor_descriptors.get("hidden_layers", {})
+    if hidden_info.get("storage") != "full_sequence":
+        raise ValueError(
+            "Dataset is not full_sequence storage — migration only applies "
+            "to full_sequence datasets."
+        )
+    if hidden_info.get("last_token_shards", 0) > 0:
+        raise ValueError(
+            "Dataset already has last-token shard splitting "
+            "— nothing to migrate."
+        )
+
+    # Read parquet index
+    index_table = pq.read_table(parquet_path)
+    index = index_table.to_pydict()
+    n_prompts = len(index["text"])
+    num_tokens_list = index["num_tokens"]
+
+    hidden_layers = hidden_info.get("layers", [])
+    hidden_dim = hidden_info.get("dim")
+    old_shards = hidden_info.get("shards", [])
+
+    model_obj = lmprobe_info.get("model")
+    if isinstance(model_obj, dict):
+        model_name = model_obj["name"]
+    elif "model_name" in lmprobe_info:
+        model_name = lmprobe_info["model_name"]
+    else:
+        raise KeyError("lmprobe_info.json missing model name")
+
+    logger.info(
+        "[MIGRATE] Dataset: %d prompts, %d layers, dim=%d, "
+        "%d old shards/layer",
+        n_prompts, len(hidden_layers), hidden_dim, len(old_shards),
+    )
+
+    # ------------------------------------------------------------------
+    # Step 2: Compute new shard boundaries
+    # ------------------------------------------------------------------
+    hidden_row_bytes = hidden_dim * 4
+
+    # Last-token shards: one vector per prompt (fixed size)
+    lt_boundaries = _compute_shard_boundaries(
+        n_prompts, hidden_row_bytes, shard_max_bytes,
+    )
+    lt_shard_count = len(lt_boundaries)
+
+    # Rest-token shards: (num_tokens - 1) vectors per prompt (variable)
+    rest_prompt_bytes = [
+        max(tok - 1, 0) * hidden_dim * 4 for tok in num_tokens_list
+    ]
+    rest_boundaries: list[int] = []
+    if any(b > 0 for b in rest_prompt_bytes):
+        rest_boundaries = _compute_shard_boundaries_variable(
+            rest_prompt_bytes, shard_max_bytes,
+        )
+
+    new_boundaries = lt_boundaries + rest_boundaries
+
+    logger.info(
+        "[MIGRATE] New plan: %d lt shards + %d rest shards "
+        "= %d total per layer",
+        lt_shard_count, len(rest_boundaries), len(new_boundaries),
+    )
+
+    # ------------------------------------------------------------------
+    # Step 3: Build per-token arrays and new prompt_metadata
+    # ------------------------------------------------------------------
+    # Last-token shard assignments
+    lt_row_in_shard = 0
+    lt_shard_idx = 0
+    lt_assignments: list[tuple[int, int]] = []
+    for i in range(n_prompts):
+        if (
+            lt_shard_idx < len(lt_boundaries)
+            and lt_row_in_shard >= lt_boundaries[lt_shard_idx]
+        ):
+            lt_shard_idx += 1
+            lt_row_in_shard = 0
+        lt_assignments.append((lt_shard_idx, lt_row_in_shard))
+        lt_row_in_shard += 1
+
+    # Rest-token shard assignments
+    rest_shard_idx = 0
+    rest_tok_offset = 0
+    rest_row_in_shard = 0
+    rest_assignments: list[tuple[int, int]] = []
+    if rest_boundaries:
+        for i in range(n_prompts):
+            if (
+                rest_shard_idx < len(rest_boundaries)
+                and rest_row_in_shard
+                >= rest_boundaries[rest_shard_idx]
+            ):
+                rest_shard_idx += 1
+                rest_tok_offset = 0
+                rest_row_in_shard = 0
+            rest_assignments.append(
+                (lt_shard_count + rest_shard_idx, rest_tok_offset),
+            )
+            rest_tok_offset += max(num_tokens_list[i] - 1, 0)
+            rest_row_in_shard += 1
+
+    # Build per-prompt token arrays
+    all_token_shard_ids: list[list[int]] = []
+    all_token_shard_offsets: list[list[int]] = []
+
+    for i in range(n_prompts):
+        num_tok = num_tokens_list[i]
+        lt_si, lt_off = lt_assignments[i]
+
+        tok_shard_ids: list[int] = []
+        tok_shard_offsets: list[int] = []
+
+        if num_tok > 1 and rest_assignments:
+            rest_si, rest_off = rest_assignments[i]
+            for t in range(num_tok - 1):
+                tok_shard_ids.append(rest_si)
+                tok_shard_offsets.append(rest_off + t)
+
+        tok_shard_ids.append(lt_si)
+        tok_shard_offsets.append(lt_off)
+
+        all_token_shard_ids.append(tok_shard_ids)
+        all_token_shard_offsets.append(tok_shard_offsets)
+
+    if dry_run:
+        return (
+            f"[DRY RUN] Would migrate {repo_id}: "
+            f"{n_prompts} prompts, {len(hidden_layers)} layers, "
+            f"{lt_shard_count} lt shards + "
+            f"{len(rest_boundaries)} rest shards"
+        )
+
+    # ------------------------------------------------------------------
+    # Step 4: Download old shards and write new ones (per-layer)
+    # ------------------------------------------------------------------
+    tmpdir_obj = tempfile.mkdtemp(prefix="lmprobe_migrate_")
+    tmpdir = Path(tmpdir_obj)
+    (tmpdir / "tensors").mkdir(parents=True, exist_ok=True)
+    (tmpdir / "index").mkdir(parents=True, exist_ok=True)
+
+    old_shard_boundaries: list[int] = [
+        s["num_prompts"] for s in old_shards
+    ]
+
+    total_layer_work = len(hidden_layers) * len(new_boundaries)
+    with tqdm(
+        total=total_layer_work,
+        desc="Re-sharding layers",
+        unit="shard",
+    ) as pbar:
+        for layer in hidden_layers:
+            pbar.set_postfix(layer=layer)
+
+            # Download and load all old shards for this layer
+            per_prompt_tensors: list[torch.Tensor] = []
+            for old_si, old_shard_desc in enumerate(old_shards):
+                fname = (
+                    f"tensors/hidden_layer{layer:03d}"
+                    f"_shard{old_si:03d}.safetensors"
+                )
+                shard_path = hf_hub_download(
+                    repo_id, fname,
+                    repo_type="dataset", token=token,
+                )
+                key = f"hidden.layer_{layer}"
+                with safe_open(shard_path, framework="pt") as sf:
+                    shard_tensor = sf.get_tensor(key)
+
+                # Split into per-prompt tensors using old layout
+                n_in_shard = old_shard_desc["num_prompts"]
+                tok_offset = 0
+                for j in range(n_in_shard):
+                    prompt_idx = (
+                        sum(old_shard_boundaries[:old_si]) + j
+                    )
+                    n_tok = num_tokens_list[prompt_idx]
+                    prompt_tensor = shard_tensor[
+                        tok_offset:tok_offset + n_tok
+                    ]
+                    per_prompt_tensors.append(prompt_tensor)
+                    tok_offset += n_tok
+
+                del shard_tensor
+
+            # Write last-token shards
+            offset = 0
+            for local_idx, shard_size in enumerate(lt_boundaries):
+                shard_idx = local_idx
+                fname = (
+                    f"tensors/hidden_layer{layer:03d}"
+                    f"_shard{shard_idx:03d}.safetensors"
+                )
+                rows = []
+                for j in range(shard_size):
+                    if offset + j < len(per_prompt_tensors):
+                        rows.append(
+                            per_prompt_tensors[offset + j][-1:]
+                        )
+                if rows:
+                    key = f"hidden.layer_{layer}"
+                    save_file(
+                        {key: torch.cat(rows, dim=0)},
+                        str(tmpdir / fname),
+                    )
+                    del rows
+                offset += shard_size
+                pbar.update(1)
+
+            # Write rest-token shards
+            offset = 0
+            for local_idx, shard_size in enumerate(rest_boundaries):
+                shard_idx = lt_shard_count + local_idx
+                fname = (
+                    f"tensors/hidden_layer{layer:03d}"
+                    f"_shard{shard_idx:03d}.safetensors"
+                )
+                rows = []
+                for j in range(shard_size):
+                    if offset + j < len(per_prompt_tensors):
+                        rest = per_prompt_tensors[offset + j][:-1]
+                        if rest.shape[0] > 0:
+                            rows.append(rest)
+                if rows:
+                    key = f"hidden.layer_{layer}"
+                    save_file(
+                        {key: torch.cat(rows, dim=0)},
+                        str(tmpdir / fname),
+                    )
+                    del rows
+                offset += shard_size
+                pbar.update(1)
+
+            del per_prompt_tensors
+
+    # ------------------------------------------------------------------
+    # Step 5: Copy logits shards unchanged (if present)
+    # ------------------------------------------------------------------
+    logits_info = tensor_descriptors.get("logits_topk", {})
+    logits_shards = logits_info.get("shards", [])
+    if logits_shards:
+        import shutil as _shutil
+
+        logger.info(
+            "[MIGRATE] Copying %d logits shards...", len(logits_shards),
+        )
+        for ls_desc in logits_shards:
+            fname = ls_desc["file"]
+            src = hf_hub_download(
+                repo_id, fname, repo_type="dataset", token=token,
+            )
+            dst = tmpdir / fname
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            _shutil.copy2(src, dst)
+
+    # ------------------------------------------------------------------
+    # Step 6: Build new prompt_metadata and write parquet index
+    # ------------------------------------------------------------------
+    rebuild_keys = {
+        "text", "label", "num_tokens", "shard_index", "row_offset",
+        "shard_index_hidden", "row_offset_hidden",
+        "token_offset_hidden", "token_offset",
+        "token_shard_ids", "token_shard_offsets",
+    }
+    extra_parquet_keys = [
+        k for k in index.keys() if k not in rebuild_keys
+    ]
+
+    prompt_metadata: list[dict] = []
+    for i in range(n_prompts):
+        lt_si, lt_off = lt_assignments[i]
+        meta: dict[str, Any] = {
+            "text": index["text"][i],
+            "label": index["label"][i],
+            "num_tokens": num_tokens_list[i],
+            "shard_index": lt_si,
+            "row_offset": lt_off,
+            "shard_index_hidden": lt_si,
+            "row_offset_hidden": lt_off,
+            "token_offset_hidden": lt_off,
+            "token_offset": lt_off,
+            "token_shard_ids": all_token_shard_ids[i],
+            "token_shard_offsets": all_token_shard_offsets[i],
+        }
+        if "shard_index_logits" in index:
+            meta["shard_index_logits"] = index[
+                "shard_index_logits"
+            ][i]
+        if "row_offset_logits" in index:
+            meta["row_offset_logits"] = index[
+                "row_offset_logits"
+            ][i]
+        for ek in extra_parquet_keys:
+            meta[ek] = index[ek][i]
+        prompt_metadata.append(meta)
+
+    _write_parquet_index(tmpdir, prompt_metadata)
+
+    # ------------------------------------------------------------------
+    # Step 7: Build new tensor descriptors and lmprobe_info
+    # ------------------------------------------------------------------
+    new_hidden_shards = []
+    off = 0
+    for _si, sz in enumerate(lt_boundaries):
+        actual = min(sz, n_prompts - off)
+        new_hidden_shards.append({
+            "num_prompts": actual,
+            "num_tokens": actual,
+        })
+        off += actual
+    off = 0
+    for _si, sz in enumerate(rest_boundaries):
+        actual = min(sz, n_prompts - off)
+        new_hidden_shards.append({
+            "num_prompts": actual,
+            "num_tokens": sum(
+                max(num_tokens_list[off + j] - 1, 0)
+                for j in range(actual)
+            ),
+        })
+        off += actual
+
+    new_hidden_desc = dict(hidden_info)
+    new_hidden_desc["shards"] = new_hidden_shards
+    new_hidden_desc["last_token_shards"] = lt_shard_count
+
+    new_td = dict(tensor_descriptors)
+    new_td["hidden_layers"] = new_hidden_desc
+
+    new_lmprobe_info = dict(lmprobe_info)
+    new_lmprobe_info["tensors"] = new_td
+
+    with open(tmpdir / INFO_FILENAME, "w") as f_out:
+        json.dump(new_lmprobe_info, f_out, indent=2)
+
+    readme = _build_readme(
+        model_name=model_name,
+        lmprobe_info=new_lmprobe_info,
+        num_prompts=n_prompts,
+        repo_id=repo_id,
+    )
+    with open(tmpdir / "README.md", "w") as f_out:
+        f_out.write(readme)
+
+    # ------------------------------------------------------------------
+    # Step 8: Upload
+    # ------------------------------------------------------------------
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=token)
+    if private is not None:
+        api.update_repo_settings(
+            repo_id, private=private, repo_type="dataset",
+        )
+
+    total_size = sum(
+        fp.stat().st_size for fp in tmpdir.rglob("*") if fp.is_file()
+    )
+    logger.info(
+        "[MIGRATE] Uploading migrated dataset (%.2f GB)...",
+        total_size / 1e9,
+    )
+    api.upload_large_folder(
+        repo_id=repo_id,
+        folder_path=str(tmpdir),
+        repo_type="dataset",
+    )
+
+    # Cleanup
+    import shutil as _shutil2
+
+    _shutil2.rmtree(tmpdir, ignore_errors=True)
+
+    # Delete old shard files no longer needed
+    old_shard_files = set()
+    new_shard_files = set()
+    for layer in hidden_layers:
+        for old_si in range(len(old_shards)):
+            old_shard_files.add(
+                f"tensors/hidden_layer{layer:03d}"
+                f"_shard{old_si:03d}.safetensors"
+            )
+        for new_si in range(len(new_boundaries)):
+            new_shard_files.add(
+                f"tensors/hidden_layer{layer:03d}"
+                f"_shard{new_si:03d}.safetensors"
+            )
+
+    stale_files = old_shard_files - new_shard_files
+    if stale_files:
+        logger.info(
+            "[MIGRATE] Deleting %d stale shard files...",
+            len(stale_files),
+        )
+        for sf in stale_files:
+            try:
+                api.delete_file(
+                    sf, repo_id=repo_id, repo_type="dataset",
+                )
+            except Exception as e:
+                logger.warning(
+                    "[MIGRATE] Failed to delete %s: %s", sf, e,
+                )
+
+    url = f"https://huggingface.co/datasets/{repo_id}"
+    logger.info("[MIGRATE] Migration complete: %s", url)
+    return url

@@ -76,6 +76,9 @@ docs = [
     "mkdocs-section-index>=0.3",
 ]
 
+[project.scripts]
+lmprobe = "lmprobe.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/AlliedToasters/lmprobe"
 Documentation = "https://alliedtoasters.github.io/lmprobe"
