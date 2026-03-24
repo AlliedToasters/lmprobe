@@ -35,6 +35,7 @@ import hashlib
 import json
 import logging
 import os
+from datetime import datetime, timezone
 import shutil
 import threading
 from dataclasses import dataclass, field
@@ -1126,6 +1127,147 @@ def _read_model_name(model_dir: Path) -> str | None:
 
 
 # =============================================================================
+# Prompt manifest sidecar (#162)
+# =============================================================================
+
+_manifest_lock = threading.Lock()
+
+
+def _manifest_key(model_name: str) -> str:
+    """Backend key for the prompt manifest JSONL file."""
+    model_hash = _hash_string(model_name)
+    return f"{model_hash}/_manifest.jsonl"
+
+
+def _append_manifest_entry(
+    model_name: str,
+    prompt: str,
+    num_tokens: int | None = None,
+) -> None:
+    """Append a single entry to the prompt manifest.
+
+    Thread-safe. Silently ignores errors so manifest issues never block
+    cache writes.
+    """
+    try:
+        backend = get_backend()
+        key = _manifest_key(model_name)
+        prompt_hash = _hash_string(prompt)
+        entry = {
+            "hash": prompt_hash,
+            "prompt": prompt,
+            "num_tokens": num_tokens,
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+        }
+        line = json.dumps(entry, ensure_ascii=False) + "\n"
+
+        with _manifest_lock:
+            existing = ""
+            if backend.exists(key):
+                try:
+                    existing = backend.read_text(key)
+                except Exception:
+                    pass
+            backend.write_text(key, existing + line)
+    except Exception:
+        # Manifest is advisory — never fail a cache write because of it.
+        logger.debug("[CACHE] Failed to append manifest entry for %r", prompt)
+
+
+@dataclass
+class ManifestEntry:
+    """A single entry from the prompt manifest."""
+
+    hash: str
+    prompt: str
+    num_tokens: int | None
+    cached_at: str
+
+
+def read_manifest(model_name: str) -> list[ManifestEntry]:
+    """Read all manifest entries for a model.
+
+    Returns an empty list if no manifest exists (pre-feature caches).
+    Entries are advisory — the corresponding safetensors file may have
+    been deleted externally.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+
+    Returns
+    -------
+    list[ManifestEntry]
+        Manifest entries in append order.
+    """
+    backend = get_backend()
+    key = _manifest_key(model_name)
+    if not backend.exists(key):
+        return []
+
+    try:
+        text = backend.read_text(key)
+    except Exception:
+        return []
+
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+            entries.append(
+                ManifestEntry(
+                    hash=d["hash"],
+                    prompt=d["prompt"],
+                    num_tokens=d.get("num_tokens"),
+                    cached_at=d.get("cached_at", ""),
+                )
+            )
+        except (json.JSONDecodeError, KeyError):
+            continue
+    return entries
+
+
+def list_cached_prompts(model_name: str, verify: bool = False) -> list[ManifestEntry]:
+    """List prompts known to the manifest for a model.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    verify : bool
+        If True, check that each prompt's safetensors file still exists
+        and filter out stale entries.
+
+    Returns
+    -------
+    list[ManifestEntry]
+        Deduplicated manifest entries (latest entry per prompt hash wins).
+    """
+    raw = read_manifest(model_name)
+
+    # Deduplicate: keep last entry per hash (latest write wins)
+    seen: dict[str, ManifestEntry] = {}
+    for entry in raw:
+        seen[entry.hash] = entry
+    entries = list(seen.values())
+
+    if verify:
+        backend = get_backend()
+        model_hash = _hash_string(model_name)
+        entries = [
+            e
+            for e in entries
+            if backend.exists(f"{model_hash}/{e.hash}.safetensors")
+        ]
+
+    return entries
+
+
+# =============================================================================
 # Shard Registry I/O (lazy caching for pull_dataset)
 # =============================================================================
 
@@ -1807,6 +1949,11 @@ def save_prompt_activations(
     new_tensors[_ATTENTION_MASK_KEY] = attention_mask.detach().cpu().contiguous()
 
     _merge_save_backend(key, new_tensors)
+
+    # Record in prompt manifest (#162)
+    seq_len = attention_mask.shape[-1] if attention_mask.dim() >= 1 else None
+    num_tokens = int(attention_mask.sum().item()) if seq_len is not None else None
+    _append_manifest_entry(model_name, prompt, num_tokens=num_tokens)
 
     # Clean up v1 directory if it exists (migrate on write, local only)
     if isinstance(get_backend(), LocalCacheBackend):
