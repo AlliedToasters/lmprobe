@@ -3361,6 +3361,10 @@ def migrate_dataset(
     else:
         raise KeyError("lmprobe_info.json missing model name")
 
+    old_shard_boundaries: list[int] = [
+        s["num_prompts"] for s in old_shards
+    ]
+
     logger.info(
         "[MIGRATE] Dataset: %d prompts, %d layers, dim=%d, "
         "%d old shards/layer",
@@ -3378,15 +3382,11 @@ def migrate_dataset(
     )
     lt_shard_count = len(lt_boundaries)
 
-    # Rest-token shards: (num_tokens - 1) vectors per prompt (variable)
-    rest_prompt_bytes = [
-        max(tok - 1, 0) * hidden_dim * 4 for tok in num_tokens_list
-    ]
-    rest_boundaries: list[int] = []
-    if any(b > 0 for b in rest_prompt_bytes):
-        rest_boundaries = _compute_shard_boundaries_variable(
-            rest_prompt_bytes, shard_max_bytes,
-        )
+    # Rest-token shards: mirror old shard boundaries (one rest shard
+    # per old shard).  This avoids recomputing variable-size boundaries
+    # and lets us write rest tensors directly from old shards with the
+    # last-token rows removed.
+    rest_boundaries = list(old_shard_boundaries)
 
     new_boundaries = lt_boundaries + rest_boundaries
 
@@ -3413,26 +3413,18 @@ def migrate_dataset(
         lt_assignments.append((lt_shard_idx, lt_row_in_shard))
         lt_row_in_shard += 1
 
-    # Rest-token shard assignments
-    rest_shard_idx = 0
-    rest_tok_offset = 0
-    rest_row_in_shard = 0
+    # Rest-token shard assignments (mirrors old shard grouping)
     rest_assignments: list[tuple[int, int]] = []
-    if rest_boundaries:
-        for i in range(n_prompts):
-            if (
-                rest_shard_idx < len(rest_boundaries)
-                and rest_row_in_shard
-                >= rest_boundaries[rest_shard_idx]
-            ):
-                rest_shard_idx += 1
-                rest_tok_offset = 0
-                rest_row_in_shard = 0
+    old_prompt_cursor = 0
+    for old_si, n_in_shard in enumerate(old_shard_boundaries):
+        rest_tok_offset = 0
+        for j in range(n_in_shard):
+            prompt_idx = old_prompt_cursor + j
             rest_assignments.append(
-                (lt_shard_count + rest_shard_idx, rest_tok_offset),
+                (lt_shard_count + old_si, rest_tok_offset),
             )
-            rest_tok_offset += max(num_tokens_list[i] - 1, 0)
-            rest_row_in_shard += 1
+            rest_tok_offset += max(num_tokens_list[prompt_idx] - 1, 0)
+        old_prompt_cursor += n_in_shard
 
     # Build per-prompt token arrays
     all_token_shard_ids: list[list[int]] = []
@@ -3473,11 +3465,26 @@ def migrate_dataset(
     (tmpdir / "tensors").mkdir(parents=True, exist_ok=True)
     (tmpdir / "index").mkdir(parents=True, exist_ok=True)
 
-    old_shard_boundaries: list[int] = [
-        s["num_prompts"] for s in old_shards
-    ]
+    # Pre-compute per-old-shard last-token row indices.
+    # Within each old shard, tokens are laid out contiguously per prompt:
+    #   [p0_t0, ..., p0_tN, p1_t0, ..., p1_tM, ...]
+    # The last-token indices are at cumulative token boundaries minus 1.
+    old_shard_lt_indices: list[torch.Tensor] = []
+    old_prompt_cursor = 0
+    for old_si, n_in_shard in enumerate(old_shard_boundaries):
+        cum = 0
+        indices = []
+        for j in range(n_in_shard):
+            prompt_idx = old_prompt_cursor + j
+            n_tok = num_tokens_list[prompt_idx]
+            cum += n_tok
+            indices.append(cum - 1)  # last token of this prompt
+        old_shard_lt_indices.append(torch.tensor(indices, dtype=torch.long))
+        old_prompt_cursor += n_in_shard
 
-    total_layer_work = len(hidden_layers) * len(new_boundaries)
+    total_layer_work = (
+        len(hidden_layers) * (lt_shard_count + len(old_shards))
+    )
     with tqdm(
         total=total_layer_work,
         desc="Re-sharding layers",
@@ -3485,10 +3492,12 @@ def migrate_dataset(
     ) as pbar:
         for layer in hidden_layers:
             pbar.set_postfix(layer=layer)
+            key = f"hidden.layer_{layer}"
 
-            # Download and load all old shards for this layer
-            per_prompt_tensors: list[torch.Tensor] = []
-            for old_si, old_shard_desc in enumerate(old_shards):
+            # Pass 1: extract lt vectors from each old shard via
+            # index_select, and write rest shards directly.
+            lt_vectors: list[torch.Tensor] = []
+            for old_si in range(len(old_shards)):
                 fname = (
                     f"tensors/hidden_layer{layer:03d}"
                     f"_shard{old_si:03d}.safetensors"
@@ -3497,75 +3506,57 @@ def migrate_dataset(
                     repo_id, fname,
                     repo_type="dataset", token=token,
                 )
-                key = f"hidden.layer_{layer}"
                 with safe_open(shard_path, framework="pt") as sf:
                     shard_tensor = sf.get_tensor(key)
 
-                # Split into per-prompt tensors using old layout
-                n_in_shard = old_shard_desc["num_prompts"]
-                tok_offset = 0
-                for j in range(n_in_shard):
-                    prompt_idx = (
-                        sum(old_shard_boundaries[:old_si]) + j
-                    )
-                    n_tok = num_tokens_list[prompt_idx]
-                    prompt_tensor = shard_tensor[
-                        tok_offset:tok_offset + n_tok
-                    ]
-                    per_prompt_tensors.append(prompt_tensor)
-                    tok_offset += n_tok
+                lt_idx = old_shard_lt_indices[old_si]
+
+                # Extract last-token vectors (one per prompt)
+                lt_vectors.append(
+                    torch.index_select(shard_tensor, 0, lt_idx)
+                )
+
+                # Build rest tensor by removing last-token rows
+                n_rows = shard_tensor.shape[0]
+                mask = torch.ones(n_rows, dtype=torch.bool)
+                mask[lt_idx] = False
+                rest_tensor = shard_tensor[mask]
 
                 del shard_tensor
 
-            # Write last-token shards
+                # Write rest shard (same index as old shard)
+                rest_shard_idx = lt_shard_count + old_si
+                rest_fname = (
+                    f"tensors/hidden_layer{layer:03d}"
+                    f"_shard{rest_shard_idx:03d}.safetensors"
+                )
+                if rest_tensor.shape[0] > 0:
+                    save_file(
+                        {key: rest_tensor},
+                        str(tmpdir / rest_fname),
+                    )
+                del rest_tensor, mask
+                pbar.update(1)
+
+            # Pass 2: concatenate lt vectors and split into lt shards
+            all_lt = torch.cat(lt_vectors, dim=0)
+            del lt_vectors
+
             offset = 0
             for local_idx, shard_size in enumerate(lt_boundaries):
-                shard_idx = local_idx
-                fname = (
-                    f"tensors/hidden_layer{layer:03d}"
-                    f"_shard{shard_idx:03d}.safetensors"
-                )
-                rows = []
-                for j in range(shard_size):
-                    if offset + j < len(per_prompt_tensors):
-                        rows.append(
-                            per_prompt_tensors[offset + j][-1:]
-                        )
-                if rows:
-                    key = f"hidden.layer_{layer}"
-                    save_file(
-                        {key: torch.cat(rows, dim=0)},
-                        str(tmpdir / fname),
+                actual = min(shard_size, all_lt.shape[0] - offset)
+                if actual > 0:
+                    lt_fname = (
+                        f"tensors/hidden_layer{layer:03d}"
+                        f"_shard{local_idx:03d}.safetensors"
                     )
-                    del rows
-                offset += shard_size
-                pbar.update(1)
-
-            # Write rest-token shards
-            offset = 0
-            for local_idx, shard_size in enumerate(rest_boundaries):
-                shard_idx = lt_shard_count + local_idx
-                fname = (
-                    f"tensors/hidden_layer{layer:03d}"
-                    f"_shard{shard_idx:03d}.safetensors"
-                )
-                rows = []
-                for j in range(shard_size):
-                    if offset + j < len(per_prompt_tensors):
-                        rest = per_prompt_tensors[offset + j][:-1]
-                        if rest.shape[0] > 0:
-                            rows.append(rest)
-                if rows:
-                    key = f"hidden.layer_{layer}"
                     save_file(
-                        {key: torch.cat(rows, dim=0)},
-                        str(tmpdir / fname),
+                        {key: all_lt[offset:offset + actual]},
+                        str(tmpdir / lt_fname),
                     )
-                    del rows
-                offset += shard_size
+                offset += actual
                 pbar.update(1)
-
-            del per_prompt_tensors
+            del all_lt
 
     # ------------------------------------------------------------------
     # Step 5: Copy logits shards unchanged (if present)
