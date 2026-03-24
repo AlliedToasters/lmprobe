@@ -1237,7 +1237,10 @@ def _write_parquet_index(
                 pa_type = pa.string()
             elif isinstance(sample, list):
                 # Infer list element type from first element
-                if sample and isinstance(sample[0], int):
+                # Check bool before int since bool is a subclass of int
+                if sample and isinstance(sample[0], bool):
+                    pa_type = pa.list_(pa.bool_())
+                elif sample and isinstance(sample[0], int):
                     pa_type = pa.list_(pa.int64())
                 elif sample and isinstance(sample[0], float):
                     pa_type = pa.list_(pa.float64())
@@ -1249,6 +1252,8 @@ def _write_parquet_index(
                         [str(x) for x in v] if v is not None else None
                         for v in values
                     ]
+            elif isinstance(sample, bool):
+                pa_type = pa.bool_()
             elif isinstance(sample, int):
                 pa_type = pa.int32()
             elif isinstance(sample, float):
@@ -1886,84 +1891,108 @@ def _push_dataset_streaming(
             manifest.pop("pending_batch", None)
             _save_manifest(staging_dir, manifest)
 
-    # Build the batched on_shard_written callback
-    completed_set = set(manifest["completed_shards"])
-    pending_shards: list[tuple[Path, str]] = []
-
-    def _flush_batch() -> None:
-        """Upload buffered shards as a single commit, then cleanup."""
-        if not pending_shards:
-            return
-        paths_in_batch = [rp for _, rp in pending_shards]
+    # Check if consolidation already completed on a prior run.
+    # If the manifest has cached metadata, skip the expensive metadata scan
+    # and consolidation loop entirely (fixes redundant S3 reads on resume).
+    cached_meta = manifest.get("consolidation_result")
+    if cached_meta is not None:
         logger.info(
-            "[SHARING] Uploading batch of %d shards: %s",
-            len(pending_shards),
-            ", ".join(paths_in_batch),
+            "[SHARING] Consolidation already completed on prior run, "
+            "skipping metadata scan and shard consolidation"
         )
-        # Save pending paths to manifest before commit so resume can
-        # find them if create_commit fails (avoids re-consolidation).
-        manifest["pending_batch"] = [
-            [str(lp), rp] for lp, rp in pending_shards
-        ]
-        _save_manifest(staging_dir, manifest)
+        tensor_descriptors = cached_meta["tensor_descriptors"]
+        prompt_metadata = cached_meta["prompt_metadata"]
+        tmpdir = staging_dir
+        (tmpdir / "tensors").mkdir(parents=True, exist_ok=True)
+        (tmpdir / "index").mkdir(parents=True, exist_ok=True)
+    else:
+        # Build the batched on_shard_written callback
+        completed_set = set(manifest["completed_shards"])
+        pending_shards: list[tuple[Path, str]] = []
 
-        operations = [
-            CommitOperationAdd(
-                path_in_repo=repo_path,
-                path_or_fileobj=str(local_path),
+        def _flush_batch() -> None:
+            """Upload buffered shards as a single commit, then cleanup."""
+            if not pending_shards:
+                return
+            paths_in_batch = [rp for _, rp in pending_shards]
+            logger.info(
+                "[SHARING] Uploading batch of %d shards: %s",
+                len(pending_shards),
+                ", ".join(paths_in_batch),
             )
-            for local_path, repo_path in pending_shards
-        ]
-        api.create_commit(
+            # Save pending paths to manifest before commit so resume can
+            # find them if create_commit fails (avoids re-consolidation).
+            manifest["pending_batch"] = [
+                [str(lp), rp] for lp, rp in pending_shards
+            ]
+            _save_manifest(staging_dir, manifest)
+
+            operations = [
+                CommitOperationAdd(
+                    path_in_repo=repo_path,
+                    path_or_fileobj=str(local_path),
+                )
+                for local_path, repo_path in pending_shards
+            ]
+            api.create_commit(
+                repo_id=repo_id,
+                operations=operations,
+                commit_message=(
+                    f"Add {len(pending_shards)} shards"
+                ),
+                repo_type="dataset",
+            )
+            # Delete local copies and update manifest
+            for local_path, repo_path in pending_shards:
+                local_path.unlink(missing_ok=True)
+                manifest["completed_shards"].append(repo_path)
+                completed_set.add(repo_path)
+            manifest.pop("pending_batch", None)
+            _save_manifest(staging_dir, manifest)
+            pending_shards.clear()
+
+        def _on_shard_written(local_path: Path, repo_path: str) -> None:
+            if repo_path in completed_set:
+                logger.debug(
+                    "[SHARING] Skipping already-uploaded shard: %s", repo_path,
+                )
+                local_path.unlink(missing_ok=True)
+                return
+            pending_shards.append((local_path, repo_path))
+            if len(pending_shards) >= stream_batch_size:
+                _flush_batch()
+
+        # Consolidate with streaming callback
+        logger.info(
+            "[SHARING] Consolidating and streaming shards "
+            "(batch_size=%d)...", stream_batch_size,
+        )
+        tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=model_name,
+            prompts=prompts,
+            kept_indices=kept_indices,
+            tensor_types=tensor_types,
+            labels=labels,
+            shard_max_bytes=shard_max_bytes,
             repo_id=repo_id,
-            operations=operations,
-            commit_message=(
-                f"Add {len(pending_shards)} shards"
-            ),
-            repo_type="dataset",
+            metadata=metadata,
+            tmpdir=staging_dir,
+            on_shard_written=_on_shard_written,
+            preload=preload,
+            preload_workers=preload_workers,
         )
-        # Delete local copies and update manifest
-        for local_path, repo_path in pending_shards:
-            local_path.unlink(missing_ok=True)
-            manifest["completed_shards"].append(repo_path)
-            completed_set.add(repo_path)
-        manifest.pop("pending_batch", None)
+
+        # Flush any remaining buffered shards
+        _flush_batch()
+
+        # Cache consolidation results in the manifest so subsequent
+        # resumes (e.g. after a Parquet index write failure) can skip
+        # the expensive metadata scan and consolidation entirely.
+        manifest["consolidation_result"] = {
+            "tensor_descriptors": tensor_descriptors,
+            "prompt_metadata": prompt_metadata,
+        }
         _save_manifest(staging_dir, manifest)
-        pending_shards.clear()
-
-    def _on_shard_written(local_path: Path, repo_path: str) -> None:
-        if repo_path in completed_set:
-            logger.debug(
-                "[SHARING] Skipping already-uploaded shard: %s", repo_path,
-            )
-            local_path.unlink(missing_ok=True)
-            return
-        pending_shards.append((local_path, repo_path))
-        if len(pending_shards) >= stream_batch_size:
-            _flush_batch()
-
-    # Consolidate with streaming callback
-    logger.info(
-        "[SHARING] Consolidating and streaming shards "
-        "(batch_size=%d)...", stream_batch_size,
-    )
-    tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
-        model_name=model_name,
-        prompts=prompts,
-        kept_indices=kept_indices,
-        tensor_types=tensor_types,
-        labels=labels,
-        shard_max_bytes=shard_max_bytes,
-        repo_id=repo_id,
-        metadata=metadata,
-        tmpdir=staging_dir,
-        on_shard_written=_on_shard_written,
-        preload=preload,
-        preload_workers=preload_workers,
-    )
-
-    # Flush any remaining buffered shards
-    _flush_batch()
 
     # Upload metadata files (parquet, info, README)
     if not manifest.get("metadata_uploaded", False):

@@ -1994,6 +1994,49 @@ class TestExtraMetadataColumns:
         assert "token_offset" in table.column_names
         assert table.column("token_offset").to_pylist() == [0, 3]
 
+    def test_bool_metadata_columns(self, tmp_path):
+        """Bool metadata columns should not crash the Parquet index write.
+
+        Regression test for #155: isinstance(True, int) is True in Python,
+        so bool values were incorrectly routed to pa.int32(), causing
+        ArrowTypeError: Expected integer, got bool.
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir()
+        prompt_metadata = [
+            {"text": "hello", "label": 1, "num_tokens": 3,
+             "shard_index": 0, "row_offset": 0, "negated": True},
+            {"text": "world", "label": 0, "num_tokens": 4,
+             "shard_index": 0, "row_offset": 1, "negated": False},
+        ]
+        _write_parquet_index(tmp_path, prompt_metadata)
+
+        table = pq.read_table(str(tmp_path / PARQUET_PATH))
+        assert "negated" in table.column_names
+        assert table.column("negated").type == pa.bool_()
+        assert table.column("negated").to_pylist() == [True, False]
+
+    def test_bool_list_metadata_columns(self, tmp_path):
+        """List-of-bool metadata columns should use pa.list_(pa.bool_())."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir()
+        prompt_metadata = [
+            {"text": "a", "label": 1, "num_tokens": 3,
+             "shard_index": 0, "row_offset": 0, "flags": [True, False]},
+            {"text": "b", "label": 0, "num_tokens": 4,
+             "shard_index": 0, "row_offset": 1, "flags": [False, True]},
+        ]
+        _write_parquet_index(tmp_path, prompt_metadata)
+
+        table = pq.read_table(str(tmp_path / PARQUET_PATH))
+        assert "flags" in table.column_names
+        assert table.column("flags").type == pa.list_(pa.bool_())
+        assert table.column("flags").to_pylist() == [[True, False], [False, True]]
+
 
 @requires_pyarrow
 class TestPushMetadataValidation:
