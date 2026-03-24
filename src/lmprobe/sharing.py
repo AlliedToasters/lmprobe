@@ -119,6 +119,7 @@ def _staging_dir_path(
     tensors: list[str] | None = None,
     stream: bool = False,
     stream_batch_size: int | None = None,
+    shuffle: bool = True,
 ) -> Path:
     """Deterministic staging directory for resumable uploads.
 
@@ -139,6 +140,8 @@ def _staging_dir_path(
         key_parts.append(["stream", True])
     if stream_batch_size is not None:
         key_parts.append(["stream_batch_size", stream_batch_size])
+    if not shuffle:
+        key_parts.append(["shuffle", False])
     content = json.dumps(key_parts, sort_keys=True)
     key = hashlib.sha256(content.encode()).hexdigest()[:16]
     return get_cache_dir() / "staging" / key
@@ -674,6 +677,7 @@ def _compute_shard_plan(
     shard_max_bytes: int,
     repo_id: str,
     metadata: list[dict] | None = None,
+    shuffle: bool = True,
 ) -> dict[str, Any]:
     """Compute the shard plan without loading any tensor data.
 
@@ -799,13 +803,14 @@ def _compute_shard_plan(
         )
 
     # --- Phase 2: Shuffle prompts (deterministic) ---
-    seed = _deterministic_seed(repo_id)
     n = len(valid_prompts)
-    perm = _shuffle_indices(n, seed)
-    valid_prompts = [valid_prompts[i] for i in perm]
-    prompt_metadata = [prompt_metadata[i] for i in perm]
-    if per_prompt_tokens:
-        per_prompt_tokens = [per_prompt_tokens[i] for i in perm]
+    if shuffle:
+        seed = _deterministic_seed(repo_id)
+        perm = _shuffle_indices(n, seed)
+        valid_prompts = [valid_prompts[i] for i in perm]
+        prompt_metadata = [prompt_metadata[i] for i in perm]
+        if per_prompt_tokens:
+            per_prompt_tokens = [per_prompt_tokens[i] for i in perm]
 
     # --- Phase 3: Compute shard boundaries ---
     # Probe one prompt for hidden_dim (loads and immediately frees one tensor)
@@ -1039,6 +1044,7 @@ def _consolidate_and_shard(
     preload: str = "none",
     preload_workers: int = 8,
     skip_shards: set[str] | None = None,
+    shuffle: bool = True,
 ) -> tuple[Path, dict, list[dict]]:
     """Consolidate cached tensors into sharded safetensors files.
 
@@ -1093,6 +1099,7 @@ def _consolidate_and_shard(
         shard_max_bytes=shard_max_bytes,
         repo_id=repo_id,
         metadata=metadata,
+        shuffle=shuffle,
     )
 
     prompt_metadata = plan["prompt_metadata"]
@@ -1679,6 +1686,7 @@ def push_dataset(
     stream_batch_size: int = 10,
     preload: str = "none",
     preload_workers: int = 8,
+    shuffle: bool = True,
 ) -> str:
     """Push cached activations to a HuggingFace Dataset repo.
 
@@ -1745,6 +1753,10 @@ def push_dataset(
     preload_workers : int
         Number of parallel threads for preloading cache reads.
         Only used when ``preload`` is not ``"none"``.  Default 8.
+    shuffle : bool
+        If True (default), deterministically shuffle prompts across shards
+        using a seed derived from ``repo_id``.  If False, preserve the
+        input prompt order in the output shards.
 
     Returns
     -------
@@ -1814,6 +1826,7 @@ def push_dataset(
         metadata=metadata, tensors=tensors,
         stream=stream,
         stream_batch_size=stream_batch_size if stream else None,
+        shuffle=shuffle,
     )
 
     if stream:
@@ -1837,6 +1850,7 @@ def push_dataset(
             stream_batch_size=stream_batch_size,
             preload=preload,
             preload_workers=preload_workers,
+            shuffle=shuffle,
         )
 
     # --- Non-streaming path (unchanged) ---
@@ -1876,6 +1890,7 @@ def push_dataset(
             tmpdir=staging_dir,
             preload=preload,
             preload_workers=preload_workers,
+            shuffle=shuffle,
         )
 
         # Step 5: Write Parquet index
@@ -1971,6 +1986,7 @@ def _push_dataset_streaming(
     stream_batch_size: int = 10,
     preload: str = "none",
     preload_workers: int = 8,
+    shuffle: bool = True,
 ) -> str:
     """Streaming upload: write shards, batch-upload via create_commit.
 
@@ -2031,6 +2047,7 @@ def _push_dataset_streaming(
             shard_max_bytes=shard_max_bytes,
             repo_id=repo_id,
             metadata=metadata,
+            shuffle=shuffle,
         )
         tensor_descriptors = plan["tensor_descriptors"]
         prompt_metadata = plan["prompt_metadata"]
@@ -2153,6 +2170,7 @@ def _push_dataset_streaming(
             preload=preload,
             preload_workers=preload_workers,
             skip_shards=remote_existing,
+            shuffle=shuffle,
         )
 
         # Flush any remaining buffered shards
