@@ -839,14 +839,33 @@ def _compute_shard_plan(
     has_hidden = bool(hidden_layers and (hidden_strategy or use_raw))
     want_logits = bool(has_logits and logits_top_k is not None)
 
+    # Number of leading shards reserved for last-token vectors (0 for
+    # pooled datasets or when no raw hidden layers are present).
+    lt_shard_count = 0
+    lt_boundaries: list[int] = []
+    rest_boundaries: list[int] = []
+
     if use_raw:
-        per_prompt_bytes = [
-            tok * hidden_dim * 4
+        # Last-token shards: one vector per prompt (fixed size)
+        hidden_row_bytes = hidden_dim * 4
+        lt_boundaries = _compute_shard_boundaries(
+            n, hidden_row_bytes, shard_max_bytes,
+        ) if has_hidden else []
+        lt_shard_count = len(lt_boundaries)
+
+        # Rest-token shards: (num_tokens - 1) vectors per prompt (variable)
+        rest_prompt_bytes = [
+            max(tok - 1, 0) * hidden_dim * 4
             for tok in per_prompt_tokens
         ]
-        hidden_boundaries = _compute_shard_boundaries_variable(
-            per_prompt_bytes, shard_max_bytes,
-        )
+        # Only create rest shards if there are tokens beyond the last
+        if any(b > 0 for b in rest_prompt_bytes):
+            rest_boundaries = _compute_shard_boundaries_variable(
+                rest_prompt_bytes, shard_max_bytes,
+            )
+
+        # Combined boundaries: last-token shards first, then rest shards
+        hidden_boundaries = lt_boundaries + rest_boundaries
     else:
         hidden_row_bytes = hidden_dim * 4
         hidden_boundaries = _compute_shard_boundaries(
@@ -861,9 +880,72 @@ def _compute_shard_plan(
         logits_boundaries = []
 
     # --- Phase 4a: Assign shard metadata (no data loading) ---
-    if has_hidden and hidden_boundaries:
+    if has_hidden and hidden_boundaries and use_raw and lt_boundaries:
+        # Per-token shard mapping for full_sequence datasets.
+        # Last-token shards have indices 0..lt_shard_count-1,
+        # rest-token shards have indices lt_shard_count..len(hidden_boundaries)-1.
+
+        # Build last-token shard assignments (prompt -> lt shard + offset)
+        lt_row_in_shard = 0
+        lt_shard_idx = 0
+        lt_assignments: list[tuple[int, int]] = []  # (shard_idx, row_offset)
+        for i in range(n):
+            if lt_shard_idx < len(lt_boundaries) and lt_row_in_shard >= lt_boundaries[lt_shard_idx]:
+                lt_shard_idx += 1
+                lt_row_in_shard = 0
+            lt_assignments.append((lt_shard_idx, lt_row_in_shard))
+            lt_row_in_shard += 1
+
+        # Build rest-token shard assignments (prompt -> rest shard + token_offset)
+        rest_shard_idx = 0
+        rest_tok_offset = 0
+        rest_row_in_shard = 0
+        rest_assignments: list[tuple[int, int]] = []  # (shard_idx, token_offset)
+        if rest_boundaries:
+            for i in range(n):
+                if (
+                    rest_shard_idx < len(rest_boundaries)
+                    and rest_row_in_shard >= rest_boundaries[rest_shard_idx]
+                ):
+                    rest_shard_idx += 1
+                    rest_tok_offset = 0
+                    rest_row_in_shard = 0
+                rest_assignments.append((lt_shard_count + rest_shard_idx, rest_tok_offset))
+                rest_tok_offset += max(per_prompt_tokens[i] - 1, 0)
+                rest_row_in_shard += 1
+
+        # Assign per-token arrays and scalar backwards-compat fields
+        for i in range(n):
+            num_tok = per_prompt_tokens[i]
+            lt_si, lt_off = lt_assignments[i]
+
+            # Build per-token arrays
+            token_shard_ids: list[int] = []
+            token_shard_offsets: list[int] = []
+
+            if num_tok > 1 and rest_assignments:
+                rest_si, rest_off = rest_assignments[i]
+                # Tokens 0..N-2 go to rest shard
+                for t in range(num_tok - 1):
+                    token_shard_ids.append(rest_si)
+                    token_shard_offsets.append(rest_off + t)
+            # Last token goes to last-token shard
+            token_shard_ids.append(lt_si)
+            token_shard_offsets.append(lt_off)
+
+            prompt_metadata[i]["token_shard_ids"] = token_shard_ids
+            prompt_metadata[i]["token_shard_offsets"] = token_shard_offsets
+
+            # Scalar backwards-compat: point to last-token shard
+            prompt_metadata[i]["shard_index_hidden"] = lt_si
+            prompt_metadata[i]["row_offset_hidden"] = lt_off
+            prompt_metadata[i]["shard_index"] = lt_si
+            prompt_metadata[i]["row_offset"] = lt_off
+            prompt_metadata[i]["token_offset_hidden"] = lt_off
+            prompt_metadata[i]["token_offset"] = lt_off
+
+    elif has_hidden and hidden_boundaries:
         offset = 0
-        token_offset_acc = 0
         for shard_idx, shard_size in enumerate(hidden_boundaries):
             for local_row in range(shard_size):
                 global_row = offset + local_row
@@ -872,10 +954,6 @@ def _compute_shard_plan(
                     prompt_metadata[global_row]["row_offset_hidden"] = local_row
                     prompt_metadata[global_row]["shard_index"] = shard_idx
                     prompt_metadata[global_row]["row_offset"] = local_row
-                    if use_raw:
-                        prompt_metadata[global_row]["token_offset_hidden"] = token_offset_acc
-                        prompt_metadata[global_row]["token_offset"] = token_offset_acc
-                        token_offset_acc += per_prompt_tokens[global_row]
             offset += shard_size
 
     if want_logits and logits_boundaries:
@@ -896,18 +974,41 @@ def _compute_shard_plan(
 
     if has_hidden and hidden_boundaries:
         hidden_shards = []
-        off = 0
-        for si, sz in enumerate(hidden_boundaries):
-            actual = min(sz, n - off)
-            shard_desc: dict[str, Any] = {
-                "num_prompts": actual,
-            }
-            if use_raw:
-                shard_desc["num_tokens"] = sum(
-                    per_prompt_tokens[off : off + actual]
-                )
-            hidden_shards.append(shard_desc)
-            off += actual
+        if use_raw and lt_boundaries:
+            # Last-token shards: 1 token per prompt
+            off = 0
+            for si, sz in enumerate(lt_boundaries):
+                actual = min(sz, n - off)
+                hidden_shards.append({
+                    "num_prompts": actual,
+                    "num_tokens": actual,  # 1 token per prompt
+                })
+                off += actual
+            # Rest-token shards: (num_tokens - 1) per prompt
+            off = 0
+            for si, sz in enumerate(rest_boundaries):
+                actual = min(sz, n - off)
+                hidden_shards.append({
+                    "num_prompts": actual,
+                    "num_tokens": sum(
+                        max(per_prompt_tokens[off + j] - 1, 0)
+                        for j in range(actual)
+                    ),
+                })
+                off += actual
+        else:
+            off = 0
+            for si, sz in enumerate(hidden_boundaries):
+                actual = min(sz, n - off)
+                shard_desc: dict[str, Any] = {
+                    "num_prompts": actual,
+                }
+                if use_raw:
+                    shard_desc["num_tokens"] = sum(
+                        per_prompt_tokens[off : off + actual]
+                    )
+                hidden_shards.append(shard_desc)
+                off += actual
 
         hidden_desc: dict[str, Any] = {
             "type": "hidden",
@@ -919,6 +1020,8 @@ def _compute_shard_plan(
         }
         if use_raw:
             hidden_desc["storage"] = "full_sequence"
+            if lt_shard_count > 0:
+                hidden_desc["last_token_shards"] = lt_shard_count
         else:
             hidden_desc["storage"] = "pooled"
             hidden_desc["pooling"] = hidden_strategy
@@ -962,6 +1065,9 @@ def _compute_shard_plan(
         "logits_top_k": logits_top_k,
         "logits_row_bytes": logits_row_bytes,
         "n": n,
+        "lt_shard_count": lt_shard_count,
+        "lt_boundaries": lt_boundaries,
+        "rest_boundaries": rest_boundaries,
     }
 
 
@@ -970,7 +1076,7 @@ def _reconstruct_plan_from_cached(cached_meta: dict) -> dict[str, Any]:
 
     Only populates the fields needed by ``_enumerate_shard_files``:
     has_hidden, hidden_layers, hidden_boundaries, want_logits,
-    logits_boundaries.
+    logits_boundaries, lt_shard_count.
     """
     td = cached_meta["tensor_descriptors"]
     hidden_info = td.get("hidden_layers", {})
@@ -981,6 +1087,7 @@ def _reconstruct_plan_from_cached(cached_meta: dict) -> dict[str, Any]:
     hidden_boundaries = [
         s["num_prompts"] for s in hidden_info.get("shards", [])
     ]
+    lt_shard_count = hidden_info.get("last_token_shards", 0)
 
     want_logits = bool(logits_info)
     logits_boundaries = [
@@ -993,6 +1100,7 @@ def _reconstruct_plan_from_cached(cached_meta: dict) -> dict[str, Any]:
         "hidden_boundaries": hidden_boundaries,
         "want_logits": want_logits,
         "logits_boundaries": logits_boundaries,
+        "lt_shard_count": lt_shard_count,
     }
 
 
@@ -1113,6 +1221,9 @@ def _consolidate_and_shard(
     has_hidden = plan["has_hidden"]
     want_logits = plan["want_logits"]
     logits_top_k = plan["logits_top_k"]
+    lt_shard_count = plan.get("lt_shard_count", 0)
+    lt_boundaries = plan.get("lt_boundaries", [])
+    rest_boundaries = plan.get("rest_boundaries", [])
 
     from tqdm import tqdm
 
@@ -1123,15 +1234,23 @@ def _consolidate_and_shard(
         # Phase 4b: Write per-layer shard files one layer at a time.
         total_layer_shards = len(hidden_layers) * len(hidden_boundaries)
 
-        def _write_layer_shards(
+        def _write_group_shards(
             layer: int,
             data: list[torch.Tensor | None],
+            boundaries: list[int],
+            shard_idx_offset: int,
+            slice_fn: Callable[[torch.Tensor], torch.Tensor],
             pbar: Any,
         ) -> None:
-            """Write all shards for one layer from preloaded data."""
+            """Write shards for one layer from preloaded data.
+
+            ``slice_fn`` selects which tokens from each prompt tensor
+            to include (e.g. last token only, or all-but-last).
+            """
             key = f"hidden.layer_{layer}"
             offset = 0
-            for shard_idx, shard_size in enumerate(hidden_boundaries):
+            for local_idx, shard_size in enumerate(boundaries):
+                shard_idx = shard_idx_offset + local_idx
                 fname = (
                     f"tensors/hidden_layer{layer:03d}"
                     f"_shard{shard_idx:03d}.safetensors"
@@ -1140,11 +1259,13 @@ def _consolidate_and_shard(
                     offset += shard_size
                     pbar.update(1)
                     continue
-                rows = [
-                    data[offset + j]
-                    for j in range(shard_size)
-                    if data[offset + j] is not None
-                ]
+                rows = []
+                for j in range(shard_size):
+                    t = data[offset + j]
+                    if t is not None:
+                        sliced = slice_fn(t)
+                        if sliced.shape[0] > 0:
+                            rows.append(sliced)
                 if rows:
                     layer_tensor = {key: torch.cat(rows, dim=0)}
                     save_file(layer_tensor, str(tmpdir / fname))
@@ -1154,6 +1275,29 @@ def _consolidate_and_shard(
                 del rows
                 offset += shard_size
                 pbar.update(1)
+
+        def _write_layer_shards(
+            layer: int,
+            data: list[torch.Tensor | None],
+            pbar: Any,
+        ) -> None:
+            """Write all shards for one layer from preloaded data."""
+            if use_raw and lt_shard_count > 0:
+                # Split: lt shards get last token, rest shards get remainder
+                _write_group_shards(
+                    layer, data, lt_boundaries, 0,
+                    lambda t: t[-1:], pbar,
+                )
+                _write_group_shards(
+                    layer, data, rest_boundaries, lt_shard_count,
+                    lambda t: t[:-1], pbar,
+                )
+            else:
+                # Non-split: write all tokens to each shard
+                _write_group_shards(
+                    layer, data, hidden_boundaries, 0,
+                    lambda t: t, pbar,
+                )
 
         if preload == "full":
             # Preload ALL layers for ALL prompts, then write shards
@@ -1207,61 +1351,88 @@ def _consolidate_and_shard(
         else:
             # preload == "none": original sequential behaviour.
             # Peak RAM = one shard's worth of one layer.
+
+            def _write_group_shards_streaming(
+                layer: int,
+                boundaries: list[int],
+                shard_idx_offset: int,
+                slice_fn: Callable[[Any], Any],
+                pbar: Any,
+            ) -> None:
+                """Load and write shards for one boundary group."""
+                key = f"hidden.layer_{layer}"
+                offset = 0
+                for local_idx, shard_size in enumerate(boundaries):
+                    shard_idx = shard_idx_offset + local_idx
+                    fname = (
+                        f"tensors/hidden_layer{layer:03d}"
+                        f"_shard{shard_idx:03d}.safetensors"
+                    )
+                    if fname in skip_shards:
+                        offset += shard_size
+                        pbar.update(1)
+                        continue
+                    shard_prompts_text = valid_prompts[
+                        offset : offset + shard_size
+                    ]
+                    rows: list[torch.Tensor] = []
+                    for prompt in shard_prompts_text:
+                        try:
+                            if use_raw:
+                                layer_tensors, _ = (
+                                    _load_hidden_raw_for_prompt(
+                                        model_name, prompt, [layer],
+                                    )
+                                )
+                            elif hidden_strategy:
+                                layer_tensors = _load_hidden_for_prompt(
+                                    model_name, prompt, [layer],
+                                    hidden_strategy,
+                                )
+                            else:
+                                layer_tensors = {}
+                            if key in layer_tensors:
+                                sliced = slice_fn(layer_tensors[key])
+                                if sliced.shape[0] > 0:
+                                    rows.append(sliced)
+                        except (
+                            FileNotFoundError, KeyError, OSError,
+                        ) as e:
+                            raise OSError(
+                                f"Prompt passed metadata scan but "
+                                f"failed to load during shard write "
+                                f"(cache may have been modified "
+                                f"concurrently): {e}"
+                            ) from e
+                    if rows:
+                        layer_tensor = {key: torch.cat(rows, dim=0)}
+                        save_file(layer_tensor, str(tmpdir / fname))
+                        if on_shard_written is not None:
+                            on_shard_written(tmpdir / fname, fname)
+                        del layer_tensor
+                    del rows
+                    offset += shard_size
+                    pbar.update(1)
+
             with tqdm(
                 total=total_layer_shards, desc="Writing hidden shards",
                 unit="shard",
             ) as pbar:
                 for layer in hidden_layers:
-                    key = f"hidden.layer_{layer}"
-                    offset = 0
-                    for shard_idx, shard_size in enumerate(hidden_boundaries):
-                        fname = (
-                            f"tensors/hidden_layer{layer:03d}"
-                            f"_shard{shard_idx:03d}.safetensors"
+                    if use_raw and lt_shard_count > 0:
+                        _write_group_shards_streaming(
+                            layer, lt_boundaries, 0,
+                            lambda t: t[-1:], pbar,
                         )
-                        if fname in skip_shards:
-                            offset += shard_size
-                            pbar.update(1)
-                            continue
-                        shard_prompts_text = valid_prompts[
-                            offset : offset + shard_size
-                        ]
-                        rows: list[torch.Tensor] = []
-                        for prompt in shard_prompts_text:
-                            try:
-                                if use_raw:
-                                    layer_tensors, _ = (
-                                        _load_hidden_raw_for_prompt(
-                                            model_name, prompt, [layer],
-                                        )
-                                    )
-                                elif hidden_strategy:
-                                    layer_tensors = _load_hidden_for_prompt(
-                                        model_name, prompt, [layer],
-                                        hidden_strategy,
-                                    )
-                                else:
-                                    layer_tensors = {}
-                                if key in layer_tensors:
-                                    rows.append(layer_tensors[key])
-                            except (
-                                FileNotFoundError, KeyError, OSError,
-                            ) as e:
-                                raise OSError(
-                                    f"Prompt passed metadata scan but "
-                                    f"failed to load during shard write "
-                                    f"(cache may have been modified "
-                                    f"concurrently): {e}"
-                                ) from e
-                        if rows:
-                            layer_tensor = {key: torch.cat(rows, dim=0)}
-                            save_file(layer_tensor, str(tmpdir / fname))
-                            if on_shard_written is not None:
-                                on_shard_written(tmpdir / fname, fname)
-                            del layer_tensor
-                        del rows
-                        offset += shard_size
-                        pbar.update(1)
+                        _write_group_shards_streaming(
+                            layer, rest_boundaries, lt_shard_count,
+                            lambda t: t[:-1], pbar,
+                        )
+                    else:
+                        _write_group_shards_streaming(
+                            layer, hidden_boundaries, 0,
+                            lambda t: t, pbar,
+                        )
 
     # --- Logits pass ---
     if want_logits and logits_boundaries:
@@ -2477,17 +2648,29 @@ def pull_dataset(
         pull_types = list(tensor_descriptors.keys())
 
     # Figure out which shards we need (v1.2: per-type shard indices)
+    # When token_shard_ids is present (v1.3 full_sequence datasets),
+    # collect all unique shard IDs across all tokens for each prompt.
+    has_token_shard_ids = "token_shard_ids" in index
     needed_shards: dict[str, set[int]] = {}
     for i in prompt_indices:
         for t_type in pull_types:
-            if t_type == "logits_topk" and "shard_index_logits" in index:
+            if (
+                t_type == "hidden_layers"
+                and has_token_shard_ids
+            ):
+                # Per-token shard mapping: collect all shards for this prompt
+                for si in index["token_shard_ids"][i]:
+                    needed_shards.setdefault(t_type, set()).add(si)
+            elif t_type == "logits_topk" and "shard_index_logits" in index:
                 si = index["shard_index_logits"][i]
+                needed_shards.setdefault(t_type, set()).add(si)
             elif t_type == "hidden_layers" and "shard_index_hidden" in index:
                 si = index["shard_index_hidden"][i]
+                needed_shards.setdefault(t_type, set()).add(si)
             else:
                 # Legacy v1.1 fallback: single shard_index for all types
                 si = index["shard_index"][i]
-            needed_shards.setdefault(t_type, set()).add(si)
+                needed_shards.setdefault(t_type, set()).add(si)
 
     # Download shard files and record local paths
     # For per-layer layout (v1.1), we download per-layer files
@@ -2627,6 +2810,10 @@ def pull_dataset(
         ):
             if col in index:
                 entry[col] = index[col][i]
+        # Per-token shard arrays (v1.3)
+        for col in ("token_shard_ids", "token_shard_offsets"):
+            if col in index:
+                entry[col] = index[col][i]
         shard_index[prompt_hash] = entry
 
     write_shard_registry(model_name, manifest, shard_index)
@@ -2670,6 +2857,7 @@ def _unpack_shard_prompts(
     shard_path: str | dict[int, str],
     shard_prompts: list[int],
     index: dict,
+    all_layer_paths: dict[int, dict[int, str]] | None = None,
 ) -> None:
     """Unpack per-prompt files from a single shard.
 
@@ -2681,9 +2869,15 @@ def _unpack_shard_prompts(
     shard_path : str | dict[int, str]
         For v1.0 co-located layout: path to the single shard file.
         For v1.1 per-layer layout: dict mapping layer index to file path.
+    all_layer_paths : dict[int, dict[int, str]] | None
+        For split full_sequence datasets: shard_idx -> {layer: path}.
+        Needed when a prompt spans multiple shards.
     """
     from safetensors import safe_open
     from tqdm import tqdm
+
+    has_token_shard_ids = "token_shard_ids" in index
+    storage = t_info.get("storage", "pooled")
 
     if isinstance(shard_path, dict):
         # Per-layer layout: load each per-layer file
@@ -2698,7 +2892,22 @@ def _unpack_shard_prompts(
             sf_keys = list(f.keys())
             tensors_data = {k: f.get_tensor(k) for k in sf_keys}
 
-    storage = t_info.get("storage", "pooled")
+    # For split full_sequence datasets, load all shard tensors upfront
+    # so we can reconstruct complete sequences from multiple shards.
+    all_shard_tensors: dict[int, dict[str, torch.Tensor]] = {}
+    if (
+        has_token_shard_ids
+        and t_type == "hidden_layers"
+        and storage == "full_sequence"
+        and all_layer_paths is not None
+    ):
+        for shard_idx, layer_paths in all_layer_paths.items():
+            shard_data: dict[str, torch.Tensor] = {}
+            for layer, layer_path in layer_paths.items():
+                with safe_open(layer_path, framework="pt") as f:
+                    for k in f.keys():
+                        shard_data[k] = f.get_tensor(k)
+            all_shard_tensors[shard_idx] = shard_data
 
     for pi in tqdm(
         shard_prompts,
@@ -2709,18 +2918,47 @@ def _unpack_shard_prompts(
         prompt_text = index["text"][pi]
 
         if t_type == "hidden_layers" and storage == "full_sequence":
-            tok_off = index["token_offset"][pi]
             num_tok = index["num_tokens"][pi]
             hidden_dim = t_info.get("dim", 0)
 
-            layer_slices = []
-            for sf_key in sf_keys:
-                match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
-                if not match:
-                    continue
-                layer = int(match.group(1))
-                chunk = tensors_data[sf_key][tok_off : tok_off + num_tok]
-                layer_slices.append((layer, chunk))
+            if has_token_shard_ids and all_shard_tensors:
+                # Split format: reconstruct from per-token shard arrays
+                token_shard_ids = index["token_shard_ids"][pi]
+                token_shard_offsets = index["token_shard_offsets"][pi]
+
+                # Discover layers from the first available shard
+                first_shard_data = next(iter(all_shard_tensors.values()))
+                layer_nums = sorted(
+                    int(re.match(r"^hidden\.layer_(\d+)$", k).group(1))
+                    for k in first_shard_data
+                    if re.match(r"^hidden\.layer_(\d+)$", k)
+                )
+
+                # For each layer, assemble tokens in sequence order
+                layer_slices = []
+                for layer_num in layer_nums:
+                    key = f"hidden.layer_{layer_num}"
+                    token_vecs = []
+                    for t_idx in range(num_tok):
+                        sid = token_shard_ids[t_idx]
+                        soff = token_shard_offsets[t_idx]
+                        token_vecs.append(
+                            all_shard_tensors[sid][key][soff : soff + 1]
+                        )
+                    layer_slices.append(
+                        (layer_num, torch.cat(token_vecs, dim=0))
+                    )
+            else:
+                # Legacy format: all tokens in one shard
+                tok_off = index["token_offset"][pi]
+                layer_slices = []
+                for sf_key in sf_keys:
+                    match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
+                    if not match:
+                        continue
+                    layer = int(match.group(1))
+                    chunk = tensors_data[sf_key][tok_off : tok_off + num_tok]
+                    layer_slices.append((layer, chunk))
 
             layer_slices.sort(key=lambda x: x[0])
             sorted_layers = [ls[0] for ls in layer_slices]
@@ -2805,11 +3043,34 @@ def _materialize_prompts(
     if per_layer_paths is None:
         per_layer_paths = {}
 
-    # Collect all (t_type, shard_idx, shard_path, shard_prompts) jobs
-    jobs = []
+    # Collect all (t_type, t_info, shard_path, shard_prompts, all_layer_paths) jobs
+    has_token_shard_ids = "token_shard_ids" in index
+    jobs: list[tuple] = []
     for t_type in pull_types:
         t_info = tensor_descriptors[t_type]
         layout = t_info.get("layout")
+        storage = t_info.get("storage", "pooled")
+
+        # For split full_sequence datasets, create ONE job with all prompts
+        # and all shard paths so reconstruction can access all shards.
+        if (
+            has_token_shard_ids
+            and t_type == "hidden_layers"
+            and storage == "full_sequence"
+            and layout == "per_layer"
+        ):
+            # Use the first available shard's layer paths as shard_path
+            first_shard_idx = min(needed_shards.get(t_type, set()))
+            first_layer_paths = per_layer_paths.get(t_type, {}).get(
+                first_shard_idx
+            )
+            if first_layer_paths:
+                all_lp = per_layer_paths.get(t_type, {})
+                jobs.append((
+                    t_type, t_info, first_layer_paths,
+                    prompt_indices, all_lp,
+                ))
+            continue
 
         for shard_idx in sorted(needed_shards.get(t_type, [])):
             shard_prompts = [
@@ -2820,37 +3081,42 @@ def _materialize_prompts(
                 continue
 
             if layout == "per_layer":
-                # Per-layer: pass dict of layer paths as shard_path
                 layer_paths = per_layer_paths.get(t_type, {}).get(shard_idx)
                 if not layer_paths:
                     continue
-                jobs.append((t_type, t_info, layer_paths, shard_prompts))
+                jobs.append((
+                    t_type, t_info, layer_paths, shard_prompts, None,
+                ))
             else:
                 if shard_idx not in shard_local_paths.get(t_type, {}):
                     continue
                 shard_path = shard_local_paths[t_type][shard_idx]
-                jobs.append((t_type, t_info, shard_path, shard_prompts))
+                jobs.append((
+                    t_type, t_info, shard_path, shard_prompts, None,
+                ))
 
     if num_workers > 0:
         from concurrent.futures import ProcessPoolExecutor
 
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = []
-            for t_type, t_info, shard_path, shard_prompts in jobs:
+            for t_type, t_info, shard_path, shard_prompts, all_lp in jobs:
                 futures.append(
                     executor.submit(
                         _unpack_shard_prompts,
                         model_name, t_type, t_info,
                         shard_path, shard_prompts, index,
+                        all_layer_paths=all_lp,
                     )
                 )
             for fut in futures:
-                fut.result()  # Raise any exceptions
+                fut.result()
     else:
-        for t_type, t_info, shard_path, shard_prompts in jobs:
+        for t_type, t_info, shard_path, shard_prompts, all_lp in jobs:
             _unpack_shard_prompts(
                 model_name, t_type, t_info,
                 shard_path, shard_prompts, index,
+                all_layer_paths=all_lp,
             )
 
 

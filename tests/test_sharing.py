@@ -2459,7 +2459,7 @@ class TestConsolidateRawActivations:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_full_sequence_tensor_shape(self, populated_raw_cache):
-        """Shard tensor dim-0 is total_tokens, not num_prompts."""
+        """Last-token shard has 1 token per prompt; rest shard has remainder."""
         from safetensors import safe_open
 
         prompts, seq_lens, layers, _ = populated_raw_cache
@@ -2480,12 +2480,20 @@ class TestConsolidateRawActivations:
             repo_id="user/raw-test",
         )
 
-        # Per-layer file for layer 0
-        shard_file = tmpdir / "tensors/hidden_layer000_shard000.safetensors"
-        with safe_open(str(shard_file), framework="pt") as f:
+        # Last-token shard (shard 0): one token per prompt
+        lt_file = tmpdir / "tensors/hidden_layer000_shard000.safetensors"
+        with safe_open(str(lt_file), framework="pt") as f:
             layer_0 = f.get_tensor("hidden.layer_0")
-            # Total tokens = 3 + 5 + 4 = 12 (may be shuffled but total same)
-            assert layer_0.shape == (sum(seq_lens), HIDDEN_DIM)
+            assert layer_0.shape == (len(prompts), HIDDEN_DIM)
+
+        # Total tokens across ALL shards equals sum(seq_lens)
+        total_tokens = 0
+        for si in range(len(tensor_descriptors["hidden_layers"]["shards"])):
+            fpath = tmpdir / f"tensors/hidden_layer000_shard{si:03d}.safetensors"
+            if fpath.exists():
+                with safe_open(str(fpath), framework="pt") as f:
+                    total_tokens += f.get_tensor("hidden.layer_0").shape[0]
+        assert total_tokens == sum(seq_lens)
 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -3353,12 +3361,18 @@ class TestRawShardBoundaryFix107:
 
         hidden_desc = tensor_descriptors["hidden_layers"]
         shard_count = len(hidden_desc["shards"])
+        lt_count = hidden_desc.get("last_token_shards", 0)
+        rest_count = shard_count - lt_count
 
-        # With fix: 1280 bytes/prompt, 4000 byte shards -> 3 prompts/shard -> 2 shards
-        # Without fix: 5120 bytes/prompt, 4000 byte shards -> 1 prompt/shard -> 5 shards
-        assert shard_count == 2, (
-            f"Expected 2 shards (per-layer sizing), got {shard_count}"
+        # Last-token shards: 5 prompts * 32 dim * 4 bytes = 640 -> 1 shard
+        # Rest-token shards (9 tokens/prompt): 9*32*4=1152 bytes/prompt,
+        # 4000 byte shards -> 3 prompts/shard -> 2 shards
+        # Total = 1 + 2 = 3 shards
+        # Without fix #107: rest would be 9*32*4*4=4608 -> 1/shard -> 5 rest shards
+        assert rest_count == 2, (
+            f"Expected 2 rest shards (per-layer sizing), got {rest_count}"
         )
+        assert lt_count == 1, f"Expected 1 last-token shard, got {lt_count}"
 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -3612,3 +3626,235 @@ class TestStagingDir:
 
         # Staging dir should be cleaned up
         assert not staging_dir.exists()
+
+
+class TestLastTokenShardSplitting:
+    """Tests for last-token shard splitting (issue #165)."""
+
+    def test_last_token_shards_created(self, populated_raw_cache):
+        """Consolidation with raw layers creates separate lt and rest shards."""
+        from safetensors import safe_open
+
+        prompts, seq_lens, layers, _ = populated_raw_cache
+        tensor_types = {
+            "raw_layers": layers,
+            "pooled": {},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/lt-test",
+        )
+
+        desc = tensor_descriptors["hidden_layers"]
+        assert desc["storage"] == "full_sequence"
+        assert "last_token_shards" in desc
+        lt_count = desc["last_token_shards"]
+        assert lt_count >= 1
+
+        # Last-token shard should have exactly num_prompts tokens
+        # (one per prompt)
+        lt_shards = desc["shards"][:lt_count]
+        lt_total_tokens = sum(s["num_tokens"] for s in lt_shards)
+        assert lt_total_tokens == len(prompts)
+
+        # Rest shards should have sum(seq_lens) - num_prompts tokens
+        rest_shards = desc["shards"][lt_count:]
+        rest_total_tokens = sum(s["num_tokens"] for s in rest_shards)
+        assert rest_total_tokens == sum(seq_lens) - len(prompts)
+
+        # Verify shard files exist and have correct shapes
+        for layer in layers:
+            # Last-token shard
+            lt_file = tmpdir / f"tensors/hidden_layer{layer:03d}_shard000.safetensors"
+            assert lt_file.exists()
+            with safe_open(str(lt_file), framework="pt") as f:
+                t = f.get_tensor(f"hidden.layer_{layer}")
+                assert t.shape == (len(prompts), HIDDEN_DIM)
+
+            # Rest shard (should exist if any prompt has > 1 token)
+            rest_file = tmpdir / f"tensors/hidden_layer{layer:03d}_shard001.safetensors"
+            assert rest_file.exists()
+            with safe_open(str(rest_file), framework="pt") as f:
+                t = f.get_tensor(f"hidden.layer_{layer}")
+                expected_rest_tokens = sum(sl - 1 for sl in seq_lens)
+                assert t.shape == (expected_rest_tokens, HIDDEN_DIM)
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_per_token_arrays_in_metadata(self, populated_raw_cache):
+        """prompt_metadata has token_shard_ids and token_shard_offsets."""
+        prompts, seq_lens, layers, _ = populated_raw_cache
+        tensor_types = {
+            "raw_layers": layers,
+            "pooled": {},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        _, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/lt-test",
+        )
+
+        lt_count = tensor_descriptors["hidden_layers"]["last_token_shards"]
+
+        for pm in prompt_metadata:
+            assert "token_shard_ids" in pm
+            assert "token_shard_offsets" in pm
+            num_tok = pm["num_tokens"]
+            shard_ids = pm["token_shard_ids"]
+            shard_offsets = pm["token_shard_offsets"]
+
+            # Arrays have correct length
+            assert len(shard_ids) == num_tok
+            assert len(shard_offsets) == num_tok
+
+            # Last token is in a last-token shard (index < lt_count)
+            assert shard_ids[-1] < lt_count
+
+            # Non-last tokens are in rest shards (index >= lt_count)
+            if num_tok > 1:
+                for sid in shard_ids[:-1]:
+                    assert sid >= lt_count
+
+            # Backwards-compat scalars point to last-token shard
+            assert pm["shard_index_hidden"] == shard_ids[-1]
+
+    def test_per_token_offsets_consistency(self, populated_raw_cache):
+        """token_shard_offsets are valid indices into shard tensors."""
+        from safetensors import safe_open
+
+        prompts, seq_lens, layers, _ = populated_raw_cache
+        tensor_types = {
+            "raw_layers": layers,
+            "pooled": {},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/lt-test",
+        )
+
+        # Load all shard sizes for layer 0
+        shard_sizes = {}
+        for shard_desc_idx, shard_desc in enumerate(
+            tensor_descriptors["hidden_layers"]["shards"]
+        ):
+            fname = f"tensors/hidden_layer000_shard{shard_desc_idx:03d}.safetensors"
+            fpath = tmpdir / fname
+            if fpath.exists():
+                with safe_open(str(fpath), framework="pt") as f:
+                    t = f.get_tensor("hidden.layer_0")
+                    shard_sizes[shard_desc_idx] = t.shape[0]
+
+        # Verify all offsets are within shard bounds
+        for pm in prompt_metadata:
+            for sid, soff in zip(
+                pm["token_shard_ids"], pm["token_shard_offsets"]
+            ):
+                assert sid in shard_sizes, f"shard {sid} not found"
+                assert 0 <= soff < shard_sizes[sid], (
+                    f"offset {soff} out of bounds for shard {sid} "
+                    f"(size {shard_sizes[sid]})"
+                )
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @requires_pyarrow
+    def test_parquet_has_list_columns(self, populated_raw_cache):
+        """Parquet index contains token_shard_ids/offsets list columns."""
+        import pyarrow.parquet as pq
+
+        prompts, seq_lens, layers, _ = populated_raw_cache
+        tensor_types = {
+            "raw_layers": layers,
+            "pooled": {},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        tmpdir, _, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/lt-test",
+        )
+
+        _write_parquet_index(tmpdir, prompt_metadata)
+        table = pq.read_table(str(tmpdir / PARQUET_PATH))
+        columns = table.column_names
+
+        assert "token_shard_ids" in columns
+        assert "token_shard_offsets" in columns
+
+        # Verify round-trip: values match metadata
+        idx = table.to_pydict()
+        for i, pm in enumerate(prompt_metadata):
+            assert idx["token_shard_ids"][i] == pm["token_shard_ids"]
+            assert idx["token_shard_offsets"][i] == pm["token_shard_offsets"]
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_enumerate_shard_files_includes_last_token(
+        self, populated_raw_cache
+    ):
+        """_enumerate_shard_files lists both lt and rest shard files."""
+        prompts, seq_lens, layers, _ = populated_raw_cache
+        tensor_types = {
+            "raw_layers": layers,
+            "pooled": {},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        plan = _compute_shard_plan(
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/lt-test",
+        )
+
+        files = _enumerate_shard_files(plan)
+        # Should have at least 2 shards per layer (lt + rest)
+        assert len(files) >= len(layers) * 2
+
+        # Verify all listed files get created during consolidation
+        tmpdir, _, _ = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=prompts,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/lt-test",
+        )
+        for f in files:
+            assert (tmpdir / f).exists(), f"Expected shard file {f} not found"
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
