@@ -496,6 +496,91 @@ def _load_hidden_raw_for_prompt(
 # =============================================================================
 
 
+def _parallel_preload(
+    prompts: list[str],
+    load_fn: Any,
+    default: Any,
+    workers: int,
+    executor: Any | None = None,
+    pbar: Any | None = None,
+) -> list:
+    """Run *load_fn* for every prompt in parallel, collecting results.
+
+    Parameters
+    ----------
+    load_fn : callable(idx, prompt) -> (idx, value)
+        Per-prompt loader.  Must return ``(index, result)`` tuple.
+    default : callable() -> value
+        Factory for the default/empty value (e.g. ``lambda: None``).
+    executor : ThreadPoolExecutor, optional
+        Reusable thread pool.  If ``None``, a temporary pool is created.
+    pbar : tqdm bar, optional
+        Shared progress bar to update per completed prompt.
+
+    Returns a list indexed by prompt position.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _run(pool: Any) -> list:
+        result = [default() for _ in prompts]
+        futures = {
+            pool.submit(load_fn, i, p): i
+            for i, p in enumerate(prompts)
+        }
+        for fut in as_completed(futures):
+            idx, value = fut.result()
+            result[idx] = value
+            if pbar is not None:
+                pbar.update(1)
+        return result
+
+    if executor is not None:
+        return _run(executor)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return _run(pool)
+
+
+def _make_hidden_loader(
+    model_name: str,
+    layers: list[int],
+    use_raw: bool,
+    hidden_strategy: str | None,
+    extract_key: str | None = None,
+) -> Any:
+    """Build a ``(idx, prompt) -> (idx, value)`` loader for hidden states.
+
+    Parameters
+    ----------
+    extract_key : str, optional
+        If given, return ``tensors.get(key)`` instead of the full dict.
+        Used by per-layer preloading to return a single tensor.
+    """
+    empty: Any = None if extract_key else {}
+
+    def _load_one(idx: int, prompt: str) -> tuple[int, Any]:
+        try:
+            if use_raw:
+                tensors, _ = _load_hidden_raw_for_prompt(
+                    model_name, prompt, layers,
+                )
+            elif hidden_strategy:
+                tensors = _load_hidden_for_prompt(
+                    model_name, prompt, layers, hidden_strategy,
+                )
+            else:
+                return idx, empty
+            if extract_key:
+                return idx, tensors.get(extract_key)
+            return idx, tensors
+        except (FileNotFoundError, KeyError, OSError) as e:
+            raise OSError(
+                f"Prompt passed metadata scan but failed to load during "
+                f"preload (cache may have been modified concurrently): {e}"
+            ) from e
+
+    return _load_one
+
+
 def _preload_layer(
     model_name: str,
     prompts: list[str],
@@ -519,46 +604,14 @@ def _preload_layer(
     Returns a list indexed by prompt position.  Each entry is the tensor
     for that prompt/layer or ``None`` on load failure.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    key = f"hidden.layer_{layer}"
-
-    def _load_one(idx: int, prompt: str) -> tuple[int, torch.Tensor | None]:
-        try:
-            if use_raw:
-                tensors, _ = _load_hidden_raw_for_prompt(
-                    model_name, prompt, [layer],
-                )
-            elif hidden_strategy:
-                tensors = _load_hidden_for_prompt(
-                    model_name, prompt, [layer], hidden_strategy,
-                )
-            else:
-                return idx, None
-            return idx, tensors.get(key)
-        except (FileNotFoundError, KeyError, OSError) as e:
-            raise OSError(
-                f"Prompt passed metadata scan but failed to load during "
-                f"preload (cache may have been modified concurrently): {e}"
-            ) from e
-
-    def _run(pool: Any) -> list[torch.Tensor | None]:
-        result: list[torch.Tensor | None] = [None] * len(prompts)
-        futures = {
-            pool.submit(_load_one, i, p): i
-            for i, p in enumerate(prompts)
-        }
-        for fut in as_completed(futures):
-            idx, tensor = fut.result()
-            result[idx] = tensor
-            if pbar is not None:
-                pbar.update(1)
-        return result
-
-    if executor is not None:
-        return _run(executor)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        return _run(pool)
+    load_fn = _make_hidden_loader(
+        model_name, [layer], use_raw, hidden_strategy,
+        extract_key=f"hidden.layer_{layer}",
+    )
+    return _parallel_preload(
+        prompts, load_fn, lambda: None, workers,
+        executor=executor, pbar=pbar,
+    )
 
 
 def _preload_full(
@@ -574,44 +627,16 @@ def _preload_full(
     Returns a list indexed by prompt position.  Each entry is a dict
     mapping ``"hidden.layer_N"`` to the corresponding tensor.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     from tqdm import tqdm
 
-    def _load_one(idx: int, prompt: str) -> tuple[int, dict[str, torch.Tensor]]:
-        try:
-            if use_raw:
-                tensors, _ = _load_hidden_raw_for_prompt(
-                    model_name, prompt, layers,
-                )
-            elif hidden_strategy:
-                tensors = _load_hidden_for_prompt(
-                    model_name, prompt, layers, hidden_strategy,
-                )
-            else:
-                return idx, {}
-            return idx, tensors
-        except (FileNotFoundError, KeyError, OSError) as e:
-            raise OSError(
-                f"Prompt passed metadata scan but failed to load during "
-                f"preload (cache may have been modified concurrently): {e}"
-            ) from e
-
-    result: list[dict[str, torch.Tensor]] = [{} for _ in prompts]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(_load_one, i, p): i
-            for i, p in enumerate(prompts)
-        }
-        for fut in tqdm(
-            as_completed(futures),
-            total=len(futures),
-            desc="Preloading all layers",
-            unit="prompt",
-        ):
-            idx, tensors = fut.result()
-            result[idx] = tensors
-    return result
+    load_fn = _make_hidden_loader(
+        model_name, layers, use_raw, hidden_strategy,
+    )
+    total = len(prompts)
+    with tqdm(total=total, desc="Preloading all layers", unit="prompt") as pbar:
+        return _parallel_preload(
+            prompts, load_fn, dict, workers, pbar=pbar,
+        )
 
 
 # =============================================================================
