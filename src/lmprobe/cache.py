@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -657,6 +658,7 @@ _SAFETENSORS_DTYPE_MAP = {
 
 _header_cache: dict[tuple[int, str], tuple[dict, int]] = {}
 _HEADER_CACHE_MAXSIZE = 8192
+_header_cache_lock = threading.Lock()
 
 
 def _parse_safetensors_header(
@@ -677,9 +679,10 @@ def _parse_safetensors_header(
         Byte offset where the tensor data begins (8 + header_size).
     """
     cache_key = (id(backend), key)
-    cached = _header_cache.get(cache_key)
-    if cached is not None:
-        return cached
+    with _header_cache_lock:
+        cached = _header_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
     import struct
 
@@ -696,9 +699,10 @@ def _parse_safetensors_header(
     header = json.loads(header_bytes)
     result = (header, 8 + header_size)
 
-    if len(_header_cache) >= _HEADER_CACHE_MAXSIZE:
-        _header_cache.pop(next(iter(_header_cache)))
-    _header_cache[cache_key] = result
+    with _header_cache_lock:
+        if len(_header_cache) >= _HEADER_CACHE_MAXSIZE:
+            _header_cache.pop(next(iter(_header_cache)))
+        _header_cache[cache_key] = result
     return result
 
 
@@ -709,6 +713,7 @@ def clear_header_cache() -> None:
 
 _mask_cache: dict[tuple[int, str], torch.Tensor] = {}
 _MASK_CACHE_MAXSIZE = 8192
+_mask_cache_lock = threading.Lock()
 
 
 def _load_tensors_selective(
@@ -741,7 +746,8 @@ def _load_tensors_selective(
         # Check mask cache for attention_mask tensors
         if tensor_name == _ATTENTION_MASK_KEY:
             mask_cache_key = (id(backend), key)
-            cached_mask = _mask_cache.get(mask_cache_key)
+            with _mask_cache_lock:
+                cached_mask = _mask_cache.get(mask_cache_key)
             if cached_mask is not None:
                 result[tensor_name] = cached_mask.clone()
                 continue
@@ -764,9 +770,10 @@ def _load_tensors_selective(
 
         # Cache attention masks for reuse across layer iterations
         if tensor_name == _ATTENTION_MASK_KEY:
-            if len(_mask_cache) >= _MASK_CACHE_MAXSIZE:
-                _mask_cache.pop(next(iter(_mask_cache)))
-            _mask_cache[(id(backend), key)] = tensor.reshape(shape).clone()
+            with _mask_cache_lock:
+                if len(_mask_cache) >= _MASK_CACHE_MAXSIZE:
+                    _mask_cache.pop(next(iter(_mask_cache)))
+                _mask_cache[(id(backend), key)] = tensor.reshape(shape).clone()
 
     return result
 
