@@ -1569,7 +1569,37 @@ def _load_pooled_from_shard(
         per_layer_paths = shards[shard_idx].get("per_layer_paths", {})
         layer_slices = []
 
-        if storage == "full_sequence":
+        # Split full_sequence datasets (token_shard_ids present):
+        # shard_index_hidden points to the last-token shard which stores
+        # one row per prompt — treat like pooled storage.
+        has_token_shard_ids = "token_shard_ids" in entry
+        if storage == "full_sequence" and has_token_shard_ids:
+            row_offset = entry.get(
+                "row_offset_hidden", entry.get("row_offset", 0)
+            )
+            for layer in layers:
+                _key = (model_name, layer, shard_idx)
+                if _key not in _shard_first_access:
+                    _shard_first_access.add(_key)
+                    logger.info(
+                        "[CACHE] Loading shard %d/%d for layer %d (first access)",
+                        shard_idx + 1, n_shards, layer,
+                    )
+                layer_path = per_layer_paths.get(
+                    layer
+                ) or per_layer_paths.get(str(layer))
+                if layer_path is None:
+                    continue
+                if not Path(layer_path).exists():
+                    raise FileNotFoundError(
+                        f"Per-layer shard file not found: {layer_path}. "
+                        "Re-run pull_dataset() to re-download."
+                    )
+                with safe_open(layer_path, framework="pt") as f:
+                    key = f"hidden.layer_{layer}"
+                    row = f.get_tensor(key)[row_offset : row_offset + 1]
+                    layer_slices.append((layer, row))
+        elif storage == "full_sequence":
             tok_off = entry.get("token_offset_hidden", entry.get("token_offset"))
             num_tok = entry["num_tokens"]
             # Convert global token offset to shard-local offset
