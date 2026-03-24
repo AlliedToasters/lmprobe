@@ -1499,7 +1499,7 @@ class TestLoadActivationDataset:
 
         with open(remote_dir / INFO_FILENAME) as f:
             info = json.load(f)
-        info["format_version"] = "2.0"
+        info["format_version"] = "3.0"
         with open(remote_dir / INFO_FILENAME, "w") as f:
             json.dump(info, f)
 
@@ -2585,10 +2585,11 @@ class TestFullSequenceRoundtrip:
                 exist_ok=True,
             )
 
-        # Verify storage type in info
-        with open(remote_dir / INFO_FILENAME) as f:
-            info = json.load(f)
-        assert info["tensors"]["hidden_layers"]["storage"] == "full_sequence"
+        # Verify storage type in parquet schema metadata
+        import pyarrow.parquet as pq
+        schema_meta = pq.read_schema(str(remote_dir / PARQUET_PATH)).metadata
+        tensors = json.loads(schema_meta[b"lmprobe:tensors"])
+        assert tensors["hidden_layers"]["storage"] == "full_sequence"
 
         # --- Phase 3: pull into fresh cache ---
         dst_cache = tmp_path / "dst_cache"
@@ -2745,16 +2746,16 @@ class TestFullSequenceWithLogits:
                 exist_ok=True,
             )
 
-        # Verify both tensor types in info
-        with open(remote_dir / INFO_FILENAME) as f:
-            info = json.load(f)
-        assert "hidden_layers" in info["tensors"]
-        assert "logits_topk" in info["tensors"]
-        assert info["tensors"]["hidden_layers"]["storage"] == "full_sequence"
-
-        # Verify Parquet has both row_offset and token_offset
+        # Verify both tensor types in parquet schema metadata
         import pyarrow.parquet as pq
 
+        schema_meta = pq.read_schema(str(remote_dir / PARQUET_PATH)).metadata
+        tensors = json.loads(schema_meta[b"lmprobe:tensors"])
+        assert "hidden_layers" in tensors
+        assert "logits_topk" in tensors
+        assert tensors["hidden_layers"]["storage"] == "full_sequence"
+
+        # Verify Parquet has both row_offset and token_offset
         table = pq.read_table(str(remote_dir / PARQUET_PATH))
         assert "row_offset" in table.column_names
         assert "token_offset" in table.column_names
@@ -3290,9 +3291,9 @@ class TestIndependentShardBoundaries:
         assert "shard_index" in col_names
         assert "row_offset" in col_names
 
-    def test_format_version_is_1_2(self):
-        """Format version is bumped to 1.2."""
-        assert FORMAT_VERSION == "1.2"
+    def test_format_version_is_2_0(self):
+        """Format version is bumped to 2.0."""
+        assert FORMAT_VERSION == "2.0"
 
     @requires_pyarrow
     def test_hidden_only_no_logits_columns(self, tmp_path, monkeypatch):
@@ -4155,9 +4156,14 @@ class TestMigrateDataset:
 
         assert "huggingface.co" in result
 
-        # Verify lmprobe_info.json
-        with open(migrated_dir / INFO_FILENAME) as f:
-            info = json.load(f)
+        # Verify metadata in parquet schema
+        import pyarrow.parquet as pq
+        schema_meta = pq.read_schema(
+            str(migrated_dir / PARQUET_PATH)
+        ).metadata
+        info = {
+            "tensors": json.loads(schema_meta[b"lmprobe:tensors"]),
+        }
 
         hidden_desc = info["tensors"]["hidden_layers"]
         assert hidden_desc["storage"] == "full_sequence"
