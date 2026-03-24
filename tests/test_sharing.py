@@ -329,6 +329,66 @@ class TestConsolidateAndShard:
         assert 1 in label_set
         assert 0 in label_set
 
+    def test_shuffle_false_preserves_order(self, populated_cache):
+        """shuffle=False preserves input prompt order in output metadata."""
+        tensor_types = {
+            "raw_layers": [],
+            "pooled": {"last_token": [0]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        labels = [1, 1, 0]
+        _, _, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=labels,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/test",
+            shuffle=False,
+        )
+        output_prompts = [p["text"] for p in prompt_metadata]
+        assert output_prompts == populated_cache
+        output_labels = [p["label"] for p in prompt_metadata]
+        assert output_labels == labels
+
+    def test_shuffle_true_is_default(self, populated_cache):
+        """Default shuffle=True produces a different order (for this seed)."""
+        tensor_types = {
+            "raw_layers": [],
+            "pooled": {"last_token": [0]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        _, _, meta_shuffled = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/test",
+        )
+        _, _, meta_unshuffled = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/test",
+            shuffle=False,
+        )
+        shuffled_prompts = [p["text"] for p in meta_shuffled]
+        unshuffled_prompts = [p["text"] for p in meta_unshuffled]
+        # Unshuffled should match input order
+        assert unshuffled_prompts == populated_cache
+        # Both contain same prompts
+        assert set(shuffled_prompts) == set(unshuffled_prompts)
+
     def test_small_shard_limit(self, populated_cache):
         """Test that small shard limits create multiple shards."""
         tensor_types = {
