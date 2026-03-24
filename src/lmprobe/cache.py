@@ -37,6 +37,7 @@ import logging
 import os
 import shutil
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1410,17 +1411,13 @@ def _discover_from_shard(model_name: str, prompt: str) -> CachedPromptInfo | Non
     )
 
 
-def _load_raw_from_shard(
-    model_name: str, prompt: str, layers: list[int]
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Load raw activations for a prompt by slicing from a shard file.
+def _resolve_hidden_shard(
+    model_name: str, prompt: str
+) -> tuple[dict, dict, list[dict], int, str, str | None]:
+    """Resolve shard entry and manifest info for hidden layers.
 
-    Returns (activations, attention_mask) like load_prompt_activations.
+    Returns (entry, t_info, shards, shard_idx, storage, layout).
     """
-    import re
-
-    from safetensors import safe_open
-
     entry = _lookup_shard(model_name, prompt)
     if entry is None:
         raise FileNotFoundError(
@@ -1436,15 +1433,8 @@ def _load_raw_from_shard(
         raise FileNotFoundError("No hidden_layers in shard manifest")
 
     storage = t_info.get("storage", "pooled")
-    if storage != "full_sequence":
-        raise FileNotFoundError(
-            "Raw activations require full_sequence storage, "
-            f"but shard has storage={storage!r}"
-        )
-
+    layout = t_info.get("layout")
     shard_idx = entry.get("shard_index_hidden", entry.get("shard_index"))
-    tok_off = entry.get("token_offset_hidden", entry.get("token_offset"))
-    num_tok = entry["num_tokens"]
 
     shards = t_info["shards"]
     if shard_idx >= len(shards):
@@ -1452,74 +1442,159 @@ def _load_raw_from_shard(
             f"Shard index {shard_idx} out of range (have {len(shards)} shards)"
         )
 
-    # Convert global token offset to shard-local offset.
-    # The parquet index stores cumulative (global) token offsets, but each
-    # shard file only contains its own tokens.
+    return entry, t_info, shards, shard_idx, storage, layout
+
+
+def _load_per_layer_slices(
+    model_name: str,
+    layers: list[int],
+    shards: list[dict],
+    shard_idx: int,
+    slice_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> list[tuple[int, torch.Tensor]]:
+    """Load tensors from per-layer shard files, applying slice_fn to each.
+
+    Handles first-access logging, path resolution, and existence checks.
+    """
+    from safetensors import safe_open
+
+    n_shards = len(shards)
+    per_layer_paths = shards[shard_idx].get("per_layer_paths", {})
+    layer_slices = []
+
+    for layer in layers:
+        _key = (model_name, layer, shard_idx)
+        if _key not in _shard_first_access:
+            _shard_first_access.add(_key)
+            logger.info(
+                "[CACHE] Loading shard %d/%d for layer %d (first access)",
+                shard_idx + 1, n_shards, layer,
+            )
+        # per_layer_paths keys may be strings (from JSON) or ints
+        layer_path = per_layer_paths.get(layer) or per_layer_paths.get(
+            str(layer)
+        )
+        if layer_path is None:
+            continue
+        if not Path(layer_path).exists():
+            raise FileNotFoundError(
+                f"Per-layer shard file not found: {layer_path}. "
+                "Re-run pull_dataset() to re-download."
+            )
+        with safe_open(layer_path, framework="pt") as f:
+            key = f"hidden.layer_{layer}"
+            layer_slices.append((layer, slice_fn(f.get_tensor(key))))
+
+    return layer_slices
+
+
+def _load_colocated_slices(
+    model_name: str,
+    layers: list[int],
+    shards: list[dict],
+    shard_idx: int,
+    slice_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> list[tuple[int, torch.Tensor]]:
+    """Load tensors from a colocated (v1.0) shard file, applying slice_fn.
+
+    Handles first-access logging and path validation.
+    """
+    import re
+
+    from safetensors import safe_open
+
+    n_shards = len(shards)
+    _colocated_key = (model_name, -1, shard_idx)
+    if _colocated_key not in _shard_first_access:
+        _shard_first_access.add(_colocated_key)
+        logger.info(
+            "[CACHE] Loading shard %d/%d (first access)",
+            shard_idx + 1, n_shards,
+        )
+    shard_path = shards[shard_idx].get("local_path")
+    if shard_path is None or not Path(shard_path).exists():
+        raise FileNotFoundError(
+            f"Shard file not found: {shard_path}. "
+            "The HF hub cache may have been evicted. "
+            "Re-run pull_dataset() to re-download."
+        )
+
+    layers_set = set(layers)
+    layer_slices = []
+    with safe_open(shard_path, framework="pt") as f:
+        for sf_key in f.keys():
+            match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
+            if not match:
+                continue
+            layer = int(match.group(1))
+            if layer not in layers_set:
+                continue
+            layer_slices.append((layer, slice_fn(f.get_tensor(sf_key))))
+
+    return layer_slices
+
+
+def _load_hidden_layer_slices(
+    model_name: str,
+    layers: list[int],
+    shards: list[dict],
+    shard_idx: int,
+    layout: str | None,
+    slice_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> list[tuple[int, torch.Tensor]]:
+    """Load hidden layer slices from either per-layer or colocated layout."""
+    if layout == "per_layer":
+        return _load_per_layer_slices(
+            model_name, layers, shards, shard_idx, slice_fn
+        )
+    return _load_colocated_slices(
+        model_name, layers, shards, shard_idx, slice_fn
+    )
+
+
+def _shard_local_token_offset(
+    entry: dict, shards: list[dict], shard_idx: int
+) -> tuple[int, int]:
+    """Compute shard-local token offset and token count from entry.
+
+    The parquet index stores cumulative (global) token offsets, but each
+    shard file only contains its own tokens.
+
+    Returns (local_tok_off, num_tok).
+    """
+    tok_off = entry.get("token_offset_hidden", entry.get("token_offset"))
+    num_tok = entry["num_tokens"]
     shard_token_base = sum(
         s.get("num_tokens", 0) for s in shards[:shard_idx]
     )
-    tok_off -= shard_token_base
+    return tok_off - shard_token_base, num_tok
 
-    layout = t_info.get("layout")
-    n_shards = len(shards)
 
-    if layout == "per_layer":
-        # v1.1+ per-layer layout: each layer in its own file
-        layer_slices = []
-        for layer in layers:
-            _key = (model_name, layer, shard_idx)
-            if _key not in _shard_first_access:
-                _shard_first_access.add(_key)
-                logger.info(
-                    "[CACHE] Loading shard %d/%d for layer %d (first access)",
-                    shard_idx + 1, n_shards, layer,
-                )
-            per_layer_paths = shards[shard_idx].get("per_layer_paths", {})
-            # per_layer_paths keys may be strings (from JSON) or ints
-            layer_path = per_layer_paths.get(layer) or per_layer_paths.get(
-                str(layer)
-            )
-            if layer_path is None:
-                continue
-            if not Path(layer_path).exists():
-                raise FileNotFoundError(
-                    f"Per-layer shard file not found: {layer_path}. "
-                    "Re-run pull_dataset() to re-download."
-                )
-            with safe_open(layer_path, framework="pt") as f:
-                key = f"hidden.layer_{layer}"
-                chunk = f.get_tensor(key)[tok_off : tok_off + num_tok]
-                layer_slices.append((layer, chunk))
-    else:
-        # v1.0 co-located layout
-        _colocated_key = (model_name, -1, shard_idx)
-        if _colocated_key not in _shard_first_access:
-            _shard_first_access.add(_colocated_key)
-            logger.info(
-                "[CACHE] Loading shard %d/%d (first access)",
-                shard_idx + 1, n_shards,
-            )
-        shard_path = shards[shard_idx].get("local_path")
-        if shard_path is None or not Path(shard_path).exists():
-            raise FileNotFoundError(
-                f"Shard file not found: {shard_path}. "
-                "The HF hub cache may have been evicted. "
-                "Re-run pull_dataset() to re-download."
-            )
+def _load_raw_from_shard(
+    model_name: str, prompt: str, layers: list[int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load raw activations for a prompt by slicing from a shard file.
 
-        with safe_open(shard_path, framework="pt") as f:
-            sf_keys = list(f.keys())
-            layer_slices = []
-            for sf_key in sf_keys:
-                match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
-                if not match:
-                    continue
-                layer = int(match.group(1))
-                if layer not in layers:
-                    continue
-                chunk = f.get_tensor(sf_key)[tok_off : tok_off + num_tok]
-                layer_slices.append((layer, chunk))
+    Returns (activations, attention_mask) like load_prompt_activations.
+    """
+    entry, t_info, shards, shard_idx, storage, layout = (
+        _resolve_hidden_shard(model_name, prompt)
+    )
 
+    if storage != "full_sequence":
+        raise FileNotFoundError(
+            "Raw activations require full_sequence storage, "
+            f"but shard has storage={storage!r}"
+        )
+
+    tok_off, num_tok = _shard_local_token_offset(entry, shards, shard_idx)
+
+    def slice_fn(t: torch.Tensor) -> torch.Tensor:
+        return t[tok_off : tok_off + num_tok]
+
+    layer_slices = _load_hidden_layer_slices(
+        model_name, layers, shards, shard_idx, layout, slice_fn
+    )
     layer_slices.sort(key=lambda x: x[0])
     raw_act = torch.cat([ls[1] for ls in layer_slices], dim=-1)
     raw_act = raw_act.unsqueeze(0)  # (1, num_tok, total_dim)
@@ -1534,175 +1609,43 @@ def _load_pooled_from_shard(
 
     Returns tensor with shape (1, n_layers * hidden_dim).
     """
-    import re
+    entry, t_info, shards, shard_idx, storage, layout = (
+        _resolve_hidden_shard(model_name, prompt)
+    )
 
-    from safetensors import safe_open
-
-    entry = _lookup_shard(model_name, prompt)
-    if entry is None:
-        raise FileNotFoundError(
-            f"No shard entry found for prompt: {prompt!r}"
+    # Determine slice function based on storage type.
+    has_token_shard_ids = "token_shard_ids" in entry
+    if storage == "full_sequence" and has_token_shard_ids:
+        # Split full_sequence datasets: shard_index_hidden points to the
+        # last-token shard which stores one row per prompt.
+        row_offset = entry.get(
+            "row_offset_hidden", entry.get("row_offset", 0)
         )
 
-    manifest = _load_shard_manifest(model_name)
-    if manifest is None:
-        raise FileNotFoundError("No shard manifest found")
+        def slice_fn(t: torch.Tensor) -> torch.Tensor:
+            return t[row_offset : row_offset + 1]
 
-    t_info = manifest["tensors"].get("hidden_layers")
-    if t_info is None:
-        raise FileNotFoundError("No hidden_layers in shard manifest")
-
-    storage = t_info.get("storage", "pooled")
-    layout = t_info.get("layout")
-    shard_idx = entry.get("shard_index_hidden", entry.get("shard_index"))
-
-    shards = t_info["shards"]
-    if shard_idx >= len(shards):
-        raise FileNotFoundError(
-            f"Shard index {shard_idx} out of range (have {len(shards)} shards)"
+    elif storage == "full_sequence":
+        # Legacy full_sequence: extract last token from full token range.
+        tok_off, num_tok = _shard_local_token_offset(
+            entry, shards, shard_idx
         )
 
-    n_shards = len(shards)
+        def slice_fn(t: torch.Tensor) -> torch.Tensor:  # noqa: F811
+            return t[tok_off + num_tok - 1 : tok_off + num_tok]
 
-    if layout == "per_layer":
-        # v1.1+ per-layer layout
-        per_layer_paths = shards[shard_idx].get("per_layer_paths", {})
-        layer_slices = []
-
-        # Split full_sequence datasets (token_shard_ids present):
-        # shard_index_hidden points to the last-token shard which stores
-        # one row per prompt — treat like pooled storage.
-        has_token_shard_ids = "token_shard_ids" in entry
-        if storage == "full_sequence" and has_token_shard_ids:
-            row_offset = entry.get(
-                "row_offset_hidden", entry.get("row_offset", 0)
-            )
-            for layer in layers:
-                _key = (model_name, layer, shard_idx)
-                if _key not in _shard_first_access:
-                    _shard_first_access.add(_key)
-                    logger.info(
-                        "[CACHE] Loading shard %d/%d for layer %d (first access)",
-                        shard_idx + 1, n_shards, layer,
-                    )
-                layer_path = per_layer_paths.get(
-                    layer
-                ) or per_layer_paths.get(str(layer))
-                if layer_path is None:
-                    continue
-                if not Path(layer_path).exists():
-                    raise FileNotFoundError(
-                        f"Per-layer shard file not found: {layer_path}. "
-                        "Re-run pull_dataset() to re-download."
-                    )
-                with safe_open(layer_path, framework="pt") as f:
-                    key = f"hidden.layer_{layer}"
-                    row = f.get_tensor(key)[row_offset : row_offset + 1]
-                    layer_slices.append((layer, row))
-        elif storage == "full_sequence":
-            tok_off = entry.get("token_offset_hidden", entry.get("token_offset"))
-            num_tok = entry["num_tokens"]
-            # Convert global token offset to shard-local offset
-            shard_token_base = sum(
-                s.get("num_tokens", 0) for s in shards[:shard_idx]
-            )
-            tok_off -= shard_token_base
-            for layer in layers:
-                _key = (model_name, layer, shard_idx)
-                if _key not in _shard_first_access:
-                    _shard_first_access.add(_key)
-                    logger.info(
-                        "[CACHE] Loading shard %d/%d for layer %d (first access)",
-                        shard_idx + 1, n_shards, layer,
-                    )
-                layer_path = per_layer_paths.get(
-                    layer
-                ) or per_layer_paths.get(str(layer))
-                if layer_path is None:
-                    continue
-                if not Path(layer_path).exists():
-                    raise FileNotFoundError(
-                        f"Per-layer shard file not found: {layer_path}. "
-                        "Re-run pull_dataset() to re-download."
-                    )
-                with safe_open(layer_path, framework="pt") as f:
-                    key = f"hidden.layer_{layer}"
-                    last_tok = f.get_tensor(key)[
-                        tok_off + num_tok - 1 : tok_off + num_tok
-                    ]
-                    layer_slices.append((layer, last_tok))
-        else:
-            row_offset = entry.get("row_offset_hidden", entry.get("row_offset"))
-            for layer in layers:
-                _key = (model_name, layer, shard_idx)
-                if _key not in _shard_first_access:
-                    _shard_first_access.add(_key)
-                    logger.info(
-                        "[CACHE] Loading shard %d/%d for layer %d (first access)",
-                        shard_idx + 1, n_shards, layer,
-                    )
-                layer_path = per_layer_paths.get(
-                    layer
-                ) or per_layer_paths.get(str(layer))
-                if layer_path is None:
-                    continue
-                if not Path(layer_path).exists():
-                    raise FileNotFoundError(
-                        f"Per-layer shard file not found: {layer_path}. "
-                        "Re-run pull_dataset() to re-download."
-                    )
-                with safe_open(layer_path, framework="pt") as f:
-                    key = f"hidden.layer_{layer}"
-                    row = f.get_tensor(key)[row_offset : row_offset + 1]
-                    layer_slices.append((layer, row))
     else:
-        # v1.0 co-located layout
-        _colocated_key = (model_name, -1, shard_idx)
-        if _colocated_key not in _shard_first_access:
-            _shard_first_access.add(_colocated_key)
-            logger.info(
-                "[CACHE] Loading shard %d/%d (first access)",
-                shard_idx + 1, n_shards,
-            )
-        shard_path = shards[shard_idx].get("local_path")
-        if shard_path is None or not Path(shard_path).exists():
-            raise FileNotFoundError(
-                f"Shard file not found: {shard_path}. "
-                "The HF hub cache may have been evicted. "
-                "Re-run pull_dataset() to re-download."
-            )
+        # Pooled storage: one row per prompt.
+        row_offset = entry.get(
+            "row_offset_hidden", entry.get("row_offset")
+        )
 
-        with safe_open(shard_path, framework="pt") as f:
-            sf_keys = list(f.keys())
+        def slice_fn(t: torch.Tensor) -> torch.Tensor:  # noqa: F811
+            return t[row_offset : row_offset + 1]
 
-            if storage == "full_sequence":
-                tok_off = entry["token_offset"]
-                num_tok = entry["num_tokens"]
-                layer_slices = []
-                for sf_key in sf_keys:
-                    match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
-                    if not match:
-                        continue
-                    layer = int(match.group(1))
-                    if layer not in layers:
-                        continue
-                    last_tok = f.get_tensor(sf_key)[
-                        tok_off + num_tok - 1 : tok_off + num_tok
-                    ]
-                    layer_slices.append((layer, last_tok))
-            else:
-                row_offset = entry["row_offset"]
-                layer_slices = []
-                for sf_key in sf_keys:
-                    match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
-                    if not match:
-                        continue
-                    layer = int(match.group(1))
-                    if layer not in layers:
-                        continue
-                    row = f.get_tensor(sf_key)[row_offset : row_offset + 1]
-                    layer_slices.append((layer, row))
-
+    layer_slices = _load_hidden_layer_slices(
+        model_name, layers, shards, shard_idx, layout, slice_fn
+    )
     layer_slices.sort(key=lambda x: x[0])
     return torch.cat([ls[1] for ls in layer_slices], dim=-1)
 
