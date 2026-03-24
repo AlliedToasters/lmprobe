@@ -25,13 +25,17 @@ from lmprobe.sharing import (
     PARQUET_PATH,
     _build_lmprobe_info,
     _build_readme,
+    _check_shards_on_remote,
     _compute_shard_boundaries_variable,
+    _compute_shard_plan,
     _compute_tensor_intersection,
     _consolidate_and_shard,
     _discover_prompts,
+    _enumerate_shard_files,
     _filter_tensor_types,
     _load_manifest,
     _new_manifest,
+    _reconstruct_plan_from_cached,
     _save_manifest,
     _staging_dir_path,
     _write_parquet_index,
@@ -852,7 +856,7 @@ class TestPushDatasetStreaming:
     def test_stream_resume_skips_completed(
         self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
     ):
-        """Resume skips already-uploaded shards."""
+        """Resume skips already-uploaded shards (verified via remote check)."""
         mock_api = MagicMock()
         MockHfApi.return_value = mock_api
 
@@ -861,7 +865,7 @@ class TestPushDatasetStreaming:
             labels=[1, 1, 0], stream=True, stream_batch_size=10,
         )
 
-        # Pre-populate manifest with shard paths (simulating partial completion)
+        # Pre-populate manifest (simulating partial completion)
         staging_dir.mkdir(parents=True, exist_ok=True)
         (staging_dir / "tensors").mkdir(parents=True, exist_ok=True)
         (staging_dir / "index").mkdir(parents=True, exist_ok=True)
@@ -872,6 +876,16 @@ class TestPushDatasetStreaming:
         manifest = _new_manifest("user/resume-test")
         manifest["completed_shards"] = shard_paths
         _save_manifest(staging_dir, manifest)
+
+        # Mock repo_info to report shards as existing on remote
+        mock_sibling = type("Sibling", (), {})
+        mock_repo_info = MagicMock()
+        mock_repo_info.siblings = [
+            mock_sibling() for _ in shard_paths
+        ]
+        for sib, path in zip(mock_repo_info.siblings, shard_paths):
+            sib.rfilename = path
+        mock_api.repo_info.return_value = mock_repo_info
 
         commit_paths = []
 
@@ -1130,6 +1144,209 @@ class TestPushDatasetStreaming:
         # All shards fit in one batch → single shard commit
         assert len(shard_commits) == 1
         assert shard_commits[0] >= 2  # at least 2 shards in the batch
+
+
+class TestDryConsolidation:
+    """Tests for dry consolidation: shard plan, remote check, skip logic."""
+
+    def test_compute_shard_plan_returns_metadata(self, populated_cache):
+        """_compute_shard_plan returns prompt_metadata and tensor_descriptors."""
+        tensor_types = {
+            "pooled": {"last_token": [0, 1]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "raw_layers": [],
+        }
+        kept_indices = list(range(len(populated_cache)))
+
+        plan = _compute_shard_plan(
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            kept_indices=kept_indices,
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_073_741_824,
+            repo_id="user/test-plan",
+        )
+
+        assert len(plan["prompt_metadata"]) == len(populated_cache)
+        assert len(plan["valid_prompts"]) == len(populated_cache)
+        assert "hidden_layers" in plan["tensor_descriptors"]
+        assert plan["has_hidden"] is True
+        assert plan["hidden_dim"] == HIDDEN_DIM
+        assert len(plan["hidden_boundaries"]) > 0
+
+    def test_enumerate_shard_files_hidden(self, populated_cache):
+        """_enumerate_shard_files lists all expected hidden shard files."""
+        plan = {
+            "has_hidden": True,
+            "hidden_layers": [0, 1],
+            "hidden_boundaries": [3],  # one shard with 3 prompts
+            "want_logits": False,
+            "logits_boundaries": [],
+        }
+        files = _enumerate_shard_files(plan)
+        assert files == [
+            "tensors/hidden_layer000_shard000.safetensors",
+            "tensors/hidden_layer001_shard000.safetensors",
+        ]
+
+    def test_enumerate_shard_files_with_logits(self):
+        """_enumerate_shard_files includes logits shards."""
+        plan = {
+            "has_hidden": True,
+            "hidden_layers": [0],
+            "hidden_boundaries": [2, 1],  # 2 shards
+            "want_logits": True,
+            "logits_boundaries": [3],
+        }
+        files = _enumerate_shard_files(plan)
+        assert "tensors/hidden_layer000_shard000.safetensors" in files
+        assert "tensors/hidden_layer000_shard001.safetensors" in files
+        assert "tensors/logits_topk_000.safetensors" in files
+
+    def test_check_shards_on_remote_finds_existing(self):
+        """_check_shards_on_remote returns shards found on remote."""
+        mock_api = MagicMock()
+        mock_sibling = type("Sibling", (), {})
+        s1 = mock_sibling()
+        s1.rfilename = "tensors/hidden_layer000_shard000.safetensors"
+        s2 = mock_sibling()
+        s2.rfilename = "README.md"
+        mock_repo_info = MagicMock()
+        mock_repo_info.siblings = [s1, s2]
+        mock_api.repo_info.return_value = mock_repo_info
+
+        shard_files = [
+            "tensors/hidden_layer000_shard000.safetensors",
+            "tensors/hidden_layer001_shard000.safetensors",
+        ]
+        existing = _check_shards_on_remote(mock_api, "user/test", shard_files)
+        assert existing == {"tensors/hidden_layer000_shard000.safetensors"}
+
+    def test_check_shards_on_remote_handles_error(self):
+        """_check_shards_on_remote returns empty set on API error."""
+        mock_api = MagicMock()
+        mock_api.repo_info.side_effect = Exception("repo not found")
+
+        existing = _check_shards_on_remote(
+            mock_api, "user/nonexistent", ["tensors/shard.safetensors"]
+        )
+        assert existing == set()
+
+    def test_reconstruct_plan_from_cached(self):
+        """_reconstruct_plan_from_cached produces valid plan for enumeration."""
+        cached = {
+            "tensor_descriptors": {
+                "hidden_layers": {
+                    "layers": [0, 1, 2],
+                    "shards": [
+                        {"num_prompts": 100},
+                        {"num_prompts": 50},
+                    ],
+                },
+                "logits_topk": {
+                    "shards": [{"num_prompts": 150}],
+                },
+            },
+            "prompt_metadata": [],
+        }
+        plan = _reconstruct_plan_from_cached(cached)
+        assert plan["has_hidden"] is True
+        assert plan["hidden_layers"] == [0, 1, 2]
+        assert plan["hidden_boundaries"] == [100, 50]
+        assert plan["want_logits"] is True
+        assert plan["logits_boundaries"] == [150]
+
+        files = _enumerate_shard_files(plan)
+        assert len(files) == 3 * 2 + 1  # 3 layers × 2 shards + 1 logits
+
+    def test_consolidate_skip_shards(self, populated_cache):
+        """_consolidate_and_shard with skip_shards skips tensor loading."""
+        tensor_types = {
+            "pooled": {"last_token": [0, 1]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "raw_layers": [],
+        }
+        kept_indices = list(range(len(populated_cache)))
+
+        # First run: get the full plan to know shard names
+        plan = _compute_shard_plan(
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            kept_indices=kept_indices,
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_073_741_824,
+            repo_id="user/skip-test",
+        )
+        all_files = set(_enumerate_shard_files(plan))
+
+        written_files = []
+
+        def track_written(local_path, repo_path):
+            written_files.append(repo_path)
+
+        # Run consolidation with all shards skipped
+        _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            kept_indices=kept_indices,
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_073_741_824,
+            repo_id="user/skip-test",
+            on_shard_written=track_written,
+            skip_shards=all_files,
+        )
+
+        # No shards should have been written
+        assert written_files == []
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_stream_partial_resume(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """Partial resume: only missing shards are consolidated."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        # Mock remote has only layer 0 shard, not layer 1
+        mock_sibling = type("Sibling", (), {})
+        s1 = mock_sibling()
+        s1.rfilename = "tensors/hidden_layer000_shard000.safetensors"
+        mock_repo_info = MagicMock()
+        mock_repo_info.siblings = [s1]
+        mock_api.repo_info.return_value = mock_repo_info
+
+        commit_paths = []
+
+        def capture_commit(*, repo_id, operations, **kwargs):
+            for op in operations:
+                commit_paths.append(op.path_in_repo)
+
+        mock_api.create_commit.side_effect = capture_commit
+
+        push_dataset(
+            repo_id="user/partial-resume",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            labels=[1, 1, 0],
+            exist_ok=True,
+            stream=True,
+        )
+
+        # Layer 0 shard should NOT be in commits (already on remote)
+        shard_paths = [
+            p for p in commit_paths if p.startswith("tensors/")
+        ]
+        assert "tensors/hidden_layer000_shard000.safetensors" not in shard_paths
+        # Layer 1 shard SHOULD be uploaded
+        assert "tensors/hidden_layer001_shard000.safetensors" in shard_paths
 
 
 class TestLoadActivationDataset:

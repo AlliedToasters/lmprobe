@@ -665,7 +665,7 @@ def _compute_shard_boundaries(
     return boundaries
 
 
-def _consolidate_and_shard(
+def _compute_shard_plan(
     model_name: str,
     prompts: list[str],
     kept_indices: list[int],
@@ -674,42 +674,23 @@ def _consolidate_and_shard(
     shard_max_bytes: int,
     repo_id: str,
     metadata: list[dict] | None = None,
-    tmpdir: Path | None = None,
-    on_shard_written: Callable[[Path, str], None] | None = None,
-    preload: str = "none",
-    preload_workers: int = 8,
-) -> tuple[Path, dict, list[dict]]:
-    """Consolidate cached tensors into sharded safetensors files.
+) -> dict[str, Any]:
+    """Compute the shard plan without loading any tensor data.
 
-    Layers are co-located within each hidden_layers shard.  Each tensor type
-    gets independent shard boundaries (v1.2), so small logits data isn't
-    needlessly split across many shards.
-
-    Uses streaming consolidation: only one shard's worth of tensors is held
-    in memory at a time, so peak memory is bounded by ``shard_max_bytes``
-    regardless of total dataset size.
+    Runs the metadata scan, deterministic shuffle, boundary computation,
+    and shard metadata assignment.  Returns everything needed to enumerate
+    expected shard filenames, build prompt_metadata, and build
+    tensor_descriptors — without touching any activation tensors.
 
     Returns
     -------
-    tmpdir : Path
-        Temporary directory containing all output files.
-    tensor_descriptors : dict
-        The "tensors" section of lmprobe_info.json.
-    prompt_metadata : list[dict]
-        Per-prompt metadata for the Parquet index.
+    dict with keys:
+        prompt_metadata, valid_prompts, tensor_descriptors,
+        hidden_boundaries, logits_boundaries, hidden_layers, hidden_dim,
+        hidden_strategy, use_raw, per_prompt_tokens, has_hidden,
+        want_logits, logits_top_k, logits_row_bytes, n
     """
-    _VALID_PRELOAD = ("none", "per_layer", "full")
-    if preload not in _VALID_PRELOAD:
-        raise ValueError(
-            f"preload must be one of {_VALID_PRELOAD!r}, got {preload!r}"
-        )
-
-    from safetensors.torch import save_file
-
-    if tmpdir is None:
-        tmpdir = Path(tempfile.mkdtemp(prefix="lmprobe_sharing_"))
-    (tmpdir / "tensors").mkdir(parents=True, exist_ok=True)
-    (tmpdir / "index").mkdir(parents=True, exist_ok=True)
+    from tqdm import tqdm
 
     pooled = tensor_types["pooled"]
     has_logits = tensor_types["has_logits"]
@@ -717,13 +698,9 @@ def _consolidate_and_shard(
     has_perplexity = tensor_types.get("has_perplexity", False)
     has_token_perplexity = tensor_types.get("has_token_perplexity", False)
 
-    # Auto-detect: if raw_layers available, store full-sequence
     raw_layers = tensor_types.get("raw_layers", [])
     use_raw = bool(raw_layers)
 
-    # Determine which pooling strategy and layers we have
-    # For hidden_layers, we co-locate all layers from the first available
-    # pooling strategy
     hidden_strategy = None
     hidden_layers: list[int] = []
     if not use_raw and pooled:
@@ -733,11 +710,9 @@ def _consolidate_and_shard(
         hidden_layers = raw_layers
 
     # --- Phase 1: Metadata-only pass (no tensor loading) ---
-    from tqdm import tqdm
-
     prompt_metadata: list[dict] = []
-    valid_prompts: list[str] = []  # prompts that exist in cache
-    per_prompt_tokens: list[int] = []  # only used when use_raw
+    valid_prompts: list[str] = []
+    per_prompt_tokens: list[int] = []
     skipped_count = 0
 
     for idx in tqdm(kept_indices, desc="Scanning cache metadata", unit="prompt"):
@@ -755,7 +730,6 @@ def _consolidate_and_shard(
 
         num_tokens = info.num_tokens
 
-        # For raw mode, we need num_tokens to compute shard boundaries
         if use_raw and hidden_layers:
             if num_tokens is None:
                 skipped_count += 1
@@ -774,7 +748,6 @@ def _consolidate_and_shard(
             **extra_meta,
         }
 
-        # Add per-token perplexity stats when available in cache
         if has_perplexity:
             try:
                 ppl = load_prompt_perplexity(model_name, prompt)
@@ -787,7 +760,6 @@ def _consolidate_and_shard(
                     f"index {idx}, skipping perplexity columns"
                 )
 
-        # Add per-token perplexity data when available
         if has_token_perplexity:
             try:
                 tok_ppl, tok_ids = load_prompt_token_perplexity(
@@ -795,7 +767,6 @@ def _consolidate_and_shard(
                 )
                 meta_entry["token_ids"] = tok_ids.tolist()
                 meta_entry["token_perplexity"] = tok_ppl.tolist()
-                # Decode token strings if we have a tokenizer
                 if _tokenizer_cache.get("instance") is None:
                     from transformers import AutoTokenizer
                     _tokenizer_cache["instance"] = (
@@ -858,15 +829,12 @@ def _consolidate_and_shard(
 
     logits_row_bytes = 0
     if has_logits and logits_top_k is not None:
-        # values (float32) + indices (int64)
         logits_row_bytes = logits_top_k * 4 + logits_top_k * 8
 
-    # Compute independent shard boundaries per tensor type (v1.2)
     has_hidden = bool(hidden_layers and (hidden_strategy or use_raw))
     want_logits = bool(has_logits and logits_top_k is not None)
 
     if use_raw:
-        # Variable-size rows: bytes depend on per-prompt token count
         per_prompt_bytes = [
             tok * hidden_dim * 4
             for tok in per_prompt_tokens
@@ -875,7 +843,7 @@ def _consolidate_and_shard(
             per_prompt_bytes, shard_max_bytes,
         )
     else:
-        hidden_row_bytes = hidden_dim * 4  # float32, single layer
+        hidden_row_bytes = hidden_dim * 4
         hidden_boundaries = _compute_shard_boundaries(
             n, hidden_row_bytes, shard_max_bytes,
         ) if has_hidden else []
@@ -887,12 +855,8 @@ def _consolidate_and_shard(
     else:
         logits_boundaries = []
 
-    # --- Phase 4: Stream shards per tensor type ---
-    tensor_descriptors: dict[str, dict] = {}
-
-    # --- Hidden pass ---
+    # --- Phase 4a: Assign shard metadata (no data loading) ---
     if has_hidden and hidden_boundaries:
-        # Phase 4a: Assign shard metadata (no data loading yet)
         offset = 0
         token_offset_acc = 0
         for shard_idx, shard_size in enumerate(hidden_boundaries):
@@ -901,7 +865,6 @@ def _consolidate_and_shard(
                 if global_row < len(prompt_metadata):
                     prompt_metadata[global_row]["shard_index_hidden"] = shard_idx
                     prompt_metadata[global_row]["row_offset_hidden"] = local_row
-                    # Legacy aliases (point to hidden by default)
                     prompt_metadata[global_row]["shard_index"] = shard_idx
                     prompt_metadata[global_row]["row_offset"] = local_row
                     if use_raw:
@@ -910,6 +873,249 @@ def _consolidate_and_shard(
                         token_offset_acc += per_prompt_tokens[global_row]
             offset += shard_size
 
+    if want_logits and logits_boundaries:
+        offset = 0
+        for shard_idx, shard_size in enumerate(logits_boundaries):
+            for local_row in range(shard_size):
+                global_row = offset + local_row
+                if global_row < len(prompt_metadata):
+                    prompt_metadata[global_row]["shard_index_logits"] = shard_idx
+                    prompt_metadata[global_row]["row_offset_logits"] = local_row
+                    if not has_hidden:
+                        prompt_metadata[global_row]["shard_index"] = shard_idx
+                        prompt_metadata[global_row]["row_offset"] = local_row
+            offset += shard_size
+
+    # --- Build tensor descriptors ---
+    tensor_descriptors: dict[str, dict] = {}
+
+    if has_hidden and hidden_boundaries:
+        hidden_shards = []
+        off = 0
+        for si, sz in enumerate(hidden_boundaries):
+            actual = min(sz, n - off)
+            shard_desc: dict[str, Any] = {
+                "num_prompts": actual,
+            }
+            if use_raw:
+                shard_desc["num_tokens"] = sum(
+                    per_prompt_tokens[off : off + actual]
+                )
+            hidden_shards.append(shard_desc)
+            off += actual
+
+        hidden_desc: dict[str, Any] = {
+            "type": "hidden",
+            "layers": hidden_layers,
+            "dim": hidden_dim,
+            "dtype": "float32",
+            "layout": "per_layer",
+            "shards": hidden_shards,
+        }
+        if use_raw:
+            hidden_desc["storage"] = "full_sequence"
+        else:
+            hidden_desc["storage"] = "pooled"
+            hidden_desc["pooling"] = hidden_strategy
+            hidden_desc["row_bytes"] = hidden_dim * 4
+
+        tensor_descriptors["hidden_layers"] = hidden_desc
+
+    if want_logits and logits_boundaries:
+        logits_shards = []
+        off = 0
+        for si, sz in enumerate(logits_boundaries):
+            actual = min(sz, n - off)
+            logits_shards.append({
+                "file": f"tensors/logits_topk_{si:03d}.safetensors",
+                "num_prompts": actual,
+            })
+            off += actual
+
+        tensor_descriptors["logits_topk"] = {
+            "type": "logits_topk",
+            "k": logits_top_k,
+            "dtype": "float32",
+            "pooling": "last_token",
+            "row_bytes": logits_row_bytes,
+            "shards": logits_shards,
+        }
+
+    return {
+        "prompt_metadata": prompt_metadata,
+        "valid_prompts": valid_prompts,
+        "tensor_descriptors": tensor_descriptors,
+        "hidden_boundaries": hidden_boundaries,
+        "logits_boundaries": logits_boundaries,
+        "hidden_layers": hidden_layers,
+        "hidden_dim": hidden_dim,
+        "hidden_strategy": hidden_strategy,
+        "use_raw": use_raw,
+        "per_prompt_tokens": per_prompt_tokens,
+        "has_hidden": has_hidden,
+        "want_logits": want_logits,
+        "logits_top_k": logits_top_k,
+        "logits_row_bytes": logits_row_bytes,
+        "n": n,
+    }
+
+
+def _reconstruct_plan_from_cached(cached_meta: dict) -> dict[str, Any]:
+    """Reconstruct a minimal plan dict from cached consolidation metadata.
+
+    Only populates the fields needed by ``_enumerate_shard_files``:
+    has_hidden, hidden_layers, hidden_boundaries, want_logits,
+    logits_boundaries.
+    """
+    td = cached_meta["tensor_descriptors"]
+    hidden_info = td.get("hidden_layers", {})
+    logits_info = td.get("logits_topk", {})
+
+    has_hidden = bool(hidden_info)
+    hidden_layers = hidden_info.get("layers", [])
+    hidden_boundaries = [
+        s["num_prompts"] for s in hidden_info.get("shards", [])
+    ]
+
+    want_logits = bool(logits_info)
+    logits_boundaries = [
+        s["num_prompts"] for s in logits_info.get("shards", [])
+    ]
+
+    return {
+        "has_hidden": has_hidden,
+        "hidden_layers": hidden_layers,
+        "hidden_boundaries": hidden_boundaries,
+        "want_logits": want_logits,
+        "logits_boundaries": logits_boundaries,
+    }
+
+
+def _enumerate_shard_files(plan: dict[str, Any]) -> list[str]:
+    """Enumerate all expected shard filenames from a shard plan."""
+    files = []
+    if plan["has_hidden"] and plan["hidden_boundaries"]:
+        for layer in plan["hidden_layers"]:
+            for shard_idx in range(len(plan["hidden_boundaries"])):
+                files.append(
+                    f"tensors/hidden_layer{layer:03d}"
+                    f"_shard{shard_idx:03d}.safetensors"
+                )
+    if plan["want_logits"] and plan["logits_boundaries"]:
+        for shard_idx in range(len(plan["logits_boundaries"])):
+            files.append(f"tensors/logits_topk_{shard_idx:03d}.safetensors")
+    return files
+
+
+def _check_shards_on_remote(
+    api: Any,
+    repo_id: str,
+    shard_files: list[str],
+) -> set[str]:
+    """Check which shard files exist on the HF remote via repo_info.
+
+    Returns the set of shard paths that exist on remote.
+    """
+    try:
+        repo_info = api.repo_info(repo_id, repo_type="dataset")
+    except Exception:
+        return set()
+
+    remote_files = {s.rfilename for s in repo_info.siblings}
+    return {f for f in shard_files if f in remote_files}
+
+
+def _consolidate_and_shard(
+    model_name: str,
+    prompts: list[str],
+    kept_indices: list[int],
+    tensor_types: dict[str, Any],
+    labels: list[int | str | None] | None,
+    shard_max_bytes: int,
+    repo_id: str,
+    metadata: list[dict] | None = None,
+    tmpdir: Path | None = None,
+    on_shard_written: Callable[[Path, str], None] | None = None,
+    preload: str = "none",
+    preload_workers: int = 8,
+    skip_shards: set[str] | None = None,
+) -> tuple[Path, dict, list[dict]]:
+    """Consolidate cached tensors into sharded safetensors files.
+
+    Layers are co-located within each hidden_layers shard.  Each tensor type
+    gets independent shard boundaries (v1.2), so small logits data isn't
+    needlessly split across many shards.
+
+    Uses streaming consolidation: only one shard's worth of tensors is held
+    in memory at a time, so peak memory is bounded by ``shard_max_bytes``
+    regardless of total dataset size.
+
+    Parameters
+    ----------
+    skip_shards : set[str] | None
+        Shard filenames to skip writing (e.g. already on remote).
+        When provided, tensor loading and file writing are skipped for
+        these shards.  The shard plan (metadata, descriptors) is still
+        computed in full.
+
+    Returns
+    -------
+    tmpdir : Path
+        Temporary directory containing all output files.
+    tensor_descriptors : dict
+        The "tensors" section of lmprobe_info.json.
+    prompt_metadata : list[dict]
+        Per-prompt metadata for the Parquet index.
+    """
+    _VALID_PRELOAD = ("none", "per_layer", "full")
+    if preload not in _VALID_PRELOAD:
+        raise ValueError(
+            f"preload must be one of {_VALID_PRELOAD!r}, got {preload!r}"
+        )
+
+    from safetensors.torch import save_file
+
+    if tmpdir is None:
+        tmpdir = Path(tempfile.mkdtemp(prefix="lmprobe_sharing_"))
+    (tmpdir / "tensors").mkdir(parents=True, exist_ok=True)
+    (tmpdir / "index").mkdir(parents=True, exist_ok=True)
+
+    if skip_shards is None:
+        skip_shards = set()
+
+    # Compute the shard plan (metadata scan, shuffle, boundaries, descriptors)
+    plan = _compute_shard_plan(
+        model_name=model_name,
+        prompts=prompts,
+        kept_indices=kept_indices,
+        tensor_types=tensor_types,
+        labels=labels,
+        shard_max_bytes=shard_max_bytes,
+        repo_id=repo_id,
+        metadata=metadata,
+    )
+
+    prompt_metadata = plan["prompt_metadata"]
+    valid_prompts = plan["valid_prompts"]
+    tensor_descriptors = plan["tensor_descriptors"]
+    hidden_boundaries = plan["hidden_boundaries"]
+    logits_boundaries = plan["logits_boundaries"]
+    hidden_layers = plan["hidden_layers"]
+    hidden_dim = plan["hidden_dim"]
+    hidden_strategy = plan["hidden_strategy"]
+    use_raw = plan["use_raw"]
+    per_prompt_tokens = plan["per_prompt_tokens"]
+    has_hidden = plan["has_hidden"]
+    want_logits = plan["want_logits"]
+    logits_top_k = plan["logits_top_k"]
+    n = plan["n"]
+
+    from tqdm import tqdm
+
+    # --- Write shards per tensor type ---
+
+    # --- Hidden pass ---
+    if has_hidden and hidden_boundaries:
         # Phase 4b: Write per-layer shard files one layer at a time.
         total_layer_shards = len(hidden_layers) * len(hidden_boundaries)
 
@@ -922,6 +1128,14 @@ def _consolidate_and_shard(
             key = f"hidden.layer_{layer}"
             offset = 0
             for shard_idx, shard_size in enumerate(hidden_boundaries):
+                fname = (
+                    f"tensors/hidden_layer{layer:03d}"
+                    f"_shard{shard_idx:03d}.safetensors"
+                )
+                if fname in skip_shards:
+                    offset += shard_size
+                    pbar.update(1)
+                    continue
                 rows = [
                     data[offset + j]
                     for j in range(shard_size)
@@ -929,10 +1143,6 @@ def _consolidate_and_shard(
                 ]
                 if rows:
                     layer_tensor = {key: torch.cat(rows, dim=0)}
-                    fname = (
-                        f"tensors/hidden_layer{layer:03d}"
-                        f"_shard{shard_idx:03d}.safetensors"
-                    )
                     save_file(layer_tensor, str(tmpdir / fname))
                     if on_shard_written is not None:
                         on_shard_written(tmpdir / fname, fname)
@@ -1001,6 +1211,14 @@ def _consolidate_and_shard(
                     key = f"hidden.layer_{layer}"
                     offset = 0
                     for shard_idx, shard_size in enumerate(hidden_boundaries):
+                        fname = (
+                            f"tensors/hidden_layer{layer:03d}"
+                            f"_shard{shard_idx:03d}.safetensors"
+                        )
+                        if fname in skip_shards:
+                            offset += shard_size
+                            pbar.update(1)
+                            continue
                         shard_prompts_text = valid_prompts[
                             offset : offset + shard_size
                         ]
@@ -1033,10 +1251,6 @@ def _consolidate_and_shard(
                                 ) from e
                         if rows:
                             layer_tensor = {key: torch.cat(rows, dim=0)}
-                            fname = (
-                                f"tensors/hidden_layer{layer:03d}"
-                                f"_shard{shard_idx:03d}.safetensors"
-                            )
                             save_file(layer_tensor, str(tmpdir / fname))
                             if on_shard_written is not None:
                                 on_shard_written(tmpdir / fname, fname)
@@ -1051,18 +1265,12 @@ def _consolidate_and_shard(
         for shard_idx, shard_size in enumerate(tqdm(
             logits_boundaries, desc="Writing logits shards", unit="shard",
         )):
-            shard_prompts_text = valid_prompts[offset : offset + shard_size]
+            fname = f"tensors/logits_topk_{shard_idx:03d}.safetensors"
+            if fname in skip_shards:
+                offset += shard_size
+                continue
 
-            # Assign per-type shard metadata for logits
-            for local_row in range(shard_size):
-                global_row = offset + local_row
-                if global_row < len(prompt_metadata):
-                    prompt_metadata[global_row]["shard_index_logits"] = shard_idx
-                    prompt_metadata[global_row]["row_offset_logits"] = local_row
-                    # If no hidden, legacy columns point to logits
-                    if not has_hidden:
-                        prompt_metadata[global_row]["shard_index"] = shard_idx
-                        prompt_metadata[global_row]["row_offset"] = local_row
+            shard_prompts_text = valid_prompts[offset : offset + shard_size]
 
             # Load and write logits tensors for this shard
             shard_data_logits: list[dict] = []
@@ -1105,59 +1313,6 @@ def _consolidate_and_shard(
 
             del shard_data_logits
             offset += shard_size
-
-    # Build tensor descriptors for lmprobe_info.json
-    if has_hidden and hidden_boundaries:
-        hidden_shards = []
-        off = 0
-        for si, sz in enumerate(hidden_boundaries):
-            actual = min(sz, n - off)
-            shard_desc: dict[str, Any] = {
-                "num_prompts": actual,
-            }
-            if use_raw:
-                shard_desc["num_tokens"] = sum(
-                    per_prompt_tokens[off : off + actual]
-                )
-            hidden_shards.append(shard_desc)
-            off += actual
-
-        hidden_desc: dict[str, Any] = {
-            "type": "hidden",
-            "layers": hidden_layers,
-            "dim": hidden_dim,
-            "dtype": "float32",
-            "layout": "per_layer",
-            "shards": hidden_shards,
-        }
-        if use_raw:
-            hidden_desc["storage"] = "full_sequence"
-        else:
-            hidden_desc["storage"] = "pooled"
-            hidden_desc["pooling"] = hidden_strategy
-            hidden_desc["row_bytes"] = hidden_dim * 4
-
-        tensor_descriptors["hidden_layers"] = hidden_desc
-
-    if want_logits and logits_boundaries:
-        logits_shards = []
-        off = 0
-        for si, sz in enumerate(logits_boundaries):
-            actual = min(sz, n - off)
-            logits_shards.append({
-                "file": f"tensors/logits_topk_{si:03d}.safetensors",
-                "num_prompts": actual,
-            })
-            off += actual
-
-        tensor_descriptors["logits_topk"] = {
-            "type": "logits_topk",
-            "k": logits_top_k,
-            "dtype": "float32",
-            "pooling": "last_token",
-            "row_bytes": logits_row_bytes,
-            "shards": logits_shards,
-        }
 
     return tmpdir, tensor_descriptors, prompt_metadata
 
@@ -1820,7 +1975,12 @@ def _push_dataset_streaming(
     preload: str = "none",
     preload_workers: int = 8,
 ) -> str:
-    """Streaming upload: write shards, batch-upload via create_commit."""
+    """Streaming upload: write shards, batch-upload via create_commit.
+
+    Uses dry consolidation with remote checks for resume: computes the
+    shard plan from cache metadata, checks which shards exist on the
+    HF remote, and only consolidates missing shards.
+    """
     import shutil
 
     from huggingface_hub import CommitOperationAdd, HfApi
@@ -1840,13 +2000,7 @@ def _push_dataset_streaming(
     if manifest is None:
         manifest = _new_manifest(repo_id)
 
-    if resuming:
-        logger.info(
-            "[SHARING] Resuming streaming upload: %d shards already uploaded",
-            len(manifest["completed_shards"]),
-        )
-
-    # Create repo early (need it for create_commit calls)
+    # Create repo early (need it for create_commit calls and remote checks)
     api = HfApi(token=token)
     api.create_repo(
         repo_id,
@@ -1855,59 +2009,52 @@ def _push_dataset_streaming(
         repo_type="dataset",
     )
 
-    # Retry any pending batch from a prior failed create_commit.
-    # These files are already consolidated locally — skip re-reading from S3.
-    prior_batch = manifest.get("pending_batch", [])
-    if prior_batch:
-        local_files_exist = all(Path(lp).exists() for lp, _ in prior_batch)
-        if local_files_exist:
-            logger.info(
-                "[SHARING] Retrying pending batch of %d shards from "
-                "prior run", len(prior_batch),
-            )
-            operations = [
-                CommitOperationAdd(
-                    path_in_repo=rp,
-                    path_or_fileobj=lp,
-                )
-                for lp, rp in prior_batch
-            ]
-            api.create_commit(
-                repo_id=repo_id,
-                operations=operations,
-                commit_message=f"Add {len(prior_batch)} shards (retry)",
-                repo_type="dataset",
-            )
-            for lp, rp in prior_batch:
-                Path(lp).unlink(missing_ok=True)
-                manifest["completed_shards"].append(rp)
-            manifest.pop("pending_batch", None)
-            _save_manifest(staging_dir, manifest)
-        else:
-            # Files gone — clear pending_batch; re-consolidation will handle
-            logger.debug(
-                "[SHARING] Pending batch files missing, will re-consolidate"
-            )
-            manifest.pop("pending_batch", None)
-            _save_manifest(staging_dir, manifest)
-
-    # Check if consolidation already completed on a prior run.
-    # If the manifest has cached metadata, skip the expensive metadata scan
-    # and consolidation loop entirely (fixes redundant S3 reads on resume).
+    # --- Dry consolidation: compute shard plan, check remote ---
+    # Use cached consolidation result if available (fast path),
+    # otherwise compute it from cache metadata (metadata scan).
     cached_meta = manifest.get("consolidation_result")
     if cached_meta is not None:
         logger.info(
-            "[SHARING] Consolidation already completed on prior run, "
-            "skipping metadata scan and shard consolidation"
+            "[SHARING] Using cached consolidation result from manifest"
         )
         tensor_descriptors = cached_meta["tensor_descriptors"]
         prompt_metadata = cached_meta["prompt_metadata"]
-        tmpdir = staging_dir
-        (tmpdir / "tensors").mkdir(parents=True, exist_ok=True)
-        (tmpdir / "index").mkdir(parents=True, exist_ok=True)
+        # Reconstruct the plan dict with enough info for _enumerate_shard_files.
+        # We need hidden_layers, hidden_boundaries, logits_boundaries,
+        # has_hidden, want_logits from the cached descriptors.
+        plan = _reconstruct_plan_from_cached(cached_meta)
     else:
+        logger.info("[SHARING] Computing shard plan from cache metadata...")
+        plan = _compute_shard_plan(
+            model_name=model_name,
+            prompts=prompts,
+            kept_indices=kept_indices,
+            tensor_types=tensor_types,
+            labels=labels,
+            shard_max_bytes=shard_max_bytes,
+            repo_id=repo_id,
+            metadata=metadata,
+        )
+        tensor_descriptors = plan["tensor_descriptors"]
+        prompt_metadata = plan["prompt_metadata"]
+
+    # Enumerate expected shard files and check which exist on remote
+    expected_files = _enumerate_shard_files(plan)
+    remote_existing = _check_shards_on_remote(api, repo_id, expected_files)
+    missing_files = set(expected_files) - remote_existing
+
+    if resuming:
+        logger.info(
+            "[SHARING] Resume check: %d/%d shards on remote, %d missing",
+            len(remote_existing), len(expected_files), len(missing_files),
+        )
+
+    tmpdir = staging_dir
+    (tmpdir / "tensors").mkdir(parents=True, exist_ok=True)
+    (tmpdir / "index").mkdir(parents=True, exist_ok=True)
+
+    if missing_files:
         # Build the batched on_shard_written callback
-        completed_set = set(manifest["completed_shards"])
         pending_shards: list[tuple[Path, str]] = []
 
         def _flush_batch() -> None:
@@ -1921,7 +2068,7 @@ def _push_dataset_streaming(
                 ", ".join(paths_in_batch),
             )
             # Save pending paths to manifest before commit so resume can
-            # find them if create_commit fails (avoids re-consolidation).
+            # find them if create_commit fails.
             manifest["pending_batch"] = [
                 [str(lp), rp] for lp, rp in pending_shards
             ]
@@ -1946,26 +2093,54 @@ def _push_dataset_streaming(
             for local_path, repo_path in pending_shards:
                 local_path.unlink(missing_ok=True)
                 manifest["completed_shards"].append(repo_path)
-                completed_set.add(repo_path)
             manifest.pop("pending_batch", None)
             _save_manifest(staging_dir, manifest)
             pending_shards.clear()
 
         def _on_shard_written(local_path: Path, repo_path: str) -> None:
-            if repo_path in completed_set:
-                logger.debug(
-                    "[SHARING] Skipping already-uploaded shard: %s", repo_path,
-                )
-                local_path.unlink(missing_ok=True)
-                return
             pending_shards.append((local_path, repo_path))
             if len(pending_shards) >= stream_batch_size:
                 _flush_batch()
 
-        # Consolidate with streaming callback
+        # Retry any pending batch from a prior failed create_commit
+        prior_batch = manifest.get("pending_batch", [])
+        if prior_batch:
+            local_files_exist = all(
+                Path(lp).exists() for lp, _ in prior_batch
+            )
+            if local_files_exist:
+                logger.info(
+                    "[SHARING] Retrying pending batch of %d shards",
+                    len(prior_batch),
+                )
+                operations = [
+                    CommitOperationAdd(
+                        path_in_repo=rp,
+                        path_or_fileobj=lp,
+                    )
+                    for lp, rp in prior_batch
+                ]
+                api.create_commit(
+                    repo_id=repo_id,
+                    operations=operations,
+                    commit_message=(
+                        f"Add {len(prior_batch)} shards (retry)"
+                    ),
+                    repo_type="dataset",
+                )
+                for lp, rp in prior_batch:
+                    Path(lp).unlink(missing_ok=True)
+                    manifest["completed_shards"].append(rp)
+                manifest.pop("pending_batch", None)
+                _save_manifest(staging_dir, manifest)
+            else:
+                manifest.pop("pending_batch", None)
+                _save_manifest(staging_dir, manifest)
+
+        # Consolidate only missing shards
         logger.info(
-            "[SHARING] Consolidating and streaming shards "
-            "(batch_size=%d)...", stream_batch_size,
+            "[SHARING] Consolidating %d missing shards "
+            "(batch_size=%d)...", len(missing_files), stream_batch_size,
         )
         tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
             model_name=model_name,
@@ -1980,19 +2155,24 @@ def _push_dataset_streaming(
             on_shard_written=_on_shard_written,
             preload=preload,
             preload_workers=preload_workers,
+            skip_shards=remote_existing,
         )
 
         # Flush any remaining buffered shards
         _flush_batch()
+    else:
+        logger.info(
+            "[SHARING] All %d shards already on remote — "
+            "dry consolidation (no tensor loading)",
+            len(expected_files),
+        )
 
-        # Cache consolidation results in the manifest so subsequent
-        # resumes (e.g. after a Parquet index write failure) can skip
-        # the expensive metadata scan and consolidation entirely.
-        manifest["consolidation_result"] = {
-            "tensor_descriptors": tensor_descriptors,
-            "prompt_metadata": prompt_metadata,
-        }
-        _save_manifest(staging_dir, manifest)
+    # Cache consolidation results in the manifest
+    manifest["consolidation_result"] = {
+        "tensor_descriptors": tensor_descriptors,
+        "prompt_metadata": prompt_metadata,
+    }
+    _save_manifest(staging_dir, manifest)
 
     # Upload metadata files (parquet, info, README)
     if not manifest.get("metadata_uploaded", False):
