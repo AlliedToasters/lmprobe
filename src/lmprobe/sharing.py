@@ -1101,14 +1101,11 @@ def _consolidate_and_shard(
     hidden_boundaries = plan["hidden_boundaries"]
     logits_boundaries = plan["logits_boundaries"]
     hidden_layers = plan["hidden_layers"]
-    hidden_dim = plan["hidden_dim"]
     hidden_strategy = plan["hidden_strategy"]
     use_raw = plan["use_raw"]
-    per_prompt_tokens = plan["per_prompt_tokens"]
     has_hidden = plan["has_hidden"]
     want_logits = plan["want_logits"]
     logits_top_k = plan["logits_top_k"]
-    n = plan["n"]
 
     from tqdm import tqdm
 
