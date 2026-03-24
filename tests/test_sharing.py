@@ -659,16 +659,26 @@ class TestPushDataset:
         mock_api.create_repo.assert_called_once()
         mock_api.upload_large_folder.assert_called_once()
 
-        # Check file structure
-        assert INFO_FILENAME in uploaded_files
+        # Check file structure — lmprobe_info.json no longer written (v2.0+)
+        assert INFO_FILENAME not in uploaded_files
         assert PARQUET_PATH in uploaded_files
         assert "README.md" in uploaded_files
 
-        info = uploaded_files[INFO_FILENAME]
-        assert info["num_prompts"] == 3
-        assert "hidden_layers" in info["tensors"]
-        assert info["prompt_ordering"] == "random"
-        assert info["tensors"]["hidden_layers"]["layout"] == "per_layer"
+        # Metadata is now embedded in parquet schema
+        import pyarrow.parquet as pq
+
+        # Find the parquet file on disk via the captured bytes
+        parquet_bytes = uploaded_files[PARQUET_PATH]
+        import io
+        pf = pq.read_schema(io.BytesIO(parquet_bytes))
+        meta = pf.metadata
+        assert b"lmprobe:format_version" in meta
+        assert meta[b"lmprobe:format_version"] == b"2.0"
+        info = json.loads(meta[b"lmprobe:tensors"])
+        assert "hidden_layers" in info
+        assert info["hidden_layers"]["layout"] == "per_layer"
+        assert int(meta[b"lmprobe:num_prompts"]) == 3
+        assert meta[b"lmprobe:prompt_ordering"] == b"random"
 
     @patch("lmprobe.sharing._check_hub_deps")
     @patch("lmprobe.sharing._check_pyarrow")
@@ -860,8 +870,8 @@ class TestPushDatasetStreaming:
         tensor_paths = [p for p in uploaded_paths if p.startswith("tensors/")]
         assert len(tensor_paths) >= 2  # at least one shard per layer
 
-        # Should have metadata files
-        assert INFO_FILENAME in uploaded_paths
+        # Should have metadata files (no lmprobe_info.json in v2.0+)
+        assert INFO_FILENAME not in uploaded_paths
         assert PARQUET_PATH in uploaded_paths
         assert "README.md" in uploaded_paths
 
@@ -969,8 +979,8 @@ class TestPushDatasetStreaming:
             assert not path.startswith("tensors/"), (
                 f"Shard {path} should have been skipped on resume"
             )
-        # Should have uploaded metadata files only
-        assert INFO_FILENAME in commit_paths
+        # Should have uploaded metadata files only (no lmprobe_info.json in v2.0+)
+        assert INFO_FILENAME not in commit_paths
         assert PARQUET_PATH in commit_paths
         assert "README.md" in commit_paths
 
@@ -1961,12 +1971,17 @@ class TestRoundtrip:
                 exist_ok=True,
             )
 
-        # Verify remote files
-        assert (remote_dir / INFO_FILENAME).exists()
+        # Verify remote files — v2.0+ embeds metadata in parquet, no JSON sidecar
+        assert not (remote_dir / INFO_FILENAME).exists()
         assert (remote_dir / PARQUET_PATH).exists()
 
-        with open(remote_dir / INFO_FILENAME) as f:
-            info = json.load(f)
+        # Check metadata is embedded in parquet schema
+        import pyarrow.parquet as pq
+        schema_meta = pq.read_schema(str(remote_dir / PARQUET_PATH)).metadata
+        info = {
+            "num_prompts": int(schema_meta[b"lmprobe:num_prompts"]),
+            "tensors": json.loads(schema_meta[b"lmprobe:tensors"]),
+        }
         assert info["num_prompts"] == 3
         assert "hidden_layers" in info["tensors"]
 

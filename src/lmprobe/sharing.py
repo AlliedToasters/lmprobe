@@ -58,7 +58,7 @@ from .cache import (
 
 logger = logging.getLogger(__name__)
 
-FORMAT_VERSION = "1.2"
+FORMAT_VERSION = "2.0"
 DEFAULT_SHARD_BYTES = 1_073_741_824  # 1 GB
 INFO_FILENAME = "lmprobe_info.json"
 PARQUET_PATH = "index/train-00000-of-00001.parquet"
@@ -1525,12 +1525,16 @@ def _consolidate_and_shard(
 def _write_parquet_index(
     tmpdir: Path,
     prompt_metadata: list[dict],
+    lmprobe_info: dict | None = None,
 ) -> None:
     """Write the Parquet index from prompt metadata.
 
     Fixed columns: text, label, num_tokens, shard_index, row_offset (or
     token_offset for full-sequence storage).  Any additional keys in
     prompt_metadata are written as extra columns with auto-inferred types.
+
+    If *lmprobe_info* is provided, its contents are embedded into the
+    parquet schema metadata under ``lmprobe:`` prefixed keys (format v2.0+).
     """
     _check_pyarrow()
     import pyarrow as pa
@@ -1621,6 +1625,21 @@ def _write_parquet_index(
             columns[ek] = pa.array(values, type=pa_type)
 
     table = pa.table(columns)
+
+    # Embed lmprobe_info as parquet schema metadata (format v2.0+)
+    if lmprobe_info is not None:
+        schema_meta = {
+            b"lmprobe:format_version": lmprobe_info["format_version"].encode(),
+            b"lmprobe:model": json.dumps(lmprobe_info["model"]).encode(),
+            b"lmprobe:tensors": json.dumps(lmprobe_info["tensors"]).encode(),
+            b"lmprobe:provenance": json.dumps(lmprobe_info["provenance"]).encode(),
+            b"lmprobe:num_prompts": str(lmprobe_info["num_prompts"]).encode(),
+            b"lmprobe:prompt_ordering": lmprobe_info.get(
+                "prompt_ordering", "random"
+            ).encode(),
+        }
+        table = table.replace_schema_metadata(schema_meta)
+
     pq.write_table(table, str(tmpdir / PARQUET_PATH))
 
 
@@ -2089,17 +2108,12 @@ def push_dataset(
             shuffle=shuffle,
         )
 
-        # Step 5: Write Parquet index
-        _write_parquet_index(tmpdir, prompt_metadata)
-
-        # Step 6: Write metadata
+        # Step 5: Write metadata + Parquet index (metadata embedded in schema)
         num_prompts = len(prompt_metadata)
         lmprobe_info = _build_lmprobe_info(
             model_name, num_prompts, tensor_descriptors,
         )
-
-        with open(tmpdir / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f, indent=2)
+        _write_parquet_index(tmpdir, prompt_metadata, lmprobe_info=lmprobe_info)
 
         readme = _build_readme(
             model_name=model_name,
@@ -2387,14 +2401,11 @@ def _push_dataset_streaming(
 
     # Upload metadata files (parquet, info, README)
     if not manifest.get("metadata_uploaded", False):
-        _write_parquet_index(tmpdir, prompt_metadata)
-
         num_prompts = len(prompt_metadata)
         lmprobe_info = _build_lmprobe_info(
             model_name, num_prompts, tensor_descriptors,
         )
-        with open(tmpdir / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f, indent=2)
+        _write_parquet_index(tmpdir, prompt_metadata, lmprobe_info=lmprobe_info)
 
         readme = _build_readme(
             model_name=model_name,
@@ -2415,7 +2426,6 @@ def _push_dataset_streaming(
             for meta_file, repo_path in [
                 (tmpdir / "index" / "train-00000-of-00001.parquet",
                  PARQUET_PATH),
-                (tmpdir / INFO_FILENAME, INFO_FILENAME),
                 (tmpdir / "README.md", "README.md"),
             ]
         ]
@@ -2458,6 +2468,46 @@ class DatasetMetadata:
     prompts: list[str] = field(default_factory=list)
 
 
+def _load_dataset_metadata(
+    parquet_path: str | Path,
+    info_path: str | Path | None = None,
+) -> dict:
+    """Load dataset metadata from parquet schema or JSON sidecar.
+
+    For v2.0+ datasets the metadata lives in the parquet file's schema
+    metadata under ``lmprobe:`` prefixed keys.  For older datasets we
+    fall back to ``lmprobe_info.json``.
+
+    Returns the reconstructed ``lmprobe_info`` dict.
+    """
+    _check_pyarrow()
+    import pyarrow.parquet as pq
+
+    schema_meta = pq.read_schema(str(parquet_path)).metadata or {}
+
+    if b"lmprobe:format_version" in schema_meta:
+        # v2.0+ — metadata embedded in parquet schema
+        return {
+            "format_version": schema_meta[b"lmprobe:format_version"].decode(),
+            "model": json.loads(schema_meta[b"lmprobe:model"]),
+            "tensors": json.loads(schema_meta[b"lmprobe:tensors"]),
+            "provenance": json.loads(schema_meta[b"lmprobe:provenance"]),
+            "num_prompts": int(schema_meta[b"lmprobe:num_prompts"]),
+            "prompt_ordering": schema_meta.get(
+                b"lmprobe:prompt_ordering", b"random"
+            ).decode(),
+        }
+
+    # Fallback: v1.x JSON sidecar
+    if info_path is None:
+        raise FileNotFoundError(
+            "Parquet file has no embedded metadata and no lmprobe_info.json "
+            "path was provided."
+        )
+    with open(info_path) as f:
+        return json.load(f)
+
+
 def fetch_dataset_metadata(
     repo_id: str,
     *,
@@ -2465,8 +2515,9 @@ def fetch_dataset_metadata(
 ) -> DatasetMetadata:
     """Fetch lightweight metadata from a remote activation dataset.
 
-    Downloads only ``lmprobe_info.json`` (~KB) and the Parquet index
-    (~KB–MB) — no tensor data is transferred.
+    Downloads only the Parquet index (~KB–MB) — no tensor data is
+    transferred.  For v1.x datasets ``lmprobe_info.json`` is also
+    downloaded as a fallback.
 
     Parameters
     ----------
@@ -2484,15 +2535,19 @@ def fetch_dataset_metadata(
     _check_hub_deps()
     from huggingface_hub import hf_hub_download
 
-    info_path = hf_hub_download(
-        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
-    )
     parquet_path = hf_hub_download(
         repo_id, PARQUET_PATH, repo_type="dataset", token=token,
     )
 
-    with open(info_path) as f:
-        lmprobe_info = json.load(f)
+    # Try loading metadata from parquet schema (v2.0+); fall back to JSON
+    info_path: str | None = None
+    try:
+        lmprobe_info = _load_dataset_metadata(parquet_path)
+    except (FileNotFoundError, KeyError):
+        info_path = hf_hub_download(
+            repo_id, INFO_FILENAME, repo_type="dataset", token=token,
+        )
+        lmprobe_info = _load_dataset_metadata(parquet_path, info_path=info_path)
 
     # Support both canonical format (model.name, tensors) and legacy
     # format (model_name, tensor_types) written by custom staging scripts.
@@ -2590,34 +2645,38 @@ def pull_dataset(
 
     # Download metadata
     logger.info("[SHARING] Downloading dataset metadata from %s...", repo_id)
-    info_path = hf_hub_download(
-        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
-    )
     parquet_path = hf_hub_download(
         repo_id, PARQUET_PATH, repo_type="dataset", token=token,
     )
 
-    with open(info_path) as f:
-        lmprobe_info = json.load(f)
+    # Try loading metadata from parquet schema (v2.0+); fall back to JSON
+    try:
+        lmprobe_info = _load_dataset_metadata(parquet_path)
+    except (FileNotFoundError, KeyError):
+        info_path = hf_hub_download(
+            repo_id, INFO_FILENAME, repo_type="dataset", token=token,
+        )
+        lmprobe_info = _load_dataset_metadata(parquet_path, info_path=info_path)
 
-    # Version check
+    # Version check — accept older formats (backward-compatible), reject newer
     remote_version = lmprobe_info.get("format_version", "1.0")
     remote_major = int(remote_version.split(".")[0])
     local_major = int(FORMAT_VERSION.split(".")[0])
-    if remote_major != local_major:
+    if remote_major > local_major:
         raise ValueError(
             f"Incompatible format version: remote has {remote_version}, "
             f"lmprobe supports {FORMAT_VERSION}. "
             f"Please upgrade lmprobe: pip install --upgrade lmprobe"
         )
-    remote_minor = int(remote_version.split(".")[1])
-    local_minor = int(FORMAT_VERSION.split(".")[1])
-    if remote_minor > local_minor:
-        warnings.warn(
-            f"Remote format {remote_version} is newer than supported "
-            f"{FORMAT_VERSION}. Some tensor types may be skipped.",
-            stacklevel=2,
-        )
+    if remote_major == local_major:
+        remote_minor = int(remote_version.split(".")[1])
+        local_minor = int(FORMAT_VERSION.split(".")[1])
+        if remote_minor > local_minor:
+            warnings.warn(
+                f"Remote format {remote_version} is newer than supported "
+                f"{FORMAT_VERSION}. Some tensor types may be skipped.",
+                stacklevel=2,
+            )
 
     model_obj = lmprobe_info.get("model")
     if isinstance(model_obj, dict):
@@ -3180,18 +3239,24 @@ def load_activation_dataset(
     _check_hub_deps()
     from huggingface_hub import hf_hub_download
 
-    info_path = hf_hub_download(
-        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
-    )
+    # Try parquet schema metadata first (v2.0+); fall back to JSON sidecar
+    try:
+        parquet_path = hf_hub_download(
+            repo_id, PARQUET_PATH, repo_type="dataset", token=token,
+        )
+        lmprobe_info = _load_dataset_metadata(parquet_path)
+    except Exception:
+        info_path = hf_hub_download(
+            repo_id, INFO_FILENAME, repo_type="dataset", token=token,
+        )
+        with open(info_path) as f:
+            lmprobe_info = json.load(f)
 
-    with open(info_path) as f:
-        lmprobe_info = json.load(f)
-
-    # Version check
+    # Version check — accept older formats (backward-compatible), reject newer
     remote_version = lmprobe_info.get("format_version", "1.0")
     remote_major = int(remote_version.split(".")[0])
     local_major = int(FORMAT_VERSION.split(".")[0])
-    if remote_major != local_major:
+    if remote_major > local_major:
         raise ValueError(
             f"Incompatible format version: remote has {remote_version}, "
             f"lmprobe supports {FORMAT_VERSION}. "
@@ -3315,15 +3380,18 @@ def migrate_dataset(
     # Step 1: Download metadata
     # ------------------------------------------------------------------
     logger.info("[MIGRATE] Downloading metadata from %s...", repo_id)
-    info_path = hf_hub_download(
-        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
-    )
     parquet_path = hf_hub_download(
         repo_id, PARQUET_PATH, repo_type="dataset", token=token,
     )
 
-    with open(info_path) as f:
-        lmprobe_info = json.load(f)
+    # Try parquet schema metadata first (v2.0+); fall back to JSON sidecar
+    try:
+        lmprobe_info = _load_dataset_metadata(parquet_path)
+    except (FileNotFoundError, KeyError):
+        info_path = hf_hub_download(
+            repo_id, INFO_FILENAME, repo_type="dataset", token=token,
+        )
+        lmprobe_info = _load_dataset_metadata(parquet_path, info_path=info_path)
 
     tensor_descriptors = (
         lmprobe_info.get("tensors")
@@ -3619,8 +3687,6 @@ def migrate_dataset(
             meta[ek] = index[ek][i]
         prompt_metadata.append(meta)
 
-    _write_parquet_index(tmpdir, prompt_metadata)
-
     # ------------------------------------------------------------------
     # Step 7: Build new tensor descriptors and lmprobe_info
     # ------------------------------------------------------------------
@@ -3654,9 +3720,9 @@ def migrate_dataset(
 
     new_lmprobe_info = dict(lmprobe_info)
     new_lmprobe_info["tensors"] = new_td
+    new_lmprobe_info["format_version"] = FORMAT_VERSION
 
-    with open(tmpdir / INFO_FILENAME, "w") as f_out:
-        json.dump(new_lmprobe_info, f_out, indent=2)
+    _write_parquet_index(tmpdir, prompt_metadata, lmprobe_info=new_lmprobe_info)
 
     readme = _build_readme(
         model_name=model_name,
