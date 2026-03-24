@@ -15,8 +15,6 @@ import numpy as np
 import torch
 from sklearn.base import clone
 
-logger = logging.getLogger(__name__)
-
 from .cache import (
     CachedExtractor,
     evict,
@@ -36,6 +34,8 @@ if TYPE_CHECKING:
     from sklearn.base import BaseEstimator
 
     from .scaling import PerLayerScaler
+
+logger = logging.getLogger(__name__)
 
 def _parse_sweep_spec(spec: str) -> tuple[bool, int | list[int] | str]:
     """Parse a sweep layer specification.

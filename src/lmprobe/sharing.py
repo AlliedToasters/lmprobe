@@ -2540,7 +2540,8 @@ def pull_dataset(
                         repo_type="dataset", token=token,
                     )
                     _downloaded_count += 1
-                    if _total_shard_files > 10 and _downloaded_count % max(1, _total_shard_files // 10) == 0:
+                    _step = max(1, _total_shard_files // 10)
+                    if _total_shard_files > 10 and _downloaded_count % _step == 0:
                         logger.info(
                             "[SHARING] Downloaded %d/%d shard files...",
                             _downloaded_count, _total_shard_files,
