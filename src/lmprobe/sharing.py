@@ -2948,9 +2948,12 @@ def _unpack_shard_prompts(
         _LOGITS_TOP_K_INDICES_KEY,
         _LOGITS_TOP_K_VALUES_KEY,
         _merge_save_backend,
+        _parse_shard_layer_nums,
         _prepare_tensor,
         _prompt_cache_key,
         _register_model,
+        _slice_hidden_from_tensors,
+        _slice_logits_from_tensors,
     )
 
     has_token_shard_ids = "token_shard_ids" in index
@@ -2963,11 +2966,9 @@ def _unpack_shard_prompts(
             with safe_open(layer_path, framework="pt") as f:
                 for k in f.keys():
                     tensors_data[k] = f.get_tensor(k)
-        sf_keys = list(tensors_data.keys())
     else:
         with safe_open(shard_path, framework="pt") as f:
-            sf_keys = list(f.keys())
-            tensors_data = {k: f.get_tensor(k) for k in sf_keys}
+            tensors_data = {k: f.get_tensor(k) for k in f.keys()}
 
     # For split full_sequence datasets, load all shard tensors upfront
     # so we can reconstruct complete sequences from multiple shards.
@@ -3005,11 +3006,7 @@ def _unpack_shard_prompts(
 
                 # Discover layers from the first available shard
                 first_shard_data = next(iter(all_shard_tensors.values()))
-                layer_nums = sorted(
-                    int(re.match(r"^hidden\.layer_(\d+)$", k).group(1))
-                    for k in first_shard_data
-                    if re.match(r"^hidden\.layer_(\d+)$", k)
-                )
+                layer_nums = _parse_shard_layer_nums(first_shard_data.keys())
 
                 # For each layer, assemble tokens in sequence order
                 layer_slices = []
@@ -3028,14 +3025,13 @@ def _unpack_shard_prompts(
             else:
                 # Legacy format: all tokens in one shard
                 tok_off = index["token_offset"][pi]
-                layer_slices = []
-                for sf_key in sf_keys:
-                    match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
-                    if not match:
-                        continue
-                    layer = int(match.group(1))
-                    chunk = tensors_data[sf_key][tok_off : tok_off + num_tok]
-                    layer_slices.append((layer, chunk))
+
+                def _tok_slice(t: torch.Tensor) -> torch.Tensor:
+                    return t[tok_off : tok_off + num_tok]
+
+                layer_slices = _slice_hidden_from_tensors(
+                    tensors_data, None, _tok_slice
+                )
 
             layer_slices.sort(key=lambda x: x[0])
             sorted_layers = [ls[0] for ls in layer_slices]
@@ -3062,27 +3058,21 @@ def _unpack_shard_prompts(
         elif t_type == "hidden_layers":
             row_offset = index["row_offset"][pi]
             pooling = t_info.get("pooling", "last_token")
-            for sf_key in sf_keys:
-                m = re.match(r"^hidden\.layer_(\d+)$", sf_key)
-                if not m:
-                    continue
-                layer = int(m.group(1))
-                row = tensors_data[sf_key][
-                    row_offset : row_offset + 1
-                ]
+
+            def _row_slice(t: torch.Tensor) -> torch.Tensor:
+                return t[row_offset : row_offset + 1]
+
+            for layer_num, row in _slice_hidden_from_tensors(
+                tensors_data, None, _row_slice
+            ):
                 save_prompt_pooled_activations(
                     model_name, prompt_text,
-                    [layer], row, pooling,
+                    [layer_num], row, pooling,
                 )
 
         elif t_type == "logits_topk":
             row_offset = index["row_offset"][pi]
-            v_row = tensors_data["logits_topk.values"][
-                row_offset : row_offset + 1
-            ]
-            i_row = tensors_data["logits_topk.indices"][
-                row_offset : row_offset + 1
-            ]
+            v_row, i_row = _slice_logits_from_tensors(tensors_data, row_offset)
             _register_model(model_name)
             cache_key = _prompt_cache_key(model_name, prompt_text)
             new_tensors = {
