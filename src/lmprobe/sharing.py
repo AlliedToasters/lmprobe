@@ -2700,6 +2700,7 @@ def pull_dataset(
                 if (
                     t_type == "hidden_layers"
                     and has_token_shard_ids
+                    and materialize
                 ):
                     # Per-token shard mapping: collect all shards for this prompt
                     for si in index["token_shard_ids"][i]:
@@ -3282,6 +3283,84 @@ def load_activation_dataset(
             result[sf_key] = torch.cat(parts, dim=0)
 
     return result, lmprobe_info
+
+
+def load_activations(
+    dataset: str,
+    *,
+    prompts: list[str] | None = None,
+    layers: list[int] | None = None,
+    pooling: str = "last_token",
+    token: str | None = None,
+    as_dict: bool = True,
+) -> "dict[int, np.ndarray] | np.ndarray":
+    """Load pooled activations from a HuggingFace activation dataset.
+
+    Convenience function that downloads needed shards and returns
+    structured activation arrays — no probe training required.
+
+    Parameters
+    ----------
+    dataset : str
+        HuggingFace Dataset repo ID.
+    prompts : list[str] | None
+        Prompts to load.  None loads all prompts in the dataset.
+    layers : list[int] | None
+        Layer indices to load.  None loads all available layers.
+    pooling : str
+        Pooling strategy (default ``"last_token"``).
+    token : str | None
+        HuggingFace API token.
+    as_dict : bool
+        If True (default), return ``{layer: ndarray(n_prompts, hidden_dim)}``.
+        If False, return ``ndarray(n_prompts, n_layers, hidden_dim)``.
+
+    Returns
+    -------
+    dict[int, np.ndarray] | np.ndarray
+        Activation arrays keyed by layer index, or a single stacked array.
+    """
+    import numpy as np
+
+    from .cache import load_pooled_batch
+
+    meta = fetch_dataset_metadata(dataset, token=token)
+
+    if layers is None:
+        layers = meta.available_layers
+    else:
+        missing = set(layers) - set(meta.available_layers)
+        if missing:
+            raise ValueError(
+                f"Layers {sorted(missing)} not in dataset. "
+                f"Available: {meta.available_layers}"
+            )
+    layers = sorted(layers)
+
+    if prompts is None:
+        prompts = meta.prompts
+
+    pull_dataset(dataset, layers=layers, target_prompts=prompts,
+                 token=token, materialize=False)
+
+    hidden_dim = meta.tensor_descriptors.get(
+        "hidden_layers", {}
+    ).get("dim")
+
+    pooled = load_pooled_batch(
+        meta.model_name, prompts, layers, pooling, fallback_to_raw=True,
+    )
+    stacked = pooled.detach().cpu().float().numpy()  # (n_prompts, n_layers*dim)
+
+    if hidden_dim is None:
+        hidden_dim = stacked.shape[-1] // len(layers)
+
+    if as_dict:
+        return {
+            layer: stacked[:, i * hidden_dim : (i + 1) * hidden_dim]
+            for i, layer in enumerate(layers)
+        }
+    return stacked.reshape(len(prompts), len(layers), hidden_dim)
 
 
 # =============================================================================

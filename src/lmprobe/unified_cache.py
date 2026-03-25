@@ -22,10 +22,10 @@ from .cache import (
     evict,
     is_prompt_logits_cached,
     is_prompt_perplexity_cached,
+    load_pooled_batch,
     load_prompt_activations,
     load_prompt_logits,
     load_prompt_perplexity,
-    load_prompt_pooled_activations,
     save_prompt_activations,
     save_prompt_logits,
     save_prompt_perplexity,
@@ -685,17 +685,9 @@ class UnifiedCache:
         layer_indices = sorted(self.layer_indices)
 
         if self.cache_pooled:
-            # Load pooled activations - already aggregated, no padding needed
-            all_activations = []
-            for prompt in prompts:
-                acts = load_prompt_pooled_activations(
-                    self.model_name, prompt, layer_indices, self.pooling
-                )
-                all_activations.append(acts)
-
-            # Concatenate along batch dimension
-            # Each acts has shape (1, n_layers * hidden_dim)
-            return torch.cat(all_activations, dim=0), None
+            return load_pooled_batch(
+                self.model_name, prompts, layer_indices, self.pooling
+            ), None
 
         else:
             # Load full-sequence activations (original behavior)

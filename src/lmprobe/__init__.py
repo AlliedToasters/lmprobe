@@ -57,6 +57,7 @@ __all__ = [
     "list_cached_prompts",
     "fetch_dataset_metadata",
     "load_activation_dataset",
+    "load_activations",
     "migrate_dataset",
     "plot_layer_importance",
     "plot_layer_importance_heatmap",
@@ -170,12 +171,14 @@ def __getattr__(name: str):
         }[name]
     if name in (
         "push_dataset", "pull_dataset", "load_activation_dataset",
-        "fetch_dataset_metadata", "DatasetMetadata", "migrate_dataset",
+        "load_activations", "fetch_dataset_metadata", "DatasetMetadata",
+        "migrate_dataset",
     ):
         from .sharing import (
             DatasetMetadata,
             fetch_dataset_metadata,
             load_activation_dataset,
+            load_activations,
             migrate_dataset,
             pull_dataset,
             push_dataset,
@@ -185,6 +188,7 @@ def __getattr__(name: str):
             "push_dataset": push_dataset,
             "pull_dataset": pull_dataset,
             "load_activation_dataset": load_activation_dataset,
+            "load_activations": load_activations,
             "fetch_dataset_metadata": fetch_dataset_metadata,
             "DatasetMetadata": DatasetMetadata,
             "migrate_dataset": migrate_dataset,

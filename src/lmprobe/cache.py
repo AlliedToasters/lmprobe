@@ -1966,6 +1966,57 @@ def load_layer_last_token(
     return torch.stack(vectors, dim=0)
 
 
+def load_pooled_batch(
+    model_name: str,
+    prompts: list[str],
+    layers: list[int],
+    pooling: str = "last_token",
+    *,
+    fallback_to_raw: bool = False,
+) -> torch.Tensor:
+    """Load pooled activations for a batch of prompts from cache.
+
+    Parameters
+    ----------
+    model_name : str
+        Model name for cache lookups.
+    prompts : list[str]
+        Prompts to load.
+    layers : list[int]
+        Sorted layer indices.
+    pooling : str
+        Pooling strategy.
+    fallback_to_raw : bool
+        If True, fall back to raw activations + manual pooling when
+        pooled cache is unavailable (for legacy datasets).
+
+    Returns
+    -------
+    torch.Tensor
+        Shape (n_prompts, n_layers * hidden_dim).
+    """
+    from .pooling import get_pooling_fn
+
+    rows: list[torch.Tensor] = []
+    for prompt in prompts:
+        try:
+            pooled = load_prompt_pooled_activations(
+                model_name, prompt, layers, pooling
+            )
+            rows.append(pooled)
+            continue
+        except FileNotFoundError:
+            if not fallback_to_raw:
+                raise
+
+        # Fallback: load raw activations and pool manually.
+        acts, mask = load_prompt_activations(model_name, prompt, layers)
+        pool_fn = get_pooling_fn(pooling)
+        rows.append(pool_fn(acts, mask))
+
+    return torch.cat(rows, dim=0)
+
+
 def save_prompt_activations(
     model_name: str,
     prompt: str,
