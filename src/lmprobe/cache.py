@@ -35,9 +35,10 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1439,6 +1440,73 @@ def _discover_from_shard(model_name: str, prompt: str) -> CachedPromptInfo | Non
     )
 
 
+# =============================================================================
+# Shared shard tensor helpers
+# =============================================================================
+
+_SHARD_LAYER_RE = re.compile(r"^hidden\.layer_(\d+)$")
+
+
+def _parse_shard_layer_nums(keys: Iterable[str]) -> list[int]:
+    """Extract sorted layer numbers from shard tensor keys like ``hidden.layer_N``."""
+    layers = []
+    for k in keys:
+        m = _SHARD_LAYER_RE.match(k)
+        if m:
+            layers.append(int(m.group(1)))
+    return sorted(layers)
+
+
+def _slice_hidden_from_tensors(
+    tensors: dict[str, torch.Tensor],
+    layers: list[int] | None,
+    slice_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> list[tuple[int, torch.Tensor]]:
+    """Extract hidden layer slices from a pre-loaded tensor dict.
+
+    Parameters
+    ----------
+    tensors : dict
+        Mapping ``"hidden.layer_N"`` → tensor (from a safetensors shard).
+    layers : list[int] | None
+        Layer numbers to extract.  ``None`` extracts all available layers.
+    slice_fn : callable
+        Applied to each layer tensor (e.g. row-offset extraction).
+
+    Returns
+    -------
+    list[tuple[int, torch.Tensor]]
+        Sorted ``(layer_num, sliced_tensor)`` pairs.
+    """
+    layers_set = set(layers) if layers is not None else None
+    result = []
+    for k, v in tensors.items():
+        m = _SHARD_LAYER_RE.match(k)
+        if not m:
+            continue
+        layer = int(m.group(1))
+        if layers_set is not None and layer not in layers_set:
+            continue
+        result.append((layer, slice_fn(v)))
+    result.sort(key=lambda x: x[0])
+    return result
+
+
+def _slice_logits_from_tensors(
+    tensors: dict[str, torch.Tensor],
+    row_offset: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract top-k logit values and indices from a pre-loaded tensor dict."""
+    values = tensors["logits_topk.values"][row_offset : row_offset + 1]
+    indices = tensors["logits_topk.indices"][row_offset : row_offset + 1]
+    return values, indices
+
+
+# =============================================================================
+# Shard loading (per-prompt API)
+# =============================================================================
+
+
 def _resolve_hidden_shard(
     model_name: str, prompt: str
 ) -> tuple[dict, dict, list[dict], int, str, str | None]:
@@ -1527,8 +1595,6 @@ def _load_colocated_slices(
 
     Handles first-access logging and path validation.
     """
-    import re
-
     from safetensors import safe_open
 
     n_shards = len(shards)
@@ -1547,19 +1613,10 @@ def _load_colocated_slices(
             "Re-run pull_dataset() to re-download."
         )
 
-    layers_set = set(layers)
-    layer_slices = []
     with safe_open(shard_path, framework="pt") as f:
-        for sf_key in f.keys():
-            match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
-            if not match:
-                continue
-            layer = int(match.group(1))
-            if layer not in layers_set:
-                continue
-            layer_slices.append((layer, slice_fn(f.get_tensor(sf_key))))
+        tensors = {k: f.get_tensor(k) for k in f.keys()}
 
-    return layer_slices
+    return _slice_hidden_from_tensors(tensors, layers, slice_fn)
 
 
 def _load_hidden_layer_slices(
@@ -1719,10 +1776,9 @@ def _load_logits_from_shard(
         )
 
     with safe_open(shard_path, framework="pt") as f:
-        values = f.get_tensor("logits_topk.values")[row_offset : row_offset + 1]
-        indices = f.get_tensor("logits_topk.indices")[row_offset : row_offset + 1]
+        tensors = {k: f.get_tensor(k) for k in f.keys()}
 
-    return values, indices
+    return _slice_logits_from_tensors(tensors, row_offset)
 
 
 # =============================================================================
