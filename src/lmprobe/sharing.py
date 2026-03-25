@@ -3406,8 +3406,8 @@ def _load_labels_for_prompts(
     """
     _check_hub_deps()
     _check_pyarrow()
-    from huggingface_hub import hf_hub_download
     import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
 
     parquet_path = hf_hub_download(
         repo_id, PARQUET_PATH, repo_type="dataset", token=token,
@@ -3424,7 +3424,7 @@ def _load_labels_for_prompts(
     prompt_to_label = dict(zip(texts, labels_raw))
 
     labels = [prompt_to_label.get(p) for p in prompts]
-    if any(l is None for l in labels):
+    if any(v is None for v in labels):
         return None
 
     return np.array(labels)
