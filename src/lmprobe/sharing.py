@@ -2714,7 +2714,10 @@ def pull_dataset(
             n_shards = len(needed_shards.get(t_type, []))
             if layout == "per_layer":
                 all_layers = t_info.get("layers", [])
-                dl_layers = all_layers if layers is None else [ly for ly in all_layers if ly in layers]
+                dl_layers = (
+                    all_layers if layers is None
+                    else [ly for ly in all_layers if ly in layers]
+                )
                 _total_shard_files += n_shards * len(dl_layers)
             else:
                 _total_shard_files += n_shards
