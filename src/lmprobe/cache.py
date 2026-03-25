@@ -1976,6 +1976,7 @@ def load_pooled_batch(
     pooling: str = "last_token",
     *,
     fallback_to_raw: bool = False,
+    show_progress: bool = False,
 ) -> torch.Tensor:
     """Load pooled activations for a batch of prompts from cache.
 
@@ -1992,18 +1993,22 @@ def load_pooled_batch(
     fallback_to_raw : bool
         If True, fall back to raw activations + manual pooling when
         pooled cache is unavailable (for legacy datasets).
+    show_progress : bool
+        If True, display a tqdm progress bar while loading.
 
     Returns
     -------
     torch.Tensor
         Shape (n_prompts, n_layers * hidden_dim).
     """
+    from tqdm import tqdm
+
     from .pooling import get_pooling_fn
 
     rows: list[torch.Tensor] = []
     missing: list[str] = []
     pool_fn = get_pooling_fn(pooling) if fallback_to_raw else None
-    for prompt in prompts:
+    for prompt in tqdm(prompts, desc="Loading activations", disable=not show_progress):
         try:
             rows.append(load_prompt_pooled_activations(
                 model_name, prompt, layers, pooling

@@ -2584,6 +2584,7 @@ def pull_dataset(
     token: str | None = None,
     materialize: bool = False,
     num_workers: int = 0,
+    show_progress: bool = False,
 ) -> int:
     """Pull activations from a HuggingFace Dataset repo into local cache.
 
@@ -2616,6 +2617,8 @@ def pull_dataset(
     num_workers : int
         Number of parallel workers for materialization.  0 (default) runs
         in the main process.  Only used when ``materialize=True``.
+    show_progress : bool
+        If True, display a tqdm progress bar for shard downloads.
 
     Returns
     -------
@@ -2751,7 +2754,13 @@ def pull_dataset(
         logger.info(
             "[SHARING] Downloading %d shard files from HF...", _total_shard_files
         )
-        _downloaded_count = 0
+
+        from tqdm import tqdm
+        _pbar = tqdm(
+            total=_total_shard_files,
+            desc="Downloading shards",
+            disable=not show_progress,
+        )
 
         for t_type in pull_types:
             t_info = tensor_descriptors[t_type]
@@ -2779,13 +2788,7 @@ def pull_dataset(
                             repo_id, fname,
                             repo_type="dataset", token=token,
                         )
-                        _downloaded_count += 1
-                        _step = max(1, _total_shard_files // 10)
-                        if _total_shard_files > 10 and _downloaded_count % _step == 0:
-                            logger.info(
-                                "[SHARING] Downloaded %d/%d shard files...",
-                                _downloaded_count, _total_shard_files,
-                            )
+                        _pbar.update(1)
                         per_layer_paths[t_type][shard_idx][layer] = shard_path
             else:
                 # v1.0 co-located layout
@@ -2804,13 +2807,14 @@ def pull_dataset(
                         repo_id, shard["file"],
                         repo_type="dataset", token=token,
                     )
-                    _downloaded_count += 1
+                    _pbar.update(1)
                     shard_local_paths[t_type][shard_idx] = shard_path
 
+        _pbar.close()
         if _total_shard_files > 0:
             logger.info(
-                "[SHARING] Downloaded %d/%d shard files",
-                _downloaded_count, _total_shard_files,
+                "[SHARING] Downloaded %d shard files",
+                _total_shard_files,
             )
 
     # ---- Build shard registry (manifest + index) ----
@@ -3302,6 +3306,7 @@ def load_activations(
     pooling: str = "last_token",
     token: str | None = None,
     as_dict: bool = True,
+    show_progress: bool = True,
 ) -> dict[int, np.ndarray] | np.ndarray:
     """Load pooled activations from a HuggingFace activation dataset.
 
@@ -3323,6 +3328,9 @@ def load_activations(
     as_dict : bool
         If True (default), return ``{layer: ndarray(n_prompts, hidden_dim)}``.
         If False, return ``ndarray(n_prompts, n_layers, hidden_dim)``.
+    show_progress : bool
+        If True (default), display tqdm progress bars for downloads
+        and activation loading.
 
     Returns
     -------
@@ -3348,7 +3356,7 @@ def load_activations(
         prompts = meta.prompts
 
     pull_dataset(dataset, layers=layers, target_prompts=prompts,
-                 token=token, materialize=False)
+                 token=token, materialize=False, show_progress=show_progress)
 
     hidden_dim = meta.tensor_descriptors.get(
         "hidden_layers", {}
@@ -3356,6 +3364,7 @@ def load_activations(
 
     pooled = load_pooled_batch(
         meta.model_name, prompts, layers, pooling, fallback_to_raw=True,
+        show_progress=show_progress,
     )
     stacked = pooled.detach().cpu().float().numpy()  # (n_prompts, n_layers*dim)
 
