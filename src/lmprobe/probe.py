@@ -1370,6 +1370,28 @@ class Probe:
                 "Probe has not been fitted. Call fit() first."
             )
 
+    def _apply_inference_transforms(self, X: np.ndarray) -> np.ndarray:
+        """Apply scaler, preprocessing pipeline, and mass-mean augmentation.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Input activations, shape (n_samples, n_features).
+
+        Returns
+        -------
+        np.ndarray
+            Transformed activations.
+        """
+        if self.scaler_ is not None:
+            X = self.scaler_.transform(X)
+        X_pre = X.copy() if self._mass_mean_direction_ is not None else None
+        if self.preprocessing_pipeline_ is not None:
+            X = self.preprocessing_pipeline_.transform(X)
+        if self._mass_mean_direction_ is not None:
+            X = self._augment_mass_mean(X, X_pre)
+        return X
+
     def predict(
         self,
         prompts: list[str],
@@ -1422,40 +1444,17 @@ class Probe:
             if X.ndim == 3:
                 # Per-token: (batch, seq_len, hidden_dim)
                 batch_size, seq_len, hidden_dim = X.shape
-                X_flat = X.reshape(-1, hidden_dim)
-
-                # Apply scaling if fitted
-                if self.scaler_ is not None:
-                    X_flat = self.scaler_.transform(X_flat)
-                # Save pre-preprocessing copy for mass-mean augmentation
-                X_flat_pre = X_flat.copy() if self._mass_mean_direction_ is not None else None
-                # Apply preprocessing if fitted
-                if self.preprocessing_pipeline_ is not None:
-                    X_flat = self.preprocessing_pipeline_.transform(X_flat)
-                # Apply mass-mean augmentation if fitted
-                if self._mass_mean_direction_ is not None:
-                    X_flat = self._augment_mass_mean(X_flat, X_flat_pre)
+                X_flat = self._apply_inference_transforms(X.reshape(-1, hidden_dim))
 
                 preds_flat = self.classifier_.predict(X_flat)
                 preds = preds_flat.reshape(batch_size, seq_len)
 
                 # For per-token, return majority vote per sample
-                # (assuming score-level pooling isn't needed for non-proba classifiers)
                 return np.array([
                     np.bincount(p.astype(int)).argmax() for p in preds
                 ])
             else:
-                # Apply scaling if fitted
-                if self.scaler_ is not None:
-                    X = self.scaler_.transform(X)
-                # Save pre-preprocessing copy for mass-mean augmentation
-                X_pre = X.copy() if self._mass_mean_direction_ is not None else None
-                # Apply preprocessing if fitted
-                if self.preprocessing_pipeline_ is not None:
-                    X = self.preprocessing_pipeline_.transform(X)
-                # Apply mass-mean augmentation if fitted
-                if self._mass_mean_direction_ is not None:
-                    X = self._augment_mass_mean(X, X_pre)
+                X = self._apply_inference_transforms(X)
                 return self.classifier_.predict(X)
 
     def predict_proba(
@@ -1504,21 +1503,7 @@ class Probe:
         if X.ndim == 3:
             # Per-token activations: (batch, seq_len, hidden_dim)
             batch_size, seq_len, hidden_dim = X.shape
-
-            # Reshape to (batch * seq_len, hidden_dim) for classification
-            X_flat = X.reshape(-1, hidden_dim)
-
-            # Apply scaling if fitted
-            if self.scaler_ is not None:
-                X_flat = self.scaler_.transform(X_flat)
-            # Save pre-preprocessing copy for mass-mean augmentation
-            X_flat_pre = X_flat.copy() if self._mass_mean_direction_ is not None else None
-            # Apply preprocessing if fitted
-            if self.preprocessing_pipeline_ is not None:
-                X_flat = self.preprocessing_pipeline_.transform(X_flat)
-            # Apply mass-mean augmentation if fitted
-            if self._mass_mean_direction_ is not None:
-                X_flat = self._augment_mass_mean(X_flat, X_flat_pre)
+            X_flat = self._apply_inference_transforms(X.reshape(-1, hidden_dim))
 
             # Classify all tokens
             probs_flat = self.classifier_.predict_proba(X_flat)
@@ -1528,7 +1513,6 @@ class Probe:
             probs = probs_flat.reshape(batch_size, seq_len, n_classes)
 
             if is_score_pooling:
-                # Apply score-level pooling (e.g., max, min, score:mean)
                 probs_tensor = torch.from_numpy(probs)
                 reduced = reduce_scores(
                     probs_tensor,
@@ -1537,21 +1521,9 @@ class Probe:
                 )
                 return reduced.float().numpy()
             else:
-                # Return per-token probabilities
                 return probs
         else:
-            # Normal case: (batch, hidden_dim)
-            # Apply scaling if fitted
-            if self.scaler_ is not None:
-                X = self.scaler_.transform(X)
-            # Save pre-preprocessing copy for mass-mean augmentation
-            X_pre = X.copy() if self._mass_mean_direction_ is not None else None
-            # Apply preprocessing if fitted
-            if self.preprocessing_pipeline_ is not None:
-                X = self.preprocessing_pipeline_.transform(X)
-            # Apply mass-mean augmentation if fitted
-            if self._mass_mean_direction_ is not None:
-                X = self._augment_mass_mean(X, X_pre)
+            X = self._apply_inference_transforms(X)
             return self.classifier_.predict_proba(X)
 
     def score(
@@ -2055,9 +2027,7 @@ class Probe:
             Predictions, shape (n_samples,).
         """
         self._check_fitted()
-        X = self._to_numpy(X)
-        if self._mass_mean_direction_ is not None:
-            X = self._augment_mass_mean(X, X)
+        X = self._apply_inference_transforms(self._to_numpy(X))
         return self.classifier_.predict(X)
 
     def predict_proba_from_activations(self, X) -> np.ndarray:
@@ -2085,9 +2055,7 @@ class Probe:
             raise ValueError(
                 "predict_proba is not available for regression tasks."
             )
-        X = self._to_numpy(X)
-        if self._mass_mean_direction_ is not None:
-            X = self._augment_mass_mean(X, X)
+        X = self._apply_inference_transforms(self._to_numpy(X))
         return self.classifier_.predict_proba(X)
 
     def score_from_activations(self, X, y) -> float:
@@ -2108,10 +2076,8 @@ class Probe:
             Accuracy (classification) or R-squared (regression).
         """
         self._check_fitted()
-        X = self._to_numpy(X)
+        X = self._apply_inference_transforms(self._to_numpy(X))
         y = self._to_numpy(y)
-        if self._mass_mean_direction_ is not None:
-            X = self._augment_mass_mean(X, X)
         return self.classifier_.score(X, y)
 
     def save(self, path: str) -> None:
