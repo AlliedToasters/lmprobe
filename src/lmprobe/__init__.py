@@ -59,6 +59,7 @@ __all__ = [
     "load_activation_dataset",
     "load_activations",
     "migrate_dataset",
+    "upgrade_dataset_format",
     "plot_layer_importance",
     "plot_layer_importance_heatmap",
     "pull_dataset",
@@ -172,7 +173,7 @@ def __getattr__(name: str):
     if name in (
         "push_dataset", "pull_dataset", "load_activation_dataset",
         "load_activations", "fetch_dataset_metadata", "DatasetMetadata",
-        "migrate_dataset",
+        "migrate_dataset", "upgrade_dataset_format",
     ):
         from .sharing import (
             DatasetMetadata,
@@ -182,6 +183,7 @@ def __getattr__(name: str):
             migrate_dataset,
             pull_dataset,
             push_dataset,
+            upgrade_dataset_format,
         )
 
         return {
@@ -192,5 +194,6 @@ def __getattr__(name: str):
             "fetch_dataset_metadata": fetch_dataset_metadata,
             "DatasetMetadata": DatasetMetadata,
             "migrate_dataset": migrate_dataset,
+            "upgrade_dataset_format": upgrade_dataset_format,
         }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -60,7 +60,7 @@ from .cache import (
 
 logger = logging.getLogger(__name__)
 
-FORMAT_VERSION = "1.2"
+FORMAT_VERSION = "2.0"
 DEFAULT_SHARD_BYTES = 1_073_741_824  # 1 GB
 INFO_FILENAME = "lmprobe_info.json"
 PARQUET_PATH = "index/train-00000-of-00001.parquet"
@@ -79,13 +79,13 @@ def _check_format_version(lmprobe_info: dict, *, check_minor: bool = True) -> No
     remote_version = lmprobe_info.get("format_version", "1.0")
     remote_major = int(remote_version.split(".")[0])
     local_major = int(FORMAT_VERSION.split(".")[0])
-    if remote_major != local_major:
+    if remote_major > local_major:
         raise ValueError(
             f"Incompatible format version: remote has {remote_version}, "
             f"lmprobe supports {FORMAT_VERSION}. "
             f"Please upgrade lmprobe: pip install --upgrade lmprobe"
         )
-    if check_minor:
+    if check_minor and remote_major == local_major:
         remote_minor = int(remote_version.split(".")[1])
         local_minor = int(FORMAT_VERSION.split(".")[1])
         if remote_minor > local_minor:
@@ -97,16 +97,42 @@ def _check_format_version(lmprobe_info: dict, *, check_minor: bool = True) -> No
 
 
 def _extract_model_name(lmprobe_info: dict) -> str:
-    """Extract model name from lmprobe_info, supporting both canonical and legacy formats."""
+    """Extract model name from lmprobe_info."""
     model_obj = lmprobe_info.get("model")
     if isinstance(model_obj, dict):
         return model_obj["name"]
-    if "model_name" in lmprobe_info:
-        return lmprobe_info["model_name"]
     raise KeyError(
-        "lmprobe_info.json missing model name — expected 'model.name' "
-        "or top-level 'model_name'"
+        "Dataset metadata missing model name — expected 'model.name'"
     )
+
+
+def _load_dataset_metadata(
+    repo_id: str,
+    token: str | None = None,
+) -> tuple[dict, str]:
+    """Download dataset metadata from Parquet schema (v2 format).
+
+    Returns ``(lmprobe_info, parquet_path)`` where *lmprobe_info* is the
+    parsed metadata dict and *parquet_path* is the local path to the
+    downloaded Parquet index.
+
+    Raises ``ValueError`` if the Parquet file has no embedded metadata
+    (v1 dataset — use ``upgrade_dataset_format()`` to migrate).
+    """
+    _check_hub_deps()
+    from huggingface_hub import hf_hub_download
+
+    parquet_path = hf_hub_download(
+        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
+    )
+
+    lmprobe_info = _extract_metadata_from_parquet(parquet_path)
+    if lmprobe_info is None:
+        raise ValueError(
+            f"Dataset {repo_id!r} uses v1 format (separate lmprobe_info.json). "
+            f"Upgrade it with: lmprobe.upgrade_dataset_format({repo_id!r})"
+        )
+    return lmprobe_info, parquet_path
 
 
 # =============================================================================
@@ -1567,15 +1593,77 @@ def _consolidate_and_shard(
 # =============================================================================
 
 
+def _embed_metadata_in_schema(
+    table,
+    lmprobe_info: dict,
+):
+    """Embed lmprobe_info into a PyArrow table's schema metadata.
+
+    Keys are prefixed with ``lmprobe:`` and values are JSON-encoded bytes.
+    """
+    meta = {
+        f"lmprobe:{key}".encode(): json.dumps(value).encode()
+        for key, value in lmprobe_info.items()
+    }
+    # Preserve any existing schema metadata (e.g. from Arrow/Parquet)
+    existing = table.schema.metadata or {}
+    merged = {**existing, **meta}
+    return table.replace_schema_metadata(merged)
+
+
+def _extract_metadata_from_parquet(parquet_path: str | Path) -> dict | None:
+    """Read lmprobe metadata from a Parquet file's schema metadata.
+
+    Returns the reconstructed ``lmprobe_info`` dict, or ``None`` if no
+    ``lmprobe:`` prefixed keys are present (v1 dataset).
+    Uses ``pq.read_schema()`` which only reads the footer — no row data.
+    """
+    _check_pyarrow()
+    import pyarrow.parquet as pq
+
+    schema = pq.read_schema(str(parquet_path))
+    raw_meta = schema.metadata or {}
+
+    # Collect lmprobe:-prefixed keys
+    lmprobe_meta: dict[str, str] = {}
+    for k, v in raw_meta.items():
+        key = k.decode() if isinstance(k, bytes) else k
+        val = v.decode() if isinstance(v, bytes) else v
+        if key.startswith("lmprobe:"):
+            lmprobe_meta[key[len("lmprobe:"):]] = val
+
+    if not lmprobe_meta:
+        return None
+
+    # Reconstruct the lmprobe_info dict
+    info: dict = {}
+    for key, val in lmprobe_meta.items():
+        # Try JSON parse for dicts/lists; fall back to raw string
+        try:
+            info[key] = json.loads(val)
+        except (json.JSONDecodeError, TypeError):
+            info[key] = val
+
+    # Coerce format_version to string (defensive — should round-trip as string via JSON)
+    if "format_version" in info and not isinstance(info["format_version"], str):
+        info["format_version"] = str(info["format_version"])
+
+    return info
+
+
 def _write_parquet_index(
     tmpdir: Path,
     prompt_metadata: list[dict],
+    lmprobe_info: dict | None = None,
 ) -> None:
     """Write the Parquet index from prompt metadata.
 
     Fixed columns: text, label, num_tokens, shard_index, row_offset (or
     token_offset for full-sequence storage).  Any additional keys in
     prompt_metadata are written as extra columns with auto-inferred types.
+
+    If *lmprobe_info* is provided, it is embedded into the Parquet schema
+    metadata under ``lmprobe:`` prefixed keys (v2 format).
     """
     _check_pyarrow()
     import pyarrow as pa
@@ -1666,6 +1754,8 @@ def _write_parquet_index(
             columns[ek] = pa.array(values, type=pa_type)
 
     table = pa.table(columns)
+    if lmprobe_info is not None:
+        table = _embed_metadata_in_schema(table, lmprobe_info)
     pq.write_table(table, str(tmpdir / PARQUET_PATH))
 
 
@@ -1840,15 +1930,14 @@ Cached activations extracted from \
 ## Load with lmprobe
 
 ```python
-from lmprobe import pull_dataset, load_activation_dataset
+from lmprobe import load_activations, Probe
 
-# Option 1: Pull into local cache (enables probe training without \
-re-extraction)
-pull_dataset("{repo_id}")
+# Load activations for specific layers (only downloads needed shards)
+acts = load_activations("{repo_id}", layers=[16])
 
-# Option 2: Load tensors directly
-tensors, info = load_activation_dataset("{repo_id}")
-# tensors["hidden.layer_16"].shape => (N, hidden_dim)
+# Train a probe
+probe = Probe(classifier="logistic_regression", random_state=42)
+probe.fit_from_activations(acts[16], labels)
 ```
 
 ## Load without lmprobe (standalone)
@@ -1858,14 +1947,15 @@ import json
 import pyarrow.parquet as pq
 from safetensors import safe_open
 
-# 1. Read the Parquet index
-index = pq.read_table("index/train-00000-of-00001.parquet").to_pandas()
+# 1. Read the Parquet index (metadata is embedded in schema)
+table = pq.read_table("index/train-00000-of-00001.parquet")
+index = table.to_pandas()
 print(index.columns)  # text, label, num_tokens, shard_index, row_offset
 
-# 2. Read tensor metadata
-with open("{INFO_FILENAME}") as f:
-    info = json.load(f)
-print(list(info["tensors"].keys()))  # e.g. ["hidden_layers", "logits_topk"]
+# 2. Read tensor metadata from Parquet schema
+schema_meta = table.schema.metadata
+tensors_info = json.loads(schema_meta[b"lmprobe:tensors"])
+print(list(tensors_info.keys()))  # e.g. ["hidden_layers", "logits_topk"]
 
 # 3. Load a shard — per-layer files: hidden_layer{{L:03d}}_shard{{S:03d}}.safetensors
 with safe_open("{example_shard}", framework="pt") as f:
@@ -2134,15 +2224,14 @@ def push_dataset(
             shuffle=shuffle,
         )
 
-        # Step 5: Write Parquet index
-        _write_parquet_index(tmpdir, prompt_metadata)
-
-        # Step 6: Write metadata
+        # Step 5: Build metadata and write Parquet index (v2: embedded)
         num_prompts = len(prompt_metadata)
         lmprobe_info = _build_lmprobe_info(
             model_name, num_prompts, tensor_descriptors,
         )
+        _write_parquet_index(tmpdir, prompt_metadata, lmprobe_info)
 
+        # Write JSON sidecar to staging dir (used by resume logic)
         with open(tmpdir / INFO_FILENAME, "w") as f:
             json.dump(lmprobe_info, f, indent=2)
 
@@ -2430,16 +2519,13 @@ def _push_dataset_streaming(
     }
     _save_manifest(staging_dir, manifest)
 
-    # Upload metadata files (parquet, info, README)
+    # Upload metadata files (parquet + README; v2 embeds info in parquet)
     if not manifest.get("metadata_uploaded", False):
-        _write_parquet_index(tmpdir, prompt_metadata)
-
         num_prompts = len(prompt_metadata)
         lmprobe_info = _build_lmprobe_info(
             model_name, num_prompts, tensor_descriptors,
         )
-        with open(tmpdir / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f, indent=2)
+        _write_parquet_index(tmpdir, prompt_metadata, lmprobe_info)
 
         readme = _build_readme(
             model_name=model_name,
@@ -2460,7 +2546,6 @@ def _push_dataset_streaming(
             for meta_file, repo_path in [
                 (tmpdir / "index" / "train-00000-of-00001.parquet",
                  PARQUET_PATH),
-                (tmpdir / INFO_FILENAME, INFO_FILENAME),
                 (tmpdir / "README.md", "README.md"),
             ]
         ]
@@ -2510,8 +2595,9 @@ def fetch_dataset_metadata(
 ) -> DatasetMetadata:
     """Fetch lightweight metadata from a remote activation dataset.
 
-    Downloads only ``lmprobe_info.json`` (~KB) and the Parquet index
-    (~KB–MB) — no tensor data is transferred.
+    Downloads the Parquet index (which contains embedded metadata in v2
+    format) — no tensor data is transferred.  Falls back to downloading
+    ``lmprobe_info.json`` for v1 datasets.
 
     Parameters
     ----------
@@ -2526,24 +2612,11 @@ def fetch_dataset_metadata(
         Parsed metadata including model name, available layers, prompt
         list, and tensor descriptors.
     """
-    _check_hub_deps()
-    from huggingface_hub import hf_hub_download
+    lmprobe_info, parquet_path = _load_dataset_metadata(repo_id, token)
 
-    info_path = hf_hub_download(
-        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
-    )
-    parquet_path = hf_hub_download(
-        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
-    )
-
-    with open(info_path) as f:
-        lmprobe_info = json.load(f)
-
-    # Support both canonical format (model.name, tensors) and legacy
-    # format (model_name, tensor_types) written by custom staging scripts.
     model_name = _extract_model_name(lmprobe_info)
     format_version = lmprobe_info.get("format_version", "1.0")
-    tensor_descriptors = lmprobe_info.get("tensors") or lmprobe_info.get("tensor_types") or {}
+    tensor_descriptors = lmprobe_info.get("tensors", {})
 
     # Extract available layers from hidden_layers descriptor
     available_layers: list[int] = []
@@ -2551,8 +2624,6 @@ def fetch_dataset_metadata(
     if hidden_info.get("layout") == "per_layer":
         available_layers = hidden_info.get("layers", [])
     else:
-        # v1.0 co-located: all layers are available but not enumerated
-        # Try to infer from shard keys if possible
         available_layers = hidden_info.get("layers", [])
 
     # Read prompts from Parquet index
@@ -2627,23 +2698,15 @@ def pull_dataset(
     _check_hub_deps()
     from huggingface_hub import hf_hub_download
 
-    # Download metadata
+    # Download metadata (v2: from parquet schema; v1: JSON fallback)
     logger.info("[SHARING] Downloading dataset metadata from %s...", repo_id)
-    info_path = hf_hub_download(
-        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
-    )
-    parquet_path = hf_hub_download(
-        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
-    )
-
-    with open(info_path) as f:
-        lmprobe_info = json.load(f)
+    lmprobe_info, parquet_path = _load_dataset_metadata(repo_id, token)
 
     # Version check
     _check_format_version(lmprobe_info)
 
     model_name = _extract_model_name(lmprobe_info)
-    tensor_descriptors = lmprobe_info.get("tensors") or lmprobe_info.get("tensor_types") or {}
+    tensor_descriptors = lmprobe_info.get("tensors", {})
 
     # Read Parquet index
     _check_pyarrow()
@@ -3212,17 +3275,12 @@ def load_activation_dataset(
     _check_hub_deps()
     from huggingface_hub import hf_hub_download
 
-    info_path = hf_hub_download(
-        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
-    )
-
-    with open(info_path) as f:
-        lmprobe_info = json.load(f)
+    lmprobe_info, _parquet_path = _load_dataset_metadata(repo_id, token)
 
     # Version check
     _check_format_version(lmprobe_info, check_minor=False)
 
-    tensor_descriptors = lmprobe_info.get("tensors") or lmprobe_info.get("tensor_types") or {}
+    tensor_descriptors = lmprobe_info.get("tensors", {})
 
     if tensors is not None:
         load_types = [k for k in tensor_descriptors if k in tensors]
@@ -3471,15 +3529,7 @@ def migrate_dataset(
     # Step 1: Download metadata
     # ------------------------------------------------------------------
     logger.info("[MIGRATE] Downloading metadata from %s...", repo_id)
-    info_path = hf_hub_download(
-        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
-    )
-    parquet_path = hf_hub_download(
-        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
-    )
-
-    with open(info_path) as f:
-        lmprobe_info = json.load(f)
+    lmprobe_info, parquet_path = _load_dataset_metadata(repo_id, token)
 
     tensor_descriptors = (
         lmprobe_info.get("tensors")
@@ -3769,8 +3819,6 @@ def migrate_dataset(
             meta[ek] = index[ek][i]
         prompt_metadata.append(meta)
 
-    _write_parquet_index(tmpdir, prompt_metadata)
-
     # ------------------------------------------------------------------
     # Step 7: Build new tensor descriptors and lmprobe_info
     # ------------------------------------------------------------------
@@ -3804,7 +3852,11 @@ def migrate_dataset(
 
     new_lmprobe_info = dict(lmprobe_info)
     new_lmprobe_info["tensors"] = new_td
+    new_lmprobe_info["format_version"] = FORMAT_VERSION
 
+    _write_parquet_index(tmpdir, prompt_metadata, new_lmprobe_info)
+
+    # Write JSON sidecar to staging dir (backward compat)
     with open(tmpdir / INFO_FILENAME, "w") as f_out:
         json.dump(new_lmprobe_info, f_out, indent=2)
 
@@ -3879,4 +3931,114 @@ def migrate_dataset(
 
     url = f"https://huggingface.co/datasets/{repo_id}"
     logger.info("[MIGRATE] Migration complete: %s", url)
+    return url
+
+
+def upgrade_dataset_format(
+    repo_id: str,
+    *,
+    token: str | None = None,
+    remove_json: bool = True,
+    dry_run: bool = False,
+) -> str:
+    """Upgrade a v1.x dataset to v2 format (metadata in Parquet schema).
+
+    This is a lightweight, metadata-only operation — no tensor files are
+    modified.  It reads the existing ``lmprobe_info.json`` and embeds its
+    contents into the Parquet index's schema metadata under ``lmprobe:``
+    prefixed keys.
+
+    Parameters
+    ----------
+    repo_id : str
+        HuggingFace repo ID of the dataset to upgrade.
+    token : str | None
+        HuggingFace API token.
+    remove_json : bool
+        If True (default), delete ``lmprobe_info.json`` from the repo
+        after embedding metadata in Parquet.
+    dry_run : bool
+        If True, download and validate but do not upload changes.
+
+    Returns
+    -------
+    str
+        URL of the upgraded dataset (or a summary string if dry_run).
+    """
+    _check_hub_deps()
+    _check_pyarrow()
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, hf_hub_download
+
+    # Download both files (we always need the JSON for v1 datasets)
+    logger.info("[UPGRADE] Downloading metadata from %s...", repo_id)
+    info_path = hf_hub_download(
+        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
+    )
+    parquet_path = hf_hub_download(
+        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
+    )
+
+    # Check if already v2
+    existing_meta = _extract_metadata_from_parquet(parquet_path)
+    if existing_meta is not None:
+        logger.info("[UPGRADE] Dataset already has v2 metadata in Parquet schema")
+        url = f"https://huggingface.co/datasets/{repo_id}"
+        return f"{url} (already v2)" if dry_run else url
+
+    # Read v1 metadata
+    with open(info_path) as f:
+        lmprobe_info = json.load(f)
+
+    # Update format version
+    lmprobe_info["format_version"] = FORMAT_VERSION
+
+    # Embed into Parquet
+    table = pq.read_table(parquet_path)
+    table = _embed_metadata_in_schema(table, lmprobe_info)
+
+    if dry_run:
+        model_name = _extract_model_name(lmprobe_info)
+        n_prompts = lmprobe_info.get("num_prompts", len(table))
+        return (
+            f"[DRY RUN] Would upgrade {repo_id}: "
+            f"model={model_name}, {n_prompts} prompts, "
+            f"format {lmprobe_info.get('format_version', '?')}"
+        )
+
+    # Write updated Parquet to temp file and upload
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = Path(tmpdir) / "train-00000-of-00001.parquet"
+        pq.write_table(table, str(out_path))
+
+        api = HfApi(token=token)
+        from huggingface_hub import CommitOperationAdd
+
+        operations = [
+            CommitOperationAdd(
+                path_in_repo=PARQUET_PATH,
+                path_or_fileobj=str(out_path),
+            ),
+        ]
+
+        if remove_json:
+            from huggingface_hub import CommitOperationDelete
+
+            operations.append(
+                CommitOperationDelete(path_in_repo=INFO_FILENAME),
+            )
+
+        api.create_commit(
+            repo_id=repo_id,
+            operations=operations,
+            commit_message=(
+                f"Upgrade to format v{FORMAT_VERSION}: "
+                "embed metadata in Parquet schema"
+            ),
+            repo_type="dataset",
+        )
+
+    url = f"https://huggingface.co/datasets/{repo_id}"
+    logger.info("[UPGRADE] Format upgrade complete: %s", url)
     return url
