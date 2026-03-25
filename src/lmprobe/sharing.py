@@ -96,6 +96,11 @@ def _check_format_version(lmprobe_info: dict, *, check_minor: bool = True) -> No
             )
 
 
+def _hidden_shard_filename(layer: int, shard: int) -> str:
+    """Build hidden layer shard filename from layer and shard index."""
+    return f"tensors/hidden_layer{layer:03d}_shard{shard:03d}.safetensors"
+
+
 def _extract_model_name(lmprobe_info: dict) -> str:
     """Extract model name from lmprobe_info."""
     model_obj = lmprobe_info.get("model")
@@ -1029,12 +1034,9 @@ def _compute_shard_plan(
             prompt_metadata[i]["token_shard_ids"] = token_shard_ids
             prompt_metadata[i]["token_shard_offsets"] = token_shard_offsets
 
-            # Scalar backwards-compat: point to last-token shard
-            prompt_metadata[i]["shard_index_hidden"] = lt_si
-            prompt_metadata[i]["row_offset_hidden"] = lt_off
+            # Universal scalars: point to last-token shard
             prompt_metadata[i]["shard_index"] = lt_si
             prompt_metadata[i]["row_offset"] = lt_off
-            prompt_metadata[i]["token_offset_hidden"] = lt_off
             prompt_metadata[i]["token_offset"] = lt_off
 
     elif has_hidden and hidden_boundaries:
@@ -1043,8 +1045,6 @@ def _compute_shard_plan(
             for local_row in range(shard_size):
                 global_row = offset + local_row
                 if global_row < len(prompt_metadata):
-                    prompt_metadata[global_row]["shard_index_hidden"] = shard_idx
-                    prompt_metadata[global_row]["row_offset_hidden"] = local_row
                     prompt_metadata[global_row]["shard_index"] = shard_idx
                     prompt_metadata[global_row]["row_offset"] = local_row
             offset += shard_size
@@ -1109,6 +1109,8 @@ def _compute_shard_plan(
             "dim": hidden_dim,
             "dtype": "float32",
             "layout": "per_layer",
+            "file_pattern": "tensors/hidden_layer{layer:03d}_shard{shard:03d}.safetensors",
+            "key_pattern": "hidden.layer_{layer}",
             "shards": hidden_shards,
         }
         if use_raw:
@@ -1138,6 +1140,7 @@ def _compute_shard_plan(
             "k": logits_top_k,
             "dtype": "float32",
             "pooling": "last_token",
+            "file_pattern": "tensors/logits_topk_{shard:03d}.safetensors",
             "row_bytes": logits_row_bytes,
             "shards": logits_shards,
         }
@@ -1204,8 +1207,7 @@ def _enumerate_shard_files(plan: dict[str, Any]) -> list[str]:
         for layer in plan["hidden_layers"]:
             for shard_idx in range(len(plan["hidden_boundaries"])):
                 files.append(
-                    f"tensors/hidden_layer{layer:03d}"
-                    f"_shard{shard_idx:03d}.safetensors"
+                    _hidden_shard_filename(layer, shard_idx)
                 )
     if plan["want_logits"] and plan["logits_boundaries"]:
         for shard_idx in range(len(plan["logits_boundaries"])):
@@ -1357,10 +1359,7 @@ def _consolidate_and_shard(
             offset = 0
             for local_idx, shard_size in enumerate(boundaries):
                 shard_idx = shard_idx_offset + local_idx
-                fname = (
-                    f"tensors/hidden_layer{layer:03d}"
-                    f"_shard{shard_idx:03d}.safetensors"
-                )
+                fname = _hidden_shard_filename(layer, shard_idx)
                 if fname in skip_shards:
                     offset += shard_size
                     pbar.update(1)
@@ -1465,10 +1464,7 @@ def _consolidate_and_shard(
                 offset = 0
                 for local_idx, shard_size in enumerate(boundaries):
                     shard_idx = shard_idx_offset + local_idx
-                    fname = (
-                        f"tensors/hidden_layer{layer:03d}"
-                        f"_shard{shard_idx:03d}.safetensors"
-                    )
+                    fname = _hidden_shard_filename(layer, shard_idx)
                     if fname in skip_shards:
                         offset += shard_size
                         pbar.update(1)
@@ -1692,9 +1688,8 @@ def _write_parquet_index(
         "row_offset": pa.array(row_offsets, type=pa.int32()),
     }
 
-    # Per-type shard columns (v1.2)
+    # Per-type shard columns (logits only; hidden uses universal shard_index/row_offset)
     per_type_keys = {
-        "shard_index_hidden", "row_offset_hidden", "token_offset_hidden",
         "shard_index_logits", "row_offset_logits",
     }
     for ptk in per_type_keys:
@@ -1866,36 +1861,21 @@ def _build_readme(
     desc_section = f"\n{description}\n" if description else ""
     model_url = f"https://huggingface.co/{model_name}"
 
-    # Find example shard and detect storage mode
-    example_shard = "tensors/hidden_layer000_shard000.safetensors"
-    is_full_sequence = False
-    for info in tensor_descriptors.values():
-        shards = info.get("shards", [])
-        layout = info.get("layout")
-        if layout == "per_layer" and shards:
-            # Derive filename from convention
-            layers = info.get("layers", [0])
-            example_shard = (
-                f"tensors/hidden_layer{layers[0]:03d}_shard000.safetensors"
-            )
-        elif shards and "file" in shards[0]:
-            example_shard = shards[0]["file"]
-        if info.get("storage") == "full_sequence":
-            is_full_sequence = True
-        if shards:
-            break
+    # Extract info for standalone example
+    hidden_info = tensor_descriptors.get("hidden_layers", {})
+    hidden_layers_list = hidden_info.get("layers", [0])
+    first_layer = hidden_layers_list[0] if hidden_layers_list else 0
+    hidden_dim = hidden_info.get("dim", "hidden_dim")
+    is_full_sequence = hidden_info.get("storage") == "full_sequence"
 
+    full_sequence_note = ""
     if is_full_sequence:
-        standalone_slice_example = (
-            'tok_off, num_tok = row["token_offset"], row["num_tokens"]\n'
-            "# Slice full-sequence activations for this prompt\n"
-            'prompt_acts = layer_0[tok_off : tok_off + num_tok]  '
-            "# (num_tokens, hidden_dim)"
-        )
-    else:
-        standalone_slice_example = (
-            'shard_idx, row_offset = row["shard_index"], row["row_offset"]'
-        )
+        full_sequence_note = """
+> **Full-sequence dataset:** The `shard_index` / `row_offset` columns \
+always address the **last-token** pooled vector. For per-token access, \
+use the `token_shard_ids` and `token_shard_offsets` list columns — see \
+the `lmprobe:tensors` schema metadata for details.
+"""
 
     yaml_header = f"""---
 tags:
@@ -1932,12 +1912,9 @@ Cached activations extracted from \
 ```python
 from lmprobe import load_activations, Probe
 
-# Load activations for specific layers (only downloads needed shards)
-acts = load_activations("{repo_id}", layers=[16])
-
-# Train a probe
+acts = load_activations("{repo_id}", layers=[{first_layer}])
 probe = Probe(classifier="logistic_regression", random_state=42)
-probe.fit_from_activations(acts[16], labels)
+probe.fit_from_activations(acts[{first_layer}], labels)
 ```
 
 ## Load without lmprobe (standalone)
@@ -1947,26 +1924,20 @@ import json
 import pyarrow.parquet as pq
 from safetensors import safe_open
 
-# 1. Read the Parquet index (metadata is embedded in schema)
+# Load the index — all metadata is embedded in the Parquet schema
 table = pq.read_table("index/train-00000-of-00001.parquet")
-index = table.to_pandas()
-print(index.columns)  # text, label, num_tokens, shard_index, row_offset
+df = table.to_pandas()
+meta = json.loads(table.schema.metadata[b"lmprobe:tensors"])
 
-# 2. Read tensor metadata from Parquet schema
-schema_meta = table.schema.metadata
-tensors_info = json.loads(schema_meta[b"lmprobe:tensors"])
-print(list(tensors_info.keys()))  # e.g. ["hidden_layers", "logits_topk"]
-
-# 3. Load a shard — per-layer files: hidden_layer{{L:03d}}_shard{{S:03d}}.safetensors
-with safe_open("{example_shard}", framework="pt") as f:
-    print(f.keys())  # e.g. ["hidden.layer_0"]
-    layer_0 = f.get_tensor("hidden.layer_0")
-
-# 4. Map prompt index -> shard row
-row = index.iloc[42]
-{standalone_slice_example}
+# Get layer {first_layer} activation for prompt 0
+row = df.iloc[0]
+pattern = meta["hidden_layers"]["file_pattern"]
+path = pattern.format(layer={first_layer}, shard=row["shard_index"])
+with safe_open(path, framework="pt") as f:
+    vec = f.get_tensor("hidden.layer_{first_layer}")[row["row_offset"]]
+    # vec.shape: ({hidden_dim},)
 ```
-
+{full_sequence_note}
 ## Load with HF Datasets
 
 ```python
@@ -2790,11 +2761,8 @@ def pull_dataset(
                 elif t_type == "logits_topk" and "shard_index_logits" in index:
                     si = index["shard_index_logits"][i]
                     needed_shards.setdefault(t_type, set()).add(si)
-                elif t_type == "hidden_layers" and "shard_index_hidden" in index:
-                    si = index["shard_index_hidden"][i]
-                    needed_shards.setdefault(t_type, set()).add(si)
                 else:
-                    # Legacy v1.1 fallback: single shard_index for all types
+                    # Universal: shard_index always addresses hidden layers
                     si = index["shard_index"][i]
                     needed_shards.setdefault(t_type, set()).add(si)
 
@@ -2842,10 +2810,7 @@ def pull_dataset(
                         continue
                     per_layer_paths[t_type][shard_idx] = {}
                     for layer in download_layers:
-                        fname = (
-                            f"tensors/hidden_layer{layer:03d}"
-                            f"_shard{shard_idx:03d}.safetensors"
-                        )
+                        fname = _hidden_shard_filename(layer, shard_idx)
                         shard_path = hf_hub_download(
                             repo_id, fname,
                             repo_type="dataset", token=token,
@@ -2929,11 +2894,8 @@ def pull_dataset(
         }
         if "token_offset" in index:
             entry["token_offset"] = index["token_offset"][i]
-        # Per-type fields (v1.2)
-        for col in (
-            "shard_index_hidden", "row_offset_hidden", "token_offset_hidden",
-            "shard_index_logits", "row_offset_logits",
-        ):
+        # Logits shard columns
+        for col in ("shard_index_logits", "row_offset_logits"):
             if col in index:
                 entry[col] = index[col][i]
         # Per-token shard arrays (v1.3)
@@ -3307,10 +3269,7 @@ def load_activation_dataset(
 
             for shard_idx, _shard in enumerate(shards):
                 for layer in download_layers:
-                    fname = (
-                        f"tensors/hidden_layer{layer:03d}"
-                        f"_shard{shard_idx:03d}.safetensors"
-                    )
+                    fname = _hidden_shard_filename(layer, shard_idx)
                     shard_path = hf_hub_download(
                         repo_id, fname,
                         repo_type="dataset", token=token,
@@ -3698,10 +3657,7 @@ def migrate_dataset(
             # index_select, and write rest shards directly.
             lt_vectors: list[torch.Tensor] = []
             for old_si in range(len(old_shards)):
-                fname = (
-                    f"tensors/hidden_layer{layer:03d}"
-                    f"_shard{old_si:03d}.safetensors"
-                )
+                fname = _hidden_shard_filename(layer, old_si)
                 shard_path = hf_hub_download(
                     repo_id, fname,
                     repo_type="dataset", token=token,
@@ -3726,10 +3682,7 @@ def migrate_dataset(
 
                 # Write rest shard (same index as old shard)
                 rest_shard_idx = lt_shard_count + old_si
-                rest_fname = (
-                    f"tensors/hidden_layer{layer:03d}"
-                    f"_shard{rest_shard_idx:03d}.safetensors"
-                )
+                rest_fname = _hidden_shard_filename(layer, rest_shard_idx)
                 if rest_tensor.shape[0] > 0:
                     save_file(
                         {key: rest_tensor},
@@ -3746,10 +3699,7 @@ def migrate_dataset(
             for local_idx, shard_size in enumerate(lt_boundaries):
                 actual = min(shard_size, all_lt.shape[0] - offset)
                 if actual > 0:
-                    lt_fname = (
-                        f"tensors/hidden_layer{layer:03d}"
-                        f"_shard{local_idx:03d}.safetensors"
-                    )
+                    lt_fname = _hidden_shard_filename(layer, local_idx)
                     save_file(
                         {key: all_lt[offset:offset + actual]},
                         str(tmpdir / lt_fname),
@@ -3783,9 +3733,7 @@ def migrate_dataset(
     # ------------------------------------------------------------------
     rebuild_keys = {
         "text", "label", "num_tokens", "shard_index", "row_offset",
-        "shard_index_hidden", "row_offset_hidden",
-        "token_offset_hidden", "token_offset",
-        "token_shard_ids", "token_shard_offsets",
+        "token_offset", "token_shard_ids", "token_shard_offsets",
     }
     extra_parquet_keys = [
         k for k in index.keys() if k not in rebuild_keys
@@ -3800,9 +3748,6 @@ def migrate_dataset(
             "num_tokens": num_tokens_list[i],
             "shard_index": lt_si,
             "row_offset": lt_off,
-            "shard_index_hidden": lt_si,
-            "row_offset_hidden": lt_off,
-            "token_offset_hidden": lt_off,
             "token_offset": lt_off,
             "token_shard_ids": all_token_shard_ids[i],
             "token_shard_offsets": all_token_shard_offsets[i],
@@ -3904,13 +3849,11 @@ def migrate_dataset(
     for layer in hidden_layers:
         for old_si in range(len(old_shards)):
             old_shard_files.add(
-                f"tensors/hidden_layer{layer:03d}"
-                f"_shard{old_si:03d}.safetensors"
+                _hidden_shard_filename(layer, old_si)
             )
         for new_si in range(len(new_boundaries)):
             new_shard_files.add(
-                f"tensors/hidden_layer{layer:03d}"
-                f"_shard{new_si:03d}.safetensors"
+                _hidden_shard_filename(layer, new_si)
             )
 
     stale_files = old_shard_files - new_shard_files

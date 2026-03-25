@@ -2158,7 +2158,6 @@ class TestRoundtrip:
         assert table.num_rows == 2
         expected_cols = {
             "text", "label", "num_tokens", "shard_index", "row_offset",
-            "shard_index_hidden", "row_offset_hidden",
         }
         assert set(table.column_names) == expected_cols
         assert set(table.column("text").to_pylist()) == set(prompts)
@@ -3082,13 +3081,12 @@ class TestIndependentShardBoundaries:
 
         # Check per-type columns in metadata
         for pm in prompt_metadata:
-            assert "shard_index_hidden" in pm
-            assert "row_offset_hidden" in pm
-            assert "shard_index_logits" in pm
-            assert "row_offset_logits" in pm
-            # Legacy columns present
+            # Hidden uses universal shard_index/row_offset
             assert "shard_index" in pm
             assert "row_offset" in pm
+            # Logits keeps per-type columns
+            assert "shard_index_logits" in pm
+            assert "row_offset_logits" in pm
 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -3142,11 +3140,13 @@ class TestIndependentShardBoundaries:
 
         table = pq.read_table(str(remote_dir / PARQUET_PATH))
         col_names = set(table.column_names)
-        assert "shard_index_hidden" in col_names
-        assert "row_offset_hidden" in col_names
+        # Hidden uses universal shard_index/row_offset (no per-type hidden columns)
+        assert "shard_index_hidden" not in col_names
+        assert "row_offset_hidden" not in col_names
+        # Logits keeps per-type columns
         assert "shard_index_logits" in col_names
         assert "row_offset_logits" in col_names
-        # Legacy columns still present
+        # Universal columns present
         assert "shard_index" in col_names
         assert "row_offset" in col_names
 
@@ -3191,8 +3191,9 @@ class TestIndependentShardBoundaries:
         for pm in prompt_metadata:
             assert "shard_index_logits" not in pm
             assert "row_offset_logits" not in pm
-            # Hidden columns present
-            assert "shard_index_hidden" in pm
+            # Universal columns present (used for hidden)
+            assert "shard_index" in pm
+            assert "row_offset" in pm
 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -3606,8 +3607,8 @@ class TestLastTokenShardSplitting:
                 for sid in shard_ids[:-1]:
                     assert sid >= lt_count
 
-            # Backwards-compat scalars point to last-token shard
-            assert pm["shard_index_hidden"] == shard_ids[-1]
+            # Universal shard_index points to last-token shard
+            assert pm["shard_index"] == shard_ids[-1]
 
     def test_per_token_offsets_consistency(self, populated_raw_cache):
         """token_shard_offsets are valid indices into shard tensors."""
