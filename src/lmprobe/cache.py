@@ -1530,7 +1530,7 @@ def _resolve_hidden_shard(
 
     storage = t_info.get("storage", "pooled")
     layout = t_info.get("layout")
-    shard_idx = entry.get("shard_index_hidden", entry.get("shard_index"))
+    shard_idx = entry.get("shard_index")
 
     shards = t_info["shards"]
     if shard_idx >= len(shards):
@@ -1647,7 +1647,7 @@ def _shard_local_token_offset(
 
     Returns (local_tok_off, num_tok).
     """
-    tok_off = entry.get("token_offset_hidden", entry.get("token_offset"))
+    tok_off = entry.get("token_offset")
     num_tok = entry["num_tokens"]
     shard_token_base = sum(
         s.get("num_tokens", 0) for s in shards[:shard_idx]
@@ -1703,9 +1703,7 @@ def _load_pooled_from_shard(
     if storage == "full_sequence" and has_token_shard_ids:
         # Split full_sequence datasets: shard_index_hidden points to the
         # last-token shard which stores one row per prompt.
-        row_offset = entry.get(
-            "row_offset_hidden", entry.get("row_offset", 0)
-        )
+        row_offset = entry.get("row_offset", 0)
 
         def slice_fn(t: torch.Tensor) -> torch.Tensor:
             return t[row_offset : row_offset + 1]
@@ -1721,9 +1719,7 @@ def _load_pooled_from_shard(
 
     else:
         # Pooled storage: one row per prompt.
-        row_offset = entry.get(
-            "row_offset_hidden", entry.get("row_offset")
-        )
+        row_offset = entry.get("row_offset")
 
         def slice_fn(t: torch.Tensor) -> torch.Tensor:  # noqa: F811
             return t[row_offset : row_offset + 1]

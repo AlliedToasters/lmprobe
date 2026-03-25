@@ -60,7 +60,7 @@ from .cache import (
 
 logger = logging.getLogger(__name__)
 
-FORMAT_VERSION = "1.2"
+FORMAT_VERSION = "2.0"
 DEFAULT_SHARD_BYTES = 1_073_741_824  # 1 GB
 INFO_FILENAME = "lmprobe_info.json"
 PARQUET_PATH = "index/train-00000-of-00001.parquet"
@@ -79,13 +79,13 @@ def _check_format_version(lmprobe_info: dict, *, check_minor: bool = True) -> No
     remote_version = lmprobe_info.get("format_version", "1.0")
     remote_major = int(remote_version.split(".")[0])
     local_major = int(FORMAT_VERSION.split(".")[0])
-    if remote_major != local_major:
+    if remote_major > local_major:
         raise ValueError(
             f"Incompatible format version: remote has {remote_version}, "
             f"lmprobe supports {FORMAT_VERSION}. "
             f"Please upgrade lmprobe: pip install --upgrade lmprobe"
         )
-    if check_minor:
+    if check_minor and remote_major == local_major:
         remote_minor = int(remote_version.split(".")[1])
         local_minor = int(FORMAT_VERSION.split(".")[1])
         if remote_minor > local_minor:
@@ -96,17 +96,48 @@ def _check_format_version(lmprobe_info: dict, *, check_minor: bool = True) -> No
             )
 
 
+def _hidden_shard_filename(layer: int, shard: int) -> str:
+    """Build hidden layer shard filename from layer and shard index."""
+    return f"tensors/hidden_layer{layer:03d}_shard{shard:03d}.safetensors"
+
+
 def _extract_model_name(lmprobe_info: dict) -> str:
-    """Extract model name from lmprobe_info, supporting both canonical and legacy formats."""
+    """Extract model name from lmprobe_info."""
     model_obj = lmprobe_info.get("model")
     if isinstance(model_obj, dict):
         return model_obj["name"]
-    if "model_name" in lmprobe_info:
-        return lmprobe_info["model_name"]
     raise KeyError(
-        "lmprobe_info.json missing model name — expected 'model.name' "
-        "or top-level 'model_name'"
+        "Dataset metadata missing model name — expected 'model.name'"
     )
+
+
+def _load_dataset_metadata(
+    repo_id: str,
+    token: str | None = None,
+) -> tuple[dict, str]:
+    """Download dataset metadata from Parquet schema (v2 format).
+
+    Returns ``(lmprobe_info, parquet_path)`` where *lmprobe_info* is the
+    parsed metadata dict and *parquet_path* is the local path to the
+    downloaded Parquet index.
+
+    Raises ``ValueError`` if the Parquet file has no embedded metadata
+    (v1 dataset — use ``upgrade_dataset_format()`` to migrate).
+    """
+    _check_hub_deps()
+    from huggingface_hub import hf_hub_download
+
+    parquet_path = hf_hub_download(
+        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
+    )
+
+    lmprobe_info = _extract_metadata_from_parquet(parquet_path)
+    if lmprobe_info is None:
+        raise ValueError(
+            f"Dataset {repo_id!r} uses v1 format (separate lmprobe_info.json). "
+            f"Upgrade it with: lmprobe.upgrade_dataset_format({repo_id!r})"
+        )
+    return lmprobe_info, parquet_path
 
 
 # =============================================================================
@@ -1003,12 +1034,9 @@ def _compute_shard_plan(
             prompt_metadata[i]["token_shard_ids"] = token_shard_ids
             prompt_metadata[i]["token_shard_offsets"] = token_shard_offsets
 
-            # Scalar backwards-compat: point to last-token shard
-            prompt_metadata[i]["shard_index_hidden"] = lt_si
-            prompt_metadata[i]["row_offset_hidden"] = lt_off
+            # Universal scalars: point to last-token shard
             prompt_metadata[i]["shard_index"] = lt_si
             prompt_metadata[i]["row_offset"] = lt_off
-            prompt_metadata[i]["token_offset_hidden"] = lt_off
             prompt_metadata[i]["token_offset"] = lt_off
 
     elif has_hidden and hidden_boundaries:
@@ -1017,8 +1045,6 @@ def _compute_shard_plan(
             for local_row in range(shard_size):
                 global_row = offset + local_row
                 if global_row < len(prompt_metadata):
-                    prompt_metadata[global_row]["shard_index_hidden"] = shard_idx
-                    prompt_metadata[global_row]["row_offset_hidden"] = local_row
                     prompt_metadata[global_row]["shard_index"] = shard_idx
                     prompt_metadata[global_row]["row_offset"] = local_row
             offset += shard_size
@@ -1083,6 +1109,8 @@ def _compute_shard_plan(
             "dim": hidden_dim,
             "dtype": "float32",
             "layout": "per_layer",
+            "file_pattern": "tensors/hidden_layer{layer:03d}_shard{shard:03d}.safetensors",
+            "key_pattern": "hidden.layer_{layer}",
             "shards": hidden_shards,
         }
         if use_raw:
@@ -1112,6 +1140,7 @@ def _compute_shard_plan(
             "k": logits_top_k,
             "dtype": "float32",
             "pooling": "last_token",
+            "file_pattern": "tensors/logits_topk_{shard:03d}.safetensors",
             "row_bytes": logits_row_bytes,
             "shards": logits_shards,
         }
@@ -1178,8 +1207,7 @@ def _enumerate_shard_files(plan: dict[str, Any]) -> list[str]:
         for layer in plan["hidden_layers"]:
             for shard_idx in range(len(plan["hidden_boundaries"])):
                 files.append(
-                    f"tensors/hidden_layer{layer:03d}"
-                    f"_shard{shard_idx:03d}.safetensors"
+                    _hidden_shard_filename(layer, shard_idx)
                 )
     if plan["want_logits"] and plan["logits_boundaries"]:
         for shard_idx in range(len(plan["logits_boundaries"])):
@@ -1331,10 +1359,7 @@ def _consolidate_and_shard(
             offset = 0
             for local_idx, shard_size in enumerate(boundaries):
                 shard_idx = shard_idx_offset + local_idx
-                fname = (
-                    f"tensors/hidden_layer{layer:03d}"
-                    f"_shard{shard_idx:03d}.safetensors"
-                )
+                fname = _hidden_shard_filename(layer, shard_idx)
                 if fname in skip_shards:
                     offset += shard_size
                     pbar.update(1)
@@ -1439,10 +1464,7 @@ def _consolidate_and_shard(
                 offset = 0
                 for local_idx, shard_size in enumerate(boundaries):
                     shard_idx = shard_idx_offset + local_idx
-                    fname = (
-                        f"tensors/hidden_layer{layer:03d}"
-                        f"_shard{shard_idx:03d}.safetensors"
-                    )
+                    fname = _hidden_shard_filename(layer, shard_idx)
                     if fname in skip_shards:
                         offset += shard_size
                         pbar.update(1)
@@ -1567,15 +1589,77 @@ def _consolidate_and_shard(
 # =============================================================================
 
 
+def _embed_metadata_in_schema(
+    table,
+    lmprobe_info: dict,
+):
+    """Embed lmprobe_info into a PyArrow table's schema metadata.
+
+    Keys are prefixed with ``lmprobe:`` and values are JSON-encoded bytes.
+    """
+    meta = {
+        f"lmprobe:{key}".encode(): json.dumps(value).encode()
+        for key, value in lmprobe_info.items()
+    }
+    # Preserve any existing schema metadata (e.g. from Arrow/Parquet)
+    existing = table.schema.metadata or {}
+    merged = {**existing, **meta}
+    return table.replace_schema_metadata(merged)
+
+
+def _extract_metadata_from_parquet(parquet_path: str | Path) -> dict | None:
+    """Read lmprobe metadata from a Parquet file's schema metadata.
+
+    Returns the reconstructed ``lmprobe_info`` dict, or ``None`` if no
+    ``lmprobe:`` prefixed keys are present (v1 dataset).
+    Uses ``pq.read_schema()`` which only reads the footer — no row data.
+    """
+    _check_pyarrow()
+    import pyarrow.parquet as pq
+
+    schema = pq.read_schema(str(parquet_path))
+    raw_meta = schema.metadata or {}
+
+    # Collect lmprobe:-prefixed keys
+    lmprobe_meta: dict[str, str] = {}
+    for k, v in raw_meta.items():
+        key = k.decode() if isinstance(k, bytes) else k
+        val = v.decode() if isinstance(v, bytes) else v
+        if key.startswith("lmprobe:"):
+            lmprobe_meta[key[len("lmprobe:"):]] = val
+
+    if not lmprobe_meta:
+        return None
+
+    # Reconstruct the lmprobe_info dict
+    info: dict = {}
+    for key, val in lmprobe_meta.items():
+        # Try JSON parse for dicts/lists; fall back to raw string
+        try:
+            info[key] = json.loads(val)
+        except (json.JSONDecodeError, TypeError):
+            info[key] = val
+
+    # Coerce format_version to string (defensive — should round-trip as string via JSON)
+    if "format_version" in info and not isinstance(info["format_version"], str):
+        info["format_version"] = str(info["format_version"])
+
+    return info
+
+
 def _write_parquet_index(
     tmpdir: Path,
     prompt_metadata: list[dict],
+    lmprobe_info: dict | None = None,
 ) -> None:
     """Write the Parquet index from prompt metadata.
 
     Fixed columns: text, label, num_tokens, shard_index, row_offset (or
     token_offset for full-sequence storage).  Any additional keys in
     prompt_metadata are written as extra columns with auto-inferred types.
+
+    If *lmprobe_info* is provided, it is embedded into the Parquet schema
+    metadata under ``lmprobe:`` prefixed keys (v2 format).
     """
     _check_pyarrow()
     import pyarrow as pa
@@ -1604,9 +1688,8 @@ def _write_parquet_index(
         "row_offset": pa.array(row_offsets, type=pa.int32()),
     }
 
-    # Per-type shard columns (v1.2)
+    # Per-type shard columns (logits only; hidden uses universal shard_index/row_offset)
     per_type_keys = {
-        "shard_index_hidden", "row_offset_hidden", "token_offset_hidden",
         "shard_index_logits", "row_offset_logits",
     }
     for ptk in per_type_keys:
@@ -1666,6 +1749,8 @@ def _write_parquet_index(
             columns[ek] = pa.array(values, type=pa_type)
 
     table = pa.table(columns)
+    if lmprobe_info is not None:
+        table = _embed_metadata_in_schema(table, lmprobe_info)
     pq.write_table(table, str(tmpdir / PARQUET_PATH))
 
 
@@ -1776,36 +1861,21 @@ def _build_readme(
     desc_section = f"\n{description}\n" if description else ""
     model_url = f"https://huggingface.co/{model_name}"
 
-    # Find example shard and detect storage mode
-    example_shard = "tensors/hidden_layer000_shard000.safetensors"
-    is_full_sequence = False
-    for info in tensor_descriptors.values():
-        shards = info.get("shards", [])
-        layout = info.get("layout")
-        if layout == "per_layer" and shards:
-            # Derive filename from convention
-            layers = info.get("layers", [0])
-            example_shard = (
-                f"tensors/hidden_layer{layers[0]:03d}_shard000.safetensors"
-            )
-        elif shards and "file" in shards[0]:
-            example_shard = shards[0]["file"]
-        if info.get("storage") == "full_sequence":
-            is_full_sequence = True
-        if shards:
-            break
+    # Extract info for standalone example
+    hidden_info = tensor_descriptors.get("hidden_layers", {})
+    hidden_layers_list = hidden_info.get("layers", [0])
+    first_layer = hidden_layers_list[0] if hidden_layers_list else 0
+    hidden_dim = hidden_info.get("dim", "hidden_dim")
+    is_full_sequence = hidden_info.get("storage") == "full_sequence"
 
+    full_sequence_note = ""
     if is_full_sequence:
-        standalone_slice_example = (
-            'tok_off, num_tok = row["token_offset"], row["num_tokens"]\n'
-            "# Slice full-sequence activations for this prompt\n"
-            'prompt_acts = layer_0[tok_off : tok_off + num_tok]  '
-            "# (num_tokens, hidden_dim)"
-        )
-    else:
-        standalone_slice_example = (
-            'shard_idx, row_offset = row["shard_index"], row["row_offset"]'
-        )
+        full_sequence_note = """
+> **Full-sequence dataset:** The `shard_index` / `row_offset` columns \
+always address the **last-token** pooled vector. For per-token access, \
+use the `token_shard_ids` and `token_shard_offsets` list columns — see \
+the `lmprobe:tensors` schema metadata for details.
+"""
 
     yaml_header = f"""---
 tags:
@@ -1840,15 +1910,11 @@ Cached activations extracted from \
 ## Load with lmprobe
 
 ```python
-from lmprobe import pull_dataset, load_activation_dataset
+from lmprobe import load_activations, Probe
 
-# Option 1: Pull into local cache (enables probe training without \
-re-extraction)
-pull_dataset("{repo_id}")
-
-# Option 2: Load tensors directly
-tensors, info = load_activation_dataset("{repo_id}")
-# tensors["hidden.layer_16"].shape => (N, hidden_dim)
+acts = load_activations("{repo_id}", layers=[{first_layer}])
+probe = Probe(classifier="logistic_regression", random_state=42)
+probe.fit_from_activations(acts[{first_layer}], labels)
 ```
 
 ## Load without lmprobe (standalone)
@@ -1858,25 +1924,20 @@ import json
 import pyarrow.parquet as pq
 from safetensors import safe_open
 
-# 1. Read the Parquet index
-index = pq.read_table("index/train-00000-of-00001.parquet").to_pandas()
-print(index.columns)  # text, label, num_tokens, shard_index, row_offset
+# Load the index — all metadata is embedded in the Parquet schema
+table = pq.read_table("index/train-00000-of-00001.parquet")
+df = table.to_pandas()
+meta = json.loads(table.schema.metadata[b"lmprobe:tensors"])
 
-# 2. Read tensor metadata
-with open("{INFO_FILENAME}") as f:
-    info = json.load(f)
-print(list(info["tensors"].keys()))  # e.g. ["hidden_layers", "logits_topk"]
-
-# 3. Load a shard — per-layer files: hidden_layer{{L:03d}}_shard{{S:03d}}.safetensors
-with safe_open("{example_shard}", framework="pt") as f:
-    print(f.keys())  # e.g. ["hidden.layer_0"]
-    layer_0 = f.get_tensor("hidden.layer_0")
-
-# 4. Map prompt index -> shard row
-row = index.iloc[42]
-{standalone_slice_example}
+# Get layer {first_layer} activation for prompt 0
+row = df.iloc[0]
+pattern = meta["hidden_layers"]["file_pattern"]
+path = pattern.format(layer={first_layer}, shard=row["shard_index"])
+with safe_open(path, framework="pt") as f:
+    vec = f.get_tensor("hidden.layer_{first_layer}")[row["row_offset"]]
+    # vec.shape: ({hidden_dim},)
 ```
-
+{full_sequence_note}
 ## Load with HF Datasets
 
 ```python
@@ -2134,15 +2195,14 @@ def push_dataset(
             shuffle=shuffle,
         )
 
-        # Step 5: Write Parquet index
-        _write_parquet_index(tmpdir, prompt_metadata)
-
-        # Step 6: Write metadata
+        # Step 5: Build metadata and write Parquet index (v2: embedded)
         num_prompts = len(prompt_metadata)
         lmprobe_info = _build_lmprobe_info(
             model_name, num_prompts, tensor_descriptors,
         )
+        _write_parquet_index(tmpdir, prompt_metadata, lmprobe_info)
 
+        # Write JSON sidecar to staging dir (used by resume logic)
         with open(tmpdir / INFO_FILENAME, "w") as f:
             json.dump(lmprobe_info, f, indent=2)
 
@@ -2430,16 +2490,13 @@ def _push_dataset_streaming(
     }
     _save_manifest(staging_dir, manifest)
 
-    # Upload metadata files (parquet, info, README)
+    # Upload metadata files (parquet + README; v2 embeds info in parquet)
     if not manifest.get("metadata_uploaded", False):
-        _write_parquet_index(tmpdir, prompt_metadata)
-
         num_prompts = len(prompt_metadata)
         lmprobe_info = _build_lmprobe_info(
             model_name, num_prompts, tensor_descriptors,
         )
-        with open(tmpdir / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f, indent=2)
+        _write_parquet_index(tmpdir, prompt_metadata, lmprobe_info)
 
         readme = _build_readme(
             model_name=model_name,
@@ -2460,7 +2517,6 @@ def _push_dataset_streaming(
             for meta_file, repo_path in [
                 (tmpdir / "index" / "train-00000-of-00001.parquet",
                  PARQUET_PATH),
-                (tmpdir / INFO_FILENAME, INFO_FILENAME),
                 (tmpdir / "README.md", "README.md"),
             ]
         ]
@@ -2510,8 +2566,9 @@ def fetch_dataset_metadata(
 ) -> DatasetMetadata:
     """Fetch lightweight metadata from a remote activation dataset.
 
-    Downloads only ``lmprobe_info.json`` (~KB) and the Parquet index
-    (~KB–MB) — no tensor data is transferred.
+    Downloads the Parquet index (which contains embedded metadata in v2
+    format) — no tensor data is transferred.  Falls back to downloading
+    ``lmprobe_info.json`` for v1 datasets.
 
     Parameters
     ----------
@@ -2526,24 +2583,11 @@ def fetch_dataset_metadata(
         Parsed metadata including model name, available layers, prompt
         list, and tensor descriptors.
     """
-    _check_hub_deps()
-    from huggingface_hub import hf_hub_download
+    lmprobe_info, parquet_path = _load_dataset_metadata(repo_id, token)
 
-    info_path = hf_hub_download(
-        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
-    )
-    parquet_path = hf_hub_download(
-        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
-    )
-
-    with open(info_path) as f:
-        lmprobe_info = json.load(f)
-
-    # Support both canonical format (model.name, tensors) and legacy
-    # format (model_name, tensor_types) written by custom staging scripts.
     model_name = _extract_model_name(lmprobe_info)
     format_version = lmprobe_info.get("format_version", "1.0")
-    tensor_descriptors = lmprobe_info.get("tensors") or lmprobe_info.get("tensor_types") or {}
+    tensor_descriptors = lmprobe_info.get("tensors", {})
 
     # Extract available layers from hidden_layers descriptor
     available_layers: list[int] = []
@@ -2551,8 +2595,6 @@ def fetch_dataset_metadata(
     if hidden_info.get("layout") == "per_layer":
         available_layers = hidden_info.get("layers", [])
     else:
-        # v1.0 co-located: all layers are available but not enumerated
-        # Try to infer from shard keys if possible
         available_layers = hidden_info.get("layers", [])
 
     # Read prompts from Parquet index
@@ -2627,23 +2669,15 @@ def pull_dataset(
     _check_hub_deps()
     from huggingface_hub import hf_hub_download
 
-    # Download metadata
+    # Download metadata (v2: from parquet schema; v1: JSON fallback)
     logger.info("[SHARING] Downloading dataset metadata from %s...", repo_id)
-    info_path = hf_hub_download(
-        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
-    )
-    parquet_path = hf_hub_download(
-        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
-    )
-
-    with open(info_path) as f:
-        lmprobe_info = json.load(f)
+    lmprobe_info, parquet_path = _load_dataset_metadata(repo_id, token)
 
     # Version check
     _check_format_version(lmprobe_info)
 
     model_name = _extract_model_name(lmprobe_info)
-    tensor_descriptors = lmprobe_info.get("tensors") or lmprobe_info.get("tensor_types") or {}
+    tensor_descriptors = lmprobe_info.get("tensors", {})
 
     # Read Parquet index
     _check_pyarrow()
@@ -2727,11 +2761,8 @@ def pull_dataset(
                 elif t_type == "logits_topk" and "shard_index_logits" in index:
                     si = index["shard_index_logits"][i]
                     needed_shards.setdefault(t_type, set()).add(si)
-                elif t_type == "hidden_layers" and "shard_index_hidden" in index:
-                    si = index["shard_index_hidden"][i]
-                    needed_shards.setdefault(t_type, set()).add(si)
                 else:
-                    # Legacy v1.1 fallback: single shard_index for all types
+                    # Universal: shard_index always addresses hidden layers
                     si = index["shard_index"][i]
                     needed_shards.setdefault(t_type, set()).add(si)
 
@@ -2779,10 +2810,7 @@ def pull_dataset(
                         continue
                     per_layer_paths[t_type][shard_idx] = {}
                     for layer in download_layers:
-                        fname = (
-                            f"tensors/hidden_layer{layer:03d}"
-                            f"_shard{shard_idx:03d}.safetensors"
-                        )
+                        fname = _hidden_shard_filename(layer, shard_idx)
                         shard_path = hf_hub_download(
                             repo_id, fname,
                             repo_type="dataset", token=token,
@@ -2866,11 +2894,8 @@ def pull_dataset(
         }
         if "token_offset" in index:
             entry["token_offset"] = index["token_offset"][i]
-        # Per-type fields (v1.2)
-        for col in (
-            "shard_index_hidden", "row_offset_hidden", "token_offset_hidden",
-            "shard_index_logits", "row_offset_logits",
-        ):
+        # Logits shard columns
+        for col in ("shard_index_logits", "row_offset_logits"):
             if col in index:
                 entry[col] = index[col][i]
         # Per-token shard arrays (v1.3)
@@ -3212,17 +3237,12 @@ def load_activation_dataset(
     _check_hub_deps()
     from huggingface_hub import hf_hub_download
 
-    info_path = hf_hub_download(
-        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
-    )
-
-    with open(info_path) as f:
-        lmprobe_info = json.load(f)
+    lmprobe_info, _parquet_path = _load_dataset_metadata(repo_id, token)
 
     # Version check
     _check_format_version(lmprobe_info, check_minor=False)
 
-    tensor_descriptors = lmprobe_info.get("tensors") or lmprobe_info.get("tensor_types") or {}
+    tensor_descriptors = lmprobe_info.get("tensors", {})
 
     if tensors is not None:
         load_types = [k for k in tensor_descriptors if k in tensors]
@@ -3249,10 +3269,7 @@ def load_activation_dataset(
 
             for shard_idx, _shard in enumerate(shards):
                 for layer in download_layers:
-                    fname = (
-                        f"tensors/hidden_layer{layer:03d}"
-                        f"_shard{shard_idx:03d}.safetensors"
-                    )
+                    fname = _hidden_shard_filename(layer, shard_idx)
                     shard_path = hf_hub_download(
                         repo_id, fname,
                         repo_type="dataset", token=token,
@@ -3471,15 +3488,7 @@ def migrate_dataset(
     # Step 1: Download metadata
     # ------------------------------------------------------------------
     logger.info("[MIGRATE] Downloading metadata from %s...", repo_id)
-    info_path = hf_hub_download(
-        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
-    )
-    parquet_path = hf_hub_download(
-        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
-    )
-
-    with open(info_path) as f:
-        lmprobe_info = json.load(f)
+    lmprobe_info, parquet_path = _load_dataset_metadata(repo_id, token)
 
     tensor_descriptors = (
         lmprobe_info.get("tensors")
@@ -3648,10 +3657,7 @@ def migrate_dataset(
             # index_select, and write rest shards directly.
             lt_vectors: list[torch.Tensor] = []
             for old_si in range(len(old_shards)):
-                fname = (
-                    f"tensors/hidden_layer{layer:03d}"
-                    f"_shard{old_si:03d}.safetensors"
-                )
+                fname = _hidden_shard_filename(layer, old_si)
                 shard_path = hf_hub_download(
                     repo_id, fname,
                     repo_type="dataset", token=token,
@@ -3676,10 +3682,7 @@ def migrate_dataset(
 
                 # Write rest shard (same index as old shard)
                 rest_shard_idx = lt_shard_count + old_si
-                rest_fname = (
-                    f"tensors/hidden_layer{layer:03d}"
-                    f"_shard{rest_shard_idx:03d}.safetensors"
-                )
+                rest_fname = _hidden_shard_filename(layer, rest_shard_idx)
                 if rest_tensor.shape[0] > 0:
                     save_file(
                         {key: rest_tensor},
@@ -3696,10 +3699,7 @@ def migrate_dataset(
             for local_idx, shard_size in enumerate(lt_boundaries):
                 actual = min(shard_size, all_lt.shape[0] - offset)
                 if actual > 0:
-                    lt_fname = (
-                        f"tensors/hidden_layer{layer:03d}"
-                        f"_shard{local_idx:03d}.safetensors"
-                    )
+                    lt_fname = _hidden_shard_filename(layer, local_idx)
                     save_file(
                         {key: all_lt[offset:offset + actual]},
                         str(tmpdir / lt_fname),
@@ -3733,9 +3733,7 @@ def migrate_dataset(
     # ------------------------------------------------------------------
     rebuild_keys = {
         "text", "label", "num_tokens", "shard_index", "row_offset",
-        "shard_index_hidden", "row_offset_hidden",
-        "token_offset_hidden", "token_offset",
-        "token_shard_ids", "token_shard_offsets",
+        "token_offset", "token_shard_ids", "token_shard_offsets",
     }
     extra_parquet_keys = [
         k for k in index.keys() if k not in rebuild_keys
@@ -3750,9 +3748,6 @@ def migrate_dataset(
             "num_tokens": num_tokens_list[i],
             "shard_index": lt_si,
             "row_offset": lt_off,
-            "shard_index_hidden": lt_si,
-            "row_offset_hidden": lt_off,
-            "token_offset_hidden": lt_off,
             "token_offset": lt_off,
             "token_shard_ids": all_token_shard_ids[i],
             "token_shard_offsets": all_token_shard_offsets[i],
@@ -3768,8 +3763,6 @@ def migrate_dataset(
         for ek in extra_parquet_keys:
             meta[ek] = index[ek][i]
         prompt_metadata.append(meta)
-
-    _write_parquet_index(tmpdir, prompt_metadata)
 
     # ------------------------------------------------------------------
     # Step 7: Build new tensor descriptors and lmprobe_info
@@ -3804,7 +3797,11 @@ def migrate_dataset(
 
     new_lmprobe_info = dict(lmprobe_info)
     new_lmprobe_info["tensors"] = new_td
+    new_lmprobe_info["format_version"] = FORMAT_VERSION
 
+    _write_parquet_index(tmpdir, prompt_metadata, new_lmprobe_info)
+
+    # Write JSON sidecar to staging dir (backward compat)
     with open(tmpdir / INFO_FILENAME, "w") as f_out:
         json.dump(new_lmprobe_info, f_out, indent=2)
 
@@ -3852,13 +3849,11 @@ def migrate_dataset(
     for layer in hidden_layers:
         for old_si in range(len(old_shards)):
             old_shard_files.add(
-                f"tensors/hidden_layer{layer:03d}"
-                f"_shard{old_si:03d}.safetensors"
+                _hidden_shard_filename(layer, old_si)
             )
         for new_si in range(len(new_boundaries)):
             new_shard_files.add(
-                f"tensors/hidden_layer{layer:03d}"
-                f"_shard{new_si:03d}.safetensors"
+                _hidden_shard_filename(layer, new_si)
             )
 
     stale_files = old_shard_files - new_shard_files
@@ -3879,4 +3874,140 @@ def migrate_dataset(
 
     url = f"https://huggingface.co/datasets/{repo_id}"
     logger.info("[MIGRATE] Migration complete: %s", url)
+    return url
+
+
+def upgrade_dataset_format(
+    repo_id: str,
+    *,
+    token: str | None = None,
+    remove_json: bool = True,
+    dry_run: bool = False,
+) -> str:
+    """Upgrade a v1.x dataset to v2 format (metadata in Parquet schema).
+
+    This is a lightweight, metadata-only operation — no tensor files are
+    modified.  It reads the existing ``lmprobe_info.json`` and embeds its
+    contents into the Parquet index's schema metadata under ``lmprobe:``
+    prefixed keys.
+
+    Parameters
+    ----------
+    repo_id : str
+        HuggingFace repo ID of the dataset to upgrade.
+    token : str | None
+        HuggingFace API token.
+    remove_json : bool
+        If True (default), delete ``lmprobe_info.json`` from the repo
+        after embedding metadata in Parquet.
+    dry_run : bool
+        If True, download and validate but do not upload changes.
+
+    Returns
+    -------
+    str
+        URL of the upgraded dataset (or a summary string if dry_run).
+    """
+    _check_hub_deps()
+    _check_pyarrow()
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, hf_hub_download
+
+    # Download both files (we always need the JSON for v1 datasets)
+    logger.info("[UPGRADE] Downloading metadata from %s...", repo_id)
+    info_path = hf_hub_download(
+        repo_id, INFO_FILENAME, repo_type="dataset", token=token,
+    )
+    parquet_path = hf_hub_download(
+        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
+    )
+
+    # Check if already v2
+    existing_meta = _extract_metadata_from_parquet(parquet_path)
+    if existing_meta is not None:
+        logger.info("[UPGRADE] Dataset already has v2 metadata in Parquet schema")
+        url = f"https://huggingface.co/datasets/{repo_id}"
+        return f"{url} (already v2)" if dry_run else url
+
+    # Read v1 metadata
+    with open(info_path) as f:
+        lmprobe_info = json.load(f)
+
+    # Transform v1 metadata to v2 shape
+    lmprobe_info["format_version"] = FORMAT_VERSION
+
+    # Rename tensor_types → tensors if needed (safety net for very old datasets)
+    if "tensor_types" in lmprobe_info and "tensors" not in lmprobe_info:
+        lmprobe_info["tensors"] = lmprobe_info.pop("tensor_types")
+
+    # Inject file_pattern / key_pattern into tensor descriptors
+    tensors = lmprobe_info.get("tensors", {})
+    if "hidden_layers" in tensors:
+        hd = tensors["hidden_layers"]
+        hd.setdefault(
+            "file_pattern",
+            "tensors/hidden_layer{layer:03d}_shard{shard:03d}.safetensors",
+        )
+        hd.setdefault("key_pattern", "hidden.layer_{layer}")
+    if "logits_topk" in tensors:
+        tensors["logits_topk"].setdefault(
+            "file_pattern",
+            "tensors/logits_topk_{shard:03d}.safetensors",
+        )
+
+    # Embed into Parquet and drop redundant per-type hidden columns
+    table = pq.read_table(parquet_path)
+    v1_hidden_cols = {
+        "shard_index_hidden", "row_offset_hidden", "token_offset_hidden",
+    }
+    drop_cols = [c for c in table.column_names if c in v1_hidden_cols]
+    if drop_cols:
+        logger.info("[UPGRADE] Dropping redundant columns: %s", drop_cols)
+        table = table.drop(drop_cols)
+    table = _embed_metadata_in_schema(table, lmprobe_info)
+
+    if dry_run:
+        model_name = _extract_model_name(lmprobe_info)
+        n_prompts = lmprobe_info.get("num_prompts", len(table))
+        return (
+            f"[DRY RUN] Would upgrade {repo_id}: "
+            f"model={model_name}, {n_prompts} prompts, "
+            f"format {lmprobe_info.get('format_version', '?')}"
+        )
+
+    # Write updated Parquet to temp file and upload
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = Path(tmpdir) / "train-00000-of-00001.parquet"
+        pq.write_table(table, str(out_path))
+
+        api = HfApi(token=token)
+        from huggingface_hub import CommitOperationAdd
+
+        operations = [
+            CommitOperationAdd(
+                path_in_repo=PARQUET_PATH,
+                path_or_fileobj=str(out_path),
+            ),
+        ]
+
+        if remove_json:
+            from huggingface_hub import CommitOperationDelete
+
+            operations.append(
+                CommitOperationDelete(path_in_repo=INFO_FILENAME),
+            )
+
+        api.create_commit(
+            repo_id=repo_id,
+            operations=operations,
+            commit_message=(
+                f"Upgrade to format v{FORMAT_VERSION}: "
+                "embed metadata in Parquet schema"
+            ),
+            repo_type="dataset",
+        )
+
+    url = f"https://huggingface.co/datasets/{repo_id}"
+    logger.info("[UPGRADE] Format upgrade complete: %s", url)
     return url

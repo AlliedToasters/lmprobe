@@ -42,6 +42,7 @@ from lmprobe.sharing import (
     load_activation_dataset,
     pull_dataset,
     push_dataset,
+    upgrade_dataset_format,
 )
 
 _has_pyarrow = True
@@ -570,13 +571,12 @@ class TestBuildReadme:
         readme = _build_readme(
             TEST_MODEL, lmprobe_info, 0, "user/test",
         )
-        assert "pull_dataset" in readme
-        assert "load_activation_dataset" in readme
+        assert "load_activations" in readme
+        assert "fit_from_activations" in readme
         # Old names should not appear
         assert "push_to_bucket" not in readme
         assert "pull_from_bucket" not in readme
         assert "load_from_bucket" not in readme
-        assert "load_activations" not in readme
 
     def test_readme_contains_standalone_loading(self):
         lmprobe_info = {
@@ -860,10 +860,10 @@ class TestPushDatasetStreaming:
         tensor_paths = [p for p in uploaded_paths if p.startswith("tensors/")]
         assert len(tensor_paths) >= 2  # at least one shard per layer
 
-        # Should have metadata files
-        assert INFO_FILENAME in uploaded_paths
+        # Should have metadata files (v2: no lmprobe_info.json in streaming)
         assert PARQUET_PATH in uploaded_paths
         assert "README.md" in uploaded_paths
+        assert INFO_FILENAME not in uploaded_paths
 
     @requires_pyarrow
     @patch("lmprobe.sharing._check_hub_deps")
@@ -969,10 +969,10 @@ class TestPushDatasetStreaming:
             assert not path.startswith("tensors/"), (
                 f"Shard {path} should have been skipped on resume"
             )
-        # Should have uploaded metadata files only
-        assert INFO_FILENAME in commit_paths
+        # Should have uploaded metadata files only (v2: no JSON sidecar)
         assert PARQUET_PATH in commit_paths
         assert "README.md" in commit_paths
+        assert INFO_FILENAME not in commit_paths
 
     @requires_pyarrow
     @patch("lmprobe.sharing._check_hub_deps")
@@ -1409,10 +1409,15 @@ class TestDryConsolidation:
         assert "tensors/hidden_layer001_shard000.safetensors" in shard_paths
 
 
+@requires_pyarrow
 class TestLoadActivationDataset:
     def _setup_remote_files(self, tmp_path):
-        """Create remote files in v1.1 per-layer format."""
+        """Create remote files in v2 per-layer format with embedded metadata."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
         from safetensors.torch import save_file
+
+        from lmprobe.sharing import _embed_metadata_in_schema
 
         (tmp_path / "tensors").mkdir(parents=True)
         (tmp_path / "index").mkdir(parents=True)
@@ -1424,7 +1429,7 @@ class TestLoadActivationDataset:
         )
 
         lmprobe_info = {
-            "format_version": "1.1",
+            "format_version": "2.0",
             "model": {"name": TEST_MODEL, "revision": None},
             "num_prompts": 3,
             "prompt_ordering": "random",
@@ -1446,8 +1451,17 @@ class TestLoadActivationDataset:
             },
             "provenance": {},
         }
-        with open(tmp_path / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f)
+
+        # Write Parquet index with embedded metadata (v2 format)
+        table = pa.table({
+            "text": pa.array(["p0", "p1", "p2"], type=pa.string()),
+            "label": pa.array([None, None, None], type=pa.int32()),
+            "num_tokens": pa.array([5, 5, 5], type=pa.int32()),
+            "shard_index": pa.array([0, 0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1, 2], type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
 
         return tmp_path, tensor
 
@@ -1485,16 +1499,31 @@ class TestLoadActivationDataset:
 
     @patch("lmprobe.sharing._check_hub_deps")
     def test_version_mismatch_raises(self, mock_deps, tmp_path):
-        remote_dir, _ = self._setup_remote_files(tmp_path)
+        import pyarrow as pa
+        import pyarrow.parquet as pq
 
-        with open(remote_dir / INFO_FILENAME) as f:
-            info = json.load(f)
-        info["format_version"] = "2.0"
-        with open(remote_dir / INFO_FILENAME, "w") as f:
-            json.dump(info, f)
+        from lmprobe.sharing import _embed_metadata_in_schema
+
+        (tmp_path / "index").mkdir(parents=True)
+        lmprobe_info = {
+            "format_version": "3.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 1,
+            "tensors": {},
+            "provenance": {},
+        }
+        table = pa.table({
+            "text": pa.array(["p0"], type=pa.string()),
+            "label": pa.array([None], type=pa.int32()),
+            "num_tokens": pa.array([5], type=pa.int32()),
+            "shard_index": pa.array([0], type=pa.int32()),
+            "row_offset": pa.array([0], type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
 
         def mock_download(repo_id, filename, **kwargs):
-            return str(remote_dir / filename)
+            return str(tmp_path / filename)
 
         with patch(
             "huggingface_hub.hf_hub_download", side_effect=mock_download,
@@ -1508,10 +1537,12 @@ class TestLoadActivationDataset:
 @requires_pyarrow
 class TestPullDataset:
     def _setup_remote_files(self, tmp_path):
-        """Create remote files in v1.1 per-layer format."""
+        """Create remote files in v2 per-layer format with embedded metadata."""
         import pyarrow as pa
         import pyarrow.parquet as pq
         from safetensors.torch import save_file
+
+        from lmprobe.sharing import _embed_metadata_in_schema
 
         (tmp_path / "tensors").mkdir(parents=True)
         (tmp_path / "index").mkdir(parents=True)
@@ -1523,18 +1554,8 @@ class TestPullDataset:
             str(tmp_path / "tensors" / "hidden_layer000_shard000.safetensors"),
         )
 
-        # Write Parquet index
-        table = pa.table({
-            "text": pa.array(prompts, type=pa.string()),
-            "label": pa.array([None, None, None], type=pa.int32()),
-            "num_tokens": pa.array([5, 5, 5], type=pa.int32()),
-            "shard_index": pa.array([0, 0, 0], type=pa.int32()),
-            "row_offset": pa.array([0, 1, 2], type=pa.int32()),
-        })
-        pq.write_table(table, str(tmp_path / PARQUET_PATH))
-
         lmprobe_info = {
-            "format_version": "1.1",
+            "format_version": "2.0",
             "model": {"name": TEST_MODEL, "revision": None},
             "num_prompts": 3,
             "prompt_ordering": "random",
@@ -1556,8 +1577,17 @@ class TestPullDataset:
             },
             "provenance": {},
         }
-        with open(tmp_path / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f)
+
+        # Write Parquet index with embedded metadata (v2)
+        table = pa.table({
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([None, None, None], type=pa.int32()),
+            "num_tokens": pa.array([5, 5, 5], type=pa.int32()),
+            "shard_index": pa.array([0, 0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1, 2], type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
 
         return tmp_path, prompts
 
@@ -1605,10 +1635,12 @@ class TestLazyPullDataset:
     """Tests for lazy (default) pull_dataset behavior."""
 
     def _setup_remote_files(self, tmp_path):
-        """Create remote files in v1.1 per-layer format."""
+        """Create remote files in v2 per-layer format with embedded metadata."""
         import pyarrow as pa
         import pyarrow.parquet as pq
         from safetensors.torch import save_file
+
+        from lmprobe.sharing import _embed_metadata_in_schema
 
         (tmp_path / "tensors").mkdir(parents=True)
         (tmp_path / "index").mkdir(parents=True)
@@ -1620,17 +1652,8 @@ class TestLazyPullDataset:
             str(tmp_path / "tensors" / "hidden_layer000_shard000.safetensors"),
         )
 
-        table = pa.table({
-            "text": pa.array(prompts, type=pa.string()),
-            "label": pa.array([None, None, None], type=pa.int32()),
-            "num_tokens": pa.array([5, 5, 5], type=pa.int32()),
-            "shard_index": pa.array([0, 0, 0], type=pa.int32()),
-            "row_offset": pa.array([0, 1, 2], type=pa.int32()),
-        })
-        pq.write_table(table, str(tmp_path / PARQUET_PATH))
-
         lmprobe_info = {
-            "format_version": "1.1",
+            "format_version": "2.0",
             "model": {"name": TEST_MODEL, "revision": None},
             "num_prompts": 3,
             "prompt_ordering": "random",
@@ -1652,8 +1675,16 @@ class TestLazyPullDataset:
             },
             "provenance": {},
         }
-        with open(tmp_path / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f)
+
+        table = pa.table({
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([None, None, None], type=pa.int32()),
+            "num_tokens": pa.array([5, 5, 5], type=pa.int32()),
+            "shard_index": pa.array([0, 0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1, 2], type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
 
         return tmp_path, prompts, tensor
 
@@ -1802,10 +1833,12 @@ class TestLazyPullDataset:
             assert torch.allclose(pooled, tensor[i : i + 1], atol=1e-6)
 
     def _setup_raw_remote_files(self, tmp_path):
-        """Create remote files with full_sequence storage (v1.1 per-layer)."""
+        """Create remote files with full_sequence storage (v2 per-layer)."""
         import pyarrow as pa
         import pyarrow.parquet as pq
         from safetensors.torch import save_file
+
+        from lmprobe.sharing import _embed_metadata_in_schema
 
         (tmp_path / "tensors").mkdir(parents=True)
         (tmp_path / "index").mkdir(parents=True)
@@ -1828,19 +1861,8 @@ class TestLazyPullDataset:
                 ),
             )
 
-        token_offsets = [0, seq_lens[0]]
-        table = pa.table({
-            "text": pa.array(prompts, type=pa.string()),
-            "label": pa.array([None, None], type=pa.int32()),
-            "num_tokens": pa.array(seq_lens, type=pa.int32()),
-            "shard_index": pa.array([0, 0], type=pa.int32()),
-            "row_offset": pa.array([0, 0], type=pa.int32()),
-            "token_offset": pa.array(token_offsets, type=pa.int32()),
-        })
-        pq.write_table(table, str(tmp_path / PARQUET_PATH))
-
         lmprobe_info = {
-            "format_version": "1.1",
+            "format_version": "2.0",
             "model": {"name": TEST_MODEL, "revision": None},
             "num_prompts": 2,
             "prompt_ordering": "sequential",
@@ -1863,8 +1885,18 @@ class TestLazyPullDataset:
             },
             "provenance": {},
         }
-        with open(tmp_path / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f)
+
+        token_offsets = [0, seq_lens[0]]
+        table = pa.table({
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([None, None], type=pa.int32()),
+            "num_tokens": pa.array(seq_lens, type=pa.int32()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 0], type=pa.int32()),
+            "token_offset": pa.array(token_offsets, type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
 
         return tmp_path, prompts, seq_lens, layers, layer_tensors
 
@@ -2127,7 +2159,6 @@ class TestRoundtrip:
         assert table.num_rows == 2
         expected_cols = {
             "text", "label", "num_tokens", "shard_index", "row_offset",
-            "shard_index_hidden", "row_offset_hidden",
         }
         assert set(table.column_names) == expected_cols
         assert set(table.column("text").to_pylist()) == set(prompts)
@@ -2812,176 +2843,6 @@ class TestPooledStorageUnchanged:
 # =============================================================================
 
 
-class TestV10BackwardCompat:
-    """Test that v1.0 co-located datasets are still readable."""
-
-    @requires_pyarrow
-    @patch("lmprobe.sharing._check_hub_deps")
-    def test_load_activation_dataset_v10(self, mock_deps, tmp_path):
-        """load_activation_dataset reads v1.0 co-located format."""
-        from safetensors.torch import save_file
-
-        (tmp_path / "tensors").mkdir(parents=True)
-
-        tensor = torch.randn(3, HIDDEN_DIM)
-        tensor1 = torch.randn(3, HIDDEN_DIM)
-        save_file(
-            {"hidden.layer_0": tensor, "hidden.layer_1": tensor1},
-            str(tmp_path / "tensors" / "hidden_layers_000.safetensors"),
-        )
-
-        lmprobe_info = {
-            "format_version": "1.0",
-            "model": {"name": TEST_MODEL, "revision": None},
-            "num_prompts": 3,
-            "tensors": {
-                "hidden_layers": {
-                    "type": "hidden",
-                    "layers": [0, 1],
-                    "dim": HIDDEN_DIM,
-                    "dtype": "float32",
-                    "shards": [
-                        {
-                            "file": "tensors/hidden_layers_000.safetensors",
-                            "num_prompts": 3,
-                        }
-                    ],
-                }
-            },
-            "provenance": {},
-        }
-        with open(tmp_path / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f)
-
-        def mock_download(repo_id, filename, **kwargs):
-            return str(tmp_path / filename)
-
-        with patch(
-            "huggingface_hub.hf_hub_download", side_effect=mock_download,
-        ):
-            result, info = load_activation_dataset("user/v10-test")
-
-        assert "hidden.layer_0" in result
-        assert "hidden.layer_1" in result
-        assert result["hidden.layer_0"].shape == (3, HIDDEN_DIM)
-
-    @requires_pyarrow
-    @patch("lmprobe.sharing._check_hub_deps")
-    def test_pull_v10_colocated(self, mock_deps, tmp_path, cache_dir):
-        """pull_dataset reads v1.0 co-located format."""
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        from safetensors.torch import save_file
-
-        remote_dir = tmp_path / "remote"
-        (remote_dir / "tensors").mkdir(parents=True)
-        (remote_dir / "index").mkdir(parents=True)
-
-        prompts = ["v10 prompt 0", "v10 prompt 1"]
-        tensor = torch.randn(2, HIDDEN_DIM)
-        save_file(
-            {"hidden.layer_0": tensor},
-            str(remote_dir / "tensors" / "hidden_layers_000.safetensors"),
-        )
-
-        table = pa.table({
-            "text": pa.array(prompts, type=pa.string()),
-            "label": pa.array([None, None], type=pa.int32()),
-            "num_tokens": pa.array([5, 5], type=pa.int32()),
-            "shard_index": pa.array([0, 0], type=pa.int32()),
-            "row_offset": pa.array([0, 1], type=pa.int32()),
-        })
-        pq.write_table(table, str(remote_dir / PARQUET_PATH))
-
-        lmprobe_info = {
-            "format_version": "1.0",
-            "model": {"name": TEST_MODEL, "revision": None},
-            "num_prompts": 2,
-            "tensors": {
-                "hidden_layers": {
-                    "type": "hidden",
-                    "layers": [0],
-                    "dim": HIDDEN_DIM,
-                    "dtype": "float32",
-                    "pooling": "last_token",
-                    "row_bytes": HIDDEN_DIM * 4,
-                    "shards": [
-                        {
-                            "file": "tensors/hidden_layers_000.safetensors",
-                            "num_prompts": 2,
-                        }
-                    ],
-                }
-            },
-            "provenance": {},
-        }
-        with open(remote_dir / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f)
-
-        def mock_download(repo_id, filename, **kwargs):
-            return str(remote_dir / filename)
-
-        with patch(
-            "huggingface_hub.hf_hub_download", side_effect=mock_download,
-        ):
-            count = pull_dataset("user/v10-test")
-
-        assert count == 2
-
-    @requires_pyarrow
-    @patch("lmprobe.sharing._check_hub_deps")
-    def test_layers_param_ignored_v10(self, mock_deps, tmp_path):
-        """layers param on v1.0 dataset emits warning and is ignored."""
-        from safetensors.torch import save_file
-
-        (tmp_path / "tensors").mkdir(parents=True)
-
-        tensor = torch.randn(3, HIDDEN_DIM)
-        tensor1 = torch.randn(3, HIDDEN_DIM)
-        save_file(
-            {"hidden.layer_0": tensor, "hidden.layer_1": tensor1},
-            str(tmp_path / "tensors" / "hidden_layers_000.safetensors"),
-        )
-
-        lmprobe_info = {
-            "format_version": "1.0",
-            "model": {"name": TEST_MODEL, "revision": None},
-            "num_prompts": 3,
-            "tensors": {
-                "hidden_layers": {
-                    "type": "hidden",
-                    "layers": [0, 1],
-                    "dim": HIDDEN_DIM,
-                    "dtype": "float32",
-                    "shards": [
-                        {
-                            "file": "tensors/hidden_layers_000.safetensors",
-                            "num_prompts": 3,
-                        }
-                    ],
-                }
-            },
-            "provenance": {},
-        }
-        with open(tmp_path / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f)
-
-        def mock_download(repo_id, filename, **kwargs):
-            return str(tmp_path / filename)
-
-        with patch(
-            "huggingface_hub.hf_hub_download", side_effect=mock_download,
-        ):
-            with pytest.warns(UserWarning, match="layers parameter is ignored"):
-                result, info = load_activation_dataset(
-                    "user/v10-test", layers=[0],
-                )
-
-        # Both layers are returned despite layers=[0] filter
-        assert "hidden.layer_0" in result
-        assert "hidden.layer_1" in result
-
-
 @requires_pyarrow
 class TestLayersParam:
     """Test selective layer download with layers parameter."""
@@ -2991,9 +2852,14 @@ class TestLayersParam:
         self, mock_deps, tmp_path,
     ):
         """layers param downloads only requested layers."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
         from safetensors.torch import save_file
 
+        from lmprobe.sharing import _embed_metadata_in_schema
+
         (tmp_path / "tensors").mkdir(parents=True)
+        (tmp_path / "index").mkdir(parents=True)
 
         t0 = torch.randn(3, HIDDEN_DIM)
         t1 = torch.randn(3, HIDDEN_DIM)
@@ -3007,7 +2873,7 @@ class TestLayersParam:
         )
 
         lmprobe_info = {
-            "format_version": "1.1",
+            "format_version": "2.0",
             "model": {"name": TEST_MODEL, "revision": None},
             "num_prompts": 3,
             "tensors": {
@@ -3026,8 +2892,15 @@ class TestLayersParam:
             },
             "provenance": {},
         }
-        with open(tmp_path / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f)
+        table = pa.table({
+            "text": pa.array(["a", "b", "c"], type=pa.string()),
+            "label": pa.array([None, None, None], type=pa.int32()),
+            "num_tokens": pa.array([5, 5, 5], type=pa.int32()),
+            "shard_index": pa.array([0, 0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1, 2], type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
 
         downloaded_files = []
 
@@ -3081,17 +2954,10 @@ class TestLayersParam:
             ),
         )
 
-        table = pa.table({
-            "text": pa.array(prompts, type=pa.string()),
-            "label": pa.array([None, None], type=pa.int32()),
-            "num_tokens": pa.array([5, 5], type=pa.int32()),
-            "shard_index": pa.array([0, 0], type=pa.int32()),
-            "row_offset": pa.array([0, 1], type=pa.int32()),
-        })
-        pq.write_table(table, str(remote_dir / PARQUET_PATH))
+        from lmprobe.sharing import _embed_metadata_in_schema
 
         lmprobe_info = {
-            "format_version": "1.1",
+            "format_version": "2.0",
             "model": {"name": TEST_MODEL, "revision": None},
             "num_prompts": 2,
             "tensors": {
@@ -3110,8 +2976,16 @@ class TestLayersParam:
             },
             "provenance": {},
         }
-        with open(remote_dir / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f)
+
+        table = pa.table({
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([None, None], type=pa.int32()),
+            "num_tokens": pa.array([5, 5], type=pa.int32()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1], type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(remote_dir / PARQUET_PATH))
 
         downloaded_files = []
 
@@ -3208,13 +3082,12 @@ class TestIndependentShardBoundaries:
 
         # Check per-type columns in metadata
         for pm in prompt_metadata:
-            assert "shard_index_hidden" in pm
-            assert "row_offset_hidden" in pm
-            assert "shard_index_logits" in pm
-            assert "row_offset_logits" in pm
-            # Legacy columns present
+            # Hidden uses universal shard_index/row_offset
             assert "shard_index" in pm
             assert "row_offset" in pm
+            # Logits keeps per-type columns
+            assert "shard_index_logits" in pm
+            assert "row_offset_logits" in pm
 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -3268,17 +3141,19 @@ class TestIndependentShardBoundaries:
 
         table = pq.read_table(str(remote_dir / PARQUET_PATH))
         col_names = set(table.column_names)
-        assert "shard_index_hidden" in col_names
-        assert "row_offset_hidden" in col_names
+        # Hidden uses universal shard_index/row_offset (no per-type hidden columns)
+        assert "shard_index_hidden" not in col_names
+        assert "row_offset_hidden" not in col_names
+        # Logits keeps per-type columns
         assert "shard_index_logits" in col_names
         assert "row_offset_logits" in col_names
-        # Legacy columns still present
+        # Universal columns present
         assert "shard_index" in col_names
         assert "row_offset" in col_names
 
-    def test_format_version_is_1_2(self):
-        """Format version is bumped to 1.2."""
-        assert FORMAT_VERSION == "1.2"
+    def test_format_version_is_2_0(self):
+        """Format version is bumped to 2.0."""
+        assert FORMAT_VERSION == "2.0"
 
     @requires_pyarrow
     def test_hidden_only_no_logits_columns(self, tmp_path, monkeypatch):
@@ -3317,8 +3192,9 @@ class TestIndependentShardBoundaries:
         for pm in prompt_metadata:
             assert "shard_index_logits" not in pm
             assert "row_offset_logits" not in pm
-            # Hidden columns present
-            assert "shard_index_hidden" in pm
+            # Universal columns present (used for hidden)
+            assert "shard_index" in pm
+            assert "row_offset" in pm
 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -3400,18 +3276,10 @@ class TestBackwardCompatLegacySingleShardIndex:
             str(remote_dir / "tensors" / "hidden_layer000_shard000.safetensors"),
         )
 
-        # v1.1 Parquet: only legacy columns (no per-type columns)
-        table = pa.table({
-            "text": pa.array(prompts, type=pa.string()),
-            "label": pa.array([None, None], type=pa.int32()),
-            "num_tokens": pa.array([5, 5], type=pa.int32()),
-            "shard_index": pa.array([0, 0], type=pa.int32()),
-            "row_offset": pa.array([0, 1], type=pa.int32()),
-        })
-        pq.write_table(table, str(remote_dir / PARQUET_PATH))
+        from lmprobe.sharing import _embed_metadata_in_schema
 
         lmprobe_info = {
-            "format_version": "1.1",
+            "format_version": "2.0",
             "model": {"name": TEST_MODEL, "revision": None},
             "num_prompts": 2,
             "tensors": {
@@ -3428,8 +3296,17 @@ class TestBackwardCompatLegacySingleShardIndex:
             },
             "provenance": {},
         }
-        with open(remote_dir / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f)
+
+        # v2 Parquet: only legacy columns (no per-type columns)
+        table = pa.table({
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([None, None], type=pa.int32()),
+            "num_tokens": pa.array([5, 5], type=pa.int32()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1], type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(remote_dir / PARQUET_PATH))
 
         def mock_download(repo_id, filename, **kwargs):
             return str(remote_dir / filename)
@@ -3731,8 +3608,8 @@ class TestLastTokenShardSplitting:
                 for sid in shard_ids[:-1]:
                     assert sid >= lt_count
 
-            # Backwards-compat scalars point to last-token shard
-            assert pm["shard_index_hidden"] == shard_ids[-1]
+            # Universal shard_index points to last-token shard
+            assert pm["shard_index"] == shard_ids[-1]
 
     def test_per_token_offsets_consistency(self, populated_raw_cache):
         """token_shard_offsets are valid indices into shard tensors."""
@@ -3911,31 +3788,7 @@ class TestMigrateDataset:
             token_offsets.append(tok_offset)
             tok_offset += sl
 
-        columns = {
-            "text": pa.array(prompts, type=pa.string()),
-            "label": pa.array([0, 1, 0], type=pa.int32()),
-            "num_tokens": pa.array(seq_lens, type=pa.int32()),
-            "shard_index": pa.array(
-                [0] * n_prompts, type=pa.int32(),
-            ),
-            "row_offset": pa.array(
-                list(range(n_prompts)), type=pa.int32(),
-            ),
-            "shard_index_hidden": pa.array(
-                [0] * n_prompts, type=pa.int32(),
-            ),
-            "row_offset_hidden": pa.array(
-                list(range(n_prompts)), type=pa.int32(),
-            ),
-            "token_offset_hidden": pa.array(
-                token_offsets, type=pa.int64(),
-            ),
-            "token_offset": pa.array(
-                token_offsets, type=pa.int64(),
-            ),
-        }
-        table = pa.table(columns)
-        pq.write_table(table, str(dest / PARQUET_PATH))
+        from lmprobe.sharing import _embed_metadata_in_schema
 
         total_tokens = sum(seq_lens)
         lmprobe_info = {
@@ -3962,8 +3815,33 @@ class TestMigrateDataset:
                 "created_at": "2024-01-01T00:00:00+00:00",
             },
         }
-        with open(dest / INFO_FILENAME, "w") as f:
-            json.dump(lmprobe_info, f, indent=2)
+
+        columns = {
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([0, 1, 0], type=pa.int32()),
+            "num_tokens": pa.array(seq_lens, type=pa.int32()),
+            "shard_index": pa.array(
+                [0] * n_prompts, type=pa.int32(),
+            ),
+            "row_offset": pa.array(
+                list(range(n_prompts)), type=pa.int32(),
+            ),
+            "shard_index_hidden": pa.array(
+                [0] * n_prompts, type=pa.int32(),
+            ),
+            "row_offset_hidden": pa.array(
+                list(range(n_prompts)), type=pa.int32(),
+            ),
+            "token_offset_hidden": pa.array(
+                token_offsets, type=pa.int64(),
+            ),
+            "token_offset": pa.array(
+                token_offsets, type=pa.int64(),
+            ),
+        }
+        table = pa.table(columns)
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(dest / PARQUET_PATH))
 
         return {
             "prompts": prompts,
@@ -3974,7 +3852,10 @@ class TestMigrateDataset:
 
     def test_migrate_rejects_non_full_sequence(self, tmp_path):
         """migrate_dataset raises on pooled datasets."""
-        from lmprobe.sharing import migrate_dataset
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from lmprobe.sharing import _embed_metadata_in_schema, migrate_dataset
 
         old_dir = tmp_path / "old"
         old_dir.mkdir()
@@ -3993,16 +3874,12 @@ class TestMigrateDataset:
                 },
             },
         }
-        with open(old_dir / INFO_FILENAME, "w") as f:
-            json.dump(info, f)
-
-        import pyarrow as pa
-        import pyarrow.parquet as pq
 
         table = pa.table({
             "text": ["a"], "label": [0], "num_tokens": [1],
             "shard_index": [0], "row_offset": [0],
         })
+        table = _embed_metadata_in_schema(table, info)
         pq.write_table(table, str(old_dir / PARQUET_PATH))
 
         def mock_dl(repo_id, filename, **kwargs):
@@ -4021,7 +3898,10 @@ class TestMigrateDataset:
 
     def test_migrate_rejects_already_migrated(self, tmp_path):
         """migrate_dataset raises on already-migrated datasets."""
-        from lmprobe.sharing import migrate_dataset
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from lmprobe.sharing import _embed_metadata_in_schema, migrate_dataset
 
         old_dir = tmp_path / "old"
         old_dir.mkdir()
@@ -4041,16 +3921,12 @@ class TestMigrateDataset:
                 },
             },
         }
-        with open(old_dir / INFO_FILENAME, "w") as f:
-            json.dump(info, f)
-
-        import pyarrow as pa
-        import pyarrow.parquet as pq
 
         table = pa.table({
             "text": ["a"], "label": [0], "num_tokens": [1],
             "shard_index": [0], "row_offset": [0],
         })
+        table = _embed_metadata_in_schema(table, info)
         pq.write_table(table, str(old_dir / PARQUET_PATH))
 
         def mock_dl(repo_id, filename, **kwargs):
@@ -4217,3 +4093,257 @@ class TestMigrateDataset:
                     orig_rest, atol=1e-6,
                 )
                 offset += n_rest
+
+
+@requires_pyarrow
+class TestUpgradeDatasetFormat:
+    """Tests for upgrade_dataset_format: v1→v2 metadata migration."""
+
+    def _make_v1_dataset(self, tmp_path):
+        """Create a realistic v1 dataset with JSON sidecar and parquet index."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir(parents=True)
+
+        # Realistic v1 metadata (based on real-world latent-lab dataset)
+        v1_info = {
+            "format_version": "1.1",
+            "model": {"name": "meta-llama/Llama-3.1-405B", "revision": None},
+            "num_prompts": 3,
+            "prompt_ordering": "random",
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0, 1],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float16",
+                    "layout": "per_layer",
+                    "storage": "full_sequence",
+                    "shards": [
+                        {"num_prompts": 3, "num_tokens": 3},
+                        {"num_prompts": 2, "num_tokens": 8},
+                    ],
+                    "last_token_shards": 1,
+                }
+            },
+            "provenance": {
+                "lmprobe_version": "0.8.0",
+                "extraction_backend": "ndif",
+                "created_at": "2025-03-19T00:00:00+00:00",
+            },
+        }
+
+        # Write v1 JSON sidecar
+        info_path = tmp_path / INFO_FILENAME
+        info_path.write_text(json.dumps(v1_info))
+
+        # Write v1 parquet with per-type hidden columns
+        table = pa.table({
+            "text": pa.array(["p0", "p1", "p2"], type=pa.string()),
+            "label": pa.array([None, None, None], type=pa.int32()),
+            "num_tokens": pa.array([5, 7, 4], type=pa.int32()),
+            "shard_index": pa.array([0, 0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1, 2], type=pa.int32()),
+            # v1 per-type hidden columns (should be dropped by migration)
+            "shard_index_hidden": pa.array([0, 0, 0], type=pa.int32()),
+            "row_offset_hidden": pa.array([0, 1, 2], type=pa.int32()),
+            "token_offset_hidden": pa.array([0, 5, 12], type=pa.int64()),
+        })
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+
+        return tmp_path, v1_info
+
+    def _run_upgrade(self, tmp_path, dest_path):
+        """Run upgrade_dataset_format with mocked HF API, capturing uploaded parquet."""
+        uploaded = {}
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(tmp_path / filename)
+
+        def mock_create_commit(repo_id, operations, **kwargs):
+            for op in operations:
+                p = getattr(op, "path_or_fileobj", None)
+                if isinstance(p, str) and Path(p).exists():
+                    shutil.copy2(p, dest_path)
+                    uploaded[op.path_in_repo] = str(dest_path)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ), patch(
+            "huggingface_hub.HfApi", return_value=MagicMock(
+                create_commit=mock_create_commit,
+            ),
+        ), patch(
+            "huggingface_hub.CommitOperationAdd",
+            side_effect=lambda **kw: MagicMock(**kw),
+        ), patch(
+            "huggingface_hub.CommitOperationDelete",
+            side_effect=lambda **kw: MagicMock(**kw),
+        ):
+            url = upgrade_dataset_format("user/test-v1")
+
+        return url, uploaded
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_injects_file_pattern_and_key_pattern(
+        self, mock_pa, mock_deps, tmp_path
+    ):
+        """Migration should add file_pattern/key_pattern to tensor descriptors."""
+        remote_dir, _ = self._make_v1_dataset(tmp_path)
+        dest = tmp_path / "uploaded.parquet"
+        url, uploaded = self._run_upgrade(remote_dir, dest)
+
+        assert "user/test-v1" in url
+
+        import pyarrow.parquet as pq
+        schema = pq.read_schema(str(dest))
+        tensors_raw = json.loads(schema.metadata[b"lmprobe:tensors"])
+        hidden = tensors_raw["hidden_layers"]
+
+        assert hidden["file_pattern"] == (
+            "tensors/hidden_layer{layer:03d}_shard{shard:03d}.safetensors"
+        )
+        assert hidden["key_pattern"] == "hidden.layer_{layer}"
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_drops_per_type_hidden_columns(
+        self, mock_pa, mock_deps, tmp_path
+    ):
+        """Migration should drop shard_index_hidden etc. from parquet."""
+        remote_dir, _ = self._make_v1_dataset(tmp_path)
+        dest = tmp_path / "uploaded.parquet"
+        self._run_upgrade(remote_dir, dest)
+
+        import pyarrow.parquet as pq
+        cols = set(pq.read_table(str(dest)).column_names)
+
+        assert "shard_index" in cols
+        assert "row_offset" in cols
+        assert "shard_index_hidden" not in cols
+        assert "row_offset_hidden" not in cols
+        assert "token_offset_hidden" not in cols
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_stamps_format_version_2(
+        self, mock_pa, mock_deps, tmp_path
+    ):
+        """Migration should set format_version to 2.0."""
+        remote_dir, _ = self._make_v1_dataset(tmp_path)
+        dest = tmp_path / "uploaded.parquet"
+        self._run_upgrade(remote_dir, dest)
+
+        import pyarrow.parquet as pq
+        schema = pq.read_schema(str(dest))
+        version = json.loads(schema.metadata[b"lmprobe:format_version"])
+        assert version == FORMAT_VERSION
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_renames_tensor_types_key(
+        self, mock_pa, mock_deps, tmp_path
+    ):
+        """Very old datasets with tensor_types key should be renamed to tensors."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir(parents=True)
+
+        v1_info = {
+            "format_version": "1.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 2,
+            "tensor_types": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "layout": "per_layer",
+                    "storage": "pooled",
+                    "shards": [{"num_prompts": 2}],
+                }
+            },
+            "provenance": {},
+        }
+        (tmp_path / INFO_FILENAME).write_text(json.dumps(v1_info))
+        table = pa.table({
+            "text": pa.array(["a", "b"], type=pa.string()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1], type=pa.int32()),
+        })
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+
+        dest = tmp_path / "uploaded.parquet"
+        self._run_upgrade(tmp_path, dest)
+
+        schema = pq.read_schema(str(dest))
+        meta = schema.metadata
+        assert b"lmprobe:tensors" in meta
+        assert b"lmprobe:tensor_types" not in meta
+        tensors = json.loads(meta[b"lmprobe:tensors"])
+        assert "file_pattern" in tensors["hidden_layers"]
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_logits_get_file_pattern(
+        self, mock_pa, mock_deps, tmp_path
+    ):
+        """Migration should inject file_pattern into logits_topk descriptor."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir(parents=True)
+
+        v1_info = {
+            "format_version": "1.1",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 2,
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "layout": "per_layer",
+                    "storage": "pooled",
+                    "shards": [{"num_prompts": 2}],
+                },
+                "logits_topk": {
+                    "type": "logits_topk",
+                    "k": 50,
+                    "dtype": "float32",
+                    "pooling": "last_token",
+                    "shards": [
+                        {"file": "tensors/logits_topk_000.safetensors",
+                         "num_prompts": 2},
+                    ],
+                },
+            },
+            "provenance": {},
+        }
+        (tmp_path / INFO_FILENAME).write_text(json.dumps(v1_info))
+        table = pa.table({
+            "text": pa.array(["a", "b"], type=pa.string()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1], type=pa.int32()),
+            "shard_index_logits": pa.array([0, 0], type=pa.int32()),
+            "row_offset_logits": pa.array([0, 1], type=pa.int32()),
+        })
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+
+        dest = tmp_path / "uploaded.parquet"
+        self._run_upgrade(tmp_path, dest)
+
+        schema = pq.read_schema(str(dest))
+        tensors = json.loads(schema.metadata[b"lmprobe:tensors"])
+        assert tensors["logits_topk"]["file_pattern"] == (
+            "tensors/logits_topk_{shard:03d}.safetensors"
+        )
+        # Logits columns should NOT be dropped
+        cols = set(pq.read_table(str(dest)).column_names)
+        assert "shard_index_logits" in cols
+        assert "row_offset_logits" in cols

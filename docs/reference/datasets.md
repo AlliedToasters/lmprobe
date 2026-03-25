@@ -54,6 +54,11 @@ See the [HuggingFace Datasets guide](../guides/datasets.md) for a walkthrough.
       show_root_heading: true
       show_source: false
 
+::: lmprobe.sharing.upgrade_dataset_format
+    options:
+      show_root_heading: true
+      show_source: false
+
 ::: lmprobe.sharing.DatasetMetadata
     options:
       show_root_heading: true

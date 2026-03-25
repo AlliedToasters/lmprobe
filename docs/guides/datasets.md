@@ -241,6 +241,21 @@ X = tensors["hidden.layer_16"].numpy()
 
 ---
 
+## Upgrading v1 datasets
+
+Datasets created with lmprobe < 0.9.0 use v1 format (separate `lmprobe_info.json` sidecar). Upgrade them to v2 (metadata embedded in Parquet schema) with a single call — no tensor data is reprocessed:
+
+```python
+from lmprobe import upgrade_dataset_format
+
+url = upgrade_dataset_format("username/my-activations")
+print(url)
+```
+
+This downloads the Parquet index and JSON sidecar, embeds the metadata into the Parquet schema, re-uploads the updated Parquet, and deletes the old JSON file. Takes seconds.
+
+---
+
 ## Typical workflows
 
 ### Research: share activations with collaborators
