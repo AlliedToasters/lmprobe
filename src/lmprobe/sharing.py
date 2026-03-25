@@ -2648,6 +2648,9 @@ def pull_dataset(
     else:
         prompt_indices = list(range(n_prompts))
 
+    # Save all requested indices for registry building (before dedup filtering)
+    all_prompt_indices = list(prompt_indices)
+
     # Dedup: skip already-cached
     if not overwrite:
         new_indices = []
@@ -2662,40 +2665,11 @@ def pull_dataset(
             )
         prompt_indices = new_indices
 
-    if not prompt_indices:
-        logger.info("[SHARING] All prompts already cached locally")
-        return 0
-
     # Determine tensor types to pull
     if tensors is not None:
         pull_types = [k for k in tensor_descriptors if k in tensors]
     else:
         pull_types = list(tensor_descriptors.keys())
-
-    # Figure out which shards we need (v1.2: per-type shard indices)
-    # When token_shard_ids is present (v1.3 full_sequence datasets),
-    # collect all unique shard IDs across all tokens for each prompt.
-    has_token_shard_ids = "token_shard_ids" in index
-    needed_shards: dict[str, set[int]] = {}
-    for i in prompt_indices:
-        for t_type in pull_types:
-            if (
-                t_type == "hidden_layers"
-                and has_token_shard_ids
-            ):
-                # Per-token shard mapping: collect all shards for this prompt
-                for si in index["token_shard_ids"][i]:
-                    needed_shards.setdefault(t_type, set()).add(si)
-            elif t_type == "logits_topk" and "shard_index_logits" in index:
-                si = index["shard_index_logits"][i]
-                needed_shards.setdefault(t_type, set()).add(si)
-            elif t_type == "hidden_layers" and "shard_index_hidden" in index:
-                si = index["shard_index_hidden"][i]
-                needed_shards.setdefault(t_type, set()).add(si)
-            else:
-                # Legacy v1.1 fallback: single shard_index for all types
-                si = index["shard_index"][i]
-                needed_shards.setdefault(t_type, set()).add(si)
 
     # Download shard files and record local paths
     # For per-layer layout (v1.1), we download per-layer files
@@ -2703,85 +2677,117 @@ def pull_dataset(
     shard_local_paths: dict[str, dict[int, str]] = {}  # t_type -> shard_idx -> path
     # Per-layer: t_type -> shard_idx -> {layer: path}
     per_layer_paths: dict[str, dict[int, dict[int, str]]] = {}
+    needed_shards: dict[str, set[int]] = {}
 
-    # Count total files to download for progress
-    _total_shard_files = 0
-    for t_type in pull_types:
-        t_info = tensor_descriptors[t_type]
-        layout = t_info.get("layout")
-        n_shards = len(needed_shards.get(t_type, []))
-        if layout == "per_layer":
-            all_layers = t_info.get("layers", [])
-            dl_layers = all_layers if layers is None else [ly for ly in all_layers if ly in layers]
-            _total_shard_files += n_shards * len(dl_layers)
-        else:
-            _total_shard_files += n_shards
-    logger.info(
-        "[SHARING] Downloading %d shard files from HF...", _total_shard_files
-    )
-    _downloaded_count = 0
+    if not prompt_indices:
+        logger.info("[SHARING] All prompts already cached locally, skipping downloads")
+    else:
+        # Figure out which shards we need (v1.2: per-type shard indices)
+        # When token_shard_ids is present (v1.3 full_sequence datasets),
+        # collect all unique shard IDs across all tokens for each prompt.
+        has_token_shard_ids = "token_shard_ids" in index
+        for i in prompt_indices:
+            for t_type in pull_types:
+                if (
+                    t_type == "hidden_layers"
+                    and has_token_shard_ids
+                ):
+                    # Per-token shard mapping: collect all shards for this prompt
+                    for si in index["token_shard_ids"][i]:
+                        needed_shards.setdefault(t_type, set()).add(si)
+                elif t_type == "logits_topk" and "shard_index_logits" in index:
+                    si = index["shard_index_logits"][i]
+                    needed_shards.setdefault(t_type, set()).add(si)
+                elif t_type == "hidden_layers" and "shard_index_hidden" in index:
+                    si = index["shard_index_hidden"][i]
+                    needed_shards.setdefault(t_type, set()).add(si)
+                else:
+                    # Legacy v1.1 fallback: single shard_index for all types
+                    si = index["shard_index"][i]
+                    needed_shards.setdefault(t_type, set()).add(si)
 
-    for t_type in pull_types:
-        t_info = tensor_descriptors[t_type]
-        shards = t_info["shards"]
-        layout = t_info.get("layout")
+        # Count total files to download for progress
+        _total_shard_files = 0
+        for t_type in pull_types:
+            t_info = tensor_descriptors[t_type]
+            layout = t_info.get("layout")
+            n_shards = len(needed_shards.get(t_type, []))
+            if layout == "per_layer":
+                all_layers = t_info.get("layers", [])
+                dl_layers = all_layers if layers is None else [ly for ly in all_layers if ly in layers]
+                _total_shard_files += n_shards * len(dl_layers)
+            else:
+                _total_shard_files += n_shards
+        logger.info(
+            "[SHARING] Downloading %d shard files from HF...", _total_shard_files
+        )
+        _downloaded_count = 0
 
-        if layout == "per_layer":
-            # v1.1 per-layer layout: derive filenames
-            all_layers = t_info.get("layers", [])
-            download_layers = all_layers
-            if layers is not None:
-                download_layers = [ly for ly in all_layers if ly in layers]
+        for t_type in pull_types:
+            t_info = tensor_descriptors[t_type]
+            shards = t_info["shards"]
+            layout = t_info.get("layout")
 
-            per_layer_paths[t_type] = {}
-            for shard_idx in sorted(needed_shards.get(t_type, [])):
-                if shard_idx >= len(shards):
-                    continue
-                per_layer_paths[t_type][shard_idx] = {}
-                for layer in download_layers:
-                    fname = (
-                        f"tensors/hidden_layer{layer:03d}"
-                        f"_shard{shard_idx:03d}.safetensors"
+            if layout == "per_layer":
+                # v1.1 per-layer layout: derive filenames
+                all_layers = t_info.get("layers", [])
+                download_layers = all_layers
+                if layers is not None:
+                    download_layers = [ly for ly in all_layers if ly in layers]
+
+                per_layer_paths[t_type] = {}
+                for shard_idx in sorted(needed_shards.get(t_type, [])):
+                    if shard_idx >= len(shards):
+                        continue
+                    per_layer_paths[t_type][shard_idx] = {}
+                    for layer in download_layers:
+                        fname = (
+                            f"tensors/hidden_layer{layer:03d}"
+                            f"_shard{shard_idx:03d}.safetensors"
+                        )
+                        shard_path = hf_hub_download(
+                            repo_id, fname,
+                            repo_type="dataset", token=token,
+                        )
+                        _downloaded_count += 1
+                        _step = max(1, _total_shard_files // 10)
+                        if _total_shard_files > 10 and _downloaded_count % _step == 0:
+                            logger.info(
+                                "[SHARING] Downloaded %d/%d shard files...",
+                                _downloaded_count, _total_shard_files,
+                            )
+                        per_layer_paths[t_type][shard_idx][layer] = shard_path
+            else:
+                # v1.0 co-located layout
+                if layers is not None:
+                    warnings.warn(
+                        "layers parameter is ignored for v1.0 co-located datasets "
+                        "(all layers are in the same file)",
+                        stacklevel=2,
                     )
+                shard_local_paths[t_type] = {}
+                for shard_idx in sorted(needed_shards.get(t_type, [])):
+                    if shard_idx >= len(shards):
+                        continue
+                    shard = shards[shard_idx]
                     shard_path = hf_hub_download(
-                        repo_id, fname,
+                        repo_id, shard["file"],
                         repo_type="dataset", token=token,
                     )
                     _downloaded_count += 1
-                    _step = max(1, _total_shard_files // 10)
-                    if _total_shard_files > 10 and _downloaded_count % _step == 0:
-                        logger.info(
-                            "[SHARING] Downloaded %d/%d shard files...",
-                            _downloaded_count, _total_shard_files,
-                        )
-                    per_layer_paths[t_type][shard_idx][layer] = shard_path
-        else:
-            # v1.0 co-located layout
-            if layers is not None:
-                warnings.warn(
-                    "layers parameter is ignored for v1.0 co-located datasets "
-                    "(all layers are in the same file)",
-                    stacklevel=2,
-                )
-            shard_local_paths[t_type] = {}
-            for shard_idx in sorted(needed_shards.get(t_type, [])):
-                if shard_idx >= len(shards):
-                    continue
-                shard = shards[shard_idx]
-                shard_path = hf_hub_download(
-                    repo_id, shard["file"],
-                    repo_type="dataset", token=token,
-                )
-                _downloaded_count += 1
-                shard_local_paths[t_type][shard_idx] = shard_path
+                    shard_local_paths[t_type][shard_idx] = shard_path
 
-    if _total_shard_files > 0:
-        logger.info(
-            "[SHARING] Downloaded %d/%d shard files",
-            _downloaded_count, _total_shard_files,
-        )
+        if _total_shard_files > 0:
+            logger.info(
+                "[SHARING] Downloaded %d/%d shard files",
+                _downloaded_count, _total_shard_files,
+            )
 
     # ---- Build shard registry (manifest + index) ----
+    # Always build the registry using ALL requested prompts (not just the
+    # ones that needed downloading).  The registry is metadata about where
+    # prompts live inside shard files — _lookup_shard() and
+    # _load_pooled_from_shard() need it even when per-prompt caches exist.
     logger.info("[SHARING] Building shard registry...")
     # Manifest: tensor descriptors with local shard paths
     manifest_tensors = {}
@@ -2814,8 +2820,10 @@ def pull_dataset(
 
     # Shard index: prompt_hash -> offset info
     # write_shard_registry merges with existing index automatically
+    # Use all_prompt_indices (pre-dedup) so the registry covers every prompt,
+    # not just those that needed downloading.
     shard_index: dict[str, Any] = {}
-    for i in prompt_indices:
+    for i in all_prompt_indices:
         prompt_text = index["text"][i]
         prompt_hash = _hash_string(prompt_text)
         entry: dict[str, Any] = {
@@ -2842,9 +2850,12 @@ def pull_dataset(
     _n_layers = len(tensor_descriptors.get("hidden_layers", {}).get("layers", []))
     logger.info(
         "[SHARING] Shard registry ready (%d prompts%s)",
-        len(prompt_indices),
+        len(all_prompt_indices),
         f", {_n_layers} layers" if _n_layers > 0 else "",
     )
+
+    if not prompt_indices:
+        return 0
 
     total_prompts = len(prompt_indices)
 
