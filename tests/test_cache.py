@@ -1281,6 +1281,11 @@ class TestSelectiveTensorLoading:
 
         cache_mod._backend = None
 
+        # Clear header caches so range-read counts are deterministic
+        from lmprobe.cache import _clear_selective_caches
+
+        _clear_selective_caches()
+
         # Save some test data (hidden_dim=48 splits evenly across 3 layers → 16 each)
         acts = torch.randn(1, 5, 48)
         mask = torch.ones(1, 5)
