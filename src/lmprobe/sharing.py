@@ -71,6 +71,50 @@ _tokenizer_cache: dict[str, Any] = {}
 
 
 # =============================================================================
+# Shared metadata helpers
+# =============================================================================
+
+
+def _check_format_version(lmprobe_info: dict, *, check_minor: bool = True) -> None:
+    """Validate remote format version against local FORMAT_VERSION.
+
+    Raises ValueError on major mismatch; warns on minor mismatch if
+    *check_minor* is True.
+    """
+    remote_version = lmprobe_info.get("format_version", "1.0")
+    remote_major = int(remote_version.split(".")[0])
+    local_major = int(FORMAT_VERSION.split(".")[0])
+    if remote_major != local_major:
+        raise ValueError(
+            f"Incompatible format version: remote has {remote_version}, "
+            f"lmprobe supports {FORMAT_VERSION}. "
+            f"Please upgrade lmprobe: pip install --upgrade lmprobe"
+        )
+    if check_minor:
+        remote_minor = int(remote_version.split(".")[1])
+        local_minor = int(FORMAT_VERSION.split(".")[1])
+        if remote_minor > local_minor:
+            warnings.warn(
+                f"Remote format {remote_version} is newer than supported "
+                f"{FORMAT_VERSION}. Some tensor types may be skipped.",
+                stacklevel=3,
+            )
+
+
+def _extract_model_name(lmprobe_info: dict) -> str:
+    """Extract model name from lmprobe_info, supporting both canonical and legacy formats."""
+    model_obj = lmprobe_info.get("model")
+    if isinstance(model_obj, dict):
+        return model_obj["name"]
+    if "model_name" in lmprobe_info:
+        return lmprobe_info["model_name"]
+    raise KeyError(
+        "lmprobe_info.json missing model name — expected 'model.name' "
+        "or top-level 'model_name'"
+    )
+
+
+# =============================================================================
 # Dependency checks
 # =============================================================================
 
@@ -1257,6 +1301,19 @@ def _consolidate_and_shard(
 
     # --- Write shards per tensor type ---
 
+    def _save_shard(
+        rows: list[torch.Tensor],
+        key: str,
+        fname: str,
+    ) -> None:
+        """Concatenate rows, save shard, invoke callback."""
+        if rows:
+            layer_tensor = {key: torch.cat(rows, dim=0)}
+            save_file(layer_tensor, str(tmpdir / fname))
+            if on_shard_written is not None:
+                on_shard_written(tmpdir / fname, fname)
+            del layer_tensor
+
     # --- Hidden pass ---
     if has_hidden and hidden_boundaries:
         # Phase 4b: Write per-layer shard files one layer at a time.
@@ -1294,12 +1351,7 @@ def _consolidate_and_shard(
                         sliced = slice_fn(t)
                         if sliced.shape[0] > 0:
                             rows.append(sliced)
-                if rows:
-                    layer_tensor = {key: torch.cat(rows, dim=0)}
-                    save_file(layer_tensor, str(tmpdir / fname))
-                    if on_shard_written is not None:
-                        on_shard_written(tmpdir / fname, fname)
-                    del layer_tensor
+                _save_shard(rows, key, fname)
                 del rows
                 offset += shard_size
                 pbar.update(1)
@@ -1432,12 +1484,7 @@ def _consolidate_and_shard(
                                 f"(cache may have been modified "
                                 f"concurrently): {e}"
                             ) from e
-                    if rows:
-                        layer_tensor = {key: torch.cat(rows, dim=0)}
-                        save_file(layer_tensor, str(tmpdir / fname))
-                        if on_shard_written is not None:
-                            on_shard_written(tmpdir / fname, fname)
-                        del layer_tensor
+                    _save_shard(rows, key, fname)
                     del rows
                     offset += shard_size
                     pbar.update(1)
@@ -2499,16 +2546,7 @@ def fetch_dataset_metadata(
 
     # Support both canonical format (model.name, tensors) and legacy
     # format (model_name, tensor_types) written by custom staging scripts.
-    model_obj = lmprobe_info.get("model")
-    if isinstance(model_obj, dict):
-        model_name = model_obj["name"]
-    elif "model_name" in lmprobe_info:
-        model_name = lmprobe_info["model_name"]
-    else:
-        raise KeyError(
-            "lmprobe_info.json missing model name — expected 'model.name' "
-            "or top-level 'model_name'"
-        )
+    model_name = _extract_model_name(lmprobe_info)
     format_version = lmprobe_info.get("format_version", "1.0")
     tensor_descriptors = lmprobe_info.get("tensors") or lmprobe_info.get("tensor_types") or {}
 
@@ -2604,34 +2642,9 @@ def pull_dataset(
         lmprobe_info = json.load(f)
 
     # Version check
-    remote_version = lmprobe_info.get("format_version", "1.0")
-    remote_major = int(remote_version.split(".")[0])
-    local_major = int(FORMAT_VERSION.split(".")[0])
-    if remote_major != local_major:
-        raise ValueError(
-            f"Incompatible format version: remote has {remote_version}, "
-            f"lmprobe supports {FORMAT_VERSION}. "
-            f"Please upgrade lmprobe: pip install --upgrade lmprobe"
-        )
-    remote_minor = int(remote_version.split(".")[1])
-    local_minor = int(FORMAT_VERSION.split(".")[1])
-    if remote_minor > local_minor:
-        warnings.warn(
-            f"Remote format {remote_version} is newer than supported "
-            f"{FORMAT_VERSION}. Some tensor types may be skipped.",
-            stacklevel=2,
-        )
+    _check_format_version(lmprobe_info)
 
-    model_obj = lmprobe_info.get("model")
-    if isinstance(model_obj, dict):
-        model_name = model_obj["name"]
-    elif "model_name" in lmprobe_info:
-        model_name = lmprobe_info["model_name"]
-    else:
-        raise KeyError(
-            "lmprobe_info.json missing model name — expected 'model.name' "
-            "or top-level 'model_name'"
-        )
+    model_name = _extract_model_name(lmprobe_info)
     tensor_descriptors = lmprobe_info.get("tensors") or lmprobe_info.get("tensor_types") or {}
 
     # Read Parquet index
@@ -2657,9 +2670,14 @@ def pull_dataset(
     # Dedup: skip already-cached
     if not overwrite:
         new_indices = []
+        requested_layers = set(layers) if layers is not None else None
         for i in prompt_indices:
             existing = discover_cached(model_name, index["text"][i])
             if existing is None:
+                new_indices.append(i)
+            elif requested_layers is not None and not requested_layers.issubset(
+                set(existing.raw_layers)
+            ):
                 new_indices.append(i)
         skipped = len(prompt_indices) - len(new_indices)
         if skipped > 0:
@@ -2926,6 +2944,15 @@ def _unpack_shard_prompts(
     from safetensors import safe_open
     from tqdm import tqdm
 
+    from .cache import (
+        _LOGITS_TOP_K_INDICES_KEY,
+        _LOGITS_TOP_K_VALUES_KEY,
+        _merge_save_backend,
+        _prepare_tensor,
+        _prompt_cache_key,
+        _register_model,
+    )
+
     has_token_shard_ids = "token_shard_ids" in index
     storage = t_info.get("storage", "pooled")
 
@@ -3056,15 +3083,6 @@ def _unpack_shard_prompts(
             i_row = tensors_data["logits_topk.indices"][
                 row_offset : row_offset + 1
             ]
-            from .cache import (
-                _LOGITS_TOP_K_INDICES_KEY,
-                _LOGITS_TOP_K_VALUES_KEY,
-                _merge_save_backend,
-                _prepare_tensor,
-                _prompt_cache_key,
-                _register_model,
-            )
-
             _register_model(model_name)
             cache_key = _prompt_cache_key(model_name, prompt_text)
             new_tensors = {
@@ -3213,15 +3231,7 @@ def load_activation_dataset(
         lmprobe_info = json.load(f)
 
     # Version check
-    remote_version = lmprobe_info.get("format_version", "1.0")
-    remote_major = int(remote_version.split(".")[0])
-    local_major = int(FORMAT_VERSION.split(".")[0])
-    if remote_major != local_major:
-        raise ValueError(
-            f"Incompatible format version: remote has {remote_version}, "
-            f"lmprobe supports {FORMAT_VERSION}. "
-            f"Please upgrade lmprobe: pip install --upgrade lmprobe"
-        )
+    _check_format_version(lmprobe_info, check_minor=False)
 
     tensor_descriptors = lmprobe_info.get("tensors") or lmprobe_info.get("tensor_types") or {}
 
@@ -3454,13 +3464,7 @@ def migrate_dataset(
     hidden_dim = hidden_info.get("dim")
     old_shards = hidden_info.get("shards", [])
 
-    model_obj = lmprobe_info.get("model")
-    if isinstance(model_obj, dict):
-        model_name = model_obj["name"]
-    elif "model_name" in lmprobe_info:
-        model_name = lmprobe_info["model_name"]
-    else:
-        raise KeyError("lmprobe_info.json missing model name")
+    model_name = _extract_model_name(lmprobe_info)
 
     old_shard_boundaries: list[int] = [
         s["num_prompts"] for s in old_shards
