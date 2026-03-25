@@ -364,12 +364,7 @@ def _has_logits_in_keys(
     tensor_keys: set[str] | list[str],
     top_k: bool | None = None,
 ) -> bool:
-    """Check whether logits data is present in a set of tensor keys.
-
-    If *top_k* is True, checks for top-k value+index keys.
-    If *top_k* is False or None, checks for full logits key.
-    If *top_k* is None (autodetect), returns True if either form is found.
-    """
+    """True if logits keys present. *top_k*: True=topk only, False=full only, None=either."""
     has_full = _LOGITS_KEY in tensor_keys
     has_topk = (
         _LOGITS_TOP_K_VALUES_KEY in tensor_keys
@@ -558,11 +553,7 @@ def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
 
 
 def _prompt_key(model_name: str, prompt: str, suffix: str = "") -> str:
-    """Get the backend key for a prompt's safetensors file.
-
-    *suffix* is inserted before ``.safetensors``, e.g. ``".logits"`` or
-    ``".perplexity"``.
-    """
+    """Backend key for a prompt file. *suffix* e.g. ``".logits"``."""
     model_hash = _hash_string(model_name)
     prompt_hash = _hash_string(prompt)
     return f"{model_hash}/{prompt_hash}{suffix}.safetensors"
@@ -2248,11 +2239,7 @@ def _select_positions(
     attention_mask: torch.Tensor,
     positions: str,
 ) -> torch.Tensor:
-    """Select token positions from a (1, seq_len, ...) tensor.
-
-    Returns a tensor with the same rank but only the selected positions
-    along dim=1.
-    """
+    """Slice token positions ("last" or "all") from a (1, seq_len, ...) tensor."""
     if positions == "last":
         mask = attention_mask[0]  # (seq_len,)
         last_pos = mask.nonzero(as_tuple=True)[0][-1].item()
@@ -2634,11 +2621,7 @@ def _update_tensor_flags(
     all_layers: set[int],
     flags: dict[str, bool],
 ) -> None:
-    """Update layer set and boolean flags from safetensors tensor keys.
-
-    Mutates *all_layers* and *flags* in place.  Expects *flags* to have
-    ``has_pooled``, ``has_perplexity``, and ``has_logits`` keys.
-    """
+    """Mutate *all_layers* and *flags* from safetensors tensor keys."""
     all_layers |= _parse_raw_layer_keys(tensor_keys)
     if any(k.startswith("pooled_") for k in tensor_keys):
         flags["has_pooled"] = True

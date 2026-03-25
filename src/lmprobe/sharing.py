@@ -76,11 +76,7 @@ _tokenizer_cache: dict[str, Any] = {}
 
 
 def _check_format_version(lmprobe_info: dict, *, check_minor: bool = True) -> None:
-    """Validate remote format version against local FORMAT_VERSION.
-
-    Raises ValueError on major mismatch; warns on minor mismatch if
-    *check_minor* is True.
-    """
+    """Raise on major version mismatch; warn on minor if *check_minor*."""
     remote_version = lmprobe_info.get("format_version", "1.0")
     remote_major = int(remote_version.split(".")[0])
     local_major = int(FORMAT_VERSION.split(".")[0])
