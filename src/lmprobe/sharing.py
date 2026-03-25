@@ -2679,14 +2679,23 @@ def pull_dataset(
     per_layer_paths: dict[str, dict[int, dict[int, str]]] = {}
     needed_shards: dict[str, set[int]] = {}
 
-    if not prompt_indices:
+    # In lazy mode (materialize=False), shard files are needed for ALL
+    # requested prompts — the registry serves activations from shard files
+    # regardless of whether per-prompt cache entries exist.  Per-prompt
+    # sidecar files (e.g. perplexity) do NOT contain hidden-layer data,
+    # so dedup-filtering must not gate shard downloads in lazy mode.
+    shard_source_indices = (
+        all_prompt_indices if not materialize else prompt_indices
+    )
+
+    if not shard_source_indices:
         logger.info("[SHARING] All prompts already cached locally, skipping downloads")
     else:
         # Figure out which shards we need (v1.2: per-type shard indices)
         # When token_shard_ids is present (v1.3 full_sequence datasets),
         # collect all unique shard IDs across all tokens for each prompt.
         has_token_shard_ids = "token_shard_ids" in index
-        for i in prompt_indices:
+        for i in shard_source_indices:
             for t_type in pull_types:
                 if (
                     t_type == "hidden_layers"
@@ -2857,17 +2866,18 @@ def pull_dataset(
         f", {_n_layers} layers" if _n_layers > 0 else "",
     )
 
+    if not materialize:
+        total_registered = len(all_prompt_indices)
+        logger.info(
+            f"[SHARING] Registered {total_registered} prompts in shard registry "
+            f"(lazy mode, no per-prompt files)"
+        )
+        return total_registered
+
     if not prompt_indices:
         return 0
 
     total_prompts = len(prompt_indices)
-
-    if not materialize:
-        logger.info(
-            f"[SHARING] Registered {total_prompts} prompts in shard registry "
-            f"(lazy mode, no per-prompt files)"
-        )
-        return total_prompts
 
     # ---- Materialize: unpack per-prompt files (old behavior) ----
     _materialize_prompts(
