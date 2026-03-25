@@ -1998,21 +1998,32 @@ def load_pooled_batch(
     from .pooling import get_pooling_fn
 
     rows: list[torch.Tensor] = []
+    missing: list[str] = []
+    pool_fn = get_pooling_fn(pooling) if fallback_to_raw else None
     for prompt in prompts:
         try:
-            pooled = load_prompt_pooled_activations(
+            rows.append(load_prompt_pooled_activations(
                 model_name, prompt, layers, pooling
-            )
-            rows.append(pooled)
+            ))
             continue
         except FileNotFoundError:
             if not fallback_to_raw:
                 raise
 
         # Fallback: load raw activations and pool manually.
-        acts, mask = load_prompt_activations(model_name, prompt, layers)
-        pool_fn = get_pooling_fn(pooling)
-        rows.append(pool_fn(acts, mask))
+        try:
+            acts, mask = load_prompt_activations(model_name, prompt, layers)
+            rows.append(pool_fn(acts, mask))  # type: ignore[misc]
+        except FileNotFoundError:
+            missing.append(prompt)
+
+    if missing:
+        preview = missing[:3]
+        suffix = f" ... and {len(missing) - 3} more" if len(missing) > 3 else ""
+        raise FileNotFoundError(
+            f"No cached activations for {len(missing)} prompt(s): "
+            f"{preview!r}{suffix}"
+        )
 
     return torch.cat(rows, dim=0)
 

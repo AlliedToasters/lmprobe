@@ -38,7 +38,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import numpy as np
 
 import torch
 
@@ -3293,7 +3296,7 @@ def load_activations(
     pooling: str = "last_token",
     token: str | None = None,
     as_dict: bool = True,
-) -> "dict[int, np.ndarray] | np.ndarray":
+) -> dict[int, np.ndarray] | np.ndarray:
     """Load pooled activations from a HuggingFace activation dataset.
 
     Convenience function that downloads needed shards and returns
@@ -3320,8 +3323,6 @@ def load_activations(
     dict[int, np.ndarray] | np.ndarray
         Activation arrays keyed by layer index, or a single stacked array.
     """
-    import numpy as np
-
     from .cache import load_pooled_batch
 
     meta = fetch_dataset_metadata(dataset, token=token)

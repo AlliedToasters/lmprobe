@@ -10,7 +10,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
 from sklearn.base import clone
 from sklearn.decomposition import PCA
 
