@@ -622,29 +622,26 @@ class Probe:
         scaling_strategy : str | None
             Scaling strategy name, or None to skip.
         single_layer_standard : bool
-            If True and n_layers == 1, use StandardScaler instead.
+            If True and n_layers == 1 and scaling_strategy is None,
+            use StandardScaler (prevents convergence issues, #40).
 
         Returns
         -------
         tuple[scaler, np.ndarray]
             (fitted scaler or None, transformed X).
         """
-        if scaling_strategy is not None and n_layers > 1:
+        if single_layer_standard and n_layers == 1:
+            # Single-layer probes always use StandardScaler to prevent
+            # convergence issues with unscaled activations (#40)
+            from sklearn.preprocessing import StandardScaler
+
+            scaler = StandardScaler()
+            return scaler, scaler.fit_transform(X)
+        elif scaling_strategy is not None and n_layers >= 1:
             from .scaling import PerLayerScaler
 
             hidden_dim_per_layer = X.shape[1] // n_layers
             scaler = PerLayerScaler(n_layers, hidden_dim_per_layer, scaling_strategy)
-            return scaler, scaler.fit_transform(X)
-        elif scaling_strategy is not None and n_layers == 1:
-            from .scaling import PerLayerScaler
-
-            hidden_dim_per_layer = X.shape[1]
-            scaler = PerLayerScaler(1, hidden_dim_per_layer, scaling_strategy)
-            return scaler, scaler.fit_transform(X)
-        elif single_layer_standard and n_layers == 1:
-            from sklearn.preprocessing import StandardScaler
-
-            scaler = StandardScaler()
             return scaler, scaler.fit_transform(X)
         return None, X
 
