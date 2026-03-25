@@ -1966,6 +1966,68 @@ def load_layer_last_token(
     return torch.stack(vectors, dim=0)
 
 
+def load_pooled_batch(
+    model_name: str,
+    prompts: list[str],
+    layers: list[int],
+    pooling: str = "last_token",
+    *,
+    fallback_to_raw: bool = False,
+) -> torch.Tensor:
+    """Load pooled activations for a batch of prompts from cache.
+
+    Parameters
+    ----------
+    model_name : str
+        Model name for cache lookups.
+    prompts : list[str]
+        Prompts to load.
+    layers : list[int]
+        Sorted layer indices.
+    pooling : str
+        Pooling strategy.
+    fallback_to_raw : bool
+        If True, fall back to raw activations + manual pooling when
+        pooled cache is unavailable (for legacy datasets).
+
+    Returns
+    -------
+    torch.Tensor
+        Shape (n_prompts, n_layers * hidden_dim).
+    """
+    from .pooling import get_pooling_fn
+
+    rows: list[torch.Tensor] = []
+    missing: list[str] = []
+    pool_fn = get_pooling_fn(pooling) if fallback_to_raw else None
+    for prompt in prompts:
+        try:
+            rows.append(load_prompt_pooled_activations(
+                model_name, prompt, layers, pooling
+            ))
+            continue
+        except FileNotFoundError:
+            if not fallback_to_raw:
+                raise
+
+        # Fallback: load raw activations and pool manually.
+        try:
+            acts, mask = load_prompt_activations(model_name, prompt, layers)
+            rows.append(pool_fn(acts, mask))  # type: ignore[misc]
+        except FileNotFoundError:
+            missing.append(prompt)
+
+    if missing:
+        preview = missing[:3]
+        suffix = f" ... and {len(missing) - 3} more" if len(missing) > 3 else ""
+        raise FileNotFoundError(
+            f"No cached activations for {len(missing)} prompt(s): "
+            f"{preview!r}{suffix}"
+        )
+
+    return torch.cat(rows, dim=0)
+
+
 def save_prompt_activations(
     model_name: str,
     prompt: str,

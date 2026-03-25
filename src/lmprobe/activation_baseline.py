@@ -10,14 +10,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
 from sklearn.base import clone
 from sklearn.decomposition import PCA
 
 from .cache import (
     CachedExtractor,
     is_prompt_pooled_cached,
-    load_prompt_pooled_activations,
+    load_pooled_batch,
 )
 from .classifiers import resolve_classifier
 from .extraction import ActivationExtractor
@@ -154,17 +153,10 @@ class ActivationBaseline:
             ):
                 return None
 
-        # All prompts are in pooled cache - load directly!
-        all_activations = []
         sorted_layers = sorted(layer_indices)
-        for prompt in prompts:
-            acts = load_prompt_pooled_activations(
-                self.model, prompt, sorted_layers, self.pooling
-            )
-            all_activations.append(acts)
-
-        # Concatenate along batch dimension
-        pooled = torch.cat(all_activations, dim=0)
+        pooled = load_pooled_batch(
+            self.model, prompts, sorted_layers, self.pooling
+        )
         return pooled.detach().cpu().float().numpy()
 
     def _extract_and_pool(self, prompts: list[str]) -> np.ndarray:

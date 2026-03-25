@@ -83,6 +83,7 @@ These decisions are **mandatory** and must not be changed without explicit discu
 | nnsight for extraction | Required dependency | Supports remote execution |
 | API key | `NDIF_API_KEY` env var | Standard credential handling |
 | Cache location | `~/.cache/lmprobe/` (or `LMPROBE_CACHE_DIR`) | XDG-style default |
+| Batch activation loading | Use `load_pooled_batch()` in `cache.py` | Single canonical path — do not add new "loop prompts → load pooled → stack" patterns |
 
 ## Code Conventions
 

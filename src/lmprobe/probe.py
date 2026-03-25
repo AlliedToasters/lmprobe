@@ -19,7 +19,7 @@ from .cache import (
     CachedExtractor,
     evict,
     is_prompt_pooled_cached,
-    load_prompt_pooled_activations,
+    load_pooled_batch,
 )
 from .classifiers import resolve_classifier
 from .extraction import ActivationExtractor
@@ -593,65 +593,20 @@ class Probe:
     ) -> tuple[np.ndarray, None]:
         """Load activations from cache and apply pooling (model-free path).
 
-        Used when ``dataset`` is set but ``model`` is None.  All prompts
-        must already be in the local cache (populated by
-        ``_pull_dataset_for_prompts``).
-
-        For split-shard datasets (with ``token_shard_ids``), loads
-        pre-pooled activations directly via ``load_prompt_pooled_activations``
-        which correctly resolves the last-token shard.  For legacy datasets,
-        falls back to loading raw activations and pooling manually.
-
-        Returns
-        -------
-        tuple[np.ndarray, None]
-            ``(pooled_activations, None)`` — attention mask is always None
-            because dataset activations don't need score-level pooling.
+        Used when ``dataset`` is set but ``model`` is None.
         """
-        from .cache import load_prompt_activations, load_prompt_pooled_activations
-
         meta = self._ensure_dataset_metadata()
-        pool_fn = get_pooling_fn(pooling_strategy)
-
-        pooled_rows = []
-        missing = []
-        for prompt in prompts:
-            # Try loading pre-pooled activations first.  This handles
-            # split-shard datasets (token_shard_ids) correctly and is
-            # also faster since it skips raw-token loading.
-            try:
-                pooled = load_prompt_pooled_activations(
-                    meta.model_name, prompt, layers, pooling_strategy
-                )
-                pooled_rows.append(pooled.detach().cpu().float())
-                continue
-            except FileNotFoundError:
-                pass
-
-            # Fall back to raw loading + manual pooling (legacy datasets).
-            try:
-                acts, mask = load_prompt_activations(
-                    meta.model_name, prompt, layers
-                )
-            except FileNotFoundError:
-                missing.append(prompt)
-                continue
-
-            # acts is already (1, seq_len, hidden_dim); mask is (1, seq_len)
-            pooled = pool_fn(acts, mask)
-            pooled_rows.append(pooled.detach().cpu().float())
-
-        if missing:
-            raise ValueError(
-                f"Cannot find activations for {len(missing)} prompt(s) in "
-                f"dataset {self.dataset!r} and no model is available for "
-                f"extraction. Missing prompts: {missing[:3]!r}"
-                + (f" ... and {len(missing) - 3} more" if len(missing) > 3 else "")
+        try:
+            result = load_pooled_batch(
+                meta.model_name, prompts, layers, pooling_strategy,
+                fallback_to_raw=True,
             )
-
-        # Concatenate pooled results: each is (1, hidden_dim)
-        result = torch.cat(pooled_rows, dim=0)
-        return result.numpy(), None
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"Cannot find activations in dataset {self.dataset!r} "
+                f"and no model is available for extraction: {exc}"
+            ) from exc
+        return result.detach().cpu().float().numpy(), None
 
     def _get_remote(self, remote: bool | None) -> bool:
         """Resolve remote parameter with method-level override."""
@@ -842,18 +797,10 @@ class Probe:
             ):
                 return None
 
-        # All prompts are in pooled cache - load directly!
-        all_activations = []
         sorted_layers = sorted(layer_indices)
-        for prompt in prompts:
-            acts = load_prompt_pooled_activations(
-                self.model, prompt, sorted_layers, pooling_strategy
-            )
-            all_activations.append(acts)
-
-        # Concatenate along batch dimension
-        # Each acts has shape (1, n_layers * hidden_dim)
-        pooled = torch.cat(all_activations, dim=0)
+        pooled = load_pooled_batch(
+            self.model, prompts, sorted_layers, pooling_strategy
+        )
         return pooled.detach().cpu().float().numpy()
 
     def _extract_and_pool(
