@@ -156,6 +156,9 @@ class TestLoadAndPoolFromCache:
         mask = torch.ones(1, 3)
 
         with patch(
+            "lmprobe.cache.load_prompt_pooled_activations",
+            side_effect=FileNotFoundError("no pooled"),
+        ), patch(
             "lmprobe.cache.load_prompt_activations",
             return_value=(acts, mask),
         ):
@@ -174,6 +177,9 @@ class TestLoadAndPoolFromCache:
         probe._dataset_metadata = meta
 
         with patch(
+            "lmprobe.cache.load_prompt_pooled_activations",
+            side_effect=FileNotFoundError("not found"),
+        ), patch(
             "lmprobe.cache.load_prompt_activations",
             side_effect=FileNotFoundError("not found"),
         ):
@@ -181,6 +187,36 @@ class TestLoadAndPoolFromCache:
                 probe._load_and_pool_from_cache(
                     ["missing"], layers=[0], pooling_strategy="last_token"
                 )
+
+    def test_load_and_pool_split_shard_uses_pooled(self):
+        """Split-shard datasets should load via load_prompt_pooled_activations.
+
+        When a dataset uses last-token shard splitting (token_shard_ids),
+        load_prompt_activations fails because _load_raw_from_shard gets the
+        rest-token shard.  _load_and_pool_from_cache should fall through to
+        load_prompt_pooled_activations which handles this correctly.
+        (Regression test for GH-182.)
+        """
+        probe = Probe(dataset="user/repo", layers=-1, pooling="last_token")
+        meta = _make_metadata(model_name="test-model")
+        probe._dataset_metadata = meta
+
+        hidden_dim = 4
+        # Pooled result: (1, hidden_dim)
+        pooled_tensor = torch.randn(1, hidden_dim)
+
+        with patch(
+            "lmprobe.cache.load_prompt_pooled_activations",
+            return_value=pooled_tensor,
+        ) as mock_pooled:
+            result, attn = probe._load_and_pool_from_cache(
+                ["prompt1"], layers=[0], pooling_strategy="last_token",
+            )
+            assert result.shape == (1, hidden_dim)
+            assert attn is None
+            mock_pooled.assert_called_once_with(
+                "test-model", "prompt1", [0], "last_token"
+            )
 
 
 # ---------------------------------------------------------------------------

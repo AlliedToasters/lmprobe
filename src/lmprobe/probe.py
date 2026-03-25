@@ -597,9 +597,10 @@ class Probe:
         must already be in the local cache (populated by
         ``_pull_dataset_for_prompts``).
 
-        Pools each prompt individually to avoid padding-induced memory
-        waste.  Peak memory is O(max_seq × hidden_dim) rather than
-        O(batch × max_seq × hidden_dim).
+        For split-shard datasets (with ``token_shard_ids``), loads
+        pre-pooled activations directly via ``load_prompt_pooled_activations``
+        which correctly resolves the last-token shard.  For legacy datasets,
+        falls back to loading raw activations and pooling manually.
 
         Returns
         -------
@@ -607,7 +608,7 @@ class Probe:
             ``(pooled_activations, None)`` — attention mask is always None
             because dataset activations don't need score-level pooling.
         """
-        from .cache import load_prompt_activations
+        from .cache import load_prompt_activations, load_prompt_pooled_activations
 
         meta = self._ensure_dataset_metadata()
         pool_fn = get_pooling_fn(pooling_strategy)
@@ -615,6 +616,19 @@ class Probe:
         pooled_rows = []
         missing = []
         for prompt in prompts:
+            # Try loading pre-pooled activations first.  This handles
+            # split-shard datasets (token_shard_ids) correctly and is
+            # also faster since it skips raw-token loading.
+            try:
+                pooled = load_prompt_pooled_activations(
+                    meta.model_name, prompt, layers, pooling_strategy
+                )
+                pooled_rows.append(pooled.detach().cpu().float())
+                continue
+            except FileNotFoundError:
+                pass
+
+            # Fall back to raw loading + manual pooling (legacy datasets).
             try:
                 acts, mask = load_prompt_activations(
                     meta.model_name, prompt, layers
