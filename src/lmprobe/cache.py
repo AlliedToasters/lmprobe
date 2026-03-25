@@ -51,7 +51,9 @@ from .cache_backends import CacheBackend, LocalCacheBackend
 # =============================================================================
 
 # In-memory caches for shard manifest/index JSON to avoid re-reading on every call.
-_shard_manifests: dict[str, dict] = {}
+# Manifests keyed by (model_name, repo_id) to avoid collision across datasets.
+_shard_manifests: dict[tuple[str, str | None], dict] = {}
+# Indices keyed by model_name (merged across repos; each entry carries repo_id).
 _shard_indices: dict[str, dict] = {}
 
 # =============================================================================
@@ -1276,9 +1278,12 @@ def list_cached_prompts(model_name: str, verify: bool = False) -> list[ManifestE
 # =============================================================================
 
 
-def _shard_manifest_key(model_name: str) -> str:
+def _shard_manifest_key(model_name: str, repo_id: str | None = None) -> str:
     """Backend key for the shard manifest JSON."""
     model_hash = _hash_string(model_name)
+    if repo_id is not None:
+        repo_hash = _hash_string(repo_id)
+        return f"{model_hash}/_shard_manifest_{repo_hash}.json"
     return f"{model_hash}/_shard_manifest.json"
 
 
@@ -1292,6 +1297,8 @@ def write_shard_registry(
     model_name: str,
     manifest: dict,
     index: dict,
+    *,
+    repo_id: str | None = None,
 ) -> None:
     """Write shard manifest and index to the cache backend.
 
@@ -1303,33 +1310,51 @@ def write_shard_registry(
         Repo-level metadata: model name, tensor descriptors, shard file paths.
     index : dict
         Per-prompt offsets: prompt_hash -> {shard_index, row_offset, ...}.
+    repo_id : str | None
+        Dataset repo ID. When provided, the manifest is keyed per-repo to
+        avoid collisions when multiple datasets share the same model.
     """
     _register_model(model_name)
     backend = get_backend()
 
-    m_key = _shard_manifest_key(model_name)
+    # Stamp repo_id into each index entry so lookups can find the right manifest
+    if repo_id is not None:
+        for entry in index.values():
+            entry.setdefault("repo_id", repo_id)
+
+    m_key = _shard_manifest_key(model_name, repo_id=repo_id)
     i_key = _shard_index_key(model_name)
 
+    # Merge new index entries into existing index (don't overwrite other repos)
+    existing_index = _load_shard_index(model_name) or {}
+    existing_index.update(index)
+
     backend.write_text(m_key, json.dumps(manifest))
-    backend.write_text(i_key, json.dumps(index))
+    backend.write_text(i_key, json.dumps(existing_index))
 
-    # Update in-memory caches
-    _shard_manifests[model_name] = manifest
-    _shard_indices[model_name] = index
+    # Update in-memory caches — manifest keyed by (model, repo_id)
+    manifest_cache_key = (model_name, repo_id)
+    _shard_manifests[manifest_cache_key] = manifest
+    _shard_indices[model_name] = existing_index
 
 
-def _load_shard_manifest(model_name: str) -> dict | None:
+def _load_shard_manifest(model_name: str, repo_id: str | None = None) -> dict | None:
     """Load shard manifest, using in-memory cache if available."""
-    if model_name in _shard_manifests:
-        return _shard_manifests[model_name]
+    cache_key = (model_name, repo_id)
+    if cache_key in _shard_manifests:
+        return _shard_manifests[cache_key]
 
+    # Try repo-specific manifest first, fall back to legacy unkeyed manifest
     backend = get_backend()
-    key = _shard_manifest_key(model_name)
+    key = _shard_manifest_key(model_name, repo_id=repo_id)
     if not backend.exists(key):
+        if repo_id is not None:
+            # Fall back to legacy (no repo_id) manifest
+            return _load_shard_manifest(model_name, repo_id=None)
         return None
 
     manifest = json.loads(backend.read_text(key))
-    _shard_manifests[model_name] = manifest
+    _shard_manifests[cache_key] = manifest
     return manifest
 
 
@@ -1372,7 +1397,7 @@ def _discover_from_shard(model_name: str, prompt: str) -> CachedPromptInfo | Non
     if entry is None:
         return None
 
-    manifest = _load_shard_manifest(model_name)
+    manifest = _load_shard_manifest(model_name, repo_id=entry.get("repo_id"))
     if manifest is None:
         return None
 
@@ -1424,7 +1449,7 @@ def _resolve_hidden_shard(
             f"No shard entry found for prompt: {prompt!r}"
         )
 
-    manifest = _load_shard_manifest(model_name)
+    manifest = _load_shard_manifest(model_name, repo_id=entry.get("repo_id"))
     if manifest is None:
         raise FileNotFoundError("No shard manifest found")
 
@@ -1665,7 +1690,7 @@ def _load_logits_from_shard(
             f"No shard entry found for prompt: {prompt!r}"
         )
 
-    manifest = _load_shard_manifest(model_name)
+    manifest = _load_shard_manifest(model_name, repo_id=entry.get("repo_id"))
     if manifest is None:
         raise FileNotFoundError("No shard manifest found")
 
@@ -2309,7 +2334,7 @@ def load_prompt_logits(
     if top_k is not None:
         entry = _lookup_shard(model_name, prompt)
         if entry is not None:
-            manifest = _load_shard_manifest(model_name)
+            manifest = _load_shard_manifest(model_name, repo_id=entry.get("repo_id"))
             if manifest and "logits_topk" in manifest.get("tensors", {}):
                 return _load_logits_from_shard(model_name, prompt)
 

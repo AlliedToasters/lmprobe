@@ -1680,7 +1680,8 @@ class TestLazyPullDataset:
         assert len(per_prompt_files) == 0
 
         # But manifest and index should exist
-        assert (model_dir / "_shard_manifest.json").exists()
+        repo_hash = _hash_string("user/test")
+        assert (model_dir / f"_shard_manifest_{repo_hash}.json").exists()
         assert (model_dir / "_shard_index.json").exists()
 
     @patch("lmprobe.sharing._check_hub_deps")

@@ -2813,11 +2813,8 @@ def pull_dataset(
     }
 
     # Shard index: prompt_hash -> offset info
-    # Load existing shard index to merge (supports multiple repos)
-    from .cache import _load_shard_index
-    existing_index = _load_shard_index(model_name) or {}
-
-    shard_index = dict(existing_index)
+    # write_shard_registry merges with existing index automatically
+    shard_index: dict[str, Any] = {}
     for i in prompt_indices:
         prompt_text = index["text"][i]
         prompt_hash = _hash_string(prompt_text)
@@ -2841,7 +2838,7 @@ def pull_dataset(
                 entry[col] = index[col][i]
         shard_index[prompt_hash] = entry
 
-    write_shard_registry(model_name, manifest, shard_index)
+    write_shard_registry(model_name, manifest, shard_index, repo_id=repo_id)
     _n_layers = len(tensor_descriptors.get("hidden_layers", {}).get("layers", []))
     logger.info(
         "[SHARING] Shard registry ready (%d prompts%s)",
