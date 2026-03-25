@@ -3306,8 +3306,9 @@ def load_activations(
     pooling: str = "last_token",
     token: str | None = None,
     as_dict: bool = True,
+    return_labels: bool = False,
     show_progress: bool = True,
-) -> dict[int, np.ndarray] | np.ndarray:
+) -> dict[int, np.ndarray] | np.ndarray | tuple:
     """Load pooled activations from a HuggingFace activation dataset.
 
     Convenience function that downloads needed shards and returns
@@ -3328,14 +3329,20 @@ def load_activations(
     as_dict : bool
         If True (default), return ``{layer: ndarray(n_prompts, hidden_dim)}``.
         If False, return ``ndarray(n_prompts, n_layers, hidden_dim)``.
+    return_labels : bool
+        If True, also return labels from the dataset's Parquet index as a
+        second element: ``(activations, labels)``.  Labels are a numpy array
+        of ints (or None if the dataset has no ``label`` column).
     show_progress : bool
         If True (default), display tqdm progress bars for downloads
         and activation loading.
 
     Returns
     -------
-    dict[int, np.ndarray] | np.ndarray
+    dict[int, np.ndarray] | np.ndarray | tuple
         Activation arrays keyed by layer index, or a single stacked array.
+        If ``return_labels=True``, returns ``(activations, labels)`` where
+        labels is ``np.ndarray | None``.
     """
     from .cache import load_pooled_batch
 
@@ -3372,11 +3379,55 @@ def load_activations(
         hidden_dim = stacked.shape[-1] // len(layers)
 
     if as_dict:
-        return {
+        activations = {
             layer: stacked[:, i * hidden_dim : (i + 1) * hidden_dim]
             for i, layer in enumerate(layers)
         }
-    return stacked.reshape(len(prompts), len(layers), hidden_dim)
+    else:
+        activations = stacked.reshape(len(prompts), len(layers), hidden_dim)
+
+    if not return_labels:
+        return activations
+
+    # Load labels from the Parquet index
+    labels = _load_labels_for_prompts(dataset, prompts, token=token)
+    return activations, labels
+
+
+def _load_labels_for_prompts(
+    repo_id: str,
+    prompts: list[str],
+    *,
+    token: str | None = None,
+) -> np.ndarray | None:
+    """Load labels from a dataset's Parquet index for given prompts.
+
+    Returns None if the dataset has no ``label`` column.
+    """
+    _check_hub_deps()
+    _check_pyarrow()
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+
+    parquet_path = hf_hub_download(
+        repo_id, PARQUET_PATH, repo_type="dataset", token=token,
+    )
+    table = pq.read_table(parquet_path)
+    index = table.to_pydict()
+
+    if "label" not in index:
+        return None
+
+    # Build prompt -> label mapping
+    texts = index["text"]
+    labels_raw = index["label"]
+    prompt_to_label = dict(zip(texts, labels_raw))
+
+    labels = [prompt_to_label.get(p) for p in prompts]
+    if any(v is None for v in labels):
+        return None
+
+    return np.array(labels)
 
 
 # =============================================================================

@@ -13,8 +13,8 @@ The workflow has three stages:
 ```
 1. Extract  →  2. Publish  →  3. Train (no model needed)
 
-UnifiedCache       push_dataset       Probe(dataset=...)
-   locally          to HF Hub          anywhere
+UnifiedCache       push_dataset       load_activations
+   locally          to HF Hub        + fit_from_activations
 ```
 
 ---
@@ -131,21 +131,34 @@ push_dataset(
 
 ## Stage 3: Train a probe from the dataset
 
-Point a `Probe` at the dataset repo instead of a model. Activations are downloaded lazily on demand and cached locally — no GPU, no model weights.
+Use `load_activations()` to download activation tensors, then train a probe with `fit_from_activations()`. Only needed shards are downloaded — if you request a single layer, only that layer's data is fetched.
 
 ```python
-from lmprobe import Probe
+from lmprobe import load_activations, Probe
 
-probe = Probe(
-    dataset="username/llama-8b-safety-activations",
-    layers=16,
-    pooling="last_token",    # must match what was used during extraction
-    classifier="logistic_regression",
-    random_state=42,
+# Downloads only layer 16 shards — fast and selective
+acts = load_activations(
+    "username/llama-8b-safety-activations",
+    layers=[16],
 )
 
-probe.fit(positive_prompts, negative_prompts)
-predictions = probe.predict(test_prompts)
+probe = Probe(classifier="logistic_regression", random_state=42)
+probe.fit_from_activations(acts[16], labels)
+
+predictions = probe.predict_from_activations(test_acts[16])
+```
+
+### Loading labels from the dataset
+
+If you pushed labels with `push_dataset()`, load them alongside activations:
+
+```python
+acts, labels = load_activations(
+    "username/llama-8b-safety-activations",
+    layers=[16],
+    return_labels=True,
+)
+# labels is a numpy array of ints (or None if no labels in dataset)
 ```
 
 ### Experiment quickly — no model needed
@@ -153,33 +166,25 @@ predictions = probe.predict(test_prompts)
 Because there's no model to load, iterating over classifiers and layers is fast:
 
 ```python
+acts = load_activations("username/llama-8b-safety-activations", layers=[16])
+
 for classifier in ["logistic_regression", "ridge", "lda", "mass_mean"]:
-    probe = Probe(
-        dataset="username/llama-8b-safety-activations",
-        layers=16,
-        classifier=classifier,
-        random_state=42,
-    )
-    probe.fit(positive_prompts, negative_prompts)
-    acc = probe.score(test_prompts, test_labels)
+    probe = Probe(classifier=classifier, random_state=42)
+    probe.fit_from_activations(acts[16], train_labels)
+    acc = probe.score_from_activations(test_acts[16], test_labels)
     print(f"{classifier}: {acc:.3f}")
 ```
 
 ### Layer sweep from a dataset
 
-`Probe.sweep_layers()` requires a local model, so with a dataset-backed probe, loop manually:
-
 ```python
+acts = load_activations("username/llama-8b-safety-activations")
+
 scores = {}
-for layer in range(32):
-    p = Probe(
-        dataset="username/llama-8b-safety-activations",
-        layers=layer,
-        classifier="ridge",
-        random_state=42,
-    )
-    p.fit(positive_prompts, negative_prompts)
-    scores[layer] = p.score(test_prompts, test_labels)
+for layer, X in acts.items():
+    probe = Probe(classifier="ridge", random_state=42)
+    probe.fit_from_activations(X[train_idx], train_labels)
+    scores[layer] = probe.score_from_activations(X[test_idx], test_labels)
 
 best = max(scores, key=scores.get)
 print(f"Best layer: {best}, accuracy: {scores[best]:.3f}")
@@ -214,10 +219,6 @@ n = pull_dataset(
     layers=[16],      # only fetch the layers you need
 )
 print(f"Pulled {n} prompts into local cache")
-
-# Now probe training hits the cache instantly
-probe = Probe(dataset="username/llama-8b-safety-activations", layers=16)
-probe.fit(positive_prompts, negative_prompts)
 ```
 
 ---
@@ -252,18 +253,25 @@ push_dataset("myorg/project-activations", "meta-llama/Llama-3.1-8B-Instruct",
              all_prompts, labels=all_labels)
 
 # Collaborators: train without GPU
-probe = Probe(dataset="myorg/project-activations", layers=16)
-probe.fit(positive_prompts, negative_prompts)
+acts, labels = load_activations("myorg/project-activations",
+                                 layers=[16], return_labels=True)
+probe = Probe(classifier="logistic_regression", random_state=42)
+probe.fit_from_activations(acts[16], labels)
 ```
 
 ### Production: pre-cache for fast inference
 
 ```python
-# Warmup before a batch job
-probe = Probe(dataset="myorg/project-activations", layers=16)
-probe.fit(positive_prompts, negative_prompts)
-probe.warmup(inference_prompts)   # downloads to local cache
+# Pull all shards upfront
+pull_dataset("myorg/project-activations")
 
-# Inference hits cache — fast
-predictions = probe.predict(inference_prompts)
+# Load and train
+acts = load_activations("myorg/project-activations", layers=[16])
+probe = Probe(classifier="logistic_regression", random_state=42)
+probe.fit_from_activations(acts[16], labels)
+
+# Predict on new activations
+new_acts = load_activations("myorg/project-activations",
+                             layers=[16], prompts=inference_prompts)
+predictions = probe.predict_from_activations(new_acts[16])
 ```

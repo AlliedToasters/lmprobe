@@ -56,7 +56,7 @@ def test_warmup_requires_model():
         random_state=42,
     )
 
-    with pytest.raises(ValueError, match="No model or dataset specified"):
+    with pytest.raises(ValueError, match="No model specified"):
         probe.warmup(["test prompt"])
 
 
