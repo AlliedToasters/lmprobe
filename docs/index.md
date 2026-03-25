@@ -109,6 +109,7 @@ See the [Quickstart](quickstart.md) for a complete walkthrough.
 | [Pooling](reference/pooling.md) | Pooling strategies and stage prefixes |
 | [Baseline](reference/baseline.md) | `BaselineProbe`, `ActivationBaseline`, `BaselineBattery` |
 | [Cache](reference/cache.md) | Cache configuration, inspection, eviction |
-| [Datasets](reference/datasets.md) | `UnifiedCache`, `push_dataset`, `pull_dataset` |
+| [Datasets](reference/datasets.md) | `UnifiedCache`, `push_dataset`, `load_activations`, `pull_dataset` |
+| [Dataset Format](reference/dataset-format.md) | v2 format specification (Parquet + safetensors) |
 | [Plotting](reference/plotting.md) | Layer importance visualization |
 | [Scaling](reference/scaling.md) | `PerLayerScaler` for multi-layer normalization |

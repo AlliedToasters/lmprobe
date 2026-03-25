@@ -207,7 +207,6 @@ probe = Probe(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `model` | `str` | *required* | HuggingFace model ID or local path |
-| `dataset` | `str \| None` | `None` | HuggingFace Dataset repo ID with pre-extracted activations (replaces `model` for extraction) |
 | `layers` | `int \| list[int] \| str` | `"middle"` | Which residual stream layers to probe |
 | `pooling` | `str \| callable` | `"last_token"` | Token aggregation (train & inference) |
 | `train_pooling` | `str \| callable` | — | Override pooling for `fit()` only |

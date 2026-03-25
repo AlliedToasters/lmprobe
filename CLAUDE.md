@@ -53,20 +53,33 @@ lmprobe/
 ├── src/
 │   └── lmprobe/
 │       ├── __init__.py
-│       ├── probe.py          # LinearProbe main class
-│       ├── extraction.py     # Activation extraction via nnsight
-│       ├── pooling.py        # Pooling strategies
-│       ├── cache.py          # Activation caching
-│       └── classifiers.py    # Built-in classifier factory
+│       ├── probe.py              # Probe (alias: LinearProbe) main class
+│       ├── extraction.py         # Activation extraction via nnsight
+│       ├── pooling.py            # Pooling strategies
+│       ├── cache.py              # Activation caching
+│       ├── classifiers.py        # Built-in classifier factory
+│       ├── sharing.py            # HuggingFace dataset push/pull/load (v2 format)
+│       ├── unified_cache.py      # UnifiedCache for bulk extraction
+│       ├── scaling.py            # PerLayerScaler
+│       ├── ensemble.py           # ProbeEnsemble
+│       ├── baseline.py           # BaselineProbe (text baselines)
+│       ├── activation_baseline.py # ActivationBaseline
+│       ├── battery.py            # BaselineBattery
+│       ├── plotting.py           # Layer importance visualization
+│       ├── hub.py                # ProbeCard, push_to_hub/from_hub
+│       └── backends.py           # Backend resolution
 ├── tests/
-│   ├── conftest.py           # Shared fixtures (tiny model)
-│   ├── test_readme_example.py # NORTH STAR: README example must pass
+│   ├── conftest.py               # Shared fixtures (tiny model)
+│   ├── test_readme_example.py    # NORTH STAR: README example must pass
 │   ├── test_probe.py
 │   ├── test_extraction.py
 │   ├── test_pooling.py
-│   └── test_cache.py
+│   ├── test_cache.py
+│   └── test_sharing.py           # Dataset sharing tests
 ├── docs/
-│   └── design/               # Design decision documents
+│   ├── design/                   # Design decision documents
+│   ├── guides/                   # User guides
+│   └── reference/                # API reference (incl. dataset-format.md)
 ├── pyproject.toml
 └── CLAUDE.md
 ```

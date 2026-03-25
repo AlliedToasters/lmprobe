@@ -1,24 +1,23 @@
-"""HuggingFace dataset sharing for activation datasets.
+"""HuggingFace dataset sharing for activation datasets (v2 format).
 
 Two-tier architecture: Parquet index + safetensors tensor store.
 
 **Parquet index** (``index/train-00000-of-00001.parquet``): small, queryable
-prompt metadata (text, labels, shard refs).  Works with ``load_dataset()``
-and the HF Dataset Viewer.
+prompt metadata (text, labels, shard refs).  All dataset-level metadata
+(model, layers, tensor descriptors, provenance) is embedded in the Parquet
+schema metadata under ``lmprobe:`` prefixed keys.  Works with
+``load_dataset()`` and the HF Dataset Viewer.
 
 **Safetensors tensor store** (``tensors/``): large activation tensors stored
-as raw contiguous bytes.  Plays well with Xet's content-defined chunking
-for byte-level dedup.  Hidden layers use per-layer sharding (v1.1): each
-file contains a single layer across a batch of prompts.  Logits shards
-are unchanged (no layer axis).
+as raw contiguous bytes.  Hidden layers use per-layer sharding: each file
+contains a single layer across a batch of prompts.
 
 Everything lives in a single HF Dataset repo::
 
     repo/
       README.md
-      lmprobe_info.json                      # provenance + tensor descriptors
       index/
-        train-00000-of-00001.parquet         # queryable prompt metadata
+        train-00000-of-00001.parquet         # queryable prompt metadata + schema metadata
       tensors/
         hidden_layer000_shard000.safetensors  # layer 0 for shard 0
         hidden_layer000_shard001.safetensors  # layer 0 for shard 1
