@@ -1458,10 +1458,10 @@ def _parse_shard_layer_nums(keys: Iterable[str]) -> list[int]:
 
 
 def _slice_hidden_from_tensors(
-    tensors: dict[str, "torch.Tensor"],
+    tensors: dict[str, torch.Tensor],
     layers: list[int] | None,
-    slice_fn: Callable[["torch.Tensor"], "torch.Tensor"],
-) -> list[tuple[int, "torch.Tensor"]]:
+    slice_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> list[tuple[int, torch.Tensor]]:
     """Extract hidden layer slices from a pre-loaded tensor dict.
 
     Parameters
@@ -1493,9 +1493,9 @@ def _slice_hidden_from_tensors(
 
 
 def _slice_logits_from_tensors(
-    tensors: dict[str, "torch.Tensor"],
+    tensors: dict[str, torch.Tensor],
     row_offset: int,
-) -> tuple["torch.Tensor", "torch.Tensor"]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract top-k logit values and indices from a pre-loaded tensor dict."""
     values = tensors["logits_topk.values"][row_offset : row_offset + 1]
     indices = tensors["logits_topk.indices"][row_offset : row_offset + 1]
