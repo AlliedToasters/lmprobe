@@ -3933,11 +3933,37 @@ def upgrade_dataset_format(
     with open(info_path) as f:
         lmprobe_info = json.load(f)
 
-    # Update format version
+    # Transform v1 metadata to v2 shape
     lmprobe_info["format_version"] = FORMAT_VERSION
 
-    # Embed into Parquet
+    # Rename tensor_types → tensors if needed (safety net for very old datasets)
+    if "tensor_types" in lmprobe_info and "tensors" not in lmprobe_info:
+        lmprobe_info["tensors"] = lmprobe_info.pop("tensor_types")
+
+    # Inject file_pattern / key_pattern into tensor descriptors
+    tensors = lmprobe_info.get("tensors", {})
+    if "hidden_layers" in tensors:
+        hd = tensors["hidden_layers"]
+        hd.setdefault(
+            "file_pattern",
+            "tensors/hidden_layer{layer:03d}_shard{shard:03d}.safetensors",
+        )
+        hd.setdefault("key_pattern", "hidden.layer_{layer}")
+    if "logits_topk" in tensors:
+        tensors["logits_topk"].setdefault(
+            "file_pattern",
+            "tensors/logits_topk_{shard:03d}.safetensors",
+        )
+
+    # Embed into Parquet and drop redundant per-type hidden columns
     table = pq.read_table(parquet_path)
+    v1_hidden_cols = {
+        "shard_index_hidden", "row_offset_hidden", "token_offset_hidden",
+    }
+    drop_cols = [c for c in table.column_names if c in v1_hidden_cols]
+    if drop_cols:
+        logger.info("[UPGRADE] Dropping redundant columns: %s", drop_cols)
+        table = table.drop(drop_cols)
     table = _embed_metadata_in_schema(table, lmprobe_info)
 
     if dry_run:

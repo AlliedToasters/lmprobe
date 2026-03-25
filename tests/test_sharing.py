@@ -42,6 +42,7 @@ from lmprobe.sharing import (
     load_activation_dataset,
     pull_dataset,
     push_dataset,
+    upgrade_dataset_format,
 )
 
 _has_pyarrow = True
@@ -4092,3 +4093,257 @@ class TestMigrateDataset:
                     orig_rest, atol=1e-6,
                 )
                 offset += n_rest
+
+
+@requires_pyarrow
+class TestUpgradeDatasetFormat:
+    """Tests for upgrade_dataset_format: v1→v2 metadata migration."""
+
+    def _make_v1_dataset(self, tmp_path):
+        """Create a realistic v1 dataset with JSON sidecar and parquet index."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir(parents=True)
+
+        # Realistic v1 metadata (based on real-world latent-lab dataset)
+        v1_info = {
+            "format_version": "1.1",
+            "model": {"name": "meta-llama/Llama-3.1-405B", "revision": None},
+            "num_prompts": 3,
+            "prompt_ordering": "random",
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0, 1],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float16",
+                    "layout": "per_layer",
+                    "storage": "full_sequence",
+                    "shards": [
+                        {"num_prompts": 3, "num_tokens": 3},
+                        {"num_prompts": 2, "num_tokens": 8},
+                    ],
+                    "last_token_shards": 1,
+                }
+            },
+            "provenance": {
+                "lmprobe_version": "0.8.0",
+                "extraction_backend": "ndif",
+                "created_at": "2025-03-19T00:00:00+00:00",
+            },
+        }
+
+        # Write v1 JSON sidecar
+        info_path = tmp_path / INFO_FILENAME
+        info_path.write_text(json.dumps(v1_info))
+
+        # Write v1 parquet with per-type hidden columns
+        table = pa.table({
+            "text": pa.array(["p0", "p1", "p2"], type=pa.string()),
+            "label": pa.array([None, None, None], type=pa.int32()),
+            "num_tokens": pa.array([5, 7, 4], type=pa.int32()),
+            "shard_index": pa.array([0, 0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1, 2], type=pa.int32()),
+            # v1 per-type hidden columns (should be dropped by migration)
+            "shard_index_hidden": pa.array([0, 0, 0], type=pa.int32()),
+            "row_offset_hidden": pa.array([0, 1, 2], type=pa.int32()),
+            "token_offset_hidden": pa.array([0, 5, 12], type=pa.int64()),
+        })
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+
+        return tmp_path, v1_info
+
+    def _run_upgrade(self, tmp_path, dest_path):
+        """Run upgrade_dataset_format with mocked HF API, capturing uploaded parquet."""
+        uploaded = {}
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(tmp_path / filename)
+
+        def mock_create_commit(repo_id, operations, **kwargs):
+            for op in operations:
+                p = getattr(op, "path_or_fileobj", None)
+                if isinstance(p, str) and Path(p).exists():
+                    shutil.copy2(p, dest_path)
+                    uploaded[op.path_in_repo] = str(dest_path)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ), patch(
+            "huggingface_hub.HfApi", return_value=MagicMock(
+                create_commit=mock_create_commit,
+            ),
+        ), patch(
+            "huggingface_hub.CommitOperationAdd",
+            side_effect=lambda **kw: MagicMock(**kw),
+        ), patch(
+            "huggingface_hub.CommitOperationDelete",
+            side_effect=lambda **kw: MagicMock(**kw),
+        ):
+            url = upgrade_dataset_format("user/test-v1")
+
+        return url, uploaded
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_injects_file_pattern_and_key_pattern(
+        self, mock_pa, mock_deps, tmp_path
+    ):
+        """Migration should add file_pattern/key_pattern to tensor descriptors."""
+        remote_dir, _ = self._make_v1_dataset(tmp_path)
+        dest = tmp_path / "uploaded.parquet"
+        url, uploaded = self._run_upgrade(remote_dir, dest)
+
+        assert "user/test-v1" in url
+
+        import pyarrow.parquet as pq
+        schema = pq.read_schema(str(dest))
+        tensors_raw = json.loads(schema.metadata[b"lmprobe:tensors"])
+        hidden = tensors_raw["hidden_layers"]
+
+        assert hidden["file_pattern"] == (
+            "tensors/hidden_layer{layer:03d}_shard{shard:03d}.safetensors"
+        )
+        assert hidden["key_pattern"] == "hidden.layer_{layer}"
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_drops_per_type_hidden_columns(
+        self, mock_pa, mock_deps, tmp_path
+    ):
+        """Migration should drop shard_index_hidden etc. from parquet."""
+        remote_dir, _ = self._make_v1_dataset(tmp_path)
+        dest = tmp_path / "uploaded.parquet"
+        self._run_upgrade(remote_dir, dest)
+
+        import pyarrow.parquet as pq
+        cols = set(pq.read_table(str(dest)).column_names)
+
+        assert "shard_index" in cols
+        assert "row_offset" in cols
+        assert "shard_index_hidden" not in cols
+        assert "row_offset_hidden" not in cols
+        assert "token_offset_hidden" not in cols
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_stamps_format_version_2(
+        self, mock_pa, mock_deps, tmp_path
+    ):
+        """Migration should set format_version to 2.0."""
+        remote_dir, _ = self._make_v1_dataset(tmp_path)
+        dest = tmp_path / "uploaded.parquet"
+        self._run_upgrade(remote_dir, dest)
+
+        import pyarrow.parquet as pq
+        schema = pq.read_schema(str(dest))
+        version = json.loads(schema.metadata[b"lmprobe:format_version"])
+        assert version == FORMAT_VERSION
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_renames_tensor_types_key(
+        self, mock_pa, mock_deps, tmp_path
+    ):
+        """Very old datasets with tensor_types key should be renamed to tensors."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir(parents=True)
+
+        v1_info = {
+            "format_version": "1.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 2,
+            "tensor_types": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "layout": "per_layer",
+                    "storage": "pooled",
+                    "shards": [{"num_prompts": 2}],
+                }
+            },
+            "provenance": {},
+        }
+        (tmp_path / INFO_FILENAME).write_text(json.dumps(v1_info))
+        table = pa.table({
+            "text": pa.array(["a", "b"], type=pa.string()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1], type=pa.int32()),
+        })
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+
+        dest = tmp_path / "uploaded.parquet"
+        self._run_upgrade(tmp_path, dest)
+
+        schema = pq.read_schema(str(dest))
+        meta = schema.metadata
+        assert b"lmprobe:tensors" in meta
+        assert b"lmprobe:tensor_types" not in meta
+        tensors = json.loads(meta[b"lmprobe:tensors"])
+        assert "file_pattern" in tensors["hidden_layers"]
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_logits_get_file_pattern(
+        self, mock_pa, mock_deps, tmp_path
+    ):
+        """Migration should inject file_pattern into logits_topk descriptor."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir(parents=True)
+
+        v1_info = {
+            "format_version": "1.1",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 2,
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "layout": "per_layer",
+                    "storage": "pooled",
+                    "shards": [{"num_prompts": 2}],
+                },
+                "logits_topk": {
+                    "type": "logits_topk",
+                    "k": 50,
+                    "dtype": "float32",
+                    "pooling": "last_token",
+                    "shards": [
+                        {"file": "tensors/logits_topk_000.safetensors",
+                         "num_prompts": 2},
+                    ],
+                },
+            },
+            "provenance": {},
+        }
+        (tmp_path / INFO_FILENAME).write_text(json.dumps(v1_info))
+        table = pa.table({
+            "text": pa.array(["a", "b"], type=pa.string()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1], type=pa.int32()),
+            "shard_index_logits": pa.array([0, 0], type=pa.int32()),
+            "row_offset_logits": pa.array([0, 1], type=pa.int32()),
+        })
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+
+        dest = tmp_path / "uploaded.parquet"
+        self._run_upgrade(tmp_path, dest)
+
+        schema = pq.read_schema(str(dest))
+        tensors = json.loads(schema.metadata[b"lmprobe:tensors"])
+        assert tensors["logits_topk"]["file_pattern"] == (
+            "tensors/logits_topk_{shard:03d}.safetensors"
+        )
+        # Logits columns should NOT be dropped
+        cols = set(pq.read_table(str(dest)).column_names)
+        assert "shard_index_logits" in cols
+        assert "row_offset_logits" in cols
