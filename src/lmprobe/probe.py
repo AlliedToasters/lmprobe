@@ -394,7 +394,6 @@ class Probe:
     def __init__(
         self,
         model: str | None = None,
-        dataset: str | None = None,
         layers: int | list[int] | str = "middle",
         pooling: str = "last_token",
         train_pooling: str | None = None,
@@ -418,7 +417,6 @@ class Probe:
         mass_mean_augment: bool = False,
     ):
         self.model = model
-        self.dataset = dataset
         self.layers = layers
         self.pooling = pooling
         self.train_pooling = train_pooling
@@ -441,10 +439,6 @@ class Probe:
         self.pca_components = pca_components
         self.mass_mean_augment = mass_mean_augment
 
-        # Dataset state (lazy)
-        self._dataset_metadata: object | None = None  # DatasetMetadata
-        self._dataset_pulled_prompts: set[str] = set()
-
         # Detect sweep mode before other validations
         self._sweep_mode, self._sweep_layers_spec = _parse_sweep_spec(layers)
 
@@ -461,8 +455,8 @@ class Probe:
                 "Use backend='nnsight' for remote execution."
             )
 
-        # Resolve pooling strategies (needed if model or dataset is provided)
-        if model is not None or dataset is not None:
+        # Resolve pooling strategies (needed if model is provided)
+        if model is not None:
             self._train_pooling, self._inference_pooling = resolve_pooling(
                 pooling, train_pooling, inference_pooling
             )
@@ -518,95 +512,13 @@ class Probe:
         self._evaluation_results_: dict | None = None
 
     def _check_model(self) -> None:
-        """Check that a model or dataset is available for prompt-based methods."""
-        if self.model is None and self.dataset is None:
+        """Check that a model is available for prompt-based methods."""
+        if self.model is None:
             raise ValueError(
-                "No model or dataset specified. Either pass model= or "
-                "dataset= to Probe(), or use the *_from_activations() "
-                "methods instead."
+                "No model specified. Either pass model= to Probe(), or use "
+                "the *_from_activations() methods with pre-loaded activations "
+                "(e.g. from lmprobe.load_activations())."
             )
-
-    def _ensure_dataset_metadata(self):
-        """Lazily fetch and cache dataset metadata.
-
-        Returns
-        -------
-        DatasetMetadata
-            Parsed metadata from the remote dataset.
-
-        Raises
-        ------
-        ValueError
-            If ``self.model`` is set and doesn't match the dataset's model.
-        """
-        if self._dataset_metadata is not None:
-            return self._dataset_metadata
-
-        from .sharing import fetch_dataset_metadata
-
-        meta = fetch_dataset_metadata(self.dataset)
-        # Validate model compatibility
-        if self.model is not None and self.model != meta.model_name:
-            raise ValueError(
-                f"Model mismatch: Probe has model={self.model!r} but dataset "
-                f"{self.dataset!r} was built with model={meta.model_name!r}. "
-                f"Either remove model= to use dataset alone, or use a "
-                f"matching model."
-            )
-        self._dataset_metadata = meta
-        return meta
-
-    def _resolve_layers_from_dataset(self) -> list[int]:
-        """Resolve layer specification using dataset metadata (no model needed).
-
-        Downloads only the HF ``config.json`` (~1KB) to get the model's
-        layer count, then applies the user's ``layers`` spec.
-        """
-        from .extraction import get_num_layers_from_config, resolve_layers
-
-        meta = self._ensure_dataset_metadata()
-        num_layers = get_num_layers_from_config(meta.model_name)
-        return resolve_layers(self.layers, num_layers)
-
-    def _pull_dataset_for_prompts(
-        self, prompts: list[str], layers: list[int]
-    ) -> None:
-        """Download only the dataset shards needed for *prompts*."""
-        new_prompts = [p for p in prompts if p not in self._dataset_pulled_prompts]
-        if not new_prompts:
-            return
-
-        from .sharing import pull_dataset
-
-        pull_dataset(
-            self.dataset,
-            target_prompts=new_prompts,
-            layers=layers,
-        )
-        self._dataset_pulled_prompts.update(new_prompts)
-
-    def _load_and_pool_from_cache(
-        self,
-        prompts: list[str],
-        layers: list[int],
-        pooling_strategy: str,
-    ) -> tuple[np.ndarray, None]:
-        """Load activations from cache and apply pooling (model-free path).
-
-        Used when ``dataset`` is set but ``model`` is None.
-        """
-        meta = self._ensure_dataset_metadata()
-        try:
-            result = load_pooled_batch(
-                meta.model_name, prompts, layers, pooling_strategy,
-                fallback_to_raw=True,
-            )
-        except FileNotFoundError as exc:
-            raise ValueError(
-                f"Cannot find activations in dataset {self.dataset!r} "
-                f"and no model is available for extraction: {exc}"
-            ) from exc
-        return result.detach().cpu().float().numpy(), None
 
     def _get_remote(self, remote: bool | None) -> bool:
         """Resolve remote parameter with method-level override."""
@@ -757,9 +669,10 @@ class Probe:
     ) -> np.ndarray | None:
         """Try to load pre-pooled activations from cache.
 
-        This checks if UnifiedCache (or similar) has already cached pooled
-        activations for all prompts. If so, we can skip both extraction AND
-        pooling, loading the final result directly.
+        Checks per-prompt pooled cache first, then falls back to shard-based
+        loading (e.g. from ``pull_dataset``). Returns None if any prompt is
+        missing from all cache layers, letting the caller fall through to
+        model extraction.
 
         Parameters
         ----------
@@ -772,7 +685,7 @@ class Probe:
         -------
         np.ndarray | None
             Pooled activations with shape (batch, hidden_dim) if all prompts
-            are in pooled cache. None if any prompt is missing.
+            are in cache. None if any prompt is missing.
         """
         # "all" pooling cannot use pre-pooled cache (needs full sequence)
         if pooling_strategy == "all":
@@ -783,25 +696,36 @@ class Probe:
         if parsed.is_score_pooling:
             return None
 
-        # No extractor means model-free (dataset-only); pooled cache uses model name
+        # No extractor means no model — can't check pooled cache
         if self._extractor is None:
             return None
 
         layer_indices = self._extractor.layer_indices
         required_layers = set(layer_indices)
-
-        # Check if ALL prompts have pooled cache
-        for prompt in prompts:
-            if not is_prompt_pooled_cached(
-                self.model, prompt, required_layers, pooling_strategy
-            ):
-                return None
-
         sorted_layers = sorted(layer_indices)
-        pooled = load_pooled_batch(
-            self.model, prompts, sorted_layers, pooling_strategy
+
+        # Fast path: check if ALL prompts have per-prompt pooled cache
+        all_cached = all(
+            is_prompt_pooled_cached(
+                self.model, prompt, required_layers, pooling_strategy
+            )
+            for prompt in prompts
         )
-        return pooled.detach().cpu().float().numpy()
+        if all_cached:
+            pooled = load_pooled_batch(
+                self.model, prompts, sorted_layers, pooling_strategy
+            )
+            return pooled.detach().cpu().float().numpy()
+
+        # Fallback: try shard-based loading (from pull_dataset / lazy shards)
+        try:
+            pooled = load_pooled_batch(
+                self.model, prompts, sorted_layers, pooling_strategy,
+                fallback_to_raw=True,
+            )
+            return pooled.detach().cpu().float().numpy()
+        except (FileNotFoundError, KeyError):
+            return None
 
     def _extract_and_pool(
         self,
@@ -835,23 +759,7 @@ class Probe:
                 # Success! Return directly without extraction
                 return pooled_from_cache, None
 
-        # If a dataset is configured, pull needed shards first so
-        # CachedExtractor finds them via the shard registry.
-        if self.dataset is not None:
-            self._ensure_dataset_metadata()
-            if self._extractor is not None:
-                ds_layers = sorted(self._extractor.layer_indices)
-            else:
-                ds_layers = self._resolve_layers_from_dataset()
-            self._pull_dataset_for_prompts(prompts, ds_layers)
-
-            # Model-free path: load directly from cache
-            if self._extractor is None:
-                return self._load_and_pool_from_cache(
-                    prompts, ds_layers, pooling_strategy
-                )
-
-        # Fall back to extraction + pooling
+        # Extract activations + apply pooling
         effective_retries = max_retries if max_retries is not None else self.max_retries
 
         # Temporarily override batch_size if provided
@@ -915,15 +823,6 @@ class Probe:
             improve throughput on GPU.
         """
         self._check_model()
-
-        # Pull from dataset if configured
-        if self.dataset is not None:
-            self._ensure_dataset_metadata()
-            if self._extractor is not None:
-                pull_layers = sorted(self._extractor.layer_indices)
-            else:
-                pull_layers = self._resolve_layers_from_dataset()
-            self._pull_dataset_for_prompts(prompts, pull_layers)
 
         # Model extraction (CachedExtractor skips already-cached prompts)
         if self._extractor is not None:
@@ -1074,10 +973,7 @@ class Probe:
             labels = np.repeat(labels, seq_len)
 
         # Auto-disable normalize_layers when preprocessing includes StandardScaler
-        if self._extractor is not None:
-            n_layers = len(self._extractor.layer_indices)
-        else:
-            n_layers = len(self._resolve_layers_from_dataset())
+        n_layers = len(self._extractor.layer_indices)
         scaling_strategy = self._get_scaling_strategy()
         if scaling_strategy is not None and self._preprocessing_includes_standard():
             import warnings

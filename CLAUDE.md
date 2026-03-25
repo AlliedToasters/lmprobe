@@ -256,6 +256,7 @@ pytest --cov=lmprobe
 ```python
 from lmprobe import LinearProbe
 
+# Train from a model (extracts activations live)
 probe = LinearProbe(
     model="meta-llama/Llama-3.1-8B-Instruct",
     layers=16,                          # int | list[int] | "all" | "middle"
@@ -269,8 +270,12 @@ probe = LinearProbe(
 probe.fit(positive_prompts, negative_prompts)
 predictions = probe.predict(new_prompts)
 
-# Override remote at call time
-predictions = probe.predict(new_prompts, remote=True)
+# Train from a dataset (no model needed)
+from lmprobe import load_activations
+
+acts, labels = load_activations("user/my-dataset", layers=[16], return_labels=True)
+probe = LinearProbe(classifier="logistic_regression", random_state=42)
+probe.fit_from_activations(acts[16], labels)
 ```
 
 ## Common Tasks

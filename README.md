@@ -504,20 +504,19 @@ print(url)  # https://huggingface.co/datasets/username/llama-safety-activations
 Once activations are on HuggingFace, anyone can train probes without loading the LLM:
 
 ```python
-from lmprobe import Probe
+from lmprobe import load_activations, Probe
 
-# No model= needed — activations are pulled from the dataset on demand
-probe = Probe(
-    dataset="username/llama-safety-activations",
-    layers=16,
-    classifier="logistic_regression",
+# Only downloads the shards for layer 16 — fast and selective
+acts, labels = load_activations(
+    "username/llama-safety-activations",
+    layers=[16],
+    return_labels=True,
 )
 
-probe.fit(positive_prompts, negative_prompts)
-predictions = probe.predict(test_prompts)
+probe = Probe(classifier="logistic_regression", random_state=42)
+probe.fit_from_activations(acts[16], labels)
+predictions = probe.predict_from_activations(test_acts[16])
 ```
-
-Activations are downloaded lazily per prompt and cached locally — repeated calls are fast.
 
 ### Pull a full dataset to local cache
 

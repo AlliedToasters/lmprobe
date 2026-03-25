@@ -23,6 +23,15 @@ See the [HuggingFace Datasets guide](../guides/datasets.md) for a walkthrough.
 
 ---
 
+## Loading
+
+::: lmprobe.sharing.load_activations
+    options:
+      show_root_heading: true
+      show_source: false
+
+---
+
 ## Publishing
 
 ::: lmprobe.sharing.push_dataset
