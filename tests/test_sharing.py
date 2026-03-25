@@ -1408,6 +1408,7 @@ class TestDryConsolidation:
         assert "tensors/hidden_layer001_shard000.safetensors" in shard_paths
 
 
+@requires_pyarrow
 class TestLoadActivationDataset:
     def _setup_remote_files(self, tmp_path):
         """Create remote files in v2 per-layer format with embedded metadata."""
