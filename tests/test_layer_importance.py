@@ -172,26 +172,6 @@ class TestComputeLayerImportance:
         assert (mean_abs > 0).all()
         assert (max_abs > 0).all()
 
-    def test_plotting_works_after_compute(self, tiny_model):
-        """plot_layer_importance works after compute_layer_importance."""
-        pytest.importorskip("matplotlib")
-        pytest.importorskip("seaborn")
-
-        probe = LinearProbe(
-            model=tiny_model,
-            layers=[-2, -1],
-            pooling="last_token",
-            device="cpu",
-            remote=False,
-        )
-        probe.fit(["positive"], ["negative"])
-        probe.compute_layer_importance()
-
-        fig, ax = probe.plot_layer_importance()
-
-        assert fig is not None
-        assert ax is not None
-
     def test_requires_fitted(self, tiny_model):
         """Raises if not fitted."""
         probe = LinearProbe(

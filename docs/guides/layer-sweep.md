@@ -76,12 +76,6 @@ best_idx = importances.argmax()
 print(f"Most important layer: {probe.candidate_layers_[best_idx]}")
 ```
 
-Visualize (requires `pip install lmprobe[plot]`):
-
-```python
-probe.plot_layer_importance()
-```
-
 ---
 
 ## Fast auto layer selection

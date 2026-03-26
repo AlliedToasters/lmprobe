@@ -452,13 +452,7 @@ class Probe:
         self._mass_mean_direction_: np.ndarray | None = None
         self.sweep_result_: LayerSweepResult | None = None
 
-        # Training data cache (for push_to_hub)
-        self._training_positive_: list[str] | None = None
-        self._training_negative_: list[str] | None = None
-        self._training_prompts_: list[str] | None = None
-        self._training_labels_: list[int] | None = None
-
-        # Evaluation results cache (for push_to_hub)
+        # Evaluation results cache
         self._evaluation_results_: dict | None = None
 
     def _check_model(self) -> None:
@@ -908,11 +902,6 @@ class Probe:
             # Standard mode: fit(prompts, labels)
             prompts = positive_prompts
             labels = np.asarray(negative_prompts)
-            # Cache for push_to_hub
-            self._training_prompts_ = list(positive_prompts)
-            self._training_labels_ = [int(x) for x in negative_prompts]
-            self._training_positive_ = None
-            self._training_negative_ = None
         else:
             # Contrastive mode: fit(positive_prompts, negative_prompts)
             neg_list: list[str] = [str(x) for x in negative_prompts]
@@ -920,11 +909,6 @@ class Probe:
             labels = np.array(
                 [1] * len(positive_prompts) + [0] * len(neg_list)
             )
-            # Cache for push_to_hub
-            self._training_positive_ = list(positive_prompts)
-            self._training_negative_ = neg_list
-            self._training_prompts_ = None
-            self._training_labels_ = None
 
         # Validate sample_weight length
         if sample_weight is not None:
@@ -1521,7 +1505,7 @@ class Probe:
         """Compute a standard set of evaluation metrics.
 
         Computes accuracy, AUROC, F1, precision, and recall. Results are
-        cached on ``self._evaluation_results_`` for use by ``push_to_hub()``.
+        cached on ``self._evaluation_results_``.
 
         Parameters
         ----------
@@ -1596,191 +1580,15 @@ class Probe:
                 results["auroc"] = auroc
 
         # Metadata
-        from .hub import _hash_prompts
+        import hashlib
 
         label_strs = [str(val) for val in labels]
-        combined = list(prompts) + label_strs
+        combined = "\n".join(sorted(list(prompts) + label_strs))
         results["n_eval"] = len(prompts)
-        results["eval_hash"] = _hash_prompts(combined)
+        results["eval_hash"] = "sha256:" + hashlib.sha256(combined.encode()).hexdigest()
 
         self._evaluation_results_ = results
         return results
-
-    def push_to_hub(
-        self,
-        repo_id: str,
-        description: str | None = None,
-        class_labels: dict[int, str] | None = None,
-        tags: list[str] | None = None,
-        metrics: dict[str, float] | None = None,
-        include_training_data: bool = True,
-        training_prompts: tuple[list[str], list[str]] | None = None,
-        private: bool = False,
-        license: str = "mit",
-        commit_message: str = "Upload lmprobe probe",
-        limitations: str | None = None,
-    ) -> str:
-        """Push this fitted probe to the HuggingFace Hub.
-
-        Parameters
-        ----------
-        repo_id : str
-            HuggingFace Hub repository ID (e.g., "username/probe-name").
-        description : str | None
-            Human-readable description.
-        class_labels : dict[int, str] | None
-            Human-readable class labels.
-        tags : list[str] | None
-            Additional tags.
-        metrics : dict[str, float] | None
-            Evaluation metrics (overrides cached evaluate() results).
-        include_training_data : bool
-            Include training prompts in training_info.json.
-        training_prompts : tuple[list[str], list[str]] | None
-            (positive, negative) prompts if not cached from fit().
-        private : bool
-            Create a private repository.
-        license : str
-            License identifier.
-        commit_message : str
-            Git commit message for the upload.
-        limitations : str | None
-            Limitations and intended use text for the model card.
-            If None, the section is omitted.
-
-        Returns
-        -------
-        str
-            URL of the created/updated Hub repository.
-        """
-        from .hub import push_to_hub
-
-        return push_to_hub(
-            self,
-            repo_id=repo_id,
-            description=description,
-            class_labels=class_labels,
-            tags=tags,
-            metrics=metrics,
-            include_training_data=include_training_data,
-            training_prompts=training_prompts,
-            private=private,
-            license=license,
-            commit_message=commit_message,
-            limitations=limitations,
-        )
-
-    @classmethod
-    def from_hub(
-        cls,
-        repo_id: str,
-        revision: str | None = None,
-        trust_classifier: bool = False,
-        load_model: bool = False,
-        device: str | None = None,
-    ) -> Probe:
-        """Load a probe from the HuggingFace Hub.
-
-        Parameters
-        ----------
-        repo_id : str
-            HuggingFace Hub repository ID.
-        revision : str | None
-            Specific commit of the probe repo.
-        trust_classifier : bool
-            Must be True to load the classifier. Required for security.
-        load_model : bool
-            If True, download and initialize the base model.
-        device : str | None
-            Override device for inference.
-
-        Returns
-        -------
-        Probe
-            The loaded probe.
-        """
-        from .hub import from_hub
-
-        return from_hub(
-            repo_id=repo_id,
-            revision=revision,
-            trust_classifier=trust_classifier,
-            load_model=load_model,
-            device=device,
-        )
-
-    def plot_layer_importance(
-        self,
-        ax: Any = None,
-        figsize: tuple[float, float] = (10, 6),
-        title: str = "Layer Importance (Group Lasso Norms)",
-        xlabel: str = "Layer Index",
-        ylabel: str = "Importance (L2 Norm)",
-        highlight_selected: bool = True,
-        bar_color: str = "steelblue",
-        selected_color: str = "coral",
-    ) -> Any:
-        """Plot layer importance scores from Group Lasso.
-
-        Only available after fitting with layers="auto".
-
-        Parameters
-        ----------
-        ax : matplotlib.axes.Axes | None
-            Matplotlib axes to plot on. If None, creates a new figure.
-        figsize : tuple[float, float]
-            Figure size if creating a new figure.
-        title : str
-            Plot title.
-        xlabel : str
-            X-axis label.
-        ylabel : str
-            Y-axis label.
-        highlight_selected : bool
-            Whether to highlight selected layers in a different color.
-        bar_color : str
-            Color for non-selected bars.
-        selected_color : str
-            Color for selected layer bars.
-
-        Returns
-        -------
-        tuple[Figure, Axes]
-            The matplotlib figure and axes objects.
-
-        Raises
-        ------
-        RuntimeError
-            If the probe has not been fitted or was not fitted with layers="auto".
-
-        Examples
-        --------
-        >>> probe = Probe(model="...", layers="auto")
-        >>> probe.fit(positive_prompts, negative_prompts)
-        >>> fig, ax = probe.plot_layer_importance()
-        >>> fig.savefig("layer_importance.png")
-        """
-        if self.candidate_layers_ is None or self.layer_importances_ is None:
-            raise RuntimeError(
-                "Layer importance not available. Either fit with layers='auto' or "
-                "'fast_auto', or call compute_layer_importance() after fitting."
-            )
-
-        from .plotting import plot_layer_importance
-
-        return plot_layer_importance(
-            candidate_layers=self.candidate_layers_,
-            layer_importances=self.layer_importances_,
-            selected_layers=self.selected_layers_,
-            ax=ax,
-            figsize=figsize,
-            title=title,
-            xlabel=xlabel,
-            ylabel=ylabel,
-            highlight_selected=highlight_selected,
-            bar_color=bar_color,
-            selected_color=selected_color,
-        )
 
     def compute_layer_importance(
         self,
@@ -1826,7 +1634,7 @@ class Probe:
         >>> probe.fit(positive_prompts, negative_prompts)
         >>> importance = probe.compute_layer_importance()
         >>> print(f"Layer {probe.candidate_layers_[importance.argmax()]} is most important")
-        >>> fig, ax = probe.plot_layer_importance()  # Now works!
+        >>> print(f"Most important: layer {probe.candidate_layers_[importance.argmax()]}")
         """
         self._check_fitted()
         assert self.classifier_ is not None

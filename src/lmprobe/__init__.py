@@ -49,7 +49,6 @@ __all__ = [
     "load_layer_last_token",
     "ModelCacheInfo",
     "PerLayerScaler",
-    "ProbeCard",
     "UnifiedCache",
     "WarmupStats",
     "cache_info",
@@ -62,8 +61,6 @@ __all__ = [
     "load_activations",
     "migrate_dataset",
     "upgrade_dataset_format",
-    "plot_layer_importance",
-    "plot_layer_importance_heatmap",
     "pull_dataset",
     "push_dataset",
     "evict",
@@ -97,13 +94,6 @@ def set_max_threads(n: int) -> None:
 
 def __getattr__(name: str) -> Any:
     """Lazy import for optional modules."""
-    if name in ("plot_layer_importance", "plot_layer_importance_heatmap"):
-        from .plotting import plot_layer_importance, plot_layer_importance_heatmap
-
-        return {
-            "plot_layer_importance": plot_layer_importance,
-            "plot_layer_importance_heatmap": plot_layer_importance_heatmap,
-        }[name]
     if name == "PerLayerScaler":
         from .scaling import PerLayerScaler
 
@@ -147,10 +137,6 @@ def __getattr__(name: str) -> Any:
             "WarmupStats": WarmupStats,
             "CachedLogits": CachedLogits,
         }[name]
-    if name == "ProbeCard":
-        from .hub import ProbeCard
-
-        return ProbeCard
     if name in ("load_layer_across_prompts", "load_layer_last_token"):
         from .cache import load_layer_across_prompts, load_layer_last_token
 

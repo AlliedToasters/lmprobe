@@ -32,10 +32,9 @@ Optional extras:
 
 | Extra | Installs |
 |-------|----------|
-| `lmprobe[hub]` | HuggingFace Hub push/pull |
+| `lmprobe[hub]` | HuggingFace Hub (activation datasets) |
 | `lmprobe[s3]` | S3 cache backend |
 | `lmprobe[nnsight]` | Remote execution via NDIF |
-| `lmprobe[plot]` | Layer importance visualization |
 | `lmprobe[embeddings]` | Sentence-transformers baselines |
 | `lmprobe[auto]` | Automatic layer selection (Group Lasso) |
 
@@ -111,5 +110,4 @@ See the [Quickstart](quickstart.md) for a complete walkthrough.
 | [Cache](reference/cache.md) | Cache configuration, inspection, eviction |
 | [Datasets](reference/datasets.md) | `UnifiedCache`, `push_dataset`, `load_activations`, `pull_dataset` |
 | [Dataset Format](reference/dataset-format.md) | v2 format specification (Parquet + safetensors) |
-| [Plotting](reference/plotting.md) | Layer importance visualization |
 | [Scaling](reference/scaling.md) | `PerLayerScaler` for multi-layer normalization |
