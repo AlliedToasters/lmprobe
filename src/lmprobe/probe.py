@@ -9,7 +9,7 @@ import logging
 import pickle
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-def _parse_sweep_spec(spec: str) -> tuple[bool, int | list[int] | str]:
+def _parse_sweep_spec(spec: int | list[int] | str) -> tuple[bool, int | list[int] | str]:
     """Parse a sweep layer specification.
 
     Parameters
@@ -152,6 +152,7 @@ class LayerSweepResult:
             return
         # Create a temporary extractor requesting ALL swept layers
         all_layers = sorted(self.probes.keys())
+        assert any_probe.model is not None
         warmup_extractor = ActivationExtractor(
             model_name=any_probe.model,
             device=any_probe.device,
@@ -163,7 +164,7 @@ class LayerSweepResult:
         warmup_cached = CachedExtractor(warmup_extractor)
         warmup_cached.extract(prompts, remote=any_probe.remote)
 
-    def _apply_to_all_probes(self, method: str, prompts: list[str], *args) -> dict:
+    def _apply_to_all_probes(self, method: str, prompts: list[str], *args: Any) -> dict[int, Any]:
         """Warmup cache, then call method on each probe and return results by layer."""
         self._warmup_cache(prompts)
         return {
@@ -190,7 +191,7 @@ class LayerSweepResult:
     ) -> int:
         """Return the layer index with the highest accuracy."""
         scores = self.score(test_prompts, test_labels)
-        return max(scores, key=scores.get)
+        return max(scores, key=lambda k: scores[k])
 
     def predict(self, prompts: list[str]) -> dict[int, np.ndarray]:
         """Predict with each layer's probe.
@@ -401,6 +402,8 @@ class Probe:
             )
 
         # Resolve pooling strategies (needed if model is provided)
+        self._train_pooling: str | None
+        self._inference_pooling: str | None
         if model is not None:
             self._train_pooling, self._inference_pooling = resolve_pooling(
                 pooling, train_pooling, inference_pooling
@@ -424,6 +427,8 @@ class Probe:
 
         # Create extractor (lazy loads model) only if model is provided
         # Skip for sweep mode — sweep creates its own extractors
+        self._extractor: ActivationExtractor | None
+        self._cached_extractor: CachedExtractor | None
         if model is not None and not self._sweep_mode:
             _torch_dtype = _resolve_dtype(dtype)
             self._extractor = ActivationExtractor(
@@ -443,7 +448,7 @@ class Probe:
         self.candidate_layers_: list[int] | None = None
         self.layer_importances_: np.ndarray | None = None
         self.scaler_: PerLayerScaler | None = None
-        self.preprocessing_pipeline_: object | None = None
+        self.preprocessing_pipeline_: Any = None
         self._mass_mean_direction_: np.ndarray | None = None
         self.sweep_result_: LayerSweepResult | None = None
 
@@ -489,7 +494,7 @@ class Probe:
         )
 
     @staticmethod
-    def _parse_preprocessing_spec(spec) -> list[str] | None:
+    def _parse_preprocessing_spec(spec: str | list[str] | None) -> list[str] | None:
         """Normalize preprocessing spec to a list of step strings, or None."""
         if spec is None:
             return None
@@ -504,7 +509,7 @@ class Probe:
             return False
         return any(s in ("standard", "standard_scaler") for s in steps)
 
-    def _build_preprocessing_pipeline(self):
+    def _build_preprocessing_pipeline(self) -> Any:
         """Build a sklearn Pipeline from the preprocessing specification.
 
         Returns
@@ -526,6 +531,7 @@ class Probe:
                 steps.append(("scaler", StandardScaler()))
             elif s.startswith("pca"):
                 # "pca", "pca:200"
+                n: int | None
                 if ":" in s:
                     n = int(s.split(":")[1])
                 else:
@@ -554,7 +560,7 @@ class Probe:
         scaling_strategy: str | None,
         *,
         single_layer_standard: bool = False,
-    ):
+    ) -> tuple[Any, np.ndarray]:
         """Create and fit a layer scaler.
 
         Parameters
@@ -686,6 +692,7 @@ class Probe:
         if self._extractor is None:
             return None
 
+        assert self.model is not None
         layer_indices = self._extractor.layer_indices
         required_layers = set(layer_indices)
         sorted_layers = sorted(layer_indices)
@@ -748,12 +755,14 @@ class Probe:
         # Extract activations + apply pooling
         effective_retries = max_retries if max_retries is not None else self.max_retries
 
+        assert self._extractor is not None
+        assert self._cached_extractor is not None
         # Temporarily override batch_size if provided
         if batch_size is not None:
             original_batch_size = self._extractor.batch_size
             self._extractor.batch_size = batch_size
         try:
-            activations, attention_mask = self._cached_extractor.extract(
+            activations, attention_mask = self._cached_extractor.extract(  # type: ignore[misc]
                 prompts,
                 remote=remote,
                 invalidate_cache=invalidate_cache,
@@ -811,7 +820,7 @@ class Probe:
         self._check_model()
 
         # Model extraction (CachedExtractor skips already-cached prompts)
-        if self._extractor is not None:
+        if self._extractor is not None and self._cached_extractor is not None:
             use_remote = self._get_remote(remote)
             effective_retries = max_retries if max_retries is not None else self.max_retries
 
@@ -901,18 +910,19 @@ class Probe:
             labels = np.asarray(negative_prompts)
             # Cache for push_to_hub
             self._training_prompts_ = list(positive_prompts)
-            self._training_labels_ = list(negative_prompts)
+            self._training_labels_ = [int(x) for x in negative_prompts]
             self._training_positive_ = None
             self._training_negative_ = None
         else:
             # Contrastive mode: fit(positive_prompts, negative_prompts)
-            prompts = list(positive_prompts) + list(negative_prompts)
+            neg_list: list[str] = [str(x) for x in negative_prompts]
+            prompts = list(positive_prompts) + neg_list
             labels = np.array(
-                [1] * len(positive_prompts) + [0] * len(negative_prompts)
+                [1] * len(positive_prompts) + [0] * len(neg_list)
             )
             # Cache for push_to_hub
             self._training_positive_ = list(positive_prompts)
-            self._training_negative_ = list(negative_prompts)
+            self._training_negative_ = neg_list
             self._training_prompts_ = None
             self._training_labels_ = None
 
@@ -927,8 +937,9 @@ class Probe:
 
         # Check if sweep mode
         if self._sweep_mode:
+            neg_strs: list[str] = [str(x) for x in negative_prompts]
             return self._fit_sweep(
-                positive_prompts, negative_prompts, remote,
+                positive_prompts, neg_strs, remote,
             )
 
         # Check if auto layer selection is needed
@@ -938,6 +949,7 @@ class Probe:
             return self._fit_fast_auto_layers(prompts, labels, remote, invalidate_cache)
 
         # Extract and pool activations
+        assert self._train_pooling is not None
         _t_extract_start = time.monotonic()
         X, _ = self._extract_and_pool(
             prompts,
@@ -953,6 +965,7 @@ class Probe:
         X, labels = self._expand_all_pooling(X, labels)
 
         # Auto-disable normalize_layers when preprocessing includes StandardScaler
+        assert self._extractor is not None
         n_layers = len(self._extractor.layer_indices)
         scaling_strategy = self._get_scaling_strategy()
         if scaling_strategy is not None and self._preprocessing_includes_standard():
@@ -1029,20 +1042,21 @@ class Probe:
 
     @staticmethod
     def _select_layer_columns(
-        X: np.ndarray, group_indices, hidden_dim_per_layer: int,
+        X: np.ndarray, group_indices: Any, hidden_dim_per_layer: int,
     ) -> np.ndarray:
         """Slice columns for selected layer groups from concatenated activations."""
-        selected_columns = []
+        selected_columns: list[int] = []
         for idx in group_indices:
             start = idx * hidden_dim_per_layer
             end = (idx + 1) * hidden_dim_per_layer
             selected_columns.extend(range(start, end))
         return X[:, selected_columns]
 
-    def _create_selected_extractor(self, layers: list[int]):
+    def _create_selected_extractor(self, layers: list[int]) -> tuple[ActivationExtractor, CachedExtractor]:
         """Create a new extractor + cached extractor for the given layers."""
         from .cache import CachedExtractor
 
+        assert self.model is not None
         extractor = ActivationExtractor(
             self.model, self.device, layers, self.batch_size,
             backend=self.backend,
@@ -1060,12 +1074,12 @@ class Probe:
 
     def _finalize_auto_layers(
         self,
-        selected_indices,
+        selected_indices: Any,
         candidate_layers: list[int],
         X_candidates: np.ndarray,
         labels: np.ndarray,
         hidden_dim_per_layer: int,
-        scaling_strategy,
+        scaling_strategy: str | None,
     ) -> Probe:
         """Shared tail for auto/fast_auto: slice, scale, retrain, update extractor."""
         self.selected_layers_ = [candidate_layers[i] for i in selected_indices]
@@ -1107,6 +1121,8 @@ class Probe:
         from .classifiers import build_group_lasso_classifier
 
         remote = self._get_remote(remote)
+        assert self._train_pooling is not None
+        assert self._extractor is not None
 
         X_candidates, _ = self._extract_and_pool(
             prompts, self._train_pooling,
@@ -1165,13 +1181,14 @@ class Probe:
         import warnings
 
         remote = self._get_remote(remote)
+        assert self._train_pooling is not None
+        assert self._extractor is not None
 
         X_candidates, _ = self._extract_and_pool(
             prompts, self._train_pooling,
             remote=remote, invalidate_cache=invalidate_cache,
         )
         X_candidates, labels_expanded = self._expand_all_pooling(X_candidates, labels)
-
         candidate_layers = self._extractor.layer_indices
         n_candidate_layers = len(candidate_layers)
         hidden_dim_per_layer = X_candidates.shape[1] // n_candidate_layers
@@ -1224,6 +1241,7 @@ class Probe:
         from .extraction import get_num_layers_from_config, resolve_layers
 
         self._check_model()
+        assert self.model is not None
 
         num_layers = get_num_layers_from_config(self.model)
         spec = self._sweep_layers_spec
@@ -1312,11 +1330,12 @@ class Probe:
         if self.preprocessing_pipeline_ is not None:
             X = self.preprocessing_pipeline_.transform(X)
         if self._mass_mean_direction_ is not None:
+            assert X_pre is not None
             X = self._augment_mass_mean(X, X_pre)
         return X
 
     def _apply_to_per_token_or_flat(
-        self, X: np.ndarray, fn,
+        self, X: np.ndarray, fn: Any,
     ) -> np.ndarray:
         """Apply a classifier function, handling 3D per-token activations.
 
@@ -1339,13 +1358,14 @@ class Probe:
         if X.ndim == 3:
             batch_size, seq_len, hidden_dim = X.shape
             X_flat = self._apply_inference_transforms(X.reshape(-1, hidden_dim))
-            result_flat = fn(X_flat)
+            result_flat: np.ndarray = fn(X_flat)
             if result_flat.ndim == 1:
-                return result_flat.reshape(batch_size, seq_len)
+                return np.asarray(result_flat.reshape(batch_size, seq_len))
             else:
-                return result_flat.reshape(batch_size, seq_len, -1)
+                return np.asarray(result_flat.reshape(batch_size, seq_len, -1))
         else:
-            return fn(self._apply_inference_transforms(X))
+            result: np.ndarray = fn(self._apply_inference_transforms(X))
+            return result
 
     def predict(
         self,
@@ -1381,11 +1401,14 @@ class Probe:
             if probs.ndim == 1:
                 return (probs > 0.5).astype(int)
             elif probs.ndim == 2:
-                return self.classes_[probs.argmax(axis=1)]
+                assert self.classes_ is not None
+                return np.asarray(self.classes_[probs.argmax(axis=1)])
             else:
                 # (n_samples, seq_len, n_classes) - per-token
-                return self.classes_[probs.argmax(axis=-1)]
+                assert self.classes_ is not None
+                return np.asarray(self.classes_[probs.argmax(axis=-1)])
         else:
+            assert self._inference_pooling is not None
             X, attention_mask = self._extract_and_pool(
                 prompts,
                 self._inference_pooling,
@@ -1393,6 +1416,7 @@ class Probe:
                 batch_size=batch_size,
             )
 
+            assert self.classifier_ is not None
             preds = self._apply_to_per_token_or_flat(X, self.classifier_.predict)
 
             if preds.ndim == 2:
@@ -1430,6 +1454,7 @@ class Probe:
         self._check_classification_task()
 
         # Extract activations
+        assert self._inference_pooling is not None
         X, attention_mask = self._extract_and_pool(
             prompts,
             self._inference_pooling,
@@ -1437,6 +1462,7 @@ class Probe:
             batch_size=batch_size,
         )
 
+        assert self.classifier_ is not None
         probs = self._apply_to_per_token_or_flat(
             X, self.classifier_.predict_proba,
         )
@@ -1538,7 +1564,7 @@ class Probe:
                         layer_metrics["auroc"] = auroc
                 layer_results[layer_idx] = layer_metrics
 
-            best_layer = max(scores, key=scores.get)
+            best_layer = max(scores, key=lambda k: scores[k])
             results: dict = {
                 "layer_results": layer_results,
                 "best_layer": best_layer,
@@ -1554,7 +1580,7 @@ class Probe:
 
         predictions = self.predict(prompts, remote=remote)
 
-        results: dict = {
+        results = {
             "accuracy": float(accuracy_score(labels, predictions)),
             "f1": float(f1_score(labels, predictions, zero_division=0)),
             "precision": float(precision_score(labels, predictions, zero_division=0)),
@@ -1683,7 +1709,7 @@ class Probe:
 
     def plot_layer_importance(
         self,
-        ax=None,
+        ax: Any = None,
         figsize: tuple[float, float] = (10, 6),
         title: str = "Layer Importance (Group Lasso Norms)",
         xlabel: str = "Layer Index",
@@ -1691,7 +1717,7 @@ class Probe:
         highlight_selected: bool = True,
         bar_color: str = "steelblue",
         selected_color: str = "coral",
-    ):
+    ) -> Any:
         """Plot layer importance scores from Group Lasso.
 
         Only available after fitting with layers="auto".
@@ -1801,6 +1827,7 @@ class Probe:
         >>> fig, ax = probe.plot_layer_importance()  # Now works!
         """
         self._check_fitted()
+        assert self.classifier_ is not None
 
         # Get coefficients
         if not hasattr(self.classifier_, "coef_"):
@@ -1815,6 +1842,7 @@ class Probe:
             coef = coef.flatten()  # (1, n_features) -> (n_features,)
 
         # Determine layer structure
+        assert self._extractor is not None
         layer_indices = self._extractor.layer_indices
         n_layers = len(layer_indices)
         n_features = len(coef)
@@ -1858,7 +1886,7 @@ class Probe:
         return importances
 
     @staticmethod
-    def _to_numpy(X) -> np.ndarray:
+    def _to_numpy(X: Any) -> np.ndarray:
         """Convert input to numpy array, handling torch tensors."""
         if isinstance(X, torch.Tensor):
             return X.detach().cpu().float().numpy()
@@ -1866,8 +1894,8 @@ class Probe:
 
     def fit_from_activations(
         self,
-        X,
-        y,
+        X: Any,
+        y: Any,
         sample_weight: np.ndarray | list[float] | None = None,
     ) -> Probe:
         """Fit the probe from pre-computed activation tensors.
@@ -1922,7 +1950,7 @@ class Probe:
 
         return self
 
-    def predict_from_activations(self, X) -> np.ndarray:
+    def predict_from_activations(self, X: Any) -> np.ndarray:
         """Predict from pre-computed activation tensors.
 
         Parameters
@@ -1936,10 +1964,11 @@ class Probe:
             Predictions, shape (n_samples,).
         """
         self._check_fitted()
+        assert self.classifier_ is not None
         X = self._apply_inference_transforms(self._to_numpy(X))
-        return self.classifier_.predict(X)
+        return np.asarray(self.classifier_.predict(X))
 
-    def predict_proba_from_activations(self, X) -> np.ndarray:
+    def predict_proba_from_activations(self, X: Any) -> np.ndarray:
         """Predict probabilities from pre-computed activation tensors.
 
         Only available for classification tasks.
@@ -1961,10 +1990,11 @@ class Probe:
         """
         self._check_fitted()
         self._check_classification_task()
+        assert self.classifier_ is not None
         X = self._apply_inference_transforms(self._to_numpy(X))
-        return self.classifier_.predict_proba(X)
+        return np.asarray(self.classifier_.predict_proba(X))
 
-    def score_from_activations(self, X, y) -> float:
+    def score_from_activations(self, X: Any, y: Any) -> float:
         """Score the probe on pre-computed activation tensors.
 
         Returns accuracy for classification, R-squared for regression.
@@ -1982,9 +2012,10 @@ class Probe:
             Accuracy (classification) or R-squared (regression).
         """
         self._check_fitted()
+        assert self.classifier_ is not None
         X = self._apply_inference_transforms(self._to_numpy(X))
         y = self._to_numpy(y)
-        return self.classifier_.score(X, y)
+        return float(self.classifier_.score(X, y))
 
     def save(self, path: str) -> None:
         """Save the fitted probe to disk.
@@ -2196,6 +2227,7 @@ class Probe:
         )
 
         all_prompts = list(positive_prompts) + list(negative_prompts)
+        assert warmup_probe._cached_extractor is not None
         warmup_probe._cached_extractor.extract(
             all_prompts,
             remote=remote,

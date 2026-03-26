@@ -10,7 +10,7 @@ import gc
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -270,7 +270,7 @@ class UnifiedCache:
         return _dtype_map[dtype]
 
     @property
-    def model(self):
+    def model(self) -> Any:
         """Get the loaded model, loading if necessary."""
         return self._resolved_backend.model
 
@@ -455,7 +455,7 @@ class UnifiedCache:
                         if effective_retries > 0:
                             batch_acts, batch_mask, batch_logits, batch_logits_indices = (
                                 retry_with_backoff(
-                                    lambda bp=batch_prompts: backend.extract_batch_with_logits(
+                                    lambda bp=batch_prompts: backend.extract_batch_with_logits(  # type: ignore[misc]
                                         bp, layer_indices,
                                         remote=remote,
                                         logit_top_k=effective_top_k,
@@ -515,20 +515,20 @@ class UnifiedCache:
                     # large batch tensor can be freed before saving.
                     # Slicing creates views that keep the original alive;
                     # .clone() breaks that reference.
-                    prompt_acts_list = [
+                    prompt_acts_list: list[torch.Tensor | None] = [
                         batch_acts[j : j + 1].clone()
                         for j in range(len(batch_prompts))
                     ]
-                    prompt_mask_list = [
+                    prompt_mask_list: list[torch.Tensor | None] = [
                         batch_mask[j : j + 1].clone()
                         for j in range(len(batch_prompts))
                     ]
-                    prompt_logits_list = (
+                    prompt_logits_list: list[torch.Tensor | None] | None = (
                         [batch_logits[j : j + 1].clone()
                          for j in range(len(batch_prompts))]
                         if batch_logits is not None else None
                     )
-                    prompt_logits_idx_list = (
+                    prompt_logits_idx_list: list[torch.Tensor | None] | None = (
                         [batch_logits_indices[j : j + 1].clone()
                          for j in range(len(batch_prompts))]
                         if batch_logits_indices is not None else None
@@ -541,10 +541,13 @@ class UnifiedCache:
                     for j, prompt in enumerate(batch_prompts):
                         prompt_acts = prompt_acts_list[j]
                         prompt_mask = prompt_mask_list[j]
+                        assert prompt_acts is not None
+                        assert prompt_mask is not None
 
                         # Save activations if needed
                         if prompt in need_activations_set:
                             if self.cache_pooled:
+                                assert self._pooling_fn is not None
                                 pooled_acts = self._pooling_fn(prompt_acts, prompt_mask)
                                 save_prompt_pooled_activations(
                                     self.model_name,
@@ -573,6 +576,7 @@ class UnifiedCache:
                                 ppl_token_ids_list[j]
                                 if ppl_token_ids_list is not None else None
                             )
+                            assert ppl_features is not None
                             save_prompt_perplexity(
                                 self.model_name, prompt, ppl_features[j],
                                 token_perplexity=tok_ppl,
@@ -590,6 +594,7 @@ class UnifiedCache:
                                 prompt_logits_idx_list[j]
                                 if prompt_logits_idx_list is not None else None
                             )
+                            assert p_logits is not None
                             if p_logits_idx is not None:
                                 save_prompt_topk_logits(
                                     self.model_name,

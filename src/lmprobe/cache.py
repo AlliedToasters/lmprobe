@@ -31,6 +31,11 @@ Features:
 
 from __future__ import annotations
 
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .extraction import ActivationExtractor
+
 import hashlib
 import json
 import logging
@@ -1335,7 +1340,7 @@ def _load_shard_manifest(model_name: str, repo_id: str | None = None) -> dict | 
             return _load_shard_manifest(model_name, repo_id=None)
         return None
 
-    manifest = json.loads(backend.read_text(key))
+    manifest: dict[str, Any] = json.loads(backend.read_text(key))
     _shard_manifests[cache_key] = manifest
     return manifest
 
@@ -1350,7 +1355,7 @@ def _load_shard_index(model_name: str) -> dict | None:
     if not backend.exists(key):
         return None
 
-    index = json.loads(backend.read_text(key))
+    index: dict[str, Any] = json.loads(backend.read_text(key))
     _shard_indices[model_name] = index
     return index
 
@@ -1537,11 +1542,11 @@ def _resolve_hidden_shard(
         model_name, prompt, "hidden_layers",
     )
 
-    storage = t_info.get("storage", "pooled")
-    layout = t_info.get("layout")
-    shard_idx = entry.get("shard_index")
+    storage: str = t_info.get("storage", "pooled")
+    layout: str | None = t_info.get("layout")
+    shard_idx: int = entry.get("shard_index", 0)
 
-    shards = t_info["shards"]
+    shards: list[dict[str, Any]] = t_info["shards"]
     if shard_idx >= len(shards):
         raise FileNotFoundError(
             f"Shard index {shard_idx} out of range (have {len(shards)} shards)"
@@ -1712,7 +1717,7 @@ def _load_pooled_from_shard(
     if storage == "full_sequence" and has_token_shard_ids:
         # Split full_sequence datasets: shard_index_hidden points to the
         # last-token shard which stores one row per prompt.
-        row_offset = entry.get("row_offset", 0)
+        row_offset: int = entry.get("row_offset", 0)
 
         def slice_fn(t: torch.Tensor) -> torch.Tensor:
             return t[row_offset : row_offset + 1]
@@ -1728,7 +1733,7 @@ def _load_pooled_from_shard(
 
     else:
         # Pooled storage: one row per prompt.
-        row_offset = entry.get("row_offset")
+        row_offset = entry.get("row_offset", 0)
 
         def slice_fn(t: torch.Tensor) -> torch.Tensor:  # noqa: F811
             return t[row_offset : row_offset + 1]
@@ -1753,8 +1758,8 @@ def _load_logits_from_shard(
         model_name, prompt, "logits_topk",
     )
 
-    shard_idx = entry.get("shard_index_logits", entry.get("shard_index"))
-    row_offset = entry.get("row_offset_logits", entry.get("row_offset"))
+    shard_idx: int = entry.get("shard_index_logits", entry.get("shard_index", 0))
+    row_offset: int = entry.get("row_offset_logits", entry.get("row_offset", 0))
 
     shards = t_info["shards"]
     if shard_idx >= len(shards):
@@ -2010,7 +2015,7 @@ def load_layer_last_token(
     vectors = []
     for acts, mask in zip(acts_list, masks_list):
         # acts: (1, seq_len, hidden_dim), mask: (1, seq_len)
-        last_pos = mask[0].nonzero(as_tuple=True)[0][-1].item()
+        last_pos = int(mask[0].nonzero(as_tuple=True)[0][-1].item())
         vectors.append(acts[0, last_pos, :])
 
     return torch.stack(vectors, dim=0)
@@ -2157,7 +2162,8 @@ def load_prompt_perplexity(model_name: str, prompt: str) -> torch.Tensor:
     # v1 (local only)
     if isinstance(get_backend(), LocalCacheBackend):
         cache_dir = get_prompt_cache_dir(model_name, prompt)
-        return torch.load(cache_dir / "perplexity.pt", weights_only=True)
+        result: torch.Tensor = torch.load(cache_dir / "perplexity.pt", weights_only=True)
+        return result
 
     raise FileNotFoundError(
         f"No cached perplexity found for prompt: {prompt!r}"
@@ -2285,7 +2291,7 @@ def _select_positions(
     """Slice token positions ("last" or "all") from a (1, seq_len, ...) tensor."""
     if positions == "last":
         mask = attention_mask[0]  # (seq_len,)
-        last_pos = mask.nonzero(as_tuple=True)[0][-1].item()
+        last_pos = int(mask.nonzero(as_tuple=True)[0][-1].item())
         return tensor[:, last_pos : last_pos + 1, :]
     if positions == "all":
         return tensor
@@ -2984,7 +2990,8 @@ def get_cached_layers(cache_dir: Path) -> set[int]:
 
 def load_layer(cache_dir: Path, layer: int) -> torch.Tensor:
     """Load a single layer's activations from legacy .pt cache."""
-    return torch.load(cache_dir / f"layer_{layer}.pt", weights_only=True)
+    result: torch.Tensor = torch.load(cache_dir / f"layer_{layer}.pt", weights_only=True)
+    return result
 
 
 def save_layer(cache_dir: Path, layer: int, activations: torch.Tensor) -> None:
@@ -2995,7 +3002,8 @@ def save_layer(cache_dir: Path, layer: int, activations: torch.Tensor) -> None:
 
 def load_attention_mask(cache_dir: Path) -> torch.Tensor:
     """Load attention mask from legacy .pt cache."""
-    return torch.load(cache_dir / "attention_mask.pt", weights_only=True)
+    result: torch.Tensor = torch.load(cache_dir / "attention_mask.pt", weights_only=True)
+    return result
 
 
 def save_attention_mask(cache_dir: Path, attention_mask: torch.Tensor) -> None:
@@ -3025,7 +3033,8 @@ def get_perplexity_cache_path(model_name: str, prompts: list[str]) -> Path:
 def load_perplexity_cache(cache_path: Path) -> torch.Tensor | None:
     """Load cached perplexity features (legacy batch format)."""
     if cache_path.exists():
-        return torch.load(cache_path, weights_only=True)
+        result: torch.Tensor = torch.load(cache_path, weights_only=True)
+        return result
     return None
 
 
@@ -3107,7 +3116,7 @@ class CachedExtractor:
         The underlying extractor.
     """
 
-    def __init__(self, extractor):
+    def __init__(self, extractor: ActivationExtractor) -> None:
         self.extractor = extractor
 
     def extract(
@@ -3210,10 +3219,15 @@ class CachedExtractor:
 
                     try:
                         if effective_retries > 0:
+                            _bp = batch_prompts
+
+                            def _extract_fn() -> tuple[torch.Tensor, torch.Tensor]:
+                                return self.extractor.extract_batch(
+                                    _bp, layer_indices, remote=remote
+                                )
+
                             batch_acts, batch_mask = retry_with_backoff(
-                                lambda bp=batch_prompts: self.extractor.extract_batch(
-                                    bp, layer_indices, remote=remote
-                                ),
+                                _extract_fn,
                                 max_retries=effective_retries,
                                 context=f"batch {batch_num}/{num_batches}",
                             )

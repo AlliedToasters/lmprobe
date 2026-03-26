@@ -7,7 +7,7 @@ classifiers with proper random_state propagation.
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from sklearn.linear_model import (
@@ -239,7 +239,7 @@ class MassMeanClassifier:
     Marks & Tegmark, "The Geometry of Truth" (2023)
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         # No parameters - this makes get_params/set_params trivial
         self.coef_: np.ndarray | None = None
         self.intercept_: float | None = None
@@ -314,7 +314,8 @@ class MassMeanClassifier:
         if self.coef_ is None:
             raise RuntimeError("Classifier has not been fitted. Call fit() first.")
 
-        return X @ self.coef_ + self.intercept_
+        result: np.ndarray = X @ self.coef_ + self.intercept_
+        return result
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict class labels.
@@ -352,7 +353,8 @@ class MassMeanClassifier:
         scores = self.decision_function(X)
 
         if self._calibrator is not None:
-            return self._calibrator.predict_proba(scores.reshape(-1, 1))
+            result: np.ndarray = self._calibrator.predict_proba(scores.reshape(-1, 1))
+            return result
 
         # Fallback: numerically stable sigmoid (should not normally be reached)
         return _stable_sigmoid_proba(scores)
@@ -390,7 +392,7 @@ class MassMeanClassifier:
         """
         return {}
 
-    def set_params(self, **params) -> MassMeanClassifier:
+    def set_params(self, **params: Any) -> MassMeanClassifier:
         """Set parameters for this estimator (sklearn compatibility).
 
         Parameters
@@ -442,8 +444,8 @@ class EnsembleClassifier:
         solver: str = "lbfgs",
         max_iter: int = 1000,
         random_state: int | None = None,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         self.C_values = C_values if C_values is not None else self._DEFAULT_C_VALUES
         self.solver = solver
         self.max_iter = max_iter
@@ -504,7 +506,8 @@ class EnsembleClassifier:
             raise RuntimeError("Classifier has not been fitted. Call fit() first.")
 
         probas = np.array([e.predict_proba(X) for e in self.estimators_])
-        return probas.mean(axis=0)
+        result: np.ndarray = probas.mean(axis=0)
+        return result
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict by thresholding averaged probabilities at 0.5.
@@ -520,7 +523,9 @@ class EnsembleClassifier:
             Predicted labels, shape (n_samples,).
         """
         proba = self.predict_proba(X)
-        return self.classes_[np.argmax(proba, axis=1)]
+        assert self.classes_ is not None, "Classifier has not been fitted."
+        result: np.ndarray = self.classes_[np.argmax(proba, axis=1)]
+        return result
 
     def score(self, X: np.ndarray, y: np.ndarray) -> float:
         """Compute accuracy.
@@ -548,7 +553,7 @@ class EnsembleClassifier:
             "random_state": self.random_state,
         }
 
-    def set_params(self, **params) -> EnsembleClassifier:
+    def set_params(self, **params: Any) -> EnsembleClassifier:
         """Set parameters for this estimator (sklearn compatibility)."""
         for key, value in params.items():
             setattr(self, key, value)
@@ -619,7 +624,7 @@ class GroupLassoClassifier:
                 "Install it with: pip install lmprobe[auto]"
             )
 
-    def _build_estimator(self):
+    def _build_estimator(self) -> Any:
         """Build the underlying skglm estimator."""
         from skglm import GeneralizedLinearEstimator
         from skglm.datafits import LogisticGroup
@@ -668,15 +673,16 @@ class GroupLassoClassifier:
         y_transformed = np.where(y == 0, -1, 1)
 
         # Build and fit estimator
-        self._estimator = self._build_estimator()
-        self._estimator.fit(X, y_transformed)
+        estimator = self._build_estimator()
+        estimator.fit(X, y_transformed)
+        self._estimator = estimator
 
         # Extract coefficients (skglm returns (1, n_features), flatten to (n_features,))
-        coef = self._estimator.coef_
+        coef = estimator.coef_
         if coef.ndim == 2:
             coef = coef.flatten()
         self.coef_ = coef
-        self.intercept_ = getattr(self._estimator, "intercept_", None)
+        self.intercept_ = getattr(estimator, "intercept_", None)
 
         # Compute group norms and identify selected groups
         coef_by_group = self.coef_.reshape(self.n_layers, self.hidden_dim)

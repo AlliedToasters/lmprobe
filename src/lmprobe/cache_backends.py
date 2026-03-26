@@ -200,7 +200,7 @@ class LocalCacheBackend(CacheBackend):
 
     def collect_entries(self) -> list[tuple[str, int, float]]:
         """Collect safetensors files and v1 prompt directories."""
-        entries = []
+        entries: list[tuple[str, int, float]] = []
         if not self.base_dir.exists():
             return entries
 
@@ -295,7 +295,7 @@ class S3CacheBackend(CacheBackend):
 
     def read_bytes(self, key: str) -> bytes:
         resp = self._s3.get_object(Bucket=self.bucket, Key=self._full_key(key))
-        return resp["Body"].read()
+        return bytes(resp["Body"].read())
 
     def read_range(self, key: str, start: int, end: int) -> bytes:
         resp = self._s3.get_object(
@@ -303,7 +303,7 @@ class S3CacheBackend(CacheBackend):
             Key=self._full_key(key),
             Range=f"bytes={start}-{end - 1}",
         )
-        return resp["Body"].read()
+        return bytes(resp["Body"].read())
 
     def write_bytes(self, key: str, data: bytes) -> None:
         self._s3.put_object(Bucket=self.bucket, Key=self._full_key(key), Body=data)
@@ -324,11 +324,11 @@ class S3CacheBackend(CacheBackend):
 
     def size(self, key: str) -> int:
         resp = self._s3.head_object(Bucket=self.bucket, Key=self._full_key(key))
-        return resp["ContentLength"]
+        return int(resp["ContentLength"])
 
     def mtime(self, key: str) -> float:
         resp = self._s3.head_object(Bucket=self.bucket, Key=self._full_key(key))
-        return resp["LastModified"].timestamp()
+        return float(resp["LastModified"].timestamp())
 
     def touch(self, key: str) -> None:
         # No-op on S3: no writable mtime, and LRU doesn't apply.

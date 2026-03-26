@@ -8,6 +8,7 @@ forward pass.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import numpy as np
 import torch
@@ -16,7 +17,7 @@ import torch.nn.functional as functional
 logger = logging.getLogger(__name__)
 
 
-def _detect_norm_type(config) -> tuple[str, float]:
+def _detect_norm_type(config: Any) -> tuple[str, float]:
     """Detect norm type and epsilon from model config attributes.
 
     Uses config attributes rather than a hardcoded model_type list,
@@ -214,7 +215,7 @@ def compute_perplexity_from_activations(
     norm_weight: torch.Tensor | None = None,
     lm_head_weight: torch.Tensor | None = None,
     norm_config: dict | None = None,
-    tokenizer: object | None = None,
+    tokenizer: Any | None = None,
     return_per_token: bool = False,
 ) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
     """Compute perplexity stats from cached last-layer activations.
