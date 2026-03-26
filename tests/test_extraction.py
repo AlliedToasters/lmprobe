@@ -8,6 +8,28 @@ import torch
 
 
 # ---------------------------------------------------------------------------
+# _require_nnsight
+# ---------------------------------------------------------------------------
+
+
+class TestRequireNnsight:
+    def test_import_error_message(self):
+        """_require_nnsight gives a clear error when nnsight is not installed."""
+        from lmprobe.extraction import _require_nnsight
+
+        with patch.dict("sys.modules", {"nnsight": None}):
+            with pytest.raises(ImportError, match="nnsight is required"):
+                _require_nnsight()
+
+    def test_success_when_installed(self):
+        """_require_nnsight succeeds when nnsight is installed."""
+        from lmprobe.extraction import _require_nnsight
+
+        result = _require_nnsight()
+        assert result is not None
+
+
+# ---------------------------------------------------------------------------
 # resolve_layers
 # ---------------------------------------------------------------------------
 
@@ -237,6 +259,53 @@ class TestLoadModel:
         model = load_model(tiny_model, device="cpu", remote=False)
         assert model is not None
 
+    def test_load_remote_creates_stub(self, tiny_model):
+        """Remote mode creates a dispatch=False stub without loading weights."""
+        from lmprobe.extraction import load_model
+
+        model = load_model(tiny_model, device="cpu", remote=True)
+        assert model is not None
+        # Remote stubs should have dispatched=True
+        assert model.dispatched is True
+
+    def test_load_runtime_error_fallback(self, tiny_model):
+        """RuntimeError with 'no kernel image' falls back to CPU."""
+        from lmprobe.extraction import load_model
+
+        nnsight_mod = MagicMock()
+        call_count = 0
+
+        def mock_lm(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("no kernel image available")
+            return MagicMock()
+
+        nnsight_mod.LanguageModel = mock_lm
+
+        with patch("lmprobe.extraction._require_nnsight", return_value=nnsight_mod), \
+             patch("lmprobe._device_utils.check_cuda_compatibility"):
+            import warnings
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                model = load_model(tiny_model, device="cuda:0", remote=False)
+            assert model is not None
+            assert call_count == 2
+            assert any("GPU detected but incompatible" in str(warning.message) for warning in w)
+
+    def test_load_runtime_error_reraises_other(self, tiny_model):
+        """RuntimeError without 'no kernel image' is re-raised."""
+        from lmprobe.extraction import load_model
+
+        nnsight_mod = MagicMock()
+        nnsight_mod.LanguageModel.side_effect = RuntimeError("some other error")
+
+        with patch("lmprobe.extraction._require_nnsight", return_value=nnsight_mod), \
+             patch("lmprobe._device_utils.check_cuda_compatibility"):
+            with pytest.raises(RuntimeError, match="some other error"):
+                load_model(tiny_model, device="cuda:0", remote=False)
+
 
 # ---------------------------------------------------------------------------
 # _unwrap_proxy / _unwrap_layer_outputs
@@ -366,6 +435,62 @@ class TestExtractActivations:
             model, prompts, [0], remote=False, batch_size=100
         )
         assert acts.shape[0] == 1
+
+    def test_padding_across_batches_mocked(self):
+        """Test padding logic using mocked _extract_batch to avoid nnsight."""
+        from lmprobe.extraction import extract_activations
+
+        model = MagicMock()
+        hidden_dim = 16
+        call_count = 0
+
+        def mock_extract_batch(model, prompts, layer_indices, remote=False):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First batch: seq_len=5
+                return (
+                    torch.randn(1, 5, hidden_dim),
+                    torch.ones(1, 5, dtype=torch.long),
+                )
+            else:
+                # Second batch: seq_len=10 (longer)
+                return (
+                    torch.randn(1, 10, hidden_dim),
+                    torch.ones(1, 10, dtype=torch.long),
+                )
+
+        with patch("lmprobe.extraction._extract_batch", side_effect=mock_extract_batch):
+            acts, mask = extract_activations(
+                model, ["short", "longer prompt"], [0], remote=False, batch_size=1
+            )
+
+        assert acts.shape == (2, 10, hidden_dim)
+        assert mask.shape == (2, 10)
+        # First batch should have been padded: last 5 positions masked out
+        assert mask[0, :5].sum() == 5
+        assert mask[0, 5:].sum() == 0
+
+    def test_no_padding_needed_mocked(self):
+        """Test when all batches have the same seq_len (no padding)."""
+        from lmprobe.extraction import extract_activations
+
+        model = MagicMock()
+        hidden_dim = 16
+
+        def mock_extract_batch(model, prompts, layer_indices, remote=False):
+            return (
+                torch.randn(1, 8, hidden_dim),
+                torch.ones(1, 8, dtype=torch.long),
+            )
+
+        with patch("lmprobe.extraction._extract_batch", side_effect=mock_extract_batch):
+            acts, mask = extract_activations(
+                model, ["a", "b"], [0], remote=False, batch_size=1
+            )
+
+        assert acts.shape == (2, 8, hidden_dim)
+        assert mask.shape == (2, 8)
 
 
 # ---------------------------------------------------------------------------

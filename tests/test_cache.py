@@ -2763,3 +2763,643 @@ class TestIsPromptPerplexityCachedEdgeCases:
         _merge_save_backend(main_key, {"perplexity": torch.tensor([1.0, 2.0, 3.0])})
 
         assert is_prompt_perplexity_cached(self.model, "test")
+
+
+class TestLoadLayerAcrossPromptsSynthetic:
+    """Tests for load_layer_across_prompts without a real model."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-layer-across"
+
+    def test_basic_load(self):
+        from lmprobe.cache import load_layer_across_prompts
+
+        prompts = ["prompt A", "prompt B"]
+        for p in prompts:
+            acts = torch.randn(1, 5, 64)
+            mask = torch.ones(1, 5, dtype=torch.long)
+            save_prompt_activations(self.model, p, [0, 1], acts, mask)
+
+        acts_list, masks_list = load_layer_across_prompts(self.model, prompts, layer=0)
+        assert len(acts_list) == 2
+        assert len(masks_list) == 2
+        for a, m in zip(acts_list, masks_list):
+            assert a.shape == (1, 5, 32)  # half of 64 (2 layers)
+            assert m.shape == (1, 5)
+
+    def test_missing_prompt_raises(self):
+        from lmprobe.cache import load_layer_across_prompts
+
+        with pytest.raises(FileNotFoundError):
+            load_layer_across_prompts(self.model, ["nonexistent"], layer=0)
+
+
+class TestLoadLayerLastTokenSynthetic:
+    """Tests for load_layer_last_token without a real model."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-last-token"
+
+    def test_basic_load(self):
+        from lmprobe.cache import load_layer_last_token
+
+        prompts = ["test one", "test two"]
+        for p in prompts:
+            acts = torch.randn(1, 5, 32)
+            mask = torch.ones(1, 5, dtype=torch.long)
+            save_prompt_activations(self.model, p, [0], acts, mask)
+
+        result = load_layer_last_token(self.model, prompts, layer=0)
+        assert result.shape == (2, 32)
+
+    def test_with_padding(self):
+        from lmprobe.cache import load_layer_last_token
+
+        acts = torch.randn(1, 8, 32)
+        mask = torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0]])
+        save_prompt_activations(self.model, "padded", [0], acts, mask)
+
+        result = load_layer_last_token(self.model, ["padded"], layer=0)
+        assert result.shape == (1, 32)
+        # Should use position 4 (last non-zero mask position)
+        assert torch.equal(result[0], acts[0, 4, :])
+
+
+class TestIsPromptLogitsCachedEdgeCases:
+    """Additional edge cases for is_prompt_logits_cached."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-logits-cached"
+
+    def test_full_logits_in_sidecar(self):
+        """Full logits (not top-k) in sidecar are detected."""
+        logits = torch.randn(1, 5, 100)
+        mask = torch.ones(1, 5)
+        save_prompt_logits(self.model, "test", logits, mask, top_k=None, positions="all")
+        assert is_prompt_logits_cached(self.model, "test", top_k=None)
+        assert not is_prompt_logits_cached(self.model, "test", top_k=10)
+
+    def test_topk_logits_check(self):
+        """Top-k logits check with explicit top_k parameter."""
+        logits = torch.randn(1, 5, 100)
+        mask = torch.ones(1, 5)
+        save_prompt_logits(self.model, "topk", logits, mask, top_k=10)
+        assert is_prompt_logits_cached(self.model, "topk", top_k=10)
+        # Should not be cached for full logits
+        assert not is_prompt_logits_cached(self.model, "topk", top_k=None)
+
+
+class TestLogitsLoadEdgeCases:
+    """Edge cases for load_prompt_logits."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-logits-load"
+
+    def test_topk_missing_raises(self):
+        """Loading top-k logits when none cached raises."""
+        with pytest.raises(FileNotFoundError):
+            load_prompt_logits(self.model, "missing", top_k=10)
+
+
+class TestSafeSaveDisabled:
+    """Test caching disabled behavior."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+    def test_save_noop_when_disabled(self):
+        """Saving activations is a no-op when caching is disabled."""
+        import lmprobe.cache as cache_mod
+
+        old = cache_mod._CACHE_MAX_BYTES
+        try:
+            cache_mod._CACHE_MAX_BYTES = -1
+            save_prompt_activations(
+                "test", "test", [0],
+                torch.randn(1, 3, 32), torch.ones(1, 3),
+            )
+            # Nothing should be cached
+            assert not is_prompt_fully_cached("test", "test", {0})
+        finally:
+            cache_mod._CACHE_MAX_BYTES = old
+
+
+class TestDiscoverCachedWithActivationsAndSidecars:
+    """Additional discover_cached scenarios with sidecar-only entries."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-discover-sidecar"
+
+    def test_with_both_raw_and_logits(self):
+        """discover_cached reports raw layers and logits together."""
+        from lmprobe.cache import discover_cached
+
+        acts = torch.randn(1, 5, 64)
+        mask = torch.ones(1, 5, dtype=torch.long)
+        save_prompt_activations(self.model, "both", [0, 1], acts, mask)
+        save_prompt_logits(self.model, "both", torch.randn(1, 5, 100), mask, top_k=10)
+
+        info = discover_cached(self.model, "both")
+        assert info is not None
+        assert info.raw_layers == [0, 1]
+        assert info.logits_top_k == 10
+
+    def test_logits_only_no_activations(self):
+        """discover_cached handles logits-only sidecar (no main file)."""
+        from lmprobe.cache import discover_cached
+
+        mask = torch.ones(1, 5)
+        save_prompt_logits(self.model, "logits-only", torch.randn(1, 5, 100), mask, top_k=5)
+
+        info = discover_cached(self.model, "logits-only")
+        assert info is not None
+        assert info.raw_layers == []
+        assert info.logits_top_k == 5
+
+    def test_perplexity_only_no_activations(self):
+        """discover_cached handles perplexity-only sidecar."""
+        from lmprobe.cache import discover_cached
+
+        save_prompt_perplexity(self.model, "ppl-only", torch.tensor([1.0, 2.0, 3.0]))
+
+        info = discover_cached(self.model, "ppl-only")
+        assert info is not None
+        assert info.has_perplexity is True
+        assert info.raw_layers == []
+
+
+class TestCacheInfoV1Directories:
+    """Test cache_info with v1-style cache directories."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.base = tmp_path
+
+    def test_v1_directory_counted(self):
+        """V1 directories are counted in cache_info."""
+        model_hash = _hash_string("v1-model")
+        model_dir = self.base / model_hash
+        model_dir.mkdir(parents=True)
+
+        # Write model name
+        (model_dir / "_model_name.txt").write_text("v1-model")
+
+        # Create a v1-style prompt directory
+        prompt_hash = _hash_string("v1-prompt")
+        prompt_dir = model_dir / prompt_hash
+        prompt_dir.mkdir()
+        torch.save(torch.randn(1, 5, 32), prompt_dir / "layer_0.pt")
+        torch.save(torch.ones(1, 5), prompt_dir / "attention_mask.pt")
+
+        info = cache_info(model="v1-model")
+        assert len(info.models) == 1
+        assert info.models[0].num_prompts == 1
+        assert info.models[0].num_layers == 1
+
+    def test_v1_pooled_detected(self):
+        """V1 pooled directories are detected by cache_info."""
+        model_hash = _hash_string("v1-pooled")
+        model_dir = self.base / model_hash
+        model_dir.mkdir(parents=True)
+        (model_dir / "_model_name.txt").write_text("v1-pooled")
+
+        prompt_hash = _hash_string("v1-prompt")
+        prompt_dir = model_dir / prompt_hash
+        prompt_dir.mkdir()
+        torch.save(torch.randn(1, 5, 32), prompt_dir / "layer_0.pt")
+
+        pooled_dir = prompt_dir / "pooled_last_token"
+        pooled_dir.mkdir()
+        torch.save(torch.randn(1, 32), pooled_dir / "layer_0.pt")
+
+        info = cache_info(model="v1-pooled")
+        assert info.models[0].has_pooled is True
+
+    def test_v1_perplexity_detected(self):
+        """V1 perplexity.pt is detected by cache_info."""
+        model_hash = _hash_string("v1-ppl")
+        model_dir = self.base / model_hash
+        model_dir.mkdir(parents=True)
+        (model_dir / "_model_name.txt").write_text("v1-ppl")
+
+        prompt_hash = _hash_string("v1-prompt")
+        prompt_dir = model_dir / prompt_hash
+        prompt_dir.mkdir()
+        torch.save(torch.randn(1, 5, 32), prompt_dir / "layer_0.pt")
+        torch.save(torch.tensor([1.0, 2.0, 3.0]), prompt_dir / "perplexity.pt")
+
+        info = cache_info(model="v1-ppl")
+        assert info.models[0].has_perplexity is True
+
+
+class TestIsPromptFullyCachedV1:
+    """Test is_prompt_fully_cached with v1 legacy directories."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.base = tmp_path
+        self.model = "v1-model-fully"
+
+    def test_v1_fully_cached(self):
+        """V1 directory with all layers and mask is fully cached."""
+        model_hash = _hash_string(self.model)
+        prompt_hash = _hash_string("v1 prompt")
+        prompt_dir = self.base / model_hash / prompt_hash
+        prompt_dir.mkdir(parents=True)
+
+        torch.save(torch.randn(1, 5, 32), prompt_dir / "layer_0.pt")
+        torch.save(torch.randn(1, 5, 32), prompt_dir / "layer_1.pt")
+        torch.save(torch.ones(1, 5), prompt_dir / "attention_mask.pt")
+
+        assert is_prompt_fully_cached(self.model, "v1 prompt", {0, 1})
+
+    def test_v1_partial_cached(self):
+        """V1 directory with missing layers is not fully cached."""
+        model_hash = _hash_string(self.model)
+        prompt_hash = _hash_string("v1 partial")
+        prompt_dir = self.base / model_hash / prompt_hash
+        prompt_dir.mkdir(parents=True)
+
+        torch.save(torch.randn(1, 5, 32), prompt_dir / "layer_0.pt")
+        torch.save(torch.ones(1, 5), prompt_dir / "attention_mask.pt")
+
+        assert not is_prompt_fully_cached(self.model, "v1 partial", {0, 1})
+
+
+class TestIsPromptPooledCachedV1:
+    """Test is_prompt_pooled_cached with v1 directories."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.base = tmp_path
+        self.model = "v1-model-pooled"
+
+    def test_v1_pooled_cached(self):
+        model_hash = _hash_string(self.model)
+        prompt_hash = _hash_string("v1 pooled prompt")
+        prompt_dir = self.base / model_hash / prompt_hash
+        pooled_dir = prompt_dir / "pooled_last_token"
+        pooled_dir.mkdir(parents=True)
+
+        torch.save(torch.randn(1, 32), pooled_dir / "layer_0.pt")
+        torch.save(torch.randn(1, 32), pooled_dir / "layer_1.pt")
+
+        assert is_prompt_pooled_cached(self.model, "v1 pooled prompt", {0, 1}, "last_token")
+
+
+class TestLoadPromptActivationsV1:
+    """Test load_prompt_activations with v1 directories."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.base = tmp_path
+        self.model = "v1-model-load"
+
+    def test_v1_load(self):
+        model_hash = _hash_string(self.model)
+        prompt_hash = _hash_string("v1 load test")
+        prompt_dir = self.base / model_hash / prompt_hash
+        prompt_dir.mkdir(parents=True)
+
+        acts0 = torch.randn(1, 5, 32)
+        mask = torch.ones(1, 5, dtype=torch.long)
+        torch.save(acts0, prompt_dir / "layer_0.pt")
+        torch.save(mask, prompt_dir / "attention_mask.pt")
+
+        loaded_acts, loaded_mask = load_prompt_activations(self.model, "v1 load test", [0])
+        assert torch.equal(loaded_acts, acts0)
+        assert torch.equal(loaded_mask, mask)
+
+
+class TestLoadPromptPooledV1:
+    """Test load_prompt_pooled_activations with v1 directories."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.base = tmp_path
+        self.model = "v1-model-pooled-load"
+
+    def test_v1_pooled_load(self):
+        model_hash = _hash_string(self.model)
+        prompt_hash = _hash_string("v1 pooled load")
+        prompt_dir = self.base / model_hash / prompt_hash
+        pooled_dir = prompt_dir / "pooled_last_token"
+        pooled_dir.mkdir(parents=True)
+
+        layer0 = torch.randn(1, 32)
+        layer1 = torch.randn(1, 32)
+        torch.save(layer0, pooled_dir / "layer_0.pt")
+        torch.save(layer1, pooled_dir / "layer_1.pt")
+
+        loaded = load_prompt_pooled_activations(self.model, "v1 pooled load", [0, 1], "last_token")
+        expected = torch.cat([layer0, layer1], dim=-1)
+        assert torch.equal(loaded, expected)
+
+
+class TestLoadPerplexityV1:
+    """Test load_prompt_perplexity with v1 directories."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.base = tmp_path
+        self.model = "v1-model-ppl-load"
+
+    def test_v1_perplexity_load(self):
+        model_hash = _hash_string(self.model)
+        prompt_hash = _hash_string("v1 ppl load")
+        prompt_dir = self.base / model_hash / prompt_hash
+        prompt_dir.mkdir(parents=True)
+
+        ppl = torch.tensor([1.5, 2.0, 0.8])
+        torch.save(ppl, prompt_dir / "perplexity.pt")
+
+        loaded = load_prompt_perplexity(self.model, "v1 ppl load")
+        assert torch.allclose(loaded, ppl)
+
+    def test_v1_perplexity_is_cached(self):
+        model_hash = _hash_string(self.model)
+        prompt_hash = _hash_string("v1 ppl check")
+        prompt_dir = self.base / model_hash / prompt_hash
+        prompt_dir.mkdir(parents=True)
+
+        torch.save(torch.tensor([1.0, 2.0, 3.0]), prompt_dir / "perplexity.pt")
+
+        assert is_prompt_perplexity_cached(self.model, "v1 ppl check")
+
+
+class TestLoadLayerAcrossPromptsV1:
+    """Test load_layer_across_prompts with v1 directories."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.base = tmp_path
+        self.model = "v1-model-layer-across"
+
+    def test_v1_layer_across(self):
+        from lmprobe.cache import load_layer_across_prompts
+
+        prompts = ["v1 layer A", "v1 layer B"]
+        for p in prompts:
+            model_hash = _hash_string(self.model)
+            prompt_hash = _hash_string(p)
+            prompt_dir = self.base / model_hash / prompt_hash
+            prompt_dir.mkdir(parents=True)
+
+            acts = torch.randn(1, 5, 32)
+            mask = torch.ones(1, 5, dtype=torch.long)
+            torch.save(acts, prompt_dir / "layer_0.pt")
+            torch.save(mask, prompt_dir / "attention_mask.pt")
+
+        acts_list, masks_list = load_layer_across_prompts(self.model, prompts, layer=0)
+        assert len(acts_list) == 2
+        assert len(masks_list) == 2
+
+
+class TestDiscoverCachedV1:
+    """Test discover_cached with v1 legacy directories."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.base = tmp_path
+        self.model = "v1-model-discover"
+
+    def test_v1_discover(self):
+        from lmprobe.cache import discover_cached
+
+        model_hash = _hash_string(self.model)
+        prompt_hash = _hash_string("v1 discover")
+        prompt_dir = self.base / model_hash / prompt_hash
+        prompt_dir.mkdir(parents=True)
+
+        torch.save(torch.randn(1, 5, 32), prompt_dir / "layer_0.pt")
+        torch.save(torch.randn(1, 5, 32), prompt_dir / "layer_1.pt")
+        mask = torch.ones(1, 5, dtype=torch.long)
+        torch.save(mask, prompt_dir / "attention_mask.pt")
+
+        info = discover_cached(self.model, "v1 discover")
+        assert info is not None
+        assert info.raw_layers == [0, 1]
+        assert info.num_tokens == 5
+
+    def test_v1_discover_with_perplexity(self):
+        from lmprobe.cache import discover_cached
+
+        model_hash = _hash_string(self.model)
+        prompt_hash = _hash_string("v1 discover ppl")
+        prompt_dir = self.base / model_hash / prompt_hash
+        prompt_dir.mkdir(parents=True)
+
+        torch.save(torch.randn(1, 5, 32), prompt_dir / "layer_0.pt")
+        torch.save(torch.tensor([1.0, 2.0, 3.0]), prompt_dir / "perplexity.pt")
+        torch.save(torch.ones(1, 5, dtype=torch.long), prompt_dir / "attention_mask.pt")
+
+        info = discover_cached(self.model, "v1 discover ppl")
+        assert info is not None
+        assert info.has_perplexity is True
+
+    def test_v1_discover_with_pooled(self):
+        from lmprobe.cache import discover_cached
+
+        model_hash = _hash_string(self.model)
+        prompt_hash = _hash_string("v1 discover pooled")
+        prompt_dir = self.base / model_hash / prompt_hash
+        prompt_dir.mkdir(parents=True)
+
+        torch.save(torch.randn(1, 5, 32), prompt_dir / "layer_0.pt")
+        torch.save(torch.ones(1, 5, dtype=torch.long), prompt_dir / "attention_mask.pt")
+
+        pooled_dir = prompt_dir / "pooled_last_token"
+        pooled_dir.mkdir()
+        torch.save(torch.randn(1, 32), pooled_dir / "layer_0.pt")
+
+        info = discover_cached(self.model, "v1 discover pooled")
+        assert info is not None
+        assert "last_token" in info.pooled
+        assert info.pooled["last_token"] == [0]
+
+
+class TestGetPromptCachedLayersV1:
+    """Test get_prompt_cached_layers with v1 directories."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.base = tmp_path
+
+    def test_v1_cached_layers(self):
+        prompt_dir = self.base / "somehash" / "prompthash"
+        prompt_dir.mkdir(parents=True)
+        torch.save(torch.randn(1, 5, 32), prompt_dir / "layer_0.pt")
+        torch.save(torch.randn(1, 5, 32), prompt_dir / "layer_3.pt")
+
+        result = get_prompt_cached_layers(prompt_dir)
+        assert result == {0, 3}
+
+    def test_v1_empty_dir(self):
+        prompt_dir = self.base / "somehash" / "emptydir"
+        prompt_dir.mkdir(parents=True)
+
+        result = get_prompt_cached_layers(prompt_dir)
+        assert result == set()
+
+    def test_v1_nonexistent(self):
+        result = get_prompt_cached_layers(self.base / "nonexistent")
+        assert result == set()
+
+
+class TestUpdateTensorFlags:
+    """Tests for _update_tensor_flags helper."""
+
+    def test_raw_layers(self):
+        from lmprobe.cache import _update_tensor_flags
+
+        layers: set[int] = set()
+        flags = {"has_pooled": False, "has_perplexity": False, "has_logits": False}
+        _update_tensor_flags({"layer_0", "layer_5"}, layers, flags)
+        assert layers == {0, 5}
+        assert not flags["has_pooled"]
+
+    def test_pooled_detected(self):
+        from lmprobe.cache import _update_tensor_flags
+
+        layers: set[int] = set()
+        flags = {"has_pooled": False, "has_perplexity": False, "has_logits": False}
+        _update_tensor_flags({"pooled_last_token_layer_0"}, layers, flags)
+        assert flags["has_pooled"]
+
+    def test_perplexity_detected(self):
+        from lmprobe.cache import _update_tensor_flags
+
+        layers: set[int] = set()
+        flags = {"has_pooled": False, "has_perplexity": False, "has_logits": False}
+        _update_tensor_flags({"perplexity"}, layers, flags)
+        assert flags["has_perplexity"]
+
+    def test_logits_detected(self):
+        from lmprobe.cache import _update_tensor_flags
+
+        layers: set[int] = set()
+        flags = {"has_pooled": False, "has_perplexity": False, "has_logits": False}
+        _update_tensor_flags({"logits"}, layers, flags)
+        assert flags["has_logits"]
+
+    def test_topk_logits_detected(self):
+        from lmprobe.cache import _update_tensor_flags
+
+        layers: set[int] = set()
+        flags = {"has_pooled": False, "has_perplexity": False, "has_logits": False}
+        _update_tensor_flags({"logits_top_k_values"}, layers, flags)
+        assert flags["has_logits"]
+
+
+class TestUpdateMtime:
+    """Tests for _update_mtime helper."""
+
+    def test_first_call(self):
+        from lmprobe.cache import _update_mtime
+
+        oldest, newest = _update_mtime(100.0, None, None)
+        assert oldest == 100.0
+        assert newest == 100.0
+
+    def test_updates_oldest(self):
+        from lmprobe.cache import _update_mtime
+
+        oldest, newest = _update_mtime(50.0, 100.0, 200.0)
+        assert oldest == 50.0
+        assert newest == 200.0
+
+    def test_updates_newest(self):
+        from lmprobe.cache import _update_mtime
+
+        oldest, newest = _update_mtime(300.0, 100.0, 200.0)
+        assert oldest == 100.0
+        assert newest == 300.0
+
+
+class TestBatchCheckCacheStatusPooled:
+    """Additional batch_check_cache_status tests for pooled paths."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        from lmprobe.cache import set_cache_backend
+        set_cache_backend(None)
+        self.model = "test-batch-pooled"
+        yield
+        set_cache_backend(None)
+
+    def test_pooled_partial_cache(self):
+        """Partial pooled cache (some layers) detected."""
+        prompt = "partial pooled"
+        save_prompt_pooled_activations(self.model, prompt, [0], torch.randn(1, 32), "last_token")
+
+        need_act, _, _, partial, found = batch_check_cache_status(
+            self.model, [prompt], required_layers={0, 1}, pooling="last_token"
+        )
+        assert need_act == [prompt]
+        assert partial == 1
+        assert found is not None
+        assert 0 in found
+
+    def test_topk_logits_check(self):
+        """Top-k logit cache check works in batch."""
+        prompt = "topk batch"
+        acts = torch.randn(1, 5, 32)
+        mask = torch.ones(1, 5)
+        save_prompt_activations(self.model, prompt, [0], acts, mask)
+        save_prompt_logits(self.model, prompt, torch.randn(1, 5, 100), mask, top_k=10)
+
+        _, _, need_log, _, _ = batch_check_cache_status(
+            self.model, [prompt], required_layers={0},
+            cache_logits=True, logit_top_k=10,
+        )
+        assert need_log == []
+
+
+class TestSavePromptActivationsV1Migration:
+    """Test that v2 save cleans up v1 directory."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.base = tmp_path
+        self.model = "v1-migrate"
+
+    def test_v1_dir_removed_on_v2_save(self):
+        """Saving v2 removes old v1 directory."""
+        model_hash = _hash_string(self.model)
+        prompt_hash = _hash_string("migrate prompt")
+        v1_dir = self.base / model_hash / prompt_hash
+        v1_dir.mkdir(parents=True)
+        torch.save(torch.randn(1, 5, 32), v1_dir / "layer_0.pt")
+
+        assert v1_dir.is_dir()
+
+        save_prompt_activations(
+            self.model, "migrate prompt", [0],
+            torch.randn(1, 5, 32), torch.ones(1, 5, dtype=torch.long)
+        )
+
+        assert not v1_dir.is_dir()
+        sf_path = get_prompt_cache_path(self.model, "migrate prompt")
+        assert sf_path.exists()
