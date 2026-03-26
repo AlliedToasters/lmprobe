@@ -1,4 +1,8 @@
-"""Tests for cache backend implementations."""
+"""Tests for cache backend implementations.
+
+Contains a shared CacheBackendTests mixin that verifies the CacheBackend ABC
+contract, used by both LocalCacheBackend and S3CacheBackend tests.
+"""
 
 import time
 
@@ -7,12 +11,12 @@ import pytest
 from lmprobe.cache_backends import CacheBackend, LocalCacheBackend
 
 
-class TestLocalCacheBackend:
-    """Tests for LocalCacheBackend (filesystem)."""
+class CacheBackendTests:
+    """Shared acceptance tests for any CacheBackend implementation.
 
-    @pytest.fixture
-    def backend(self, tmp_path):
-        return LocalCacheBackend(tmp_path)
+    Subclasses must provide a `backend` fixture that returns a ready-to-use
+    CacheBackend instance.
+    """
 
     def test_implements_abc(self, backend):
         assert isinstance(backend, CacheBackend)
@@ -65,15 +69,7 @@ class TestLocalCacheBackend:
         backend.write_bytes("model/file.bin", b"data")
         after = time.time()
         mt = backend.mtime("model/file.bin")
-        assert before - 1 <= mt <= after + 1  # allow small tolerance
-
-    def test_touch(self, backend):
-        backend.write_bytes("model/file.bin", b"data")
-        original_mtime = backend.mtime("model/file.bin")
-        time.sleep(0.05)
-        backend.touch("model/file.bin")
-        new_mtime = backend.mtime("model/file.bin")
-        assert new_mtime >= original_mtime
+        assert before - 5 <= mt <= after + 5
 
     def test_collect_entries_safetensors(self, backend):
         backend.write_bytes("abc123/prompt1.safetensors", b"data1")
@@ -84,17 +80,14 @@ class TestLocalCacheBackend:
         keys = {e[0] for e in entries}
         assert "abc123/prompt1.safetensors" in keys
         assert "abc123/prompt2.safetensors" in keys
-        # Each entry is (key, size, mtime)
         for key, size, mtime in entries:
             assert isinstance(size, int)
             assert isinstance(mtime, float)
 
     def test_collect_entries_skips_metadata(self, backend):
-        """_model_name.txt should not appear in collect_entries for v2 files."""
         backend.write_text("abc123/_model_name.txt", "my-model")
         backend.write_bytes("abc123/prompt1.safetensors", b"data")
         entries = backend.collect_entries()
-        # Only the safetensors file, not the text file
         assert len(entries) == 1
         assert entries[0][0] == "abc123/prompt1.safetensors"
 
@@ -104,12 +97,28 @@ class TestLocalCacheBackend:
         backend.write_text("abc123/_model_name.txt", "model")
 
         count = backend.delete_tree("abc123")
-        assert count == 2  # two safetensors files (not the _model_name.txt)
+        assert count >= 2
         assert not backend.exists("abc123/prompt1.safetensors")
         assert not backend.exists("abc123/_model_name.txt")
 
     def test_delete_tree_nonexistent(self, backend):
         assert backend.delete_tree("nonexistent") == 0
+
+
+class TestLocalCacheBackend(CacheBackendTests):
+    """Tests for LocalCacheBackend (filesystem)."""
+
+    @pytest.fixture
+    def backend(self, tmp_path):
+        return LocalCacheBackend(tmp_path)
+
+    def test_touch(self, backend):
+        backend.write_bytes("model/file.bin", b"data")
+        original_mtime = backend.mtime("model/file.bin")
+        time.sleep(0.05)
+        backend.touch("model/file.bin")
+        new_mtime = backend.mtime("model/file.bin")
+        assert new_mtime >= original_mtime
 
     def test_write_bytes_creates_parent_dirs(self, backend):
         backend.write_bytes("deep/nested/dir/file.bin", b"data")

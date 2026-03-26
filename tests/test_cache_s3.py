@@ -2,13 +2,14 @@
 
 import pytest
 
-from lmprobe.cache_backends import CacheBackend, LocalCacheBackend
+from lmprobe.cache_backends import LocalCacheBackend
 
 # Skip all tests if moto is not installed
 moto = pytest.importorskip("moto")
 boto3 = pytest.importorskip("boto3")
 
 from moto import mock_aws  # noqa: E402
+from test_cache_backends import CacheBackendTests  # noqa: E402
 
 from lmprobe.cache_backends import S3CacheBackend  # noqa: E402
 
@@ -23,91 +24,20 @@ def s3_backend():
         yield S3CacheBackend(TEST_BUCKET, TEST_PREFIX)
 
 
-class TestS3CacheBackend:
-    """Tests for S3CacheBackend with moto."""
+class TestS3CacheBackend(CacheBackendTests):
+    """Tests for S3CacheBackend with moto.
 
-    def test_implements_abc(self, s3_backend):
-        assert isinstance(s3_backend, CacheBackend)
+    Inherits all shared CacheBackend acceptance tests from CacheBackendTests.
+    """
 
-    def test_exists_false_when_missing(self, s3_backend):
-        assert not s3_backend.exists("nonexistent/key.bin")
+    @pytest.fixture
+    def backend(self, s3_backend):
+        return s3_backend
 
-    def test_write_and_read_bytes(self, s3_backend):
-        s3_backend.write_bytes("model/file.bin", b"hello s3")
-        assert s3_backend.exists("model/file.bin")
-        assert s3_backend.read_bytes("model/file.bin") == b"hello s3"
-
-    def test_write_and_read_text(self, s3_backend):
-        s3_backend.write_text("model/_model_name.txt", "my-model")
-        assert s3_backend.read_text("model/_model_name.txt") == "my-model"
-
-    def test_delete(self, s3_backend):
-        s3_backend.write_bytes("model/file.bin", b"data")
-        assert s3_backend.exists("model/file.bin")
-        s3_backend.delete("model/file.bin")
-        assert not s3_backend.exists("model/file.bin")
-
-    def test_delete_nonexistent_is_noop(self, s3_backend):
-        s3_backend.delete("does/not/exist.bin")  # should not raise
-
-    def test_list_keys(self, s3_backend):
-        s3_backend.write_bytes("model1/a.bin", b"data")
-        s3_backend.write_bytes("model1/b.bin", b"data")
-        s3_backend.write_bytes("model2/c.bin", b"data")
-
-        keys = s3_backend.list_keys("model1/")
-        assert sorted(keys) == ["model1/a.bin", "model1/b.bin"]
-
-    def test_list_keys_empty_prefix(self, s3_backend):
-        s3_backend.write_bytes("model1/a.bin", b"data")
-        s3_backend.write_bytes("model2/b.bin", b"data")
-        keys = s3_backend.list_keys()
-        assert len(keys) == 2
-
-    def test_size(self, s3_backend):
-        data = b"x" * 100
-        s3_backend.write_bytes("model/file.bin", data)
-        assert s3_backend.size("model/file.bin") == 100
-
-    def test_mtime(self, s3_backend):
-        import time
-
-        before = time.time()
-        s3_backend.write_bytes("model/file.bin", b"data")
-        after = time.time()
-        mt = s3_backend.mtime("model/file.bin")
-        # moto timestamps are approximate
-        assert mt >= before - 5
-        assert mt <= after + 5
-
-    def test_touch_is_noop(self, s3_backend):
+    def test_touch_is_noop(self, backend):
         """touch() is a no-op on S3 (no writable mtime, LRU doesn't apply)."""
-        s3_backend.write_bytes("model/file.bin", b"data")
-        s3_backend.touch("model/file.bin")  # should not raise
-
-    def test_collect_entries(self, s3_backend):
-        s3_backend.write_bytes("abc123/prompt1.safetensors", b"data1")
-        s3_backend.write_bytes("abc123/prompt2.safetensors", b"data22")
-
-        entries = s3_backend.collect_entries()
-        assert len(entries) == 2
-        keys = {e[0] for e in entries}
-        assert "abc123/prompt1.safetensors" in keys
-
-    def test_collect_entries_skips_model_name(self, s3_backend):
-        s3_backend.write_text("abc123/_model_name.txt", "my-model")
-        s3_backend.write_bytes("abc123/prompt1.safetensors", b"data")
-        entries = s3_backend.collect_entries()
-        assert len(entries) == 1
-
-    def test_delete_tree(self, s3_backend):
-        s3_backend.write_bytes("abc123/prompt1.safetensors", b"data")
-        s3_backend.write_bytes("abc123/prompt2.safetensors", b"data")
-        s3_backend.write_text("abc123/_model_name.txt", "model")
-
-        count = s3_backend.delete_tree("abc123/")
-        assert count == 3  # all objects under prefix
-        assert not s3_backend.exists("abc123/prompt1.safetensors")
+        backend.write_bytes("model/file.bin", b"data")
+        backend.touch("model/file.bin")  # should not raise
 
     def test_prefix_handling(self):
         """Keys are correctly prefixed."""
@@ -115,7 +45,6 @@ class TestS3CacheBackend:
             boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="test")
             backend = S3CacheBackend("test", "my/prefix")
             backend.write_bytes("key.bin", b"data")
-            # The full S3 key should include the prefix
             assert backend._full_key("key.bin") == "my/prefix/key.bin"
             assert backend.read_bytes("key.bin") == b"data"
 
@@ -386,16 +315,13 @@ class TestS3Integration:
 
         old_limit = cache_mod._CACHE_MAX_BYTES
         try:
-            # Set a very small cache limit
             cache_mod._CACHE_MAX_BYTES = 1  # 1 byte
 
-            # This should still work — eviction is no-op on S3
             save_prompt_activations(
                 "test-model", "p1", [0],
                 torch.randn(1, 5, 64),
                 torch.ones(1, 5, dtype=torch.long),
             )
-            # File should still exist (not evicted)
             from lmprobe.cache import is_prompt_fully_cached
 
             assert is_prompt_fully_cached("test-model", "p1", {0})
@@ -427,19 +353,17 @@ class TestS3Integration:
         model = "test-model"
         prompt = "selective test"
         layers = [0, 1, 2]
-        acts = torch.randn(1, 5, 192)  # 3 layers × 64 hidden_dim
+        acts = torch.randn(1, 5, 192)
         mask = torch.ones(1, 5, dtype=torch.long)
 
         save_prompt_activations(model, prompt, layers, acts, mask)
 
         key = _prompt_cache_key(model, prompt)
 
-        # Load only layer_1 — should NOT download the full file
         result = _load_tensors_from_backend(key, ["layer_1"])
         assert set(result.keys()) == {"layer_1"}
         assert result["layer_1"].shape == (1, 5, 64)
 
-        # Load subset and verify values match full load
         full = _load_tensors_from_backend(key)
         assert torch.equal(result["layer_1"], full["layer_1"])
 
@@ -465,24 +389,19 @@ class TestS3Integration:
         save_prompt_activations(model, prompt, layers, acts, mask)
         key = _prompt_cache_key(model, prompt)
 
-        # Load layer_0 — first call parses header
         r0 = _load_tensors_from_backend(key, ["layer_0"])
         assert r0["layer_0"].shape == (1, 5, 64)
 
-        # Load layer_1 — header should be cached, mask should be fetched fresh
         r1 = _load_tensors_from_backend(key, ["layer_1"])
         assert r1["layer_1"].shape == (1, 5, 64)
 
-        # Load layer_2 + attention_mask — mask fetched, then cached
         r2 = _load_tensors_from_backend(key, ["layer_2", "attention_mask"])
         assert r2["layer_2"].shape == (1, 5, 64)
         assert "attention_mask" in r2
 
-        # Load layer_0 + attention_mask again — both header and mask cached
         r3 = _load_tensors_from_backend(key, ["layer_0", "attention_mask"])
         assert torch.equal(r3["attention_mask"], r2["attention_mask"])
 
-        # Verify all layer values match full load
         full = _load_tensors_from_backend(key)
         assert torch.equal(r0["layer_0"], full["layer_0"])
         assert torch.equal(r1["layer_1"], full["layer_1"])
@@ -502,12 +421,10 @@ class TestS3Integration:
         model = "test-model"
         prompt = "test prompt"
 
-        # Save layer 0
         acts0 = torch.randn(1, 5, 64)
         mask = torch.ones(1, 5, dtype=torch.long)
         save_prompt_activations(model, prompt, [0], acts0, mask)
 
-        # Save layer 1 (should merge)
         acts1 = torch.randn(1, 5, 64)
         save_prompt_activations(model, prompt, [1], acts1, mask)
 

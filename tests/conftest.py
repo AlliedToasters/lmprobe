@@ -8,6 +8,28 @@ import pytest
 # See: https://huggingface.co/stas/tiny-random-llama-2
 TEST_MODEL = "stas/tiny-random-llama-2"
 
+# Shared test data used across multiple test files
+POSITIVE_PROMPTS = [
+    "The dog barked loudly",
+    "My puppy loves to play fetch",
+    "Dogs are loyal companions",
+    "The golden retriever wagged its tail",
+    "Walking the dog in the park",
+]
+
+NEGATIVE_PROMPTS = [
+    "The cat purred softly",
+    "My kitten sleeps all day",
+    "Cats are independent animals",
+    "The tabby cat stretched lazily",
+    "The cat knocked things off the table",
+]
+
+TEST_PROMPTS = [
+    "A dog chased the ball",
+    "The cat sat on the mat",
+]
+
 
 @pytest.fixture
 def tiny_model():

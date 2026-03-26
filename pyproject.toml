@@ -52,6 +52,7 @@ s3 = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "diff-cover>=9.0",
     "ruff>=0.1",
     "black>=23.0",
     "moto[s3]>=5.0",

@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_PROMPTS
 
 from lmprobe.battery import (
     BASELINE_REGISTRY,
@@ -9,24 +10,6 @@ from lmprobe.battery import (
     BaselineResult,
     BaselineResults,
 )
-
-# Test data
-POSITIVE_PROMPTS = [
-    "The dog barked loudly",
-    "My puppy loves to play fetch",
-    "Dogs are loyal companions",
-]
-
-NEGATIVE_PROMPTS = [
-    "The cat purred softly",
-    "My kitten sleeps all day",
-    "Cats are independent animals",
-]
-
-TEST_PROMPTS = [
-    "A dog chased the ball",
-    "The cat sat on the mat",
-]
 
 TEST_LABELS = [1, 0]
 

@@ -7,10 +7,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from conftest import TEST_MODEL
 
 from lmprobe import LinearProbe
-
-TEST_MODEL = "stas/tiny-random-llama-2"
 
 try:
     import skops  # noqa: F401
@@ -38,11 +37,6 @@ def fitted_probe():
     negative = ["cat purr scratch meow", "kitty litter nap"]
     probe.fit(positive, negative)
     return probe
-
-
-@pytest.fixture
-def tiny_model():
-    return TEST_MODEL
 
 
 class TestTrainingDataCaching:

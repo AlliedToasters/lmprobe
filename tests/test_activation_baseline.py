@@ -2,26 +2,9 @@
 
 import numpy as np
 import pytest
+from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_PROMPTS
 
 from lmprobe.activation_baseline import ActivationBaseline
-
-# Test data
-POSITIVE_PROMPTS = [
-    "The dog barked loudly",
-    "My puppy loves to play fetch",
-    "Dogs are loyal companions",
-]
-
-NEGATIVE_PROMPTS = [
-    "The cat purred softly",
-    "My kitten sleeps all day",
-    "Cats are independent animals",
-]
-
-TEST_PROMPTS = [
-    "A dog chased the ball",
-    "The cat sat on the mat",
-]
 
 
 class TestActivationBaselineBasic:
@@ -203,43 +186,7 @@ class TestActivationBaselineLayer0:
         assert baseline._extractor.layer_indices == [0]
 
 
-class TestActivationBaselinePooling:
-    """Test different pooling strategies."""
 
-    @pytest.mark.parametrize("pooling", ["last_token", "first_token", "mean"])
-    def test_different_pooling(self, tiny_model, pooling):
-        """Different pooling strategies work."""
-        baseline = ActivationBaseline(
-            model=tiny_model,
-            method="random_direction",
-            pooling=pooling,
-            device="cpu",
-            remote=False,
-        )
-        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
-
-        predictions = baseline.predict(TEST_PROMPTS)
-        assert predictions.shape == (2,)
-
-
-class TestActivationBaselineClassifiers:
-    """Test different classifier options."""
-
-    @pytest.mark.parametrize("classifier", [
-        "logistic_regression",
-        "ridge",
-        "svm",
-    ])
-    def test_different_classifiers(self, tiny_model, classifier):
-        """Different classifiers work with activation baselines."""
-        baseline = ActivationBaseline(
-            model=tiny_model,
-            method="pca",
-            classifier=classifier,
-            device="cpu",
-            remote=False,
-        )
-        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
-
-        predictions = baseline.predict(TEST_PROMPTS)
-        assert predictions.shape == (2,)
+# Pooling and classifier parametrized tests removed — pooling strategies are
+# tested in test_pooling_stages.py, and classifier compatibility is covered by
+# test_classifiers.py::TestAllClassifiersPredict.
