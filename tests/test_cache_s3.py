@@ -9,10 +9,9 @@ moto = pytest.importorskip("moto")
 boto3 = pytest.importorskip("boto3")
 
 from moto import mock_aws  # noqa: E402
+from test_cache_backends import CacheBackendTests  # noqa: E402
 
 from lmprobe.cache_backends import S3CacheBackend  # noqa: E402
-
-from test_cache_backends import CacheBackendTests  # noqa: E402
 
 TEST_BUCKET = "test-cache-bucket"
 TEST_PREFIX = "lmprobe-cache"

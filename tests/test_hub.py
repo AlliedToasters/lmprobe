@@ -7,10 +7,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from conftest import TEST_MODEL
 
 from lmprobe import LinearProbe
-
-from conftest import TEST_MODEL
 
 try:
     import skops  # noqa: F401

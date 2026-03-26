@@ -2,10 +2,9 @@
 
 import numpy as np
 import pytest
+from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_PROMPTS
 
 from lmprobe.activation_baseline import ActivationBaseline
-
-from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_PROMPTS
 
 
 class TestActivationBaselineBasic:

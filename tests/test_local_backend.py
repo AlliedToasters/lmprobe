@@ -15,6 +15,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import torch
+from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_PROMPTS
 
 from lmprobe import LinearProbe
 from lmprobe.backends import (
@@ -26,9 +27,6 @@ from lmprobe.backends import (
     clear_local_model_cache,
     resolve_backend,
 )
-
-from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_PROMPTS
-
 
 # ── ExtractionBackend ABC ────────────────────────────────────────────────────
 

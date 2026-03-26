@@ -5,12 +5,11 @@ import tempfile
 
 import numpy as np
 import pytest
-
-from lmprobe import Probe, ProbeEnsemble
-
 from conftest import NEGATIVE_PROMPTS as NEG
 from conftest import POSITIVE_PROMPTS as POS
 from conftest import TEST_PROMPTS
+
+from lmprobe import Probe, ProbeEnsemble
 
 
 @pytest.fixture

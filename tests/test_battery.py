@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_PROMPTS
 
 from lmprobe.battery import (
     BASELINE_REGISTRY,
@@ -9,8 +10,6 @@ from lmprobe.battery import (
     BaselineResult,
     BaselineResults,
 )
-
-from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_PROMPTS
 
 TEST_LABELS = [1, 0]
 
