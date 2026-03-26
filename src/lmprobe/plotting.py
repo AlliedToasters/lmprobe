@@ -115,7 +115,7 @@ def plot_layer_importance(
 
     # Customize axes
     ax.set_xticks(x_positions)
-    ax.set_xticklabels([str(l) for l in candidate_layers])
+    ax.set_xticklabels([str(layer) for layer in candidate_layers])
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)

@@ -31,7 +31,7 @@ Features:
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .extraction import ActivationExtractor

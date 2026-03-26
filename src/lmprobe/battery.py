@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING
 
 import numpy as np
 

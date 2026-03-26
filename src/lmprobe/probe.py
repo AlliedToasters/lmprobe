@@ -1052,7 +1052,9 @@ class Probe:
             selected_columns.extend(range(start, end))
         return X[:, selected_columns]
 
-    def _create_selected_extractor(self, layers: list[int]) -> tuple[ActivationExtractor, CachedExtractor]:
+    def _create_selected_extractor(
+        self, layers: list[int],
+    ) -> tuple[ActivationExtractor, CachedExtractor]:
         """Create a new extractor + cached extractor for the given layers."""
         from .cache import CachedExtractor
 
