@@ -117,9 +117,7 @@ def build_classifier(
         defaults.update(extra)
         return SGDClassifier(**defaults)
     elif name == "sgd_gpu":
-        defaults = dict(random_state=random_state)
-        defaults.update(extra)
-        return SGDGPUClassifier(**defaults)
+        return SGDGPUClassifier(random_state=random_state, **extra)
     elif name == "mass_mean":
         return MassMeanClassifier()
     elif name == "ensemble":
@@ -751,6 +749,7 @@ class SGDGPUClassifier:
             Logit scores, shape ``(n_samples,)``.
         """
         self._check_fitted()
+        assert self.coef_ is not None and self.intercept_ is not None
         X = np.asarray(X, dtype=np.float32)
         return X @ self.coef_ + self.intercept_[0]
 
