@@ -485,11 +485,16 @@ def _build_remote_extract_fn(
     return _wrapper
 
 
+def _unwrap_proxy(x):
+    """Unwrap an nnsight proxy to a plain tensor if needed."""
+    return x.value if hasattr(x, "value") else x
+
+
 def _unwrap_layer_outputs(raw_outputs: list) -> list[torch.Tensor]:
     """Unwrap proxy / tuple layer outputs into plain tensors."""
     tensors = []
     for raw in raw_outputs:
-        val = raw.value if hasattr(raw, "value") else raw
+        val = _unwrap_proxy(raw)
         if isinstance(val, tuple):
             val = val[0]
         tensors.append(val)
@@ -551,13 +556,9 @@ def _extract_batch(
             else:
                 output = entry["output"]
 
-            if isinstance(output, tuple):
-                tensor = output[0]
-            else:
-                tensor = output
-
-            if hasattr(tensor, "value"):
-                tensor = tensor.value
+            tensor = _unwrap_proxy(output)
+            if isinstance(tensor, tuple):
+                tensor = tensor[0]
 
             activation_tensors.append(tensor)
 
@@ -625,18 +626,10 @@ def _extract_batch_with_logits(
         if logit_top_k is not None:
             # logits_proxy is a (values, indices) tuple from server-side topk
             vals_proxy, idxs_proxy = logits_proxy
-            logits_val = (
-                vals_proxy.value if hasattr(vals_proxy, "value") else vals_proxy
-            )
-            logits_indices = (
-                idxs_proxy.value if hasattr(idxs_proxy, "value") else idxs_proxy
-            )
+            logits_val = _unwrap_proxy(vals_proxy)
+            logits_indices = _unwrap_proxy(idxs_proxy)
         else:
-            logits_val = (
-                logits_proxy.value
-                if hasattr(logits_proxy, "value")
-                else logits_proxy
-            )
+            logits_val = _unwrap_proxy(logits_proxy)
     else:
         modules_to_cache = [model.model.layers[i] for i in layer_indices]
 
@@ -654,17 +647,13 @@ def _extract_batch_with_logits(
             else:
                 output = entry["output"]
 
-            if isinstance(output, tuple):
-                tensor = output[0]
-            else:
-                tensor = output
-
-            if hasattr(tensor, "value"):
-                tensor = tensor.value
+            tensor = _unwrap_proxy(output)
+            if isinstance(tensor, tuple):
+                tensor = tensor[0]
 
             activation_tensors.append(tensor)
 
-        logits_val = logits.value if hasattr(logits, "value") else logits
+        logits_val = _unwrap_proxy(logits)
 
     combined = torch.cat(activation_tensors, dim=-1)
     attention_mask = tokenized["attention_mask"]

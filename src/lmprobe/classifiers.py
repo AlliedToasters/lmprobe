@@ -43,6 +43,16 @@ CLASSIFICATION_CLASSIFIERS = BUILTIN_CLASSIFIERS - {"ridge_regression"}
 REGRESSION_CLASSIFIERS = frozenset({"ridge_regression"})
 
 
+def _stable_sigmoid_proba(scores: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid → (n_samples, 2) class probabilities."""
+    prob_positive = np.empty_like(scores, dtype=np.float64)
+    pos = scores >= 0
+    neg = ~pos
+    prob_positive[pos] = 1 / (1 + np.exp(-scores[pos]))
+    prob_positive[neg] = np.exp(scores[neg]) / (1 + np.exp(scores[neg]))
+    return np.column_stack([1 - prob_positive, prob_positive])
+
+
 def build_classifier(
     name: str,
     random_state: int | None = None,
@@ -345,14 +355,7 @@ class MassMeanClassifier:
             return self._calibrator.predict_proba(scores.reshape(-1, 1))
 
         # Fallback: numerically stable sigmoid (should not normally be reached)
-        prob_positive = np.empty_like(scores, dtype=np.float64)
-        pos = scores >= 0
-        neg = ~pos
-        prob_positive[pos] = 1 / (1 + np.exp(-scores[pos]))
-        prob_positive[neg] = np.exp(scores[neg]) / (1 + np.exp(scores[neg]))
-        prob_negative = 1 - prob_positive
-
-        return np.column_stack([prob_negative, prob_positive])
+        return _stable_sigmoid_proba(scores)
 
     def score(self, X: np.ndarray, y: np.ndarray) -> float:
         """Compute accuracy.
@@ -731,15 +734,7 @@ class GroupLassoClassifier:
         intercept = self.intercept_ if self.intercept_ is not None else 0
         scores = X @ self.coef_ + intercept
 
-        # Numerically stable sigmoid to get P(y=1)
-        prob_positive = np.empty_like(scores, dtype=np.float64)
-        pos = scores >= 0
-        neg = ~pos
-        prob_positive[pos] = 1 / (1 + np.exp(-scores[pos]))
-        prob_positive[neg] = np.exp(scores[neg]) / (1 + np.exp(scores[neg]))
-        prob_negative = 1 - prob_positive
-
-        return np.column_stack([prob_negative, prob_positive])
+        return _stable_sigmoid_proba(scores)
 
     def score(self, X: np.ndarray, y: np.ndarray) -> float:
         """Compute accuracy.

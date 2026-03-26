@@ -163,7 +163,7 @@ def _load_dataset_metadata(
     return lmprobe_info, parquet_path
 
 
-def _filter_tensor_types(
+def _select_tensor_types(
     tensor_descriptors: dict, requested: list[str] | None,
 ) -> list[str]:
     """Return the list of tensor types to process, filtered by user request."""
@@ -2751,7 +2751,7 @@ def pull_dataset(
         prompt_indices = new_indices
 
     # Determine tensor types to pull
-    pull_types = _filter_tensor_types(tensor_descriptors, tensors)
+    pull_types = _select_tensor_types(tensor_descriptors, tensors)
 
     # Download shard files and record local paths
     # For per-layer layout (v1.1), we download per-layer files
@@ -3267,7 +3267,7 @@ def load_activation_dataset(
 
     tensor_descriptors = lmprobe_info.get("tensors", {})
 
-    load_types = _filter_tensor_types(tensor_descriptors, tensors)
+    load_types = _select_tensor_types(tensor_descriptors, tensors)
 
     result: dict[str, torch.Tensor] = {}
 
