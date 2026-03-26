@@ -274,7 +274,7 @@ def _build_training_info(
         neg_prompts = None
 
     # Build training data section
-    training_data = {}
+    training_data: dict[str, Any] = {}
     if pos_prompts is not None:
         training_data["n_positive"] = len(pos_prompts)
         training_data["positive_hash"] = _hash_prompts(pos_prompts)
@@ -603,8 +603,8 @@ def push_to_hub(
     _check_hub_deps()
     from huggingface_hub import HfApi
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
+    with tempfile.TemporaryDirectory() as tmpdir_str:
+        tmpdir = Path(tmpdir_str)
 
         # Serialize classifier
         fmt = _serialize_classifier(probe.classifier_, tmpdir / "classifier")
@@ -782,10 +782,10 @@ def from_hub(
     probe.selected_layers_ = selected_layers
 
     # Store hub metadata for reference
-    probe._hub_repo_id_ = repo_id
-    probe._hub_config_ = config
-    probe._hub_model_name_ = model_name
-    probe._hub_model_revision_ = model_revision
+    setattr(probe, "_hub_repo_id_", repo_id)
+    setattr(probe, "_hub_config_", config)
+    setattr(probe, "_hub_model_name_", model_name)
+    setattr(probe, "_hub_model_revision_", model_revision)
 
     return probe
 

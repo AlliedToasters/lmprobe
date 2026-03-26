@@ -162,7 +162,8 @@ class PerLayerScaler:
             X_scaled = (X_reshaped - means) / stds
 
         # Reshape back to (n_samples, n_layers * hidden_dim)
-        return X_scaled.reshape(X.shape[0], -1)
+        result: np.ndarray = X_scaled.reshape(X.shape[0], -1)
+        return result
 
     def fit_transform(self, X: np.ndarray) -> np.ndarray:
         """Fit scaler and transform data in one step.
@@ -219,7 +220,8 @@ class PerLayerScaler:
             X_original = X_reshaped * stds + means
 
         # Reshape back
-        return X_original.reshape(X.shape[0], -1)
+        result: np.ndarray = X_original.reshape(X.shape[0], -1)
+        return result
 
     def get_layer_stats(self) -> dict[str, np.ndarray]:
         """Get per-layer statistics for analysis.

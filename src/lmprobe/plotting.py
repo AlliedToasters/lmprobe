@@ -6,7 +6,7 @@ and other probe diagnostics.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
@@ -96,9 +96,10 @@ def plot_layer_importance(
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
     else:
-        fig = ax.get_figure()
+        fig = cast("Figure", ax.get_figure())
 
     # Prepare bar colors
+    colors: str | list[str]
     if highlight_selected and selected_layers is not None:
         selected_set = set(selected_layers)
         colors = [
@@ -114,7 +115,7 @@ def plot_layer_importance(
 
     # Customize axes
     ax.set_xticks(x_positions)
-    ax.set_xticklabels(candidate_layers)
+    ax.set_xticklabels([str(layer) for layer in candidate_layers])
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -179,7 +180,7 @@ def plot_layer_importance_heatmap(
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
     else:
-        fig = ax.get_figure()
+        fig = cast("Figure", ax.get_figure())
 
     # Reshape for heatmap (1 row)
     importance_matrix = layer_importances.reshape(1, -1)

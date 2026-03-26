@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -79,10 +79,10 @@ class BaselineResults:
         sorted_results = sorted(self.results, key=lambda r: r.score, reverse=True)
         return sorted_results[:n]
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[BaselineResult]:
         return iter(self.results)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.results)
 
     def __getitem__(self, key: str | int) -> BaselineResult:
@@ -296,7 +296,8 @@ class BaselineBattery:
             kwargs["device"] = self.device
             kwargs["remote"] = self.remote
 
-        return cls(**kwargs)
+        instance: BaselineProbe | ActivationBaseline = cls(**kwargs)
+        return instance
 
     def fit(
         self,

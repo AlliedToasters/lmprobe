@@ -131,7 +131,7 @@ class ActivationBaseline:
         self.pca_: PCA | None = None
 
     def _try_load_from_pooled_cache(
-        self, prompts: list[str]
+        self, prompts: list[str],
     ) -> np.ndarray | None:
         """Try to load pre-pooled activations from cache.
 
@@ -144,6 +144,7 @@ class ActivationBaseline:
             Pooled activations if all prompts are in cache, else None.
         """
         layer_indices = self._extractor.layer_indices
+        assert layer_indices is not None
         required_layers = set(layer_indices)
 
         # Check if ALL prompts have pooled cache
@@ -172,9 +173,11 @@ class ActivationBaseline:
             return pooled_from_cache
 
         # Fall back to extraction + pooling
-        activations, attention_mask = self._cached_extractor.extract(
+        result = self._cached_extractor.extract(
             prompts, remote=self.remote
         )
+        assert result is not None, "Activation extraction returned None"
+        activations, attention_mask = result
         pool_fn = get_pooling_fn(self.pooling)
         pooled = pool_fn(activations, attention_mask)
         return pooled.detach().cpu().float().numpy()
@@ -186,15 +189,17 @@ class ActivationBaseline:
                 rng = np.random.RandomState(self.random_state)
                 direction = rng.randn(X.shape[1])
                 self.random_direction_ = direction / np.linalg.norm(direction)
+            assert self.random_direction_ is not None
             # Project onto random direction -> 1D feature
-            return (X @ self.random_direction_).reshape(-1, 1)
+            return np.asarray((X @ self.random_direction_).reshape(-1, 1))
 
         elif self.method == "pca":
             if fit:
                 n_comp = min(self.n_components, X.shape[0], X.shape[1])
                 self.pca_ = PCA(n_components=n_comp, random_state=self.random_state)
-                return self.pca_.fit_transform(X)
-            return self.pca_.transform(X)
+                return np.asarray(self.pca_.fit_transform(X))
+            assert self.pca_ is not None
+            return np.asarray(self.pca_.transform(X))
 
         elif self.method == "layer_0":
             # No transformation needed - just use raw embeddings
@@ -251,9 +256,10 @@ class ActivationBaseline:
             Predicted class labels, shape (n_prompts,).
         """
         self._check_fitted()
+        assert self.classifier_ is not None
         X = self._extract_and_pool(prompts)
         X = self._transform(X, fit=False)
-        return self.classifier_.predict(X)
+        return np.asarray(self.classifier_.predict(X))
 
     def predict_proba(self, prompts: list[str]) -> np.ndarray:
         """Predict class probabilities.
@@ -274,6 +280,7 @@ class ActivationBaseline:
             If the classifier doesn't support predict_proba.
         """
         self._check_fitted()
+        assert self.classifier_ is not None
 
         if not hasattr(self.classifier_, "predict_proba"):
             raise AttributeError(
@@ -283,7 +290,7 @@ class ActivationBaseline:
 
         X = self._extract_and_pool(prompts)
         X = self._transform(X, fit=False)
-        return self.classifier_.predict_proba(X)
+        return np.asarray(self.classifier_.predict_proba(X))
 
     def score(self, prompts: list[str], labels: list[int] | np.ndarray) -> float:
         """Compute classification accuracy.

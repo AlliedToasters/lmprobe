@@ -17,6 +17,8 @@ Example
 >>> predictions = probe.predict(test_prompts)
 """
 
+from typing import Any
+
 from .activation_baseline import ActivationBaseline
 from .baseline import BaselineProbe
 from .battery import BaselineBattery, BaselineResult, BaselineResults
@@ -93,7 +95,7 @@ def set_max_threads(n: int) -> None:
         os.environ[var] = str(n)
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     """Lazy import for optional modules."""
     if name in ("plot_layer_importance", "plot_layer_importance_heatmap"):
         from .plotting import plot_layer_importance, plot_layer_importance_heatmap

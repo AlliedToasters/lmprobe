@@ -10,7 +10,7 @@ This module defines the ExtractionBackend ABC and provides two implementations:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -42,7 +42,7 @@ class ExtractionBackend(ABC):
         self,
         prompts: list[str],
         layer_indices: list[int],
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract activations for a batch of prompts.
 
@@ -67,7 +67,7 @@ class ExtractionBackend(ABC):
         self,
         prompts: list[str],
         layer_indices: list[int],
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Extract activations AND logits for a batch of prompts.
 
@@ -99,7 +99,7 @@ class ExtractionBackend(ABC):
 
     @property
     @abstractmethod
-    def model(self):
+    def model(self) -> Any:
         """Get the underlying model object.
 
         The return type depends on the backend:
@@ -137,7 +137,7 @@ class NnsightBackend(ExtractionBackend):
         self._remote_model = None
 
     @property
-    def model(self):
+    def model(self) -> Any:
         """Get the nnsight LanguageModel, loading if necessary."""
         if self._model is None:
             from .extraction import get_cached_model
@@ -147,7 +147,7 @@ class NnsightBackend(ExtractionBackend):
             )
         return self._model
 
-    def _get_model_for_remote(self):
+    def _get_model_for_remote(self) -> Any:
         """Get a lightweight model stub for remote execution.
 
         When the backend was created with remote=False but a call-time
@@ -167,14 +167,14 @@ class NnsightBackend(ExtractionBackend):
         return self._remote_model
 
     @property
-    def tokenizer(self) -> PreTrainedTokenizerBase:
+    def tokenizer(self) -> Any:
         return self.model.tokenizer
 
     def extract_batch(
         self,
         prompts: list[str],
         layer_indices: list[int],
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from .extraction import _extract_batch
 
@@ -186,7 +186,7 @@ class NnsightBackend(ExtractionBackend):
         self,
         prompts: list[str],
         layer_indices: list[int],
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         from .extraction import _extract_batch_with_logits
 
@@ -201,10 +201,10 @@ class NnsightBackend(ExtractionBackend):
 
 # Global cache for locally-loaded HuggingFace models
 # Key: (model_name, device), Value: (model, tokenizer)
-_LOCAL_MODEL_CACHE: dict[tuple, tuple] = {}
+_LOCAL_MODEL_CACHE: dict[tuple[Any, ...], tuple[Any, PreTrainedTokenizerBase]] = {}
 
 
-def _get_decoder_layers(model) -> list:
+def _get_decoder_layers(model: Any) -> list[Any]:
     """Get the list of decoder/transformer layers from a model.
 
     Tries common attribute paths used by different model architectures.
@@ -258,7 +258,7 @@ def _get_decoder_layers(model) -> list:
 
 def _get_local_model(
     model_name: str, device: str, dtype: torch.dtype = torch.float32
-):
+) -> tuple[Any, PreTrainedTokenizerBase]:
     """Load a HuggingFace model locally, with caching.
 
     Parameters
@@ -295,7 +295,7 @@ def _get_local_model(
                 config.quantization_config["linear_class"] = "bitlinear"
 
         if device == "auto":
-            model = AutoModelForCausalLM.from_pretrained(
+            model: Any = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 config=config,
                 device_map="auto",
@@ -344,10 +344,10 @@ class LocalBackend(ExtractionBackend):
     ):
         super().__init__(model_name, device)
         self.dtype = dtype
-        self._model = None
-        self._tokenizer = None
+        self._model: Any = None
+        self._tokenizer: PreTrainedTokenizerBase | None = None
 
-    def _load(self):
+    def _load(self) -> None:
         """Load model and tokenizer."""
         if self._model is None:
             model, tokenizer = _get_local_model(
@@ -357,20 +357,21 @@ class LocalBackend(ExtractionBackend):
             self._tokenizer = tokenizer
 
     @property
-    def model(self):
+    def model(self) -> Any:
         self._load()
         return self._model
 
     @property
     def tokenizer(self) -> PreTrainedTokenizerBase:
         self._load()
+        assert self._tokenizer is not None
         return self._tokenizer
 
     def extract_batch(
         self,
         prompts: list[str],
         layer_indices: list[int],
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         model = self.model
         tokenizer = self.tokenizer
@@ -388,14 +389,14 @@ class LocalBackend(ExtractionBackend):
         attention_mask = tokenized["attention_mask"].to(device)
 
         # Set up hooks to capture activations
-        captured = {}
+        captured: dict[int, torch.Tensor] = {}
         hooks = []
 
         for layer_idx in layer_indices:
             layer_module = decoder_layers[layer_idx]
 
-            def make_hook(idx):
-                def hook_fn(module, input, output):
+            def make_hook(idx: int) -> Any:
+                def hook_fn(module: Any, input: Any, output: Any) -> None:
                     # output is typically a tuple: (hidden_states, ...)
                     if isinstance(output, tuple):
                         captured[idx] = output[0].detach()
@@ -423,7 +424,7 @@ class LocalBackend(ExtractionBackend):
         self,
         prompts: list[str],
         layer_indices: list[int],
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         model = self.model
         tokenizer = self.tokenizer
@@ -439,14 +440,14 @@ class LocalBackend(ExtractionBackend):
         input_ids = tokenized["input_ids"].to(device)
         attention_mask = tokenized["attention_mask"].to(device)
 
-        captured = {}
+        captured: dict[int, torch.Tensor] = {}
         hooks = []
 
         for layer_idx in layer_indices:
             layer_module = decoder_layers[layer_idx]
 
-            def make_hook(idx):
-                def hook_fn(module, input, output):
+            def make_hook(idx: int) -> Any:
+                def hook_fn(module: Any, input: Any, output: Any) -> None:
                     if isinstance(output, tuple):
                         captured[idx] = output[0].detach()
                     else:

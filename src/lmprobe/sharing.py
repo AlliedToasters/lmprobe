@@ -128,7 +128,7 @@ def _extract_model_name(lmprobe_info: dict) -> str:
     """Extract model name from lmprobe_info."""
     model_obj = lmprobe_info.get("model")
     if isinstance(model_obj, dict):
-        return model_obj["name"]
+        return str(model_obj["name"])
     raise KeyError(
         "Dataset metadata missing model name — expected 'model.name'"
     )
@@ -273,7 +273,8 @@ def _load_manifest(staging_dir: Path) -> dict | None:
     if not manifest_path.exists():
         return None
     with open(manifest_path) as f:
-        return json.load(f)
+        result: dict[Any, Any] = json.load(f)
+        return result
 
 
 def _save_manifest(staging_dir: Path, manifest: dict) -> None:
@@ -463,7 +464,7 @@ def _filter_tensor_types(
     if tensors_filter is None:
         return available
 
-    result = {
+    result: dict[str, Any] = {
         "raw_layers": [],
         "pooled": {},
         "has_logits": False,
@@ -554,6 +555,10 @@ def _load_logits_for_prompt(
     values, indices = load_prompt_logits(model_name, prompt, top_k=top_k)
     # values: (1, positions, K), indices: (1, positions, K)
     # For pooled (last_token), we expect shape (1, K) or (1, 1, K)
+    if indices is None:
+        raise ValueError(
+            f"No top-k indices found for prompt (model={model_name!r})"
+        )
     return {
         "logits_topk.values": values.reshape(1, -1),
         "logits_topk.indices": indices.reshape(1, -1),
@@ -1622,9 +1627,9 @@ def _consolidate_and_shard(
 
 
 def _embed_metadata_in_schema(
-    table,
-    lmprobe_info: dict,
-):
+    table: Any,
+    lmprobe_info: dict[str, Any],
+) -> Any:
     """Embed lmprobe_info into a PyArrow table's schema metadata.
 
     Keys are prefixed with ``lmprobe:`` and values are JSON-encoded bytes.
@@ -2916,22 +2921,22 @@ def pull_dataset(
     for i in all_prompt_indices:
         prompt_text = index["text"][i]
         prompt_hash = _hash_string(prompt_text)
-        entry: dict[str, Any] = {
+        shard_entry: dict[str, Any] = {
             "shard_index": index["shard_index"][i],
             "row_offset": index["row_offset"][i],
             "num_tokens": index["num_tokens"][i],
         }
         if "token_offset" in index:
-            entry["token_offset"] = index["token_offset"][i]
+            shard_entry["token_offset"] = index["token_offset"][i]
         # Logits shard columns
         for col in ("shard_index_logits", "row_offset_logits"):
             if col in index:
-                entry[col] = index[col][i]
+                shard_entry[col] = index[col][i]
         # Per-token shard arrays (v1.3)
         for col in ("token_shard_ids", "token_shard_offsets"):
             if col in index:
-                entry[col] = index[col][i]
-        shard_index[prompt_hash] = entry
+                shard_entry[col] = index[col][i]
+        shard_index[prompt_hash] = shard_entry
 
     write_shard_registry(model_name, manifest, shard_index, repo_id=repo_id)
     _n_layers = len(tensor_descriptors.get("hidden_layers", {}).get("layers", []))
@@ -3394,6 +3399,7 @@ def load_activations(
     if hidden_dim is None:
         hidden_dim = stacked.shape[-1] // len(layers)
 
+    activations: dict[int, np.ndarray] | np.ndarray
     if as_dict:
         activations = {
             layer: stacked[:, i * hidden_dim : (i + 1) * hidden_dim]
@@ -3990,9 +3996,9 @@ def upgrade_dataset_format(
         pq.write_table(table, str(out_path))
 
         api = HfApi(token=token)
-        from huggingface_hub import CommitOperationAdd
+        from huggingface_hub import CommitOperationAdd, CommitOperationDelete
 
-        operations = [
+        operations: list[CommitOperationAdd | CommitOperationDelete] = [
             CommitOperationAdd(
                 path_in_repo=PARQUET_PATH,
                 path_or_fileobj=str(out_path),
@@ -4000,8 +4006,6 @@ def upgrade_dataset_format(
         ]
 
         if remove_json:
-            from huggingface_hub import CommitOperationDelete
-
             operations.append(
                 CommitOperationDelete(path_in_repo=INFO_FILENAME),
             )

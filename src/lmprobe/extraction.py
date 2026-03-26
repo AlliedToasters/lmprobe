@@ -7,7 +7,7 @@ from specified layers. Supports both local and remote execution.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from tqdm import tqdm
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from nnsight import LanguageModel
 
 
-def _require_nnsight():
+def _require_nnsight() -> Any:
     """Import and return the nnsight module, raising a clear error if not installed."""
     try:
         import nnsight
@@ -130,7 +130,7 @@ def get_num_layers_from_config(model_name: str) -> int:
     # Try common ones in order of prevalence
     for attr in ("num_hidden_layers", "n_layer", "num_layers", "n_layers"):
         if hasattr(config, attr):
-            return getattr(config, attr)
+            return int(getattr(config, attr))
 
     raise ValueError(
         f"Could not determine layer count from config for {model_name}. "
@@ -204,17 +204,17 @@ def resolve_auto_candidates(
             resolved.append(idx)
     else:
         # Integer mode
-        for idx in candidates:
-            idx = int(idx)
+        for c in candidates:
+            layer_idx = int(c)
             # Handle negative indexing
-            if idx < 0:
-                idx = num_layers + idx
-            if not (0 <= idx < num_layers):
+            if layer_idx < 0:
+                layer_idx = num_layers + layer_idx
+            if not (0 <= layer_idx < num_layers):
                 raise ValueError(
-                    f"Layer index {idx} out of range for model with {num_layers} layers. "
+                    f"Layer index {layer_idx} out of range for model with {num_layers} layers. "
                     f"Valid range: [0, {num_layers - 1}] or [-{num_layers}, -1]"
                 )
-            resolved.append(idx)
+            resolved.append(layer_idx)
 
     # Remove duplicates and sort
     return sorted(set(resolved))
@@ -344,6 +344,7 @@ def load_model(
         check_cuda_compatibility(device)
 
         # Local execution - load weights to specified device
+        device_map: str | dict[str, str]
         if device == "auto":
             device_map = "auto"
         elif device == "cpu":
@@ -380,7 +381,7 @@ def _build_remote_extract_fn(
     layer_indices: list[int],
     with_logits: bool = False,
     logit_top_k: int | None = None,
-):
+) -> Any:
     """Build a trace function for remote nnsight execution.
 
     nnsight's remote tracing serializes the source code inside the
@@ -462,6 +463,8 @@ def _build_remote_extract_fn(
     tmp.close()
 
     spec = importlib.util.spec_from_file_location("_lmprobe_remote", tmp_path)
+    assert spec is not None, f"Failed to create module spec from {tmp_path}"
+    assert spec.loader is not None, f"Module spec has no loader for {tmp_path}"
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
@@ -471,7 +474,7 @@ def _build_remote_extract_fn(
     # (i.e., after the wrapper returns).
     _extract_fn = mod.extract
 
-    def _wrapper(model, tokenized):
+    def _wrapper(model: Any, tokenized: Any) -> Any:
         try:
             return _extract_fn(model, tokenized)
         finally:
@@ -485,7 +488,7 @@ def _build_remote_extract_fn(
     return _wrapper
 
 
-def _unwrap_proxy(x):
+def _unwrap_proxy(x: Any) -> Any:
     """Unwrap an nnsight proxy to a plain tensor if needed."""
     return x.value if hasattr(x, "value") else x
 
@@ -910,7 +913,7 @@ class ActivationExtractor:
         return self._backend.model
 
     @property
-    def tokenizer(self):
+    def tokenizer(self) -> Any:
         """Get the model's tokenizer."""
         return self._backend.tokenizer
 
@@ -933,7 +936,7 @@ class ActivationExtractor:
         self,
         prompts: list[str],
         layer_indices: list[int],
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract activations for a single batch of prompts.
 
@@ -959,7 +962,7 @@ class ActivationExtractor:
         self,
         prompts: list[str],
         layer_indices: list[int],
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Extract activations AND logits for a single batch of prompts.
 
