@@ -395,7 +395,9 @@ class BaselineProbe:
                 logits = model.lm_head.output.save()
 
             # Unwrap proxy if needed
-            logits_val = logits.value if hasattr(logits, "value") else logits
+            from .extraction import _unwrap_proxy
+
+            logits_val = _unwrap_proxy(logits)
 
             # Compute per-token cross-entropy loss
             # Shift logits and labels for next-token prediction
