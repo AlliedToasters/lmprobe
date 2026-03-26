@@ -7,7 +7,11 @@ from lmprobe import LinearProbe
 from lmprobe.classifiers import (
     BUILTIN_CLASSIFIERS,
     CLASSIFICATION_CLASSIFIERS,
+    EnsembleClassifier,
+    MassMeanClassifier,
+    _stable_sigmoid_proba,
     build_classifier,
+    resolve_classifier,
     validate_classifier,
 )
 
@@ -339,3 +343,226 @@ class TestAllClassifiersPredict:
 
         assert isinstance(accuracy, float)
         assert 0.0 <= accuracy <= 1.0
+
+
+class TestStableSigmoidProba:
+    """Tests for _stable_sigmoid_proba."""
+
+    def test_zero_scores(self):
+        scores = np.array([0.0])
+        proba = _stable_sigmoid_proba(scores)
+        assert proba.shape == (1, 2)
+        assert proba[0, 0] == pytest.approx(0.5)
+        assert proba[0, 1] == pytest.approx(0.5)
+
+    def test_positive_scores(self):
+        scores = np.array([10.0])
+        proba = _stable_sigmoid_proba(scores)
+        assert proba[0, 1] > 0.99
+
+    def test_negative_scores(self):
+        scores = np.array([-10.0])
+        proba = _stable_sigmoid_proba(scores)
+        assert proba[0, 0] > 0.99
+
+    def test_large_positive(self):
+        """No overflow for very large positive scores."""
+        scores = np.array([500.0])
+        proba = _stable_sigmoid_proba(scores)
+        assert np.isfinite(proba).all()
+        assert proba[0, 1] == pytest.approx(1.0, abs=1e-10)
+
+    def test_large_negative(self):
+        """No overflow for very large negative scores."""
+        scores = np.array([-500.0])
+        proba = _stable_sigmoid_proba(scores)
+        assert np.isfinite(proba).all()
+        assert proba[0, 0] == pytest.approx(1.0, abs=1e-10)
+
+    def test_probabilities_sum_to_one(self):
+        scores = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])
+        proba = _stable_sigmoid_proba(scores)
+        assert np.allclose(proba.sum(axis=1), 1.0)
+
+
+class TestMassMeanClassifier:
+    """Tests for MassMeanClassifier."""
+
+    @pytest.fixture
+    def data(self):
+        rng = np.random.default_rng(42)
+        X_pos = rng.normal(1.0, 0.5, (20, 4))
+        X_neg = rng.normal(-1.0, 0.5, (20, 4))
+        X = np.vstack([X_pos, X_neg])
+        y = np.array([1] * 20 + [0] * 20)
+        return X, y
+
+    def test_fit_predict(self, data):
+        X, y = data
+        clf = MassMeanClassifier()
+        clf.fit(X, y)
+        preds = clf.predict(X)
+        assert preds.shape == (40,)
+        assert set(preds).issubset({0, 1})
+
+    def test_predict_proba(self, data):
+        X, y = data
+        clf = MassMeanClassifier()
+        clf.fit(X, y)
+        proba = clf.predict_proba(X)
+        assert proba.shape == (40, 2)
+        assert np.allclose(proba.sum(axis=1), 1.0)
+
+    def test_decision_function(self, data):
+        X, y = data
+        clf = MassMeanClassifier()
+        clf.fit(X, y)
+        scores = clf.decision_function(X)
+        assert scores.shape == (40,)
+
+    def test_decision_function_unfitted_raises(self):
+        clf = MassMeanClassifier()
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            clf.decision_function(np.array([[1, 2]]))
+
+    def test_score(self, data):
+        X, y = data
+        clf = MassMeanClassifier()
+        clf.fit(X, y)
+        acc = clf.score(X, y)
+        assert 0.0 <= acc <= 1.0
+
+    def test_get_params(self):
+        clf = MassMeanClassifier()
+        assert clf.get_params() == {}
+
+    def test_set_params(self):
+        clf = MassMeanClassifier()
+        result = clf.set_params(anything="ignored")
+        assert result is clf
+
+    def test_single_class_raises(self):
+        X = np.array([[1, 2], [3, 4]])
+        y = np.array([1, 1])
+        clf = MassMeanClassifier()
+        with pytest.raises(ValueError, match="Both classes must have"):
+            clf.fit(X, y)
+
+
+class TestEnsembleClassifier:
+    """Tests for EnsembleClassifier."""
+
+    @pytest.fixture
+    def data(self):
+        rng = np.random.default_rng(42)
+        X = rng.normal(0, 1, (30, 4))
+        y = np.array([0] * 15 + [1] * 15)
+        return X, y
+
+    def test_fit_predict(self, data):
+        X, y = data
+        clf = EnsembleClassifier(random_state=42)
+        clf.fit(X, y)
+        preds = clf.predict(X)
+        assert preds.shape == (30,)
+
+    def test_predict_proba(self, data):
+        X, y = data
+        clf = EnsembleClassifier(random_state=42)
+        clf.fit(X, y)
+        proba = clf.predict_proba(X)
+        assert proba.shape == (30, 2)
+        assert np.allclose(proba.sum(axis=1), 1.0, atol=0.01)
+
+    def test_predict_proba_unfitted_raises(self):
+        clf = EnsembleClassifier()
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            clf.predict_proba(np.array([[1, 2]]))
+
+    def test_score(self, data):
+        X, y = data
+        clf = EnsembleClassifier(random_state=42)
+        clf.fit(X, y)
+        acc = clf.score(X, y)
+        assert 0.0 <= acc <= 1.0
+
+    def test_custom_c_values(self, data):
+        X, y = data
+        clf = EnsembleClassifier(C_values=[0.1, 1.0], random_state=42)
+        clf.fit(X, y)
+        assert len(clf.estimators_) == 2
+
+    def test_coef_and_intercept(self, data):
+        X, y = data
+        clf = EnsembleClassifier(random_state=42)
+        clf.fit(X, y)
+        assert clf.coef_ is not None
+        assert clf.intercept_ is not None
+        assert clf.classes_ is not None
+
+    def test_get_params(self):
+        clf = EnsembleClassifier(C_values=[0.1], solver="saga", max_iter=500, random_state=1)
+        params = clf.get_params()
+        assert params["C_values"] == [0.1]
+        assert params["solver"] == "saga"
+        assert params["max_iter"] == 500
+        assert params["random_state"] == 1
+
+    def test_set_params(self):
+        clf = EnsembleClassifier()
+        clf.set_params(solver="saga")
+        assert clf.solver == "saga"
+
+
+class TestResolveClassifier:
+    """Tests for resolve_classifier."""
+
+    def test_resolve_string(self):
+        clf = resolve_classifier("logistic_regression", random_state=42)
+        assert hasattr(clf, "fit")
+
+    def test_resolve_custom_estimator(self):
+        from sklearn.linear_model import LogisticRegression
+        custom = LogisticRegression()
+        clf = resolve_classifier(custom)
+        assert clf is custom
+
+    def test_resolve_with_kwargs(self):
+        clf = resolve_classifier(
+            "logistic_regression", random_state=42,
+            classifier_kwargs={"C": 0.01},
+        )
+        assert clf.C == 0.01
+
+    def test_resolve_warns_for_no_predict_proba(self):
+        with pytest.warns(UserWarning, match="does not support predict_proba"):
+            resolve_classifier("ridge")
+
+
+class TestBuildClassifierKwargs:
+    """Test classifier_kwargs forwarding for each built-in classifier."""
+
+    def test_logistic_regression_cv_kwargs(self):
+        clf = build_classifier("logistic_regression_cv", classifier_kwargs={"cv": 3})
+        assert clf.cv == 3
+
+    def test_ridge_regression(self):
+        clf = build_classifier("ridge_regression", classifier_kwargs={"alpha": 2.0})
+        assert clf.alpha == 2.0
+
+    def test_svm_kwargs(self):
+        clf = build_classifier("svm", classifier_kwargs={"C": 0.5})
+        assert clf.C == 0.5
+
+    def test_sgd_kwargs(self):
+        clf = build_classifier("sgd", random_state=42)
+        assert clf.random_state == 42
+
+    def test_ensemble_kwargs(self):
+        clf = build_classifier("ensemble", classifier_kwargs={"C_values": [0.1, 1.0]})
+        assert clf.C_values == [0.1, 1.0]
+
+    def test_lda_kwargs(self):
+        clf = build_classifier("lda")
+        from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+        assert isinstance(clf, LinearDiscriminantAnalysis)
