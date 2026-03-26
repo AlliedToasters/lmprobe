@@ -19,18 +19,18 @@ The `classifier` parameter accepts either a string (built-in) or an sklearn-comp
 
 ```python
 # Built-in (string)
-probe = LinearProbe(classifier="logistic_regression")
-probe = LinearProbe(classifier="svm")
-probe = LinearProbe(classifier="ridge")
+probe = Probe(classifier="logistic_regression")
+probe = Probe(classifier="svm")
+probe = Probe(classifier="ridge")
 
 # Custom sklearn estimator
 from sklearn.svm import SVC
-probe = LinearProbe(classifier=SVC(kernel="linear", probability=True))
+probe = Probe(classifier=SVC(kernel="linear", probability=True))
 
 # Custom with pipeline
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-probe = LinearProbe(
+probe = Probe(
     classifier=Pipeline([
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression()),
@@ -70,7 +70,7 @@ At `__init__` time, we validate:
 
 ```python
 # Warning: classifier lacks predict_proba
-probe = LinearProbe(classifier=RidgeClassifier())
+probe = Probe(classifier=RidgeClassifier())
 # UserWarning: RidgeClassifier does not support predict_proba().
 # probe.predict_proba() will raise an error.
 ```
@@ -83,7 +83,7 @@ For classifiers without native probability support, users can wrap with `Calibra
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.svm import LinearSVC
 
-probe = LinearProbe(
+probe = Probe(
     classifier=CalibratedClassifierCV(LinearSVC(), cv=3)
 )
 ```
@@ -104,7 +104,7 @@ from sklearn.decomposition import PCA
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 
-probe = LinearProbe(
+probe = Probe(
     layers="all",  # 32 layers × 4096 = 131,072 dims
     classifier=Pipeline([
         ("pca", PCA(n_components=1000)),
@@ -179,11 +179,11 @@ probs = probe.predict_proba(test)
 
 ### Random State Propagation
 
-**Decision**: `LinearProbe.random_state` propagates to all built-in classifiers. This ensures reproducibility from a single parameter.
+**Decision**: `Probe.random_state` propagates to all built-in classifiers. This ensures reproducibility from a single parameter.
 
 ```python
-# LinearProbe's random_state flows to the classifier
-probe = LinearProbe(
+# Probe's random_state flows to the classifier
+probe = Probe(
     model="...",
     classifier="logistic_regression",
     random_state=42,  # Propagates to LogisticRegression
@@ -193,7 +193,7 @@ probe = LinearProbe(
 For custom classifiers, users must set `random_state` themselves:
 ```python
 # Custom classifier — user controls random_state
-probe = LinearProbe(
+probe = Probe(
     model="...",
     classifier=SVC(kernel="linear", probability=True, random_state=42),
     random_state=42,  # Does NOT automatically propagate to custom classifiers
@@ -202,7 +202,7 @@ probe = LinearProbe(
 
 ### Built-In Classifier Factory
 
-Built-in classifiers are constructed with `random_state` from `LinearProbe`:
+Built-in classifiers are constructed with `random_state` from `Probe`:
 
 ```python
 def _build_classifier(name: str, random_state: int | None) -> BaseEstimator:
@@ -261,7 +261,7 @@ Could automatically wrap classifiers lacking `predict_proba()`. Rejected because
 - Users who don't need probabilities shouldn't pay the cost
 
 ### Neural Network Classifiers
-Could support PyTorch-based classifiers for non-linear probing. Deferred to future work — the "linear" in `LinearProbe` is intentional. Could add `NonlinearProbe` later.
+Could support PyTorch-based classifiers for non-linear probing. Deferred to future work — the "linear" in `Probe` is intentional. Could add `NonlinearProbe` later.
 
 ### Ensemble of Layer-Specific Classifiers
 Train one classifier per layer, ensemble predictions. More complex, deferred to potential `EnsembleProbe` class.

@@ -238,7 +238,7 @@ Implementation notes:
 # Probe is in a "ready but model-less" state — classifier is loaded,
 # config is loaded, but ActivationExtractor isn't initialized until
 # the user calls predict() with a model available.
-probe = LinearProbe.from_hub(
+probe = Probe.from_hub(
     "alliedtoasters/cbrn-detector-llama3-8b",
     trust_classifier=True,
 )
@@ -247,7 +247,7 @@ probe.predict(["some new text"])  # requires base model already available locall
 # Full setup: download base model and initialize everything
 # Passes the pinned base_model.revision to transformers' from_pretrained(),
 # so the user gets exactly the right model weights for reproducibility.
-probe = LinearProbe.from_hub(
+probe = Probe.from_hub(
     "alliedtoasters/cbrn-detector-llama3-8b",
     load_model=True,            # downloads base model if not cached
     trust_classifier=True,
@@ -256,7 +256,7 @@ probe = LinearProbe.from_hub(
 probe.predict(["some new text"])  # works immediately
 
 # Pin a specific Hub commit of the probe repo itself
-probe = LinearProbe.from_hub(
+probe = Probe.from_hub(
     "alliedtoasters/cbrn-detector-llama3-8b",
     revision="abc123",          # specific probe repo commit
     trust_classifier=True,
@@ -265,7 +265,7 @@ probe = LinearProbe.from_hub(
 
 Implementation notes:
 
-- `from_hub` downloads the probe repo via `snapshot_download`, reads `probe_config.json`, constructs a `LinearProbe` with the saved config, then loads the classifier from `classifier.skops`.
+- `from_hub` downloads the probe repo via `snapshot_download`, reads `probe_config.json`, constructs a `Probe` with the saved config, then loads the classifier from `classifier.skops`.
 - **`load_model` parameter** (default `False`): when `False`, the probe is returned without initializing the `ActivationExtractor`. The extractor is lazily initialized on the first call to `predict()`, at which point the base model must be available locally. When `True`, `from_hub` eagerly initializes the extractor, downloading the base model via transformers' `from_pretrained()` if needed. The pinned `base_model.revision` is passed through, ensuring exact weight reproducibility.
 - **Model validation**: on load (or on first `predict()` if lazy), we compare the `base_model.name` in config against the model the user will run inference with. If they don't match, we **warn** but don't error — the user may intentionally be testing cross-model transfer. If the model is not available and `load_model=False`, `predict()` raises a clear error: `"This probe was trained on meta-llama/Llama-3.1-8B-Instruct (revision abc123). Pass load_model=True to from_hub() to download it, or ensure the model is available locally."`
 - **Revision validation**: if the user has a different revision of the base model checked out locally, we warn. We don't error because the user may not have the exact commit available.
@@ -293,7 +293,7 @@ A key feature: given a probe on the Hub, can I verify it?
 
 ```python
 # Reproduce from scratch
-probe = LinearProbe.from_hub(
+probe = Probe.from_hub(
     "alliedtoasters/cbrn-detector-llama3-8b",
     load_model=True,
     trust_classifier=True,
@@ -301,7 +301,7 @@ probe = LinearProbe.from_hub(
 card = ProbeCard.from_hub("alliedtoasters/cbrn-detector-llama3-8b")
 
 # Re-train with the published training data
-fresh_probe = LinearProbe(**card.to_reproduce_config())
+fresh_probe = Probe(**card.to_reproduce_config())
 fresh_probe.fit(card.positive_examples, card.negative_examples)
 
 # Compare
@@ -506,7 +506,7 @@ class ProbeCard:
         return self.base_model == model
 
     def to_reproduce_config(self) -> dict:
-        """Return kwargs suitable for LinearProbe(...) constructor."""
+        """Return kwargs suitable for Probe(...) constructor."""
         return {
             "model": self.base_model,
             "layers": self.layers_spec_original,
@@ -543,7 +543,7 @@ class ProbeCard:
 - `training_info.json` can grow large if training prompts are very long or numerous; consider a size cap or separate file for data
 
 **Migration**:
-- Existing `.pkl` probes saved with `probe.save()` still work via `LinearProbe.load()`
+- Existing `.pkl` probes saved with `probe.save()` still work via `Probe.load()`
 - No breaking changes to the existing API
 - `push_to_hub` / `from_hub` are purely additive
 
