@@ -163,6 +163,14 @@ class LayerSweepResult:
         warmup_cached = CachedExtractor(warmup_extractor)
         warmup_cached.extract(prompts, remote=any_probe.remote)
 
+    def _apply_to_all_probes(self, method: str, prompts: list[str], *args) -> dict:
+        """Warmup cache, then call method on each probe and return results by layer."""
+        self._warmup_cache(prompts)
+        return {
+            layer: getattr(probe, method)(prompts, *args)
+            for layer, probe in sorted(self.probes.items())
+        }
+
     def score(
         self,
         test_prompts: list[str],
@@ -172,96 +180,33 @@ class LayerSweepResult:
 
         Performs a single warmup extraction pass for all layers, then
         scores each probe from cache (no redundant forward passes).
-
-        Parameters
-        ----------
-        test_prompts : list[str]
-            Test prompts.
-        test_labels : list[int] | np.ndarray
-            True labels.
-
-        Returns
-        -------
-        dict[int, float]
-            Mapping from layer index to accuracy.
         """
-        self._warmup_cache(test_prompts)
-        return {
-            layer: probe.score(test_prompts, test_labels)
-            for layer, probe in sorted(self.probes.items())
-        }
+        return self._apply_to_all_probes("score", test_prompts, test_labels)
 
     def best_layer(
         self,
         test_prompts: list[str],
         test_labels: list[int] | np.ndarray,
     ) -> int:
-        """Return the layer index with the highest accuracy.
-
-        Parameters
-        ----------
-        test_prompts : list[str]
-            Test prompts.
-        test_labels : list[int] | np.ndarray
-            True labels.
-
-        Returns
-        -------
-        int
-            Layer index with the best score.
-        """
+        """Return the layer index with the highest accuracy."""
         scores = self.score(test_prompts, test_labels)
         return max(scores, key=scores.get)
 
-    def predict(
-        self,
-        prompts: list[str],
-    ) -> dict[int, np.ndarray]:
+    def predict(self, prompts: list[str]) -> dict[int, np.ndarray]:
         """Predict with each layer's probe.
 
         Performs a single warmup extraction pass for all layers, then
         predicts from cache (no redundant forward passes).
-
-        Parameters
-        ----------
-        prompts : list[str]
-            Text prompts to classify.
-
-        Returns
-        -------
-        dict[int, np.ndarray]
-            Mapping from layer index to predictions array.
         """
-        self._warmup_cache(prompts)
-        return {
-            layer: probe.predict(prompts)
-            for layer, probe in sorted(self.probes.items())
-        }
+        return self._apply_to_all_probes("predict", prompts)
 
-    def predict_proba(
-        self,
-        prompts: list[str],
-    ) -> dict[int, np.ndarray]:
+    def predict_proba(self, prompts: list[str]) -> dict[int, np.ndarray]:
         """Predict probabilities with each layer's probe.
 
         Performs a single warmup extraction pass for all layers, then
         predicts from cache (no redundant forward passes).
-
-        Parameters
-        ----------
-        prompts : list[str]
-            Text prompts to classify.
-
-        Returns
-        -------
-        dict[int, np.ndarray]
-            Mapping from layer index to probability arrays.
         """
-        self._warmup_cache(prompts)
-        return {
-            layer: probe.predict_proba(prompts)
-            for layer, probe in sorted(self.probes.items())
-        }
+        return self._apply_to_all_probes("predict_proba", prompts)
 
 
 class Probe:
@@ -543,15 +488,20 @@ class Probe:
             f"Expected True, False, 'per_neuron', or 'per_layer'."
         )
 
+    @staticmethod
+    def _parse_preprocessing_spec(spec) -> list[str] | None:
+        """Normalize preprocessing spec to a list of step strings, or None."""
+        if spec is None:
+            return None
+        if isinstance(spec, str):
+            return [s.strip() for s in spec.split("+")]
+        return list(spec)
+
     def _preprocessing_includes_standard(self) -> bool:
         """Check if preprocessing spec includes StandardScaler."""
-        spec = self.preprocessing
-        if spec is None:
+        steps = self._parse_preprocessing_spec(self.preprocessing)
+        if steps is None:
             return False
-        if isinstance(spec, str):
-            steps = [s.strip() for s in spec.split("+")]
-        else:
-            steps = list(spec)
         return any(s in ("standard", "standard_scaler") for s in steps)
 
     def _build_preprocessing_pipeline(self):
@@ -566,15 +516,9 @@ class Probe:
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler
 
-        spec = self.preprocessing
-        if spec is None:
+        steps_spec = self._parse_preprocessing_spec(self.preprocessing)
+        if steps_spec is None:
             return None
-
-        # Normalize to list of step strings
-        if isinstance(spec, str):
-            steps_spec = [s.strip() for s in spec.split("+")]
-        else:
-            steps_spec = list(spec)
 
         steps = []
         for s in steps_spec:
@@ -1006,13 +950,7 @@ class Probe:
         _t_extract_elapsed = time.monotonic() - _t_extract_start
 
         # Handle "all" pooling for training (expand to per-token examples)
-        if self._train_pooling == "all" and X.ndim == 3:
-            # X is (batch, seq_len, hidden_dim)
-            # Expand to (batch * seq_len, hidden_dim)
-            batch_size, seq_len, hidden_dim = X.shape
-            X = X.reshape(-1, hidden_dim)
-            # Repeat labels for each token
-            labels = np.repeat(labels, seq_len)
+        X, labels = self._expand_all_pooling(X, labels)
 
         # Auto-disable normalize_layers when preprocessing includes StandardScaler
         n_layers = len(self._extractor.layer_indices)
@@ -1080,6 +1018,77 @@ class Probe:
         evict()
         return self
 
+    def _expand_all_pooling(
+        self, X: np.ndarray, labels: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Expand per-token examples when using 'all' pooling."""
+        if self._train_pooling == "all" and X.ndim == 3:
+            batch_size_orig, seq_len, hidden_dim_total = X.shape
+            return X.reshape(-1, hidden_dim_total), np.repeat(labels, seq_len)
+        return X, labels
+
+    @staticmethod
+    def _select_layer_columns(
+        X: np.ndarray, group_indices, hidden_dim_per_layer: int,
+    ) -> np.ndarray:
+        """Slice columns for selected layer groups from concatenated activations."""
+        selected_columns = []
+        for idx in group_indices:
+            start = idx * hidden_dim_per_layer
+            end = (idx + 1) * hidden_dim_per_layer
+            selected_columns.extend(range(start, end))
+        return X[:, selected_columns]
+
+    def _create_selected_extractor(self, layers: list[int]):
+        """Create a new extractor + cached extractor for the given layers."""
+        from .cache import CachedExtractor
+
+        extractor = ActivationExtractor(
+            self.model, self.device, layers, self.batch_size,
+            backend=self.backend,
+        )
+        return extractor, CachedExtractor(extractor)
+
+    def _copy_state_from_probe(self, source: Probe) -> None:
+        """Copy fitted state from another probe into this one."""
+        self.classifier_ = source.classifier_
+        self.classes_ = source.classes_
+        self.scaler_ = source.scaler_
+        self.preprocessing_pipeline_ = source.preprocessing_pipeline_
+        self._extractor = source._extractor
+        self._cached_extractor = source._cached_extractor
+
+    def _finalize_auto_layers(
+        self,
+        selected_indices,
+        candidate_layers: list[int],
+        X_candidates: np.ndarray,
+        labels: np.ndarray,
+        hidden_dim_per_layer: int,
+        scaling_strategy,
+    ) -> Probe:
+        """Shared tail for auto/fast_auto: slice, scale, retrain, update extractor."""
+        self.selected_layers_ = [candidate_layers[i] for i in selected_indices]
+
+        X_selected = self._select_layer_columns(
+            X_candidates, selected_indices, hidden_dim_per_layer,
+        )
+
+        n_selected = len(self.selected_layers_)
+        self.scaler_, X_selected = self._fit_layer_scaler(
+            X_selected, n_selected, scaling_strategy,
+        )
+
+        self._extractor, self._cached_extractor = self._create_selected_extractor(
+            self.selected_layers_,
+        )
+
+        self.classifier_ = clone(self._classifier_template)
+        self.classifier_.fit(X_selected, labels)
+        self.classes_ = self.classifier_.classes_
+
+        return self
+
     def _fit_auto_layers(
         self,
         prompts: list[str],
@@ -1089,46 +1098,31 @@ class Probe:
     ) -> Probe:
         """Fit with automatic layer selection via Group Lasso.
 
-        This is a two-phase process:
+        Two-phase process:
         1. Train Group Lasso on candidate layers to identify selected layers
         2. Re-train the user's classifier on selected layers only
         """
         import warnings
 
-        from .cache import CachedExtractor
         from .classifiers import build_group_lasso_classifier
 
         remote = self._get_remote(remote)
 
-        # Phase 1: Extract activations from candidate layers
         X_candidates, _ = self._extract_and_pool(
-            prompts,
-            self._train_pooling,
-            remote=remote,
-            invalidate_cache=invalidate_cache,
+            prompts, self._train_pooling,
+            remote=remote, invalidate_cache=invalidate_cache,
         )
+        X_candidates, labels_expanded = self._expand_all_pooling(X_candidates, labels)
 
-        # Handle "all" pooling (expand to per-token examples)
-        if self._train_pooling == "all" and X_candidates.ndim == 3:
-            batch_size_orig, seq_len, hidden_dim_total = X_candidates.shape
-            X_candidates = X_candidates.reshape(-1, hidden_dim_total)
-            labels_expanded = np.repeat(labels, seq_len)
-        else:
-            labels_expanded = labels
-
-        # Get hidden_dim per layer and number of candidate layers
         candidate_layers = self._extractor.layer_indices
         n_candidate_layers = len(candidate_layers)
-        hidden_dim_total = X_candidates.shape[1]
-        hidden_dim_per_layer = hidden_dim_total // n_candidate_layers
+        hidden_dim_per_layer = X_candidates.shape[1] // n_candidate_layers
 
-        # Apply per-layer normalization if enabled (before Group Lasso)
         scaling_strategy = self._get_scaling_strategy()
-        candidate_scaler, X_candidates_scaled = self._fit_layer_scaler(
+        _candidate_scaler, X_candidates_scaled = self._fit_layer_scaler(
             X_candidates, n_candidate_layers, scaling_strategy,
         )
 
-        # Phase 1: Train Group Lasso classifier
         group_lasso_clf = build_group_lasso_classifier(
             hidden_dim=hidden_dim_per_layer,
             n_layers=n_candidate_layers,
@@ -1137,15 +1131,11 @@ class Probe:
         )
         group_lasso_clf.fit(X_candidates_scaled, labels_expanded)
 
-        # Store candidate layers and their importances (group norms)
         self.candidate_layers_ = candidate_layers
         self.layer_importances_ = group_lasso_clf.group_norms_
 
-        # Identify selected layers
         selected_group_indices = group_lasso_clf.selected_groups_
-
         if not selected_group_indices:
-            # All groups were zeroed out - fallback to all candidates
             warnings.warn(
                 f"Group Lasso selected no layers (alpha={self.auto_alpha} may be too high). "
                 "Falling back to all candidate layers. Consider reducing auto_alpha.",
@@ -1153,45 +1143,10 @@ class Probe:
             )
             selected_group_indices = list(range(n_candidate_layers))
 
-        # Map group indices back to actual layer indices
-        self.selected_layers_ = [candidate_layers[i] for i in selected_group_indices]
-
-        # Phase 2: Slice selected layer activations from candidates (no re-extraction!)
-        # This avoids a second forward pass through the model
-        selected_columns = []
-        for idx in selected_group_indices:
-            start = idx * hidden_dim_per_layer
-            end = (idx + 1) * hidden_dim_per_layer
-            selected_columns.extend(range(start, end))
-        X_selected = X_candidates[:, selected_columns]  # Use unscaled for re-fit
-        labels_final = labels_expanded
-
-        # Apply per-layer normalization to selected layers if enabled
-        n_selected = len(self.selected_layers_)
-        self.scaler_, X_selected = self._fit_layer_scaler(
-            X_selected, n_selected, scaling_strategy,
+        return self._finalize_auto_layers(
+            selected_group_indices, candidate_layers,
+            X_candidates, labels_expanded, hidden_dim_per_layer, scaling_strategy,
         )
-
-        # Create extractor for selected layers (needed for inference later)
-        selected_extractor = ActivationExtractor(
-            self.model,
-            self.device,
-            self.selected_layers_,
-            self.batch_size,
-            backend=self.backend,
-        )
-        selected_cached_extractor = CachedExtractor(selected_extractor)
-
-        # Phase 2: Train final classifier on selected layers
-        self.classifier_ = clone(self._classifier_template)
-        self.classifier_.fit(X_selected, labels_final)
-        self.classes_ = self.classifier_.classes_
-
-        # Update extractor to use selected layers for inference
-        self._extractor = selected_extractor
-        self._cached_extractor = selected_cached_extractor
-
-        return self
 
     def _fit_fast_auto_layers(
         self,
@@ -1202,70 +1157,46 @@ class Probe:
     ) -> Probe:
         """Fit with fast automatic layer selection via coefficient importance.
 
-        This is a fast alternative to Group Lasso layer selection:
         1. Train the user's classifier on all candidate layers (with normalization)
         2. Compute layer importance from classifier coefficients
         3. Select top-k layers based on importance
         4. Re-train classifier on selected layers only
-
-        This approach is much faster than Group Lasso while still providing
-        interpretable layer importance scores.
         """
         import warnings
 
-        from .cache import CachedExtractor
-
         remote = self._get_remote(remote)
 
-        # Phase 1: Extract activations from candidate layers
         X_candidates, _ = self._extract_and_pool(
-            prompts,
-            self._train_pooling,
-            remote=remote,
-            invalidate_cache=invalidate_cache,
+            prompts, self._train_pooling,
+            remote=remote, invalidate_cache=invalidate_cache,
         )
+        X_candidates, labels_expanded = self._expand_all_pooling(X_candidates, labels)
 
-        # Handle "all" pooling (expand to per-token examples)
-        if self._train_pooling == "all" and X_candidates.ndim == 3:
-            batch_size_orig, seq_len, hidden_dim_total = X_candidates.shape
-            X_candidates = X_candidates.reshape(-1, hidden_dim_total)
-            labels_expanded = np.repeat(labels, seq_len)
-        else:
-            labels_expanded = labels
-
-        # Get hidden_dim per layer and number of candidate layers
         candidate_layers = self._extractor.layer_indices
         n_candidate_layers = len(candidate_layers)
-        hidden_dim_total = X_candidates.shape[1]
-        hidden_dim_per_layer = hidden_dim_total // n_candidate_layers
+        hidden_dim_per_layer = X_candidates.shape[1] // n_candidate_layers
 
-        # Store candidate layers for importance computation
         self.candidate_layers_ = list(candidate_layers)
 
-        # Apply per-layer normalization if enabled
         scaling_strategy = self._get_scaling_strategy()
-        scaler, X_candidates_scaled = self._fit_layer_scaler(
+        _scaler, X_candidates_scaled = self._fit_layer_scaler(
             X_candidates, n_candidate_layers, scaling_strategy,
         )
 
-        # Phase 1: Train classifier on all candidate layers
+        # Train on all candidates to compute importance
         self.classifier_ = clone(self._classifier_template)
         self.classifier_.fit(X_candidates_scaled, labels_expanded)
         self.classes_ = self.classifier_.classes_
 
-        # Phase 2: Compute layer importance from coefficients
         importance = self.compute_layer_importance(metric="l2", normalize=False)
 
-        # Phase 3: Select top-k layers
         top_k = self.fast_auto_top_k
         if top_k is None:
-            # Default: select half the candidate layers (at least 1)
             top_k = max(1, n_candidate_layers // 2)
         top_k = min(top_k, n_candidate_layers)
 
-        # Get indices of top-k layers by importance
         top_indices = np.argsort(importance)[-top_k:]
-        top_indices = np.sort(top_indices)  # Keep original order
+        top_indices = np.sort(top_indices)
 
         if len(top_indices) == 0:
             warnings.warn(
@@ -1274,42 +1205,10 @@ class Probe:
             )
             top_indices = np.arange(n_candidate_layers)
 
-        self.selected_layers_ = [candidate_layers[i] for i in top_indices]
-
-        # Phase 4: Re-train on selected layers only (slice from existing data)
-        selected_columns = []
-        for idx in top_indices:
-            start = idx * hidden_dim_per_layer
-            end = (idx + 1) * hidden_dim_per_layer
-            selected_columns.extend(range(start, end))
-        X_selected = X_candidates[:, selected_columns]  # Use unscaled for re-fit
-
-        # Apply normalization to selected layers if enabled
-        n_selected = len(self.selected_layers_)
-        self.scaler_, X_selected = self._fit_layer_scaler(
-            X_selected, n_selected, scaling_strategy,
+        return self._finalize_auto_layers(
+            top_indices, candidate_layers,
+            X_candidates, labels_expanded, hidden_dim_per_layer, scaling_strategy,
         )
-
-        # Create extractor for selected layers (needed for inference later)
-        selected_extractor = ActivationExtractor(
-            self.model,
-            self.device,
-            self.selected_layers_,
-            self.batch_size,
-            backend=self.backend,
-        )
-        selected_cached_extractor = CachedExtractor(selected_extractor)
-
-        # Re-train final classifier on selected layers
-        self.classifier_ = clone(self._classifier_template)
-        self.classifier_.fit(X_selected, labels_expanded)
-        self.classes_ = self.classifier_.classes_
-
-        # Update extractor to use selected layers for inference
-        self._extractor = selected_extractor
-        self._cached_extractor = selected_cached_extractor
-
-        return self
 
     def _fit_sweep(
         self,
@@ -1364,13 +1263,7 @@ class Probe:
         # Use the first layer's probe as a default active probe
         # (user can pick the best after evaluate())
         first_layer = self.sweep_result_.layers[0]
-        best_probe = self.sweep_result_[first_layer]
-        self.classifier_ = best_probe.classifier_
-        self.classes_ = best_probe.classes_
-        self.scaler_ = best_probe.scaler_
-        self.preprocessing_pipeline_ = best_probe.preprocessing_pipeline_
-        self._extractor = best_probe._extractor
-        self._cached_extractor = best_probe._cached_extractor
+        self._copy_state_from_probe(self.sweep_result_[first_layer])
 
         return self
 
@@ -1380,6 +1273,25 @@ class Probe:
             raise RuntimeError(
                 "Probe has not been fitted. Call fit() first."
             )
+
+    def _check_classification_task(self) -> None:
+        """Raise if task is not classification."""
+        if self.task == "regression":
+            raise ValueError(
+                "predict_proba is not available for regression tasks."
+            )
+
+    @staticmethod
+    def _try_auroc(labels: np.ndarray, proba: np.ndarray) -> float | None:
+        """Compute AUROC, returning None on failure."""
+        try:
+            from sklearn.metrics import roc_auc_score
+
+            if proba.ndim == 2 and proba.shape[1] == 2:
+                return float(roc_auc_score(labels, proba[:, 1]))
+            return float(roc_auc_score(labels, proba))
+        except Exception:
+            return None
 
     def _apply_inference_transforms(self, X: np.ndarray) -> np.ndarray:
         """Apply scaler, preprocessing pipeline, and mass-mean augmentation.
@@ -1515,11 +1427,7 @@ class Probe:
             - "all": (n_samples, seq_len, n_classes)
         """
         self._check_fitted()
-
-        if self.task == "regression":
-            raise ValueError(
-                "predict_proba is not available for regression tasks."
-            )
+        self._check_classification_task()
 
         # Extract activations
         X, attention_mask = self._extract_and_pool(
@@ -1625,16 +1533,9 @@ class Probe:
                     "recall": float(recall_score(labels, layer_preds, zero_division=0)),
                 }
                 if hasattr(probe.classifier_, "predict_proba"):
-                    try:
-                        from sklearn.metrics import roc_auc_score
-
-                        proba = probe.predict_proba(prompts, remote=remote)
-                        if proba.ndim == 2 and proba.shape[1] == 2:
-                            layer_metrics["auroc"] = float(roc_auc_score(labels, proba[:, 1]))
-                        else:
-                            layer_metrics["auroc"] = float(roc_auc_score(labels, proba))
-                    except Exception:
-                        pass
+                    auroc = self._try_auroc(labels, probe.predict_proba(prompts, remote=remote))
+                    if auroc is not None:
+                        layer_metrics["auroc"] = auroc
                 layer_results[layer_idx] = layer_metrics
 
             best_layer = max(scores, key=scores.get)
@@ -1646,13 +1547,7 @@ class Probe:
             }
 
             # Update this probe to use the best layer's probe
-            best_probe = self.sweep_result_[best_layer]
-            self.classifier_ = best_probe.classifier_
-            self.classes_ = best_probe.classes_
-            self.scaler_ = best_probe.scaler_
-            self.preprocessing_pipeline_ = best_probe.preprocessing_pipeline_
-            self._extractor = best_probe._extractor
-            self._cached_extractor = best_probe._cached_extractor
+            self._copy_state_from_probe(self.sweep_result_[best_layer])
 
             self._evaluation_results_ = results
             return results
@@ -1668,16 +1563,9 @@ class Probe:
 
         # AUROC if predict_proba is available
         if self.task == "classification" and hasattr(self.classifier_, "predict_proba"):
-            try:
-                from sklearn.metrics import roc_auc_score
-
-                probabilities = self.predict_proba(prompts, remote=remote)
-                if probabilities.ndim == 2 and probabilities.shape[1] == 2:
-                    results["auroc"] = float(roc_auc_score(labels, probabilities[:, 1]))
-                else:
-                    results["auroc"] = float(roc_auc_score(labels, probabilities))
-            except Exception:
-                pass
+            auroc = self._try_auroc(labels, self.predict_proba(prompts, remote=remote))
+            if auroc is not None:
+                results["auroc"] = auroc
 
         # Metadata
         from .hub import _hash_prompts
@@ -2072,10 +1960,7 @@ class Probe:
             If task is regression.
         """
         self._check_fitted()
-        if self.task == "regression":
-            raise ValueError(
-                "predict_proba is not available for regression tasks."
-            )
+        self._check_classification_task()
         X = self._apply_inference_transforms(self._to_numpy(X))
         return self.classifier_.predict_proba(X)
 
