@@ -45,6 +45,7 @@ from lmprobe.cache import (
     set_cache_dtype,
     set_cache_limit,
 )
+from lmprobe.cache_backends import LocalCacheBackend
 
 
 class TestLegacyCacheStorage:
@@ -1795,3 +1796,970 @@ class TestManifestBackwardCompat:
         info = discover_cached(TEST_MODEL, prompt)
         assert info is not None
         assert 0 in info.raw_layers
+
+
+# =============================================================================
+# Additional coverage tests (targeting 70%+ coverage)
+# =============================================================================
+
+
+class TestHashString:
+    """Tests for _hash_string pure function."""
+
+    def test_deterministic(self):
+        assert _hash_string("hello") == _hash_string("hello")
+
+    def test_different_inputs_different_hashes(self):
+        assert _hash_string("hello") != _hash_string("world")
+
+    def test_default_length(self):
+        result = _hash_string("test")
+        assert len(result) == 16
+        assert all(c in "0123456789abcdef" for c in result)
+
+    def test_custom_length(self):
+        result = _hash_string("test", length=8)
+        assert len(result) == 8
+
+    def test_empty_string(self):
+        result = _hash_string("")
+        assert len(result) == 16
+
+
+class TestFormatLayers:
+    """Tests for _format_layers helper."""
+
+    def test_small_set(self):
+        from lmprobe.cache import _format_layers
+
+        result = _format_layers({0, 1, 2})
+        assert result == "[0, 1, 2]"
+
+    def test_large_set_truncated(self):
+        from lmprobe.cache import _format_layers
+
+        layers = set(range(20))
+        result = _format_layers(layers, max_show=10)
+        assert "20 total" in result
+        assert "..." in result
+
+    def test_list_input(self):
+        from lmprobe.cache import _format_layers
+
+        result = _format_layers([5, 3, 1])
+        assert result == "[1, 3, 5]"
+
+
+class TestParseKeyHelpers:
+    """Tests for key parsing helpers."""
+
+    def test_parse_raw_layer_keys(self):
+        from lmprobe.cache import _parse_raw_layer_keys
+
+        keys = {"layer_0", "layer_5", "attention_mask", "pooled_last_token_layer_0"}
+        assert _parse_raw_layer_keys(keys) == {0, 5}
+
+    def test_parse_raw_layer_keys_empty(self):
+        from lmprobe.cache import _parse_raw_layer_keys
+
+        assert _parse_raw_layer_keys(set()) == set()
+
+    def test_parse_raw_layer_keys_invalid(self):
+        from lmprobe.cache import _parse_raw_layer_keys
+
+        keys = {"layer_abc", "layer_"}
+        assert _parse_raw_layer_keys(keys) == set()
+
+    def test_parse_pooled_layer_keys(self):
+        from lmprobe.cache import _parse_pooled_layer_keys
+
+        keys = {"pooled_last_token_layer_0", "pooled_last_token_layer_3", "layer_0"}
+        assert _parse_pooled_layer_keys(keys, "last_token") == {0, 3}
+
+    def test_parse_pooled_layer_keys_wrong_strategy(self):
+        from lmprobe.cache import _parse_pooled_layer_keys
+
+        keys = {"pooled_last_token_layer_0"}
+        assert _parse_pooled_layer_keys(keys, "mean") == set()
+
+    def test_parse_all_pooled_keys(self):
+        from lmprobe.cache import _parse_all_pooled_keys
+
+        keys = [
+            "pooled_last_token_layer_0",
+            "pooled_last_token_layer_1",
+            "pooled_mean_layer_0",
+            "layer_0",
+        ]
+        result = _parse_all_pooled_keys(keys)
+        assert "last_token" in result
+        assert result["last_token"] == [0, 1]
+        assert "mean" in result
+        assert result["mean"] == [0]
+
+
+class TestPrepareTensor:
+    """Tests for _prepare_tensor."""
+
+    def test_detaches_and_makes_contiguous(self):
+        from lmprobe.cache import _prepare_tensor
+
+        t = torch.randn(3, 4, requires_grad=True)
+        result = _prepare_tensor(t)
+        assert not result.requires_grad
+        assert result.is_contiguous()
+        assert result.device.type == "cpu"
+
+    def test_dtype_conversion(self):
+        import lmprobe.cache as cache_mod
+        from lmprobe.cache import _prepare_tensor
+
+        old = cache_mod._CACHE_DTYPE
+        try:
+            cache_mod._CACHE_DTYPE = torch.float16
+            t = torch.randn(3, 4, dtype=torch.float32)
+            result = _prepare_tensor(t)
+            assert result.dtype == torch.float16
+        finally:
+            cache_mod._CACHE_DTYPE = old
+
+    def test_no_conversion_for_int(self):
+        import lmprobe.cache as cache_mod
+        from lmprobe.cache import _prepare_tensor
+
+        old = cache_mod._CACHE_DTYPE
+        try:
+            cache_mod._CACHE_DTYPE = torch.float16
+            t = torch.ones(3, dtype=torch.long)
+            result = _prepare_tensor(t)
+            assert result.dtype == torch.long  # int tensors should not be converted
+        finally:
+            cache_mod._CACHE_DTYPE = old
+
+
+class TestSetCacheDtypeEdgeCases:
+    """Edge cases for set_cache_dtype."""
+
+    def test_invalid_dtype_raises(self):
+        with pytest.raises(ValueError, match="Unknown dtype"):
+            set_cache_dtype("float8")
+
+    def test_bfloat16(self):
+        import lmprobe.cache as cache_mod
+
+        set_cache_dtype("bfloat16")
+        try:
+            assert cache_mod._CACHE_DTYPE == torch.bfloat16
+        finally:
+            set_cache_dtype(None)
+
+    def test_float32(self):
+        import lmprobe.cache as cache_mod
+
+        set_cache_dtype("float32")
+        try:
+            assert cache_mod._CACHE_DTYPE == torch.float32
+        finally:
+            set_cache_dtype(None)
+
+    def test_none_resets(self):
+        import lmprobe.cache as cache_mod
+
+        set_cache_dtype("float16")
+        set_cache_dtype(None)
+        assert cache_mod._CACHE_DTYPE is None
+
+
+class TestSetCacheLimitEdgeCases:
+    """Edge cases for set_cache_limit."""
+
+    def test_positive_value(self):
+        import lmprobe.cache as cache_mod
+
+        old = cache_mod._CACHE_MAX_BYTES
+        try:
+            set_cache_limit(gb=10.0)
+            assert cache_mod._CACHE_MAX_BYTES == int(10.0 * 1024**3)
+        finally:
+            cache_mod._CACHE_MAX_BYTES = old
+
+    def test_none_resets(self):
+        import lmprobe.cache as cache_mod
+
+        old = cache_mod._CACHE_MAX_BYTES
+        try:
+            set_cache_limit(gb=5.0)
+            set_cache_limit(None)
+            assert cache_mod._CACHE_MAX_BYTES is None
+        finally:
+            cache_mod._CACHE_MAX_BYTES = old
+
+
+class TestEnableCacheLogging:
+    """Tests for enable_cache_logging."""
+
+    def test_sets_level(self):
+        import logging
+
+        from lmprobe.cache import enable_cache_logging, logger
+
+        original_level = logger.level
+        original_handlers = logger.handlers[:]
+        try:
+            enable_cache_logging(logging.DEBUG)
+            assert logger.level == logging.DEBUG
+            assert len(logger.handlers) >= 1
+        finally:
+            logger.setLevel(original_level)
+            logger.handlers = original_handlers
+
+    def test_does_not_add_duplicate_handlers(self):
+        import logging
+
+        from lmprobe.cache import enable_cache_logging, logger
+
+        original_handlers = logger.handlers[:]
+        try:
+            enable_cache_logging(logging.INFO)
+            count_after_first = len(logger.handlers)
+            enable_cache_logging(logging.INFO)
+            count_after_second = len(logger.handlers)
+            assert count_after_second == count_after_first
+        finally:
+            logger.handlers = original_handlers
+
+
+class TestSetCacheBackend:
+    """Tests for set_cache_backend."""
+
+    def test_set_none_resets(self):
+        import lmprobe.cache as cache_mod
+        from lmprobe.cache import set_cache_backend
+
+        set_cache_backend(None)
+        assert cache_mod._backend is None
+
+    def test_set_string_local_path(self, tmp_path):
+        import lmprobe.cache as cache_mod
+        from lmprobe.cache import set_cache_backend
+
+        old = cache_mod._backend
+        try:
+            set_cache_backend(str(tmp_path))
+            assert isinstance(cache_mod._backend, LocalCacheBackend)
+        finally:
+            cache_mod._backend = old
+
+    def test_set_backend_instance(self, tmp_path):
+        import lmprobe.cache as cache_mod
+        from lmprobe.cache import set_cache_backend
+
+        old = cache_mod._backend
+        try:
+            backend = LocalCacheBackend(tmp_path)
+            set_cache_backend(backend)
+            assert cache_mod._backend is backend
+        finally:
+            cache_mod._backend = old
+
+    def test_invalid_type_raises(self):
+        from lmprobe.cache import set_cache_backend
+
+        with pytest.raises(TypeError, match="Expected CacheBackend"):
+            set_cache_backend(42)
+
+    def test_unsupported_uri_raises(self):
+        from lmprobe.cache import _parse_backend_uri
+
+        with pytest.raises(ValueError, match="Unsupported"):
+            _parse_backend_uri("gs://bucket/prefix")
+
+
+class TestDiscoverCached:
+    """Tests for discover_cached introspection."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-discover"
+
+    def test_returns_none_for_uncached(self):
+        from lmprobe.cache import discover_cached
+
+        assert discover_cached(self.model, "never cached") is None
+
+    def test_returns_raw_layers(self):
+        from lmprobe.cache import discover_cached
+
+        acts = torch.randn(1, 5, 64)
+        mask = torch.ones(1, 5, dtype=torch.long)
+        save_prompt_activations(self.model, "test prompt", [0, 1], acts, mask)
+
+        info = discover_cached(self.model, "test prompt")
+        assert info is not None
+        assert info.raw_layers == [0, 1]
+        assert info.num_tokens == 5
+
+    def test_returns_pooled_info(self):
+        from lmprobe.cache import discover_cached
+
+        acts = torch.randn(1, 5, 64)
+        mask = torch.ones(1, 5, dtype=torch.long)
+        save_prompt_activations(self.model, "test", [0, 1], acts, mask)
+        save_prompt_pooled_activations(self.model, "test", [0, 1], torch.randn(1, 64), "last_token")
+
+        info = discover_cached(self.model, "test")
+        assert info is not None
+        assert "last_token" in info.pooled
+        assert info.pooled["last_token"] == [0, 1]
+
+    def test_detects_perplexity(self):
+        from lmprobe.cache import discover_cached
+
+        save_prompt_perplexity(self.model, "ppl test", torch.tensor([1.0, 2.0, 3.0]))
+
+        info = discover_cached(self.model, "ppl test")
+        assert info is not None
+        assert info.has_perplexity is True
+
+    def test_detects_logits(self):
+        from lmprobe.cache import discover_cached
+
+        logits = torch.randn(1, 5, 100)
+        mask = torch.ones(1, 5)
+        save_prompt_logits(self.model, "logits test", logits, mask, top_k=10)
+
+        info = discover_cached(self.model, "logits test")
+        assert info is not None
+        assert info.logits_top_k == 10
+
+    def test_detects_token_perplexity(self):
+        from lmprobe.cache import discover_cached
+
+        save_prompt_perplexity(
+            self.model, "tok ppl",
+            torch.tensor([1.0, 2.0, 3.0]),
+            token_perplexity=torch.tensor([0.5, 0.6, 0.7]),
+            token_ids=torch.tensor([1, 2, 3, 4]),
+        )
+
+        info = discover_cached(self.model, "tok ppl")
+        assert info is not None
+        assert info.has_token_perplexity is True
+
+
+class TestSelectPositions:
+    """Tests for _select_positions helper."""
+
+    def test_last_position(self):
+        from lmprobe.cache import _select_positions
+
+        tensor = torch.randn(1, 5, 10)
+        mask = torch.tensor([[1, 1, 1, 0, 0]])
+        result = _select_positions(tensor, mask, "last")
+        assert result.shape == (1, 1, 10)
+        assert torch.equal(result[0, 0], tensor[0, 2])
+
+    def test_all_positions(self):
+        from lmprobe.cache import _select_positions
+
+        tensor = torch.randn(1, 5, 10)
+        mask = torch.ones(1, 5)
+        result = _select_positions(tensor, mask, "all")
+        assert torch.equal(result, tensor)
+
+    def test_invalid_positions_raises(self):
+        from lmprobe.cache import _select_positions
+
+        with pytest.raises(ValueError, match="Invalid positions"):
+            _select_positions(torch.randn(1, 5, 10), torch.ones(1, 5), "middle")
+
+
+class TestGetPooledCacheKey:
+    """Tests for get_pooled_cache_key."""
+
+    def test_returns_correct_prefix(self):
+        from lmprobe.cache import get_pooled_cache_key
+
+        assert get_pooled_cache_key("last_token") == "pooled_last_token"
+        assert get_pooled_cache_key("mean") == "pooled_mean"
+
+
+class TestGetPromptCachedRawLayers:
+    """Tests for get_prompt_cached_raw_layers."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-raw-layers"
+
+    def test_returns_none_for_uncached(self):
+        from lmprobe.cache import get_prompt_cached_raw_layers
+
+        assert get_prompt_cached_raw_layers(self.model, "uncached") is None
+
+    def test_returns_layers_for_cached(self):
+        from lmprobe.cache import get_prompt_cached_raw_layers
+
+        acts = torch.randn(1, 5, 64)
+        mask = torch.ones(1, 5, dtype=torch.long)
+        save_prompt_activations(self.model, "test", [0, 1], acts, mask)
+
+        result = get_prompt_cached_raw_layers(self.model, "test")
+        assert result == {0, 1}
+
+
+class TestGetPromptCachedPooledLayers:
+    """Tests for get_prompt_cached_pooled_layers."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-pooled-layers"
+
+    def test_returns_none_for_uncached(self):
+        from lmprobe.cache import get_prompt_cached_pooled_layers
+
+        assert get_prompt_cached_pooled_layers(self.model, "uncached", "last_token") is None
+
+    def test_returns_layers_for_cached(self):
+        from lmprobe.cache import get_prompt_cached_pooled_layers
+
+        save_prompt_pooled_activations(self.model, "test", [0, 2], torch.randn(1, 64), "last_token")
+        result = get_prompt_cached_pooled_layers(self.model, "test", "last_token")
+        assert result == {0, 2}
+
+
+class TestTokenPerplexityCache:
+    """Tests for token-level perplexity cache functions."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-tok-ppl"
+
+    def test_save_and_load_token_perplexity(self):
+        from lmprobe.cache import (
+            is_prompt_token_perplexity_cached,
+            load_prompt_token_perplexity,
+        )
+
+        tok_ppl = torch.tensor([0.5, 0.6, 0.7])
+        tok_ids = torch.tensor([100, 200, 300, 400])
+        ppl_features = torch.tensor([1.0, 2.0, 3.0])
+
+        save_prompt_perplexity(
+            self.model, "test",
+            ppl_features,
+            token_perplexity=tok_ppl,
+            token_ids=tok_ids,
+        )
+
+        assert is_prompt_token_perplexity_cached(self.model, "test")
+
+        loaded_ppl, loaded_ids = load_prompt_token_perplexity(self.model, "test")
+        assert torch.allclose(loaded_ppl, tok_ppl)
+        assert torch.equal(loaded_ids, tok_ids)
+
+    def test_not_cached_raises(self):
+        from lmprobe.cache import load_prompt_token_perplexity
+
+        with pytest.raises(FileNotFoundError):
+            load_prompt_token_perplexity(self.model, "uncached")
+
+    def test_not_cached_returns_false(self):
+        from lmprobe.cache import is_prompt_token_perplexity_cached
+
+        assert not is_prompt_token_perplexity_cached(self.model, "uncached")
+
+
+class TestLoadPooledBatch:
+    """Tests for load_pooled_batch function."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-pooled-batch"
+
+    def test_basic_load(self):
+        from lmprobe.cache import load_pooled_batch
+
+        prompts = ["prompt A", "prompt B", "prompt C"]
+        for p in prompts:
+            save_prompt_pooled_activations(
+                self.model, p, [0, 1], torch.randn(1, 64), "last_token"
+            )
+
+        result = load_pooled_batch(self.model, prompts, [0, 1], "last_token")
+        assert result.shape == (3, 64)
+
+    def test_missing_prompt_raises(self):
+        from lmprobe.cache import load_pooled_batch
+
+        save_prompt_pooled_activations(
+            self.model, "exists", [0], torch.randn(1, 32), "last_token"
+        )
+
+        with pytest.raises(FileNotFoundError):
+            load_pooled_batch(
+                self.model, ["exists", "missing"], [0], "last_token"
+            )
+
+    def test_missing_raises_without_fallback(self):
+        from lmprobe.cache import load_pooled_batch
+
+        with pytest.raises(FileNotFoundError):
+            load_pooled_batch(
+                self.model, ["missing1", "missing2"], [0], "last_token",
+                fallback_to_raw=False,
+            )
+
+
+class TestWriteAndReadShardRegistry:
+    """Tests for write_shard_registry and related shard functions."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-shard"
+
+    def test_write_and_read_manifest(self):
+        from lmprobe.cache import _load_shard_manifest, write_shard_registry
+
+        manifest = {"model": self.model, "tensors": {"hidden_layers": {"layers": [0, 1]}}}
+        index = {"abc123": {"shard_index": 0, "row_offset": 0}}
+
+        write_shard_registry(self.model, manifest, index)
+
+        loaded = _load_shard_manifest(self.model)
+        assert loaded is not None
+        assert loaded["model"] == self.model
+
+    def test_write_and_read_index(self):
+        from lmprobe.cache import _load_shard_index, write_shard_registry
+
+        manifest = {"model": self.model}
+        index = {"hash1": {"shard_index": 0, "row_offset": 10}}
+
+        write_shard_registry(self.model, manifest, index)
+
+        loaded = _load_shard_index(self.model)
+        assert loaded is not None
+        assert "hash1" in loaded
+        assert loaded["hash1"]["row_offset"] == 10
+
+    def test_repo_id_stamped(self):
+        from lmprobe.cache import _load_shard_index, write_shard_registry
+
+        manifest = {"model": self.model}
+        index = {"hash1": {"shard_index": 0}}
+
+        write_shard_registry(self.model, manifest, index, repo_id="user/dataset")
+
+        loaded = _load_shard_index(self.model)
+        assert loaded["hash1"]["repo_id"] == "user/dataset"
+
+    def test_index_merge(self):
+        from lmprobe.cache import _load_shard_index, write_shard_registry
+
+        write_shard_registry(self.model, {"m": 1}, {"h1": {"s": 0}})
+        write_shard_registry(self.model, {"m": 2}, {"h2": {"s": 1}})
+
+        loaded = _load_shard_index(self.model)
+        assert "h1" in loaded
+        assert "h2" in loaded
+
+    def test_lookup_shard(self):
+        from lmprobe.cache import _lookup_shard, write_shard_registry
+
+        prompt = "test prompt for shard"
+        prompt_hash = _hash_string(prompt)
+        manifest = {"model": self.model}
+        index = {prompt_hash: {"shard_index": 2, "row_offset": 5}}
+
+        write_shard_registry(self.model, manifest, index)
+
+        result = _lookup_shard(self.model, prompt)
+        assert result is not None
+        assert result["shard_index"] == 2
+        assert result["row_offset"] == 5
+
+    def test_lookup_shard_missing(self):
+        from lmprobe.cache import _lookup_shard
+
+        assert _lookup_shard(self.model, "never registered") is None
+
+
+class TestEvictFunction:
+    """Tests for evict() LRU eviction."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-evict"
+
+    def test_noop_when_no_limit(self):
+        import lmprobe.cache as cache_mod
+        from lmprobe.cache import evict
+
+        old = cache_mod._CACHE_MAX_BYTES
+        try:
+            cache_mod._CACHE_MAX_BYTES = None
+            save_prompt_activations(self.model, "test", [0], torch.randn(1, 5, 32), torch.ones(1, 5))
+            evict()  # Should not raise or delete anything
+            assert is_prompt_fully_cached(self.model, "test", {0})
+        finally:
+            cache_mod._CACHE_MAX_BYTES = old
+
+    def test_noop_when_disabled(self):
+        import lmprobe.cache as cache_mod
+        from lmprobe.cache import evict
+
+        old = cache_mod._CACHE_MAX_BYTES
+        try:
+            cache_mod._CACHE_MAX_BYTES = -1
+            evict()  # Should not raise
+        finally:
+            cache_mod._CACHE_MAX_BYTES = old
+
+
+class TestCollectCacheEntries:
+    """Tests for _collect_cache_entries."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-collect"
+
+    def test_empty_cache(self):
+        from lmprobe.cache import _collect_cache_entries
+
+        entries = _collect_cache_entries()
+        assert entries == []
+
+    def test_finds_safetensors_files(self):
+        from lmprobe.cache import _collect_cache_entries
+
+        save_prompt_activations(self.model, "p1", [0], torch.randn(1, 3, 32), torch.ones(1, 3))
+        save_prompt_activations(self.model, "p2", [0], torch.randn(1, 3, 32), torch.ones(1, 3))
+
+        entries = _collect_cache_entries()
+        # At least 2 main safetensors files (may also have _model_name.txt etc.)
+        sf_entries = [e for e in entries if str(e[0]).endswith(".safetensors")]
+        assert len(sf_entries) >= 2
+
+
+class TestClearCache:
+    """Tests for clear_cache."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-clear"
+
+    def test_clears_all(self):
+        from lmprobe.cache import clear_cache
+
+        save_prompt_activations(self.model, "p1", [0], torch.randn(1, 3, 32), torch.ones(1, 3))
+        save_prompt_activations(self.model, "p2", [0], torch.randn(1, 3, 32), torch.ones(1, 3))
+
+        count = clear_cache()
+        assert count >= 2
+
+        info = cache_info()
+        assert info.total_size_bytes == 0
+
+    def test_empty_cache_returns_zero(self):
+        from lmprobe.cache import clear_cache
+
+        # Ensure the cache dir exists but is empty of model dirs
+        count = clear_cache()
+        assert count == 0
+
+
+class TestComputeCacheKey:
+    """Tests for compute_cache_key legacy function."""
+
+    def test_deterministic(self):
+        from lmprobe.cache import compute_cache_key
+
+        key1 = compute_cache_key("model", ["prompt1"], [0, 1])
+        key2 = compute_cache_key("model", ["prompt1"], [0, 1])
+        assert key1 == key2
+
+    def test_different_inputs(self):
+        from lmprobe.cache import compute_cache_key
+
+        key1 = compute_cache_key("model", ["prompt1"], [0])
+        key2 = compute_cache_key("model", ["prompt2"], [0])
+        assert key1 != key2
+
+    def test_length(self):
+        from lmprobe.cache import compute_cache_key
+
+        key = compute_cache_key("model", ["prompt"], [0])
+        assert len(key) == 32
+
+
+class TestGetCachePath:
+    """Tests for get_cache_path legacy function."""
+
+    def test_returns_path_with_pt_suffix(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        from lmprobe.cache import get_cache_path
+
+        path = get_cache_path("abc123")
+        assert str(path).endswith("abc123.pt")
+
+
+class TestModelCacheInfoRepr:
+    """Tests for ModelCacheInfo.__repr__."""
+
+    def test_repr_with_name(self):
+        from lmprobe.cache import ModelCacheInfo
+
+        info = ModelCacheInfo(
+            model_name="test/model",
+            model_hash="abc123",
+            size_bytes=1024**3,
+            num_prompts=10,
+            num_layers=5,
+            has_pooled=True,
+            has_perplexity=False,
+            has_logits=True,
+        )
+        text = repr(info)
+        assert "test/model" in text
+        assert "10 prompts" in text
+        assert "pooled" in text
+        assert "logits" in text
+
+    def test_repr_without_name(self):
+        from lmprobe.cache import ModelCacheInfo
+
+        info = ModelCacheInfo(
+            model_name=None,
+            model_hash="abc123",
+            size_bytes=0,
+            num_prompts=0,
+            num_layers=0,
+            has_pooled=False,
+            has_perplexity=False,
+        )
+        text = repr(info)
+        assert "abc123" in text
+
+    def test_size_gb_property(self):
+        from lmprobe.cache import ModelCacheInfo
+
+        info = ModelCacheInfo(
+            model_name="m", model_hash="h",
+            size_bytes=2 * 1024**3,
+            num_prompts=0, num_layers=0,
+            has_pooled=False, has_perplexity=False,
+        )
+        assert abs(info.size_gb - 2.0) < 0.001
+
+
+class TestCacheInfoRepr:
+    """Tests for CacheInfo.__repr__ with various states."""
+
+    def test_with_limit(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        save_prompt_activations(
+            "test-model", "p1", [0],
+            torch.randn(1, 3, 32), torch.ones(1, 3),
+        )
+
+        import lmprobe.cache as cache_mod
+
+        old = cache_mod._CACHE_MAX_BYTES
+        try:
+            cache_mod._CACHE_MAX_BYTES = 10 * 1024**3
+            info = cache_info()
+            text = repr(info)
+            assert "Size limit" in text
+        finally:
+            cache_mod._CACHE_MAX_BYTES = old
+
+    def test_total_size_gb_property(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        info = cache_info()
+        assert info.total_size_gb == 0.0
+
+
+class TestCacheInfoMultipleModels:
+    """Tests for cache_info with multiple models."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+    def test_two_models(self):
+        save_prompt_activations("model-a", "p1", [0], torch.randn(1, 3, 32), torch.ones(1, 3))
+        save_prompt_activations("model-b", "p1", [0], torch.randn(1, 3, 32), torch.ones(1, 3))
+
+        info = cache_info()
+        assert len(info.models) == 2
+
+    def test_has_logits_flag(self):
+        save_prompt_activations("model-logits", "p1", [0], torch.randn(1, 3, 32), torch.ones(1, 3))
+        save_prompt_logits("model-logits", "p1", torch.randn(1, 3, 100), torch.ones(1, 3), top_k=5)
+
+        info = cache_info(model="model-logits")
+        assert info.models[0].has_logits is True
+
+    def test_has_perplexity_flag(self):
+        save_prompt_activations("model-ppl", "p1", [0], torch.randn(1, 3, 32), torch.ones(1, 3))
+        save_prompt_perplexity("model-ppl", "p1", torch.tensor([1.0, 2.0, 3.0]))
+
+        info = cache_info(model="model-ppl")
+        assert info.models[0].has_perplexity is True
+
+
+class TestHasLogitsInKeys:
+    """Tests for _has_logits_in_keys helper."""
+
+    def test_full_logits(self):
+        from lmprobe.cache import _has_logits_in_keys
+
+        keys = {"logits"}
+        assert _has_logits_in_keys(keys, top_k=False) is True
+        assert _has_logits_in_keys(keys, top_k=True) is False
+        assert _has_logits_in_keys(keys, top_k=None) is True
+
+    def test_topk_logits(self):
+        from lmprobe.cache import _has_logits_in_keys
+
+        keys = {"logits_top_k_values", "logits_top_k_indices"}
+        assert _has_logits_in_keys(keys, top_k=True) is True
+        assert _has_logits_in_keys(keys, top_k=False) is False
+        assert _has_logits_in_keys(keys, top_k=None) is True
+
+    def test_no_logits(self):
+        from lmprobe.cache import _has_logits_in_keys
+
+        keys = {"layer_0", "attention_mask"}
+        assert _has_logits_in_keys(keys, top_k=None) is False
+
+
+class TestPerplexityCacheRoundtrip:
+    """Tests for perplexity save/load roundtrip."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-ppl-rt"
+
+    def test_basic_roundtrip(self):
+        from lmprobe.cache import load_prompt_perplexity
+
+        ppl = torch.tensor([1.5, 2.5, 3.5])
+        save_prompt_perplexity(self.model, "test", ppl)
+
+        loaded = load_prompt_perplexity(self.model, "test")
+        assert torch.allclose(loaded, ppl)
+
+    def test_missing_raises(self):
+        from lmprobe.cache import load_prompt_perplexity
+
+        with pytest.raises(FileNotFoundError):
+            load_prompt_perplexity(self.model, "missing")
+
+
+class TestLogitsFullRoundtrip:
+    """Tests for full logits (not top-k) save/load."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-logits-full"
+
+    def test_full_logits_roundtrip(self):
+        logits = torch.randn(1, 5, 100)
+        mask = torch.ones(1, 5)
+        save_prompt_logits(self.model, "test", logits, mask, top_k=None, positions="all")
+
+        assert is_prompt_logits_cached(self.model, "test", top_k=None)
+        loaded, indices = load_prompt_logits(self.model, "test", top_k=None)
+        assert indices is None
+        assert torch.allclose(loaded, logits, atol=1e-4)
+
+    def test_missing_raises(self):
+        with pytest.raises(FileNotFoundError):
+            load_prompt_logits(self.model, "missing", top_k=None)
+
+
+class TestLoadPromptActivationsMissing:
+    """Test error handling for load_prompt_activations with no cache."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+    def test_raises_for_uncached(self):
+        with pytest.raises(FileNotFoundError, match="No cached activations"):
+            load_prompt_activations("no-model", "no-prompt", [0])
+
+
+class TestLoadPromptPooledActivationsMissing:
+    """Test error handling for load_prompt_pooled_activations with no cache."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+    def test_raises_for_uncached(self):
+        with pytest.raises(FileNotFoundError, match="No cached pooled"):
+            load_prompt_pooled_activations("no-model", "no-prompt", [0], "last_token")
+
+
+class TestLegacyPerplexityCache:
+    """Tests for legacy batch perplexity cache functions."""
+
+    def test_save_and_load(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        from lmprobe.cache import (
+            get_perplexity_cache_path,
+            load_perplexity_cache,
+            save_perplexity_cache,
+        )
+
+        path = get_perplexity_cache_path("model", ["p1", "p2"])
+        features = torch.randn(2, 3)
+        save_perplexity_cache(path, features)
+
+        loaded = load_perplexity_cache(path)
+        assert loaded is not None
+        assert torch.allclose(loaded, features)
+
+    def test_load_nonexistent_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        from lmprobe.cache import load_perplexity_cache
+
+        result = load_perplexity_cache(tmp_path / "nonexistent.pt")
+        assert result is None
+
+
+class TestIsPromptPerplexityCachedEdgeCases:
+    """Edge cases for is_prompt_perplexity_cached."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+        self.model = "test-model-ppl-check"
+
+    def test_false_when_nothing_cached(self):
+        from lmprobe.cache import is_prompt_perplexity_cached
+
+        assert not is_prompt_perplexity_cached(self.model, "uncached")
+
+    def test_in_main_file(self):
+        """Perplexity stored in main file (pre-sidecar) is detected."""
+        from lmprobe.cache import is_prompt_perplexity_cached
+
+        main_key = _prompt_cache_key(self.model, "test")
+        _merge_save_backend(main_key, {"perplexity": torch.tensor([1.0, 2.0, 3.0])})
+
+        assert is_prompt_perplexity_cached(self.model, "test")
