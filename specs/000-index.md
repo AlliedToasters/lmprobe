@@ -23,8 +23,6 @@ affects: [module names]
 
 | File | Title | Status | Affects |
 |------|-------|--------|---------|
-| [005-hub-integration.md](005-hub-integration.md) | HuggingFace Hub Integration | implemented | `hub.py`, `probe.py` |
-
 ---
 
 ## Design docs

@@ -31,7 +31,7 @@ pip install lmprobe
 Optional extras:
 
 ```bash
-pip install lmprobe[hub]         # HuggingFace Hub integration (push/pull probes)
+pip install lmprobe[hub]         # HuggingFace Hub (activation datasets)
 pip install lmprobe[s3]          # S3 cache backend
 pip install lmprobe[nnsight]     # nnsight/NDIF remote execution
 pip install lmprobe[embeddings]  # Sentence-transformers baselines
@@ -387,54 +387,6 @@ metrics = probe.evaluate(test_prompts, test_labels)
 
 ---
 
-## HuggingFace Hub Integration
-
-Share trained probes via the HuggingFace Hub. Requires `pip install lmprobe[hub]`.
-
-### Push a probe
-
-```python
-probe.fit(positive_prompts, negative_prompts)
-
-url = probe.push_to_hub(
-    "username/dog-vs-cat-probe",
-    description="Detects dog-like vs cat-like text",
-    class_labels={0: "cat", 1: "dog"},
-    tags=["safety", "animals"],
-    include_training_data=True,   # Include prompts for reproducibility
-    private=False,
-)
-print(url)  # https://huggingface.co/username/dog-vs-cat-probe
-```
-
-### Load a probe
-
-```python
-from lmprobe import Probe
-
-probe = Probe.from_hub(
-    "username/dog-vs-cat-probe",
-    trust_classifier=True,   # Required: acknowledge loading serialized model
-    load_model=True,         # Download the base LLM for inference
-    device="auto",
-)
-predictions = probe.predict(["Arf! Let's go outside!"])
-```
-
-### Inspect probe metadata
-
-```python
-from lmprobe import ProbeCard
-
-card = ProbeCard.from_hub("username/dog-vs-cat-probe")
-print(card.base_model)       # meta-llama/Llama-3.1-8B-Instruct
-print(card.layers)           # [16]
-print(card.classifier_type)  # LogisticRegression
-print(card.metrics)          # {"accuracy": 0.85}
-```
-
----
-
 ## Caching
 
 Activation extraction is expensive, so `lmprobe` caches activations automatically. The cache is stored at `~/.cache/lmprobe/` by default (or set `LMPROBE_CACHE_DIR`).
@@ -473,7 +425,7 @@ predictions = probe.predict(test_prompts)
 
 ## Activation Datasets
 
-Extract activations once from a large model, share them as a HuggingFace Dataset, and let others train probes without ever loading the model locally. Requires `pip install lmprobe[hub]`.
+Extract activations once from a large model, share them as a HuggingFace dataset, and let others train probes without ever loading the model locally. Requires `pip install lmprobe[hub]`.
 
 ### Push cached activations to HuggingFace
 

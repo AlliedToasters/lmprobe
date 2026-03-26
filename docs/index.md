@@ -32,7 +32,7 @@ Optional extras:
 
 | Extra | Installs |
 |-------|----------|
-| `lmprobe[hub]` | HuggingFace Hub push/pull |
+| `lmprobe[hub]` | HuggingFace Hub (activation datasets) |
 | `lmprobe[s3]` | S3 cache backend |
 | `lmprobe[nnsight]` | Remote execution via NDIF |
 | `lmprobe[embeddings]` | Sentence-transformers baselines |

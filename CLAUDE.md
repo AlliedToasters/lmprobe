@@ -65,7 +65,6 @@ lmprobe/
 │       ├── baseline.py           # BaselineProbe (text baselines)
 │       ├── activation_baseline.py # ActivationBaseline
 │       ├── battery.py            # BaselineBattery
-│       ├── hub.py                # ProbeCard, push_to_hub/from_hub
 │       └── backends.py           # Backend resolution
 ├── tests/
 │   ├── conftest.py               # Shared fixtures (tiny model)

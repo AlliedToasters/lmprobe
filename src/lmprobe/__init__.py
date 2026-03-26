@@ -49,7 +49,6 @@ __all__ = [
     "load_layer_last_token",
     "ModelCacheInfo",
     "PerLayerScaler",
-    "ProbeCard",
     "UnifiedCache",
     "WarmupStats",
     "cache_info",
@@ -138,10 +137,6 @@ def __getattr__(name: str) -> Any:
             "WarmupStats": WarmupStats,
             "CachedLogits": CachedLogits,
         }[name]
-    if name == "ProbeCard":
-        from .hub import ProbeCard
-
-        return ProbeCard
     if name in ("load_layer_across_prompts", "load_layer_last_token"):
         from .cache import load_layer_across_prompts, load_layer_last_token
 
