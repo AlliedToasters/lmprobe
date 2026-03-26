@@ -68,7 +68,7 @@ class ExtractionBackend(ABC):
         prompts: list[str],
         layer_indices: list[int],
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Extract activations AND logits for a batch of prompts.
 
         Parameters
@@ -77,6 +77,7 @@ class ExtractionBackend(ABC):
             List of text prompts.
         layer_indices : list[int]
             Layer indices to extract from (positive integers).
+            Pass an empty list to extract logits only (no activations).
         **kwargs
             Backend-specific parameters. Notable:
             - logit_top_k (int | None): When set and remote=True (nnsight
@@ -85,8 +86,9 @@ class ExtractionBackend(ABC):
 
         Returns
         -------
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
-            - activations: Shape (batch, seq_len, hidden_dim * num_layers)
+        tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]
+            - activations: Shape (batch, seq_len, hidden_dim * num_layers),
+              or None when layer_indices is empty
             - attention_mask: Shape (batch, seq_len)
             - logits: Shape (batch, seq_len, vocab_size) or (batch, seq_len, K)
             - logits_indices: None or (batch, seq_len, K) int64 indices
@@ -187,7 +189,7 @@ class NnsightBackend(ExtractionBackend):
         prompts: list[str],
         layer_indices: list[int],
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         from .extraction import _extract_batch_with_logits
 
         remote = kwargs.get("remote", self.remote)
@@ -425,10 +427,9 @@ class LocalBackend(ExtractionBackend):
         prompts: list[str],
         layer_indices: list[int],
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         model = self.model
         tokenizer = self.tokenizer
-        decoder_layers = _get_decoder_layers(model)
 
         tokenized = tokenizer(
             prompts,
@@ -443,19 +444,21 @@ class LocalBackend(ExtractionBackend):
         captured: dict[int, torch.Tensor] = {}
         hooks = []
 
-        for layer_idx in layer_indices:
-            layer_module = decoder_layers[layer_idx]
+        if layer_indices:
+            decoder_layers = _get_decoder_layers(model)
+            for layer_idx in layer_indices:
+                layer_module = decoder_layers[layer_idx]
 
-            def make_hook(idx: int) -> Any:
-                def hook_fn(module: Any, input: Any, output: Any) -> None:
-                    if isinstance(output, tuple):
-                        captured[idx] = output[0].detach()
-                    else:
-                        captured[idx] = output.detach()
-                return hook_fn
+                def make_hook(idx: int) -> Any:
+                    def hook_fn(module: Any, input: Any, output: Any) -> None:
+                        if isinstance(output, tuple):
+                            captured[idx] = output[0].detach()
+                        else:
+                            captured[idx] = output.detach()
+                    return hook_fn
 
-            h = layer_module.register_forward_hook(make_hook(layer_idx))
-            hooks.append(h)
+                h = layer_module.register_forward_hook(make_hook(layer_idx))
+                hooks.append(h)
 
         try:
             with torch.no_grad():
@@ -464,8 +467,11 @@ class LocalBackend(ExtractionBackend):
             for h in hooks:
                 h.remove()
 
-        activation_tensors = [captured[idx].cpu() for idx in layer_indices]
-        combined = torch.cat(activation_tensors, dim=-1)
+        if layer_indices:
+            activation_tensors = [captured[idx].cpu() for idx in layer_indices]
+            combined = torch.cat(activation_tensors, dim=-1)
+        else:
+            combined = None
         logits = outputs.logits.detach().cpu()
 
         return combined, tokenized["attention_mask"], logits, None

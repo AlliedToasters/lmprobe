@@ -615,6 +615,24 @@ class TestBuildRemoteExtractFnTopK:
         )
         assert callable(fn)
 
+    def test_generated_code_logits_only_no_layers(self):
+        """Empty layer_indices produces valid code that only extracts logits."""
+        from lmprobe.extraction import _build_remote_extract_fn
+
+        fn = _build_remote_extract_fn(
+            layer_indices=[], with_logits=True, logit_top_k=10
+        )
+        assert callable(fn)
+
+    def test_generated_code_logits_only_no_layers_no_topk(self):
+        """Empty layer_indices with full logits produces valid code."""
+        from lmprobe.extraction import _build_remote_extract_fn
+
+        fn = _build_remote_extract_fn(
+            layer_indices=[], with_logits=True, logit_top_k=None
+        )
+        assert callable(fn)
+
     def test_temp_file_cleaned_up_after_call(self):
         from lmprobe.extraction import _build_remote_extract_fn
 
@@ -901,3 +919,72 @@ class TestActivationExtractor:
         )
         num_layers = get_num_layers_from_config(tiny_model)
         assert extractor.layer_indices == [num_layers - 1]
+
+    def test_extract_batch_with_logits_empty_layers_local(self, tiny_model):
+        """Passing layer_indices=[] returns None activations and valid logits (local)."""
+        from lmprobe.extraction import ActivationExtractor
+
+        extractor = ActivationExtractor(
+            model_name=tiny_model,
+            device="cpu",
+            layers=-1,
+            remote=False,
+            backend="local",
+        )
+        result = extractor.extract_batch_with_logits(["hello world"], [])
+        assert len(result) == 4
+        acts, mask, logits, indices = result
+        assert acts is None
+        assert mask.ndim == 2
+        assert logits.ndim == 3
+        assert indices is None
+
+    def test_extract_batch_with_logits_empty_layers_nnsight(self, tiny_model):
+        """Passing layer_indices=[] returns None activations and valid logits (nnsight)."""
+        from lmprobe.extraction import ActivationExtractor
+
+        extractor = ActivationExtractor(
+            model_name=tiny_model,
+            device="cpu",
+            layers=-1,
+            remote=False,
+            backend="nnsight",
+        )
+        result = extractor.extract_batch_with_logits(["hello world"], [])
+        assert len(result) == 4
+        acts, mask, logits, indices = result
+        assert acts is None
+        assert mask.ndim == 2
+        assert logits.ndim == 3
+
+    def test_extract_logits_only_local(self, tiny_model):
+        """extract_logits_only returns (logits, mask, indices) without activations."""
+        from lmprobe.extraction import ActivationExtractor
+
+        extractor = ActivationExtractor(
+            model_name=tiny_model,
+            device="cpu",
+            layers=-1,
+            remote=False,
+            backend="local",
+        )
+        logits, mask, indices = extractor.extract_logits_only(["hello world"])
+        assert logits.ndim == 3
+        assert mask.ndim == 2
+        assert indices is None
+
+    def test_extract_logits_only_nnsight(self, tiny_model):
+        """extract_logits_only works via nnsight backend."""
+        from lmprobe.extraction import ActivationExtractor
+
+        extractor = ActivationExtractor(
+            model_name=tiny_model,
+            device="cpu",
+            layers=-1,
+            remote=False,
+            backend="nnsight",
+        )
+        logits, mask, indices = extractor.extract_logits_only(["hello", "world"])
+        assert logits.ndim == 3
+        assert logits.shape[0] == 2
+        assert mask.shape[0] == 2

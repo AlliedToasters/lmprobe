@@ -484,7 +484,7 @@ class UnifiedCache:
                         raise
 
                     # Move batch tensors to CPU to free any GPU memory
-                    batch_acts = batch_acts.cpu()
+                    batch_acts = batch_acts.cpu() if batch_acts is not None else None
                     batch_mask = batch_mask.cpu()
                     batch_logits = batch_logits.cpu() if batch_logits is not None else None
                     if batch_logits_indices is not None:
