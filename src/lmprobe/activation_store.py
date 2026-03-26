@@ -7,38 +7,35 @@ repeated disk reads.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any  # noqa: UP035
 
 import numpy as np
 
-if TYPE_CHECKING:
-    pass
 
-
-def _lazy_load_activations():
+def _lazy_load_activations() -> tuple:
     from .sharing import fetch_dataset_metadata, load_activations
 
     return load_activations, fetch_dataset_metadata
 
 
-def _lazy_load_pooled_batch():
+def _lazy_load_pooled_batch() -> Any:
     from .cache import load_pooled_batch
 
     return load_pooled_batch
 
 
 # Re-export at module level for mockability in tests
-def load_activations(*args, **kwargs):
+def load_activations(*args: Any, **kwargs: Any) -> Any:
     fn, _ = _lazy_load_activations()
     return fn(*args, **kwargs)
 
 
-def fetch_dataset_metadata(*args, **kwargs):
+def fetch_dataset_metadata(*args: Any, **kwargs: Any) -> Any:
     _, fn = _lazy_load_activations()
     return fn(*args, **kwargs)
 
 
-def load_pooled_batch(*args, **kwargs):
+def load_pooled_batch(*args: Any, **kwargs: Any) -> Any:
     fn = _lazy_load_pooled_batch()
     return fn(*args, **kwargs)
 
@@ -281,7 +278,7 @@ class ActivationStore:
             return None
         if prompts is not None:
             idx = self._resolve_indices(prompts)
-            return self._labels[idx]
+            return np.asarray(self._labels[idx])
         return self._labels
 
     def get_fold(
@@ -327,7 +324,7 @@ class ActivationStore:
     def __enter__(self) -> ActivationStore:
         return self
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(self, *exc: Any) -> None:
         self.clear()
 
     def __repr__(self) -> str:
