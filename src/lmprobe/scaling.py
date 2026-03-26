@@ -140,6 +140,7 @@ class PerLayerScaler:
             If X has wrong number of features.
         """
         self._check_fitted()
+        assert self.means_ is not None and self.stds_ is not None
         X_reshaped = self._validate_and_reshape(X)
 
         if self.strategy == "per_neuron":
@@ -187,6 +188,7 @@ class PerLayerScaler:
             If scaler has not been fitted.
         """
         self._check_fitted()
+        assert self.means_ is not None and self.stds_ is not None
         X_reshaped = self._validate_and_reshape(X)
 
         if self.strategy == "per_neuron":
@@ -216,6 +218,7 @@ class PerLayerScaler:
             If scaler has not been fitted.
         """
         self._check_fitted()
+        assert self.means_ is not None and self.stds_ is not None
 
         if self.strategy == "per_neuron":
             return {
