@@ -65,7 +65,6 @@ lmprobe/
 │       ├── baseline.py           # BaselineProbe (text baselines)
 │       ├── activation_baseline.py # ActivationBaseline
 │       ├── battery.py            # BaselineBattery
-│       ├── plotting.py           # Layer importance visualization
 │       ├── hub.py                # ProbeCard, push_to_hub/from_hub
 │       └── backends.py           # Backend resolution
 ├── tests/

@@ -34,7 +34,6 @@ Optional extras:
 pip install lmprobe[hub]         # HuggingFace Hub integration (push/pull probes)
 pip install lmprobe[s3]          # S3 cache backend
 pip install lmprobe[nnsight]     # nnsight/NDIF remote execution
-pip install lmprobe[plot]        # Layer importance visualization
 pip install lmprobe[embeddings]  # Sentence-transformers baselines
 pip install lmprobe[auto]        # Automatic layer selection (Group Lasso)
 ```
@@ -338,9 +337,6 @@ probe.fit(positive_prompts, negative_prompts)
 importances = probe.compute_layer_importance(metric="l2")
 best_idx = importances.argmax()
 print(f"Most important layer: {probe.candidate_layers_[best_idx]}")
-
-# Visualize layer importance (requires: pip install lmprobe[plot])
-probe.plot_layer_importance()
 ```
 
 ### Fast Auto Layer Selection

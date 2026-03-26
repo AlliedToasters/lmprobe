@@ -65,7 +65,6 @@ nav:
     - Pooling: reference/pooling.md
     - Classifiers: reference/classifiers.md
     - Cache: reference/cache.md
-    - Plotting: reference/plotting.md
     - Scaling: reference/scaling.md
   - Design:
     - API Philosophy: design/001-api-philosophy.md

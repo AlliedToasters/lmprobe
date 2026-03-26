@@ -61,10 +61,6 @@ dev = [
 auto = [
     "skglm>=0.3",
 ]
-plot = [
-    "matplotlib>=3.5",
-    "seaborn>=0.12",
-]
 embeddings = [
     "sentence-transformers>=2.0",
 ]
@@ -77,9 +73,6 @@ docs = [
     "mkdocstrings[python]>=0.24",
     "mkdocs-section-index>=0.3",
 ]
-
-[project.scripts]
-lmprobe = "lmprobe.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/AlliedToasters/lmprobe"

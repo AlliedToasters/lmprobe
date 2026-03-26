@@ -1709,79 +1709,6 @@ class Probe:
             device=device,
         )
 
-    def plot_layer_importance(
-        self,
-        ax: Any = None,
-        figsize: tuple[float, float] = (10, 6),
-        title: str = "Layer Importance (Group Lasso Norms)",
-        xlabel: str = "Layer Index",
-        ylabel: str = "Importance (L2 Norm)",
-        highlight_selected: bool = True,
-        bar_color: str = "steelblue",
-        selected_color: str = "coral",
-    ) -> Any:
-        """Plot layer importance scores from Group Lasso.
-
-        Only available after fitting with layers="auto".
-
-        Parameters
-        ----------
-        ax : matplotlib.axes.Axes | None
-            Matplotlib axes to plot on. If None, creates a new figure.
-        figsize : tuple[float, float]
-            Figure size if creating a new figure.
-        title : str
-            Plot title.
-        xlabel : str
-            X-axis label.
-        ylabel : str
-            Y-axis label.
-        highlight_selected : bool
-            Whether to highlight selected layers in a different color.
-        bar_color : str
-            Color for non-selected bars.
-        selected_color : str
-            Color for selected layer bars.
-
-        Returns
-        -------
-        tuple[Figure, Axes]
-            The matplotlib figure and axes objects.
-
-        Raises
-        ------
-        RuntimeError
-            If the probe has not been fitted or was not fitted with layers="auto".
-
-        Examples
-        --------
-        >>> probe = Probe(model="...", layers="auto")
-        >>> probe.fit(positive_prompts, negative_prompts)
-        >>> fig, ax = probe.plot_layer_importance()
-        >>> fig.savefig("layer_importance.png")
-        """
-        if self.candidate_layers_ is None or self.layer_importances_ is None:
-            raise RuntimeError(
-                "Layer importance not available. Either fit with layers='auto' or "
-                "'fast_auto', or call compute_layer_importance() after fitting."
-            )
-
-        from .plotting import plot_layer_importance
-
-        return plot_layer_importance(
-            candidate_layers=self.candidate_layers_,
-            layer_importances=self.layer_importances_,
-            selected_layers=self.selected_layers_,
-            ax=ax,
-            figsize=figsize,
-            title=title,
-            xlabel=xlabel,
-            ylabel=ylabel,
-            highlight_selected=highlight_selected,
-            bar_color=bar_color,
-            selected_color=selected_color,
-        )
-
     def compute_layer_importance(
         self,
         metric: str = "l2",
@@ -1826,7 +1753,7 @@ class Probe:
         >>> probe.fit(positive_prompts, negative_prompts)
         >>> importance = probe.compute_layer_importance()
         >>> print(f"Layer {probe.candidate_layers_[importance.argmax()]} is most important")
-        >>> fig, ax = probe.plot_layer_importance()  # Now works!
+        >>> print(f"Most important: layer {probe.candidate_layers_[importance.argmax()]}")
         """
         self._check_fitted()
         assert self.classifier_ is not None
