@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from ._model_cache import ModelCache as _ModelCache
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
@@ -200,8 +202,10 @@ class NnsightBackend(ExtractionBackend):
 
 
 # Global cache for locally-loaded HuggingFace models
-# Key: (model_name, device), Value: (model, tokenizer)
-_LOCAL_MODEL_CACHE: dict[tuple[Any, ...], tuple[Any, PreTrainedTokenizerBase]] = {}
+# Key: (model_name, device, dtype), Value: (model, tokenizer)
+_LOCAL_MODEL_CACHE: _ModelCache[tuple[Any, PreTrainedTokenizerBase]] = _ModelCache(
+    "LocalModelCache"
+)
 
 
 def _get_decoder_layers(model: Any) -> list[Any]:
@@ -256,6 +260,43 @@ def _get_decoder_layers(model: Any) -> list[Any]:
     )
 
 
+def _load_local_model(
+    model_name: str, device: str, dtype: torch.dtype = torch.float32
+) -> tuple[Any, PreTrainedTokenizerBase]:
+    """Load a HuggingFace model locally (no caching — use _get_local_model)."""
+    from lmprobe._device_utils import check_cuda_compatibility
+
+    check_cuda_compatibility(device)
+
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    config = AutoConfig.from_pretrained(model_name)
+    if getattr(config, "quantization_config", None) is not None:
+        if config.quantization_config.get("linear_class") == "autobitlinear":
+            config.quantization_config["linear_class"] = "bitlinear"
+
+    if device == "auto":
+        model: Any = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            config=config,
+            device_map="auto",
+            torch_dtype=dtype,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            config=config,
+            torch_dtype=dtype,
+        )
+        model = model.to(device)
+    model.eval()
+    return (model, tokenizer)
+
+
 def _get_local_model(
     model_name: str, device: str, dtype: torch.dtype = torch.float32
 ) -> tuple[Any, PreTrainedTokenizerBase]:
@@ -276,47 +317,13 @@ def _get_local_model(
         (model, tokenizer)
     """
     cache_key = (model_name, device, dtype)
-    if cache_key not in _LOCAL_MODEL_CACHE:
-        from lmprobe._device_utils import check_cuda_compatibility
-
-        check_cuda_compatibility(device)
-
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        from transformers import AutoConfig
-
-        config = AutoConfig.from_pretrained(model_name)
-        if getattr(config, "quantization_config", None) is not None:
-            if config.quantization_config.get("linear_class") == "autobitlinear":
-                config.quantization_config["linear_class"] = "bitlinear"
-
-        if device == "auto":
-            model: Any = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                config=config,
-                device_map="auto",
-                torch_dtype=dtype,
-            )
-        else:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                config=config,
-                torch_dtype=dtype,
-            )
-            model = model.to(device)
-        model.eval()
-        _LOCAL_MODEL_CACHE[cache_key] = (model, tokenizer)
-
-    return _LOCAL_MODEL_CACHE[cache_key]
+    return _LOCAL_MODEL_CACHE.get(
+        cache_key, lambda: _load_local_model(model_name, device, dtype)
+    )
 
 
 def clear_local_model_cache() -> None:
     """Clear the local model cache to free memory."""
-    global _LOCAL_MODEL_CACHE
     _LOCAL_MODEL_CACHE.clear()
 
 

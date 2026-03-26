@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 from tqdm import tqdm
 
+from ._model_cache import ModelCache as _ModelCache
+
 if TYPE_CHECKING:
     from nnsight import LanguageModel
 
@@ -29,8 +31,8 @@ def _require_nnsight() -> Any:
 
 
 # Global model cache to avoid loading the same model multiple times
-# Key: (model_name, device), Value: LanguageModel
-_MODEL_CACHE: dict = {}
+# Key: (model_name, device, remote), Value: LanguageModel
+_MODEL_CACHE: _ModelCache = _ModelCache("NnsightModelCache")
 
 
 def get_cached_model(
@@ -56,11 +58,10 @@ def get_cached_model(
     LanguageModel
         The cached or newly loaded model.
     """
-    # Include remote in cache key since remote stubs differ from local models
     cache_key = (model_name, device, remote)
-    if cache_key not in _MODEL_CACHE:
-        _MODEL_CACHE[cache_key] = load_model(model_name, device, remote=remote)
-    return _MODEL_CACHE[cache_key]
+    return _MODEL_CACHE.get(
+        cache_key, lambda: load_model(model_name, device, remote=remote)
+    )
 
 
 def clear_model_cache() -> None:
@@ -69,7 +70,6 @@ def clear_model_cache() -> None:
     Call this when you're done with all probes and want to release
     GPU/CPU memory held by loaded models.
     """
-    global _MODEL_CACHE
     _MODEL_CACHE.clear()
 
 
