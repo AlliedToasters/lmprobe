@@ -31,6 +31,7 @@ BUILTIN_CLASSIFIERS = frozenset({
     "ridge_regression",
     "svm",
     "sgd",
+    "sgd_gpu",
     "mass_mean",
     "lda",
     "ensemble",
@@ -115,6 +116,8 @@ def build_classifier(
         defaults = dict(loss="log_loss", random_state=random_state)
         defaults.update(extra)
         return SGDClassifier(**defaults)
+    elif name == "sgd_gpu":
+        return SGDGPUClassifier(random_state=random_state, **extra)
     elif name == "mass_mean":
         return MassMeanClassifier()
     elif name == "ensemble":
@@ -555,6 +558,264 @@ class EnsembleClassifier:
 
     def set_params(self, **params: Any) -> EnsembleClassifier:
         """Set parameters for this estimator (sklearn compatibility)."""
+        for key, value in params.items():
+            setattr(self, key, value)
+        return self
+
+
+class SGDGPUClassifier:
+    """GPU-accelerated SGD classifier for large-scale linear probe training.
+
+    Implements minibatch SGD with L2 regularization using PyTorch, providing
+    significant speedups over sklearn's LBFGS solver on large activation
+    datasets (100k+ samples). Accepts numpy arrays (sklearn-compatible
+    interface) and handles GPU memory management automatically.
+
+    .. note::
+
+        **Binary classification only.** Uses a single output neuron with
+        BCEWithLogitsLoss. ``predict_proba`` returns shape ``(n, 2)``.
+
+    .. note::
+
+        **Regularization convention.** Uses ``weight_decay`` (direct
+        regularization strength), unlike sklearn's ``C`` (inverse).
+        Roughly: ``C ≈ 1 / (n_samples * weight_decay)``.
+
+    Parameters
+    ----------
+    lr : float
+        Learning rate for SGD optimizer.
+    epochs : int
+        Number of training epochs.
+    batch_size : int
+        Minibatch size for SGD.
+    weight_decay : float
+        L2 regularization strength (passed to SGD optimizer as weight decay).
+        Higher values = stronger regularization. See note above for
+        relationship to sklearn's ``C`` parameter.
+    device : str
+        PyTorch device. ``"auto"`` selects CUDA if available, else CPU.
+    random_state : int | None
+        Random seed for reproducibility.
+
+    Attributes
+    ----------
+    coef_ : np.ndarray
+        Fitted weights, shape ``(n_features,)``. Stored on CPU as float32.
+    intercept_ : np.ndarray
+        Fitted bias, shape ``(1,)``. Stored on CPU as float32.
+    classes_ : np.ndarray
+        Class labels ``[0, 1]``.
+    """
+
+    def __init__(
+        self,
+        lr: float = 0.01,
+        epochs: int = 100,
+        batch_size: int = 256,
+        weight_decay: float = 1e-4,
+        device: str = "auto",
+        random_state: int | None = None,
+    ) -> None:
+        self.lr = lr
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.weight_decay = weight_decay
+        self.device = device
+        self.random_state = random_state
+        self.coef_: np.ndarray | None = None
+        self.intercept_: np.ndarray | None = None
+        self.classes_: np.ndarray | None = None
+
+    def _resolve_device(self) -> Any:
+        import torch
+
+        if self.device == "auto":
+            if torch.cuda.is_available():
+                try:
+                    # Verify the GPU can actually run kernels (capability check)
+                    t = torch.tensor([1.0], device="cuda")
+                    _ = t + t
+                    del t
+                    return torch.device("cuda")
+                except (RuntimeError, torch.cuda.CudaError):
+                    pass
+            return torch.device("cpu")
+        return torch.device(self.device)
+
+    def _check_fitted(self) -> None:
+        if self.coef_ is None:
+            raise RuntimeError(
+                "SGDGPUClassifier has not been fitted. Call fit() first."
+            )
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        sample_weight: np.ndarray | None = None,
+    ) -> SGDGPUClassifier:
+        """Fit the classifier using minibatch SGD.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Training features, shape ``(n_samples, n_features)``.
+        y : np.ndarray
+            Labels, shape ``(n_samples,)``.
+        sample_weight : np.ndarray | None
+            Per-sample weights. If None, all samples are equally weighted.
+
+        Returns
+        -------
+        SGDGPUClassifier
+            Self, for method chaining.
+        """
+        import torch
+
+        device = self._resolve_device()
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+        n_samples, n_features = X.shape
+
+        # Reproducibility
+        if self.random_state is not None:
+            torch.manual_seed(self.random_state)
+
+        # Build model
+        model = torch.nn.Linear(n_features, 1).to(device)
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=self.lr, weight_decay=self.weight_decay,
+        )
+        loss_fn = torch.nn.BCEWithLogitsLoss(reduction="none")
+
+        # Prepare data
+        X_t = torch.from_numpy(X)
+        y_t = torch.from_numpy(y)
+        w_t = (
+            torch.from_numpy(np.asarray(sample_weight, dtype=np.float32))
+            if sample_weight is not None
+            else None
+        )
+
+        # Shuffle indices
+        rng = np.random.default_rng(self.random_state)
+
+        for _epoch in range(self.epochs):
+            perm = torch.from_numpy(rng.permutation(n_samples))
+            for start in range(0, n_samples, self.batch_size):
+                idx = perm[start : start + self.batch_size]
+                xb = X_t[idx].to(device)
+                yb = y_t[idx].to(device)
+
+                logits = model(xb).squeeze(-1)
+                loss = loss_fn(logits, yb)
+
+                if w_t is not None:
+                    wb = w_t[idx].to(device)
+                    loss = loss * wb
+
+                loss = loss.mean()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+        # Extract weights to CPU numpy
+        with torch.no_grad():
+            self.coef_ = model.weight.detach().cpu().numpy().ravel()
+            self.intercept_ = model.bias.detach().cpu().numpy()
+
+        self.classes_ = np.array([0, 1])
+
+        # Clean up GPU memory
+        del model, optimizer, X_t, y_t, w_t
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return self
+
+    def decision_function(self, X: np.ndarray) -> np.ndarray:
+        """Compute raw logit scores.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features, shape ``(n_samples, n_features)``.
+
+        Returns
+        -------
+        np.ndarray
+            Logit scores, shape ``(n_samples,)``.
+        """
+        self._check_fitted()
+        assert self.coef_ is not None and self.intercept_ is not None
+        X = np.asarray(X, dtype=np.float32)
+        scores: np.ndarray = X @ self.coef_ + self.intercept_[0]
+        return scores
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict class labels.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features, shape ``(n_samples, n_features)``.
+
+        Returns
+        -------
+        np.ndarray
+            Predicted labels, shape ``(n_samples,)``.
+        """
+        scores = self.decision_function(X)
+        return (scores >= 0).astype(int)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Predict class probabilities.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features, shape ``(n_samples, n_features)``.
+
+        Returns
+        -------
+        np.ndarray
+            Probabilities, shape ``(n_samples, 2)``.
+        """
+        scores = self.decision_function(X)
+        return _stable_sigmoid_proba(scores)
+
+    def score(self, X: np.ndarray, y: np.ndarray) -> float:
+        """Accuracy on the given data.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features.
+        y : np.ndarray
+            True labels.
+
+        Returns
+        -------
+        float
+            Accuracy.
+        """
+        return float((self.predict(X) == np.asarray(y)).mean())
+
+    def get_params(self, deep: bool = True) -> dict:
+        """Get parameters for sklearn clone compatibility."""
+        return {
+            "lr": self.lr,
+            "epochs": self.epochs,
+            "batch_size": self.batch_size,
+            "weight_decay": self.weight_decay,
+            "device": self.device,
+            "random_state": self.random_state,
+        }
+
+    def set_params(self, **params: Any) -> SGDGPUClassifier:
+        """Set parameters for sklearn clone compatibility."""
         for key, value in params.items():
             setattr(self, key, value)
         return self

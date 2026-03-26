@@ -87,6 +87,7 @@ pythonpath = ["src"]
 markers = [
     "remote: marks tests that require NDIF remote execution (deselect with '-m \"not remote\"')",
     "nnsight: marks tests that load a model via nnsight (disables coverage.py tracing)",
+    "gpu: marks tests that require a compatible CUDA GPU (deselect with '-m \"not gpu\"')",
 ]
 
 [tool.ruff]
