@@ -732,3 +732,131 @@ class TestSGDGPUClassifier:
         # GPU memory should be cleaned up (model deleted)
         torch.cuda.empty_cache()  # force cleanup
         # No assertion on exact memory — just verify no crash
+
+    # --- LR scheduler tests (#228) ---
+
+    def test_cosine_scheduler(self, data):
+        """Cosine scheduler runs without error and tracks loss."""
+        X, y = data
+        clf = SGDGPUClassifier(
+            device="cpu", random_state=42, epochs=20, scheduler="cosine",
+        )
+        clf.fit(X, y)
+        assert clf.coef_ is not None
+        assert len(clf.train_loss_) == 20
+
+    def test_reduce_on_plateau_scheduler(self, data):
+        """ReduceOnPlateau scheduler runs without error."""
+        X, y = data
+        clf = SGDGPUClassifier(
+            device="cpu", random_state=42, epochs=20,
+            scheduler="reduce_on_plateau",
+        )
+        clf.fit(X, y)
+        assert clf.coef_ is not None
+        assert len(clf.train_loss_) == 20
+
+    def test_no_scheduler_default(self, data):
+        """Default (None) scheduler works — backward compatible."""
+        X, y = data
+        clf = SGDGPUClassifier(device="cpu", random_state=42, epochs=10)
+        clf.fit(X, y)
+        assert len(clf.train_loss_) == 10
+
+    def test_invalid_scheduler_raises(self):
+        """Unknown scheduler name raises ValueError at init."""
+        with pytest.raises(ValueError, match="Unknown scheduler"):
+            SGDGPUClassifier(scheduler="invalid")
+
+    # --- Convergence monitoring & early stopping tests (#229) ---
+
+    def test_train_loss_tracked(self, data):
+        """train_loss_ is a list of floats with length == epochs."""
+        X, y = data
+        clf = SGDGPUClassifier(device="cpu", random_state=42, epochs=15)
+        clf.fit(X, y)
+        assert isinstance(clf.train_loss_, list)
+        assert len(clf.train_loss_) == 15
+        assert all(isinstance(v, float) for v in clf.train_loss_)
+
+    def test_verbose_prints(self, data, capsys):
+        """verbose=True produces output to stdout."""
+        X, y = data
+        clf = SGDGPUClassifier(
+            device="cpu", random_state=42, epochs=5, verbose=True,
+        )
+        clf.fit(X, y)
+        captured = capsys.readouterr()
+        assert "Epoch" in captured.out
+        assert "loss=" in captured.out
+
+    def test_early_stopping_stops_early(self):
+        """Early stopping terminates before max epochs when loss plateaus."""
+        # Constant features = zero gradient after first step → loss never improves
+        X = np.ones((100, 8), dtype=np.float32)
+        y = np.array([1] * 50 + [0] * 50, dtype=np.float32)
+        clf = SGDGPUClassifier(
+            device="cpu", random_state=42, epochs=500,
+            early_stopping=5, lr=0.01,
+        )
+        clf.fit(X, y)
+        # Should have stopped well before 500 epochs (loss can't improve)
+        assert len(clf.train_loss_) < 500
+
+    def test_early_stopping_restores_best(self, data):
+        """Early stopping restores best weights."""
+        X, y = data
+        clf = SGDGPUClassifier(
+            device="cpu", random_state=42, epochs=200, early_stopping=10,
+        )
+        clf.fit(X, y)
+        # Should still produce valid predictions
+        preds = clf.predict(X)
+        assert preds.shape == (100,)
+        assert set(preds).issubset({0, 1})
+
+    def test_early_stopping_verbose(self, capsys):
+        """Early stopping with verbose prints the stopping message."""
+        X = np.ones((100, 8), dtype=np.float32)
+        y = np.array([1] * 50 + [0] * 50, dtype=np.float32)
+        clf = SGDGPUClassifier(
+            device="cpu", random_state=42, epochs=500,
+            early_stopping=5, verbose=True, lr=0.01,
+        )
+        clf.fit(X, y)
+        captured = capsys.readouterr()
+        assert "Early stopping" in captured.out
+
+    # --- get_params / clone with new params ---
+
+    def test_get_params_includes_new(self):
+        """get_params includes scheduler, verbose, early_stopping."""
+        clf = SGDGPUClassifier(
+            scheduler="cosine", verbose=True, early_stopping=10,
+        )
+        params = clf.get_params()
+        assert params["scheduler"] == "cosine"
+        assert params["verbose"] is True
+        assert params["early_stopping"] == 10
+
+    def test_sklearn_clone_new_params(self):
+        """sklearn clone preserves new parameters."""
+        clf = SGDGPUClassifier(
+            scheduler="reduce_on_plateau", verbose=True,
+            early_stopping=7, device="cpu", random_state=42,
+        )
+        cloned = clone(clf)
+        assert isinstance(cloned, SGDGPUClassifier)
+        assert cloned.scheduler == "reduce_on_plateau"
+        assert cloned.verbose is True
+        assert cloned.early_stopping == 7
+
+    def test_build_classifier_passes_scheduler(self):
+        """build_classifier forwards scheduler kwarg."""
+        clf = build_classifier(
+            "sgd_gpu", random_state=42,
+            classifier_kwargs={"scheduler": "cosine", "early_stopping": 5},
+        )
+        assert isinstance(clf, SGDGPUClassifier)
+        assert clf.scheduler == "cosine"
+        assert clf.early_stopping == 5

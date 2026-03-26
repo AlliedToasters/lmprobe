@@ -596,6 +596,20 @@ class SGDGPUClassifier:
         relationship to sklearn's ``C`` parameter.
     device : str
         PyTorch device. ``"auto"`` selects CUDA if available, else CPU.
+    scheduler : str | None
+        Learning rate schedule. Options:
+
+        - ``None`` (default) — constant LR (current behavior)
+        - ``"cosine"`` — ``CosineAnnealingLR`` decaying to 0 over ``epochs``
+        - ``"reduce_on_plateau"`` — ``ReduceLROnPlateau`` (patience=5,
+          factor=0.5) reducing LR when epoch loss stalls
+    verbose : bool
+        If True, print training loss every 10 epochs (or every epoch if
+        ``epochs <= 10``).
+    early_stopping : int | None
+        Patience for early stopping. If set, training stops when epoch loss
+        has not improved for this many consecutive epochs. The best weights
+        (lowest loss) are restored.
     random_state : int | None
         Random seed for reproducibility.
 
@@ -607,7 +621,11 @@ class SGDGPUClassifier:
         Fitted bias, shape ``(1,)``. Stored on CPU as float32.
     classes_ : np.ndarray
         Class labels ``[0, 1]``.
+    train_loss_ : list[float]
+        Per-epoch training loss history. Available after ``fit()``.
     """
+
+    _VALID_SCHEDULERS = frozenset({None, "cosine", "reduce_on_plateau"})
 
     def __init__(
         self,
@@ -616,17 +634,30 @@ class SGDGPUClassifier:
         batch_size: int = 256,
         weight_decay: float = 1e-4,
         device: str = "auto",
+        scheduler: str | None = None,
+        verbose: bool = False,
+        early_stopping: int | None = None,
         random_state: int | None = None,
     ) -> None:
+        if scheduler not in self._VALID_SCHEDULERS:
+            valid = sorted(s for s in self._VALID_SCHEDULERS if s)
+            raise ValueError(
+                f"Unknown scheduler: {scheduler!r}. "
+                f"Valid options: {valid} or None"
+            )
         self.lr = lr
         self.epochs = epochs
         self.batch_size = batch_size
         self.weight_decay = weight_decay
         self.device = device
+        self.scheduler = scheduler
+        self.verbose = verbose
+        self.early_stopping = early_stopping
         self.random_state = random_state
         self.coef_: np.ndarray | None = None
         self.intercept_: np.ndarray | None = None
         self.classes_: np.ndarray | None = None
+        self.train_loss_: list[float] = []
 
     def _resolve_device(self) -> Any:
         import torch
@@ -649,6 +680,24 @@ class SGDGPUClassifier:
             raise RuntimeError(
                 "SGDGPUClassifier has not been fitted. Call fit() first."
             )
+
+    def _build_scheduler(self, optimizer: Any) -> Any:
+        """Build the LR scheduler if configured.
+
+        Returns None for constant LR (no scheduler).
+        """
+        import torch.optim.lr_scheduler as sched
+
+        if self.scheduler is None:
+            return None
+        elif self.scheduler == "cosine":
+            return sched.CosineAnnealingLR(optimizer, T_max=self.epochs)
+        elif self.scheduler == "reduce_on_plateau":
+            return sched.ReduceLROnPlateau(
+                optimizer, mode="min", patience=5, factor=0.5,
+            )
+        else:  # pragma: no cover — validated in __init__
+            raise ValueError(f"Unknown scheduler: {self.scheduler!r}")
 
     def fit(
         self,
@@ -688,6 +737,7 @@ class SGDGPUClassifier:
         optimizer = torch.optim.SGD(
             model.parameters(), lr=self.lr, weight_decay=self.weight_decay,
         )
+        lr_scheduler = self._build_scheduler(optimizer)
         loss_fn = torch.nn.BCEWithLogitsLoss(reduction="none")
 
         # Prepare data
@@ -702,8 +752,18 @@ class SGDGPUClassifier:
         # Shuffle indices
         rng = np.random.default_rng(self.random_state)
 
-        for _epoch in range(self.epochs):
+        # Convergence tracking
+        self.train_loss_ = []
+        best_loss = float("inf")
+        best_state: dict[str, Any] | None = None
+        epochs_without_improvement = 0
+        verbose_interval = 1 if self.epochs <= 10 else 10
+
+        for epoch in range(self.epochs):
             perm = torch.from_numpy(rng.permutation(n_samples))
+            epoch_loss_sum = 0.0
+            epoch_samples = 0
+
             for start in range(0, n_samples, self.batch_size):
                 idx = perm[start : start + self.batch_size]
                 xb = X_t[idx].to(device)
@@ -721,6 +781,47 @@ class SGDGPUClassifier:
                 loss.backward()
                 optimizer.step()
 
+                batch_size_actual = len(idx)
+                epoch_loss_sum += loss.item() * batch_size_actual
+                epoch_samples += batch_size_actual
+
+            epoch_loss = epoch_loss_sum / epoch_samples
+            self.train_loss_.append(epoch_loss)
+
+            # LR scheduler step
+            if lr_scheduler is not None:
+                if self.scheduler == "reduce_on_plateau":
+                    lr_scheduler.step(epoch_loss)
+                else:
+                    lr_scheduler.step()
+
+            # Verbose logging
+            if self.verbose and (epoch % verbose_interval == 0 or epoch == self.epochs - 1):
+                current_lr = optimizer.param_groups[0]["lr"]
+                print(f"Epoch {epoch:4d}/{self.epochs}  loss={epoch_loss:.6f}  lr={current_lr:.2e}")
+
+            # Early stopping
+            if self.early_stopping is not None:
+                if epoch_loss < best_loss:
+                    best_loss = epoch_loss
+                    best_state = {
+                        k: v.clone() for k, v in model.state_dict().items()
+                    }
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                    if epochs_without_improvement >= self.early_stopping:
+                        if self.verbose:
+                            print(
+                                f"Early stopping at epoch {epoch} "
+                                f"(no improvement for {self.early_stopping} epochs)"
+                            )
+                        break
+
+        # Restore best weights if early stopping was used and we found a best
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
         # Extract weights to CPU numpy
         with torch.no_grad():
             self.coef_ = model.weight.detach().cpu().numpy().ravel()
@@ -729,7 +830,7 @@ class SGDGPUClassifier:
         self.classes_ = np.array([0, 1])
 
         # Clean up GPU memory
-        del model, optimizer, X_t, y_t, w_t
+        del model, optimizer, lr_scheduler, X_t, y_t, w_t, best_state
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -811,6 +912,9 @@ class SGDGPUClassifier:
             "batch_size": self.batch_size,
             "weight_decay": self.weight_decay,
             "device": self.device,
+            "scheduler": self.scheduler,
+            "verbose": self.verbose,
+            "early_stopping": self.early_stopping,
             "random_state": self.random_state,
         }
 
