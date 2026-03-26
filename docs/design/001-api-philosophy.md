@@ -14,7 +14,7 @@
 
 ### sklearn Compatibility
 
-The primary `LinearProbe` class follows sklearn conventions:
+The primary `Probe` class follows sklearn conventions:
 
 ```python
 # sklearn pattern
@@ -59,7 +59,7 @@ probe.fit(all_prompts, labels)  # labels: list[int] or np.array
 All configuration happens at construction time:
 
 ```python
-probe = LinearProbe(
+probe = Probe(
     model="...",
     layers=16,
     train_pooling="last_token",
@@ -82,16 +82,16 @@ The `remote` parameter controls whether nnsight runs model inference locally or 
 
 ```python
 # Local execution (default)
-probe = LinearProbe(model="meta-llama/Llama-3.1-8B-Instruct", remote=False)
+probe = Probe(model="meta-llama/Llama-3.1-8B-Instruct", remote=False)
 
 # Remote execution
-probe = LinearProbe(model="meta-llama/Llama-3.1-70B-Instruct", remote=True)
+probe = Probe(model="meta-llama/Llama-3.1-70B-Instruct", remote=True)
 ```
 
 **Override at method call**: The `remote` parameter can be overridden on `fit()` and `predict()`:
 
 ```python
-probe = LinearProbe(model="...", remote=True)  # default to remote
+probe = Probe(model="...", remote=True)  # default to remote
 
 # Train remotely (uses init default)
 probe.fit(pos, neg)
@@ -119,7 +119,7 @@ CONFIG.API.APIKEY = os.getenv("NDIF_API_KEY")
 The `random_state` parameter ensures reproducibility across all random operations:
 
 ```python
-probe = LinearProbe(
+probe = Probe(
     model="...",
     classifier="logistic_regression",
     random_state=42,  # Propagates to classifier and any other random operations
@@ -138,7 +138,7 @@ probe = LinearProbe(
 **Decision**: Activation caching to disk is **always enabled**. Extracting activations from LLMs (especially remotely) is expensive, so we cache by default to enable rapid iteration on classifier experiments.
 
 ```python
-probe = LinearProbe(model="meta-llama/Llama-3.1-8B-Instruct")
+probe = Probe(model="meta-llama/Llama-3.1-8B-Instruct")
 probe.fit(pos, neg)  # Extracts and caches activations
 probe.fit(pos, neg)  # Second call uses cached activations
 ```
@@ -157,7 +157,7 @@ probe.fit(pos, neg, invalidate_cache=True)
 A minimal example should work:
 
 ```python
-probe = LinearProbe()  # Uses reasonable defaults
+probe = Probe()  # Uses reasonable defaults
 probe.fit(pos, neg)
 probe.predict(test)
 ```
@@ -177,13 +177,13 @@ We provide three pooling parameters for progressive complexity:
 
 ```python
 # Simple: same strategy for train and inference (most users)
-probe = LinearProbe(pooling="last_token")
+probe = Probe(pooling="last_token")
 
 # Advanced: different strategies for train vs inference
-probe = LinearProbe(train_pooling="last_token", inference_pooling="max")
+probe = Probe(train_pooling="last_token", inference_pooling="max")
 
 # Mixed: set a base, override one
-probe = LinearProbe(pooling="last_token", inference_pooling="all")
+probe = Probe(pooling="last_token", inference_pooling="all")
 ```
 
 **Collision resolution** (most specific wins):
@@ -204,10 +204,10 @@ Simple things are simple, complex things are possible:
 
 ```python
 # Level 1: One-liner (local execution)
-probe = LinearProbe(model="meta-llama/Llama-3.1-8B-Instruct")
+probe = Probe(model="meta-llama/Llama-3.1-8B-Instruct")
 
 # Level 2: Common customization (remote execution for large models)
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-70B-Instruct",
     layers=[14, 15, 16],
     classifier="logistic_regression",
@@ -219,7 +219,7 @@ probe = LinearProbe(
 from sklearn.svm import SVC
 from lmprobe.pooling import WeightedMeanPooling
 
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-8B-Instruct",
     layers=[14, 15, 16],
     train_pooling=WeightedMeanPooling(weights="attention"),
