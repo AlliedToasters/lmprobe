@@ -1,8 +1,11 @@
 """Tests for mass_mean_augment feature on LinearProbe."""
 
 import numpy as np
+import pytest
 
 from lmprobe import LinearProbe
+
+pytestmark = pytest.mark.nnsight
 
 
 class TestMassMeanAugmentDefault:

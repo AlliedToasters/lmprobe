@@ -14,6 +14,8 @@ from lmprobe.cache import (
 )
 from lmprobe.unified_cache import CachedLogits, UnifiedCache, WarmupStats
 
+pytestmark = pytest.mark.nnsight
+
 
 class TestUnifiedCache:
     """Tests for UnifiedCache extraction and caching."""

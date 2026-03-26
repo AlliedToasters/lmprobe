@@ -6,6 +6,8 @@ from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_PROMPTS
 
 from lmprobe.activation_baseline import ActivationBaseline
 
+pytestmark = pytest.mark.nnsight
+
 
 class TestActivationBaselineBasic:
     """Basic functionality tests for ActivationBaseline."""

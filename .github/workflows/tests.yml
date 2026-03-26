@@ -34,8 +34,13 @@ jobs:
       - name: Type check with mypy
         run: mypy src/lmprobe/
 
-      - name: Run tests with coverage
-        run: pytest --cov=lmprobe --cov-report=xml --cov-report=term-missing --cov-fail-under=30 -v
+      - name: Run unit tests with coverage (nnsight-free)
+        run: >
+          pytest -m "not nnsight" --cov=lmprobe --cov-report=xml
+          --cov-report=term-missing --cov-fail-under=40 -v
+
+      - name: Run nnsight integration tests
+        run: pytest -m nnsight -v
 
       - name: Check coverage on changed lines
         if: github.event_name == 'pull_request'

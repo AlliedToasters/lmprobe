@@ -11,6 +11,8 @@ from conftest import TEST_PROMPTS
 
 from lmprobe import Probe, ProbeEnsemble
 
+pytestmark = pytest.mark.nnsight
+
 
 @pytest.fixture
 def two_probes(tiny_model):

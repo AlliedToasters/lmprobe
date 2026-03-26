@@ -1,6 +1,10 @@
 """Tests for classifier_kwargs parameter (Issue #75)."""
 
+import pytest
+
 from lmprobe import LinearProbe
+
+pytestmark = pytest.mark.nnsight
 
 
 class TestClassifierKwargs:

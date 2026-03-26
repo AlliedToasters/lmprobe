@@ -13,6 +13,8 @@ from lmprobe.battery import (
 
 TEST_LABELS = [1, 0]
 
+pytestmark = pytest.mark.nnsight
+
 
 class TestBaselineResult:
     """Tests for BaselineResult dataclass."""

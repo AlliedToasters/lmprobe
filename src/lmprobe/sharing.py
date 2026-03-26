@@ -3449,6 +3449,8 @@ def _load_labels_for_prompts(
     if any(v is None for v in labels):
         return None
 
+    import numpy as np
+
     return np.array(labels)
 
 

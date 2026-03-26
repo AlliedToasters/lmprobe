@@ -4347,3 +4347,1313 @@ class TestUpgradeDatasetFormat:
         cols = set(pq.read_table(str(dest)).column_names)
         assert "shard_index_logits" in cols
         assert "row_offset_logits" in cols
+
+
+# =============================================================================
+# NEW: Additional coverage tests
+# =============================================================================
+
+
+class TestNewCheckFormatVersion:
+    """Cover _check_format_version minor-version warning and edge cases."""
+
+    def test_minor_version_warning(self):
+        """Minor version mismatch produces a warning when check_minor=True."""
+        import warnings as _w
+
+        from lmprobe.sharing import _check_format_version
+
+        info = {"format_version": "2.99"}
+        with _w.catch_warnings(record=True) as caught:
+            _w.simplefilter("always")
+            _check_format_version(info, check_minor=True)
+        assert len(caught) == 1
+        assert "newer than supported" in str(caught[0].message)
+
+    def test_minor_version_no_warn_when_disabled(self):
+        """No warning when check_minor=False."""
+        import warnings as _w
+
+        from lmprobe.sharing import _check_format_version
+
+        info = {"format_version": "2.99"}
+        with _w.catch_warnings(record=True) as caught:
+            _w.simplefilter("always")
+            _check_format_version(info, check_minor=False)
+        assert len(caught) == 0
+
+    def test_major_version_mismatch_raises(self):
+        from lmprobe.sharing import _check_format_version
+
+        info = {"format_version": "99.0"}
+        with pytest.raises(ValueError, match="Incompatible format version"):
+            _check_format_version(info)
+
+    def test_same_version_no_warning(self):
+        import warnings as _w
+
+        from lmprobe.sharing import _check_format_version
+
+        info = {"format_version": FORMAT_VERSION}
+        with _w.catch_warnings(record=True) as caught:
+            _w.simplefilter("always")
+            _check_format_version(info, check_minor=True)
+        assert len(caught) == 0
+
+    def test_missing_version_defaults_to_1_0(self):
+        """Missing format_version defaults to 1.0 (no error for major <= local)."""
+        from lmprobe.sharing import _check_format_version
+
+        _check_format_version({})  # Should not raise
+
+
+class TestNewExtractModelName:
+    """Cover _extract_model_name error path."""
+
+    def test_missing_model_raises(self):
+        from lmprobe.sharing import _extract_model_name
+
+        with pytest.raises(KeyError, match="model.name"):
+            _extract_model_name({})
+
+    def test_non_dict_model_raises(self):
+        from lmprobe.sharing import _extract_model_name
+
+        with pytest.raises(KeyError, match="model.name"):
+            _extract_model_name({"model": "just-a-string"})
+
+    def test_valid_model_returns_name(self):
+        from lmprobe.sharing import _extract_model_name
+
+        name = _extract_model_name({"model": {"name": "foo/bar"}})
+        assert name == "foo/bar"
+
+
+class TestNewHiddenShardFilename:
+    """Cover _hidden_shard_filename."""
+
+    def test_basic_formatting(self):
+        from lmprobe.sharing import _hidden_shard_filename
+
+        assert _hidden_shard_filename(0, 0) == (
+            "tensors/hidden_layer000_shard000.safetensors"
+        )
+        assert _hidden_shard_filename(12, 5) == (
+            "tensors/hidden_layer012_shard005.safetensors"
+        )
+
+
+class TestNewSelectTensorTypes:
+    """Cover _select_tensor_types."""
+
+    def test_no_filter_returns_all(self):
+        from lmprobe.sharing import _select_tensor_types
+
+        descriptors = {"hidden_layers": {}, "logits_topk": {}}
+        result = _select_tensor_types(descriptors, None)
+        assert result == ["hidden_layers", "logits_topk"]
+
+    def test_filter_returns_subset(self):
+        from lmprobe.sharing import _select_tensor_types
+
+        descriptors = {"hidden_layers": {}, "logits_topk": {}}
+        result = _select_tensor_types(descriptors, ["logits_topk"])
+        assert result == ["logits_topk"]
+
+    def test_filter_with_nonexistent_key(self):
+        from lmprobe.sharing import _select_tensor_types
+
+        descriptors = {"hidden_layers": {}}
+        result = _select_tensor_types(descriptors, ["nonexistent"])
+        assert result == []
+
+
+class TestNewComputeShardBoundaries:
+    """Cover _compute_shard_boundaries edge cases."""
+
+    def test_zero_row_bytes(self):
+        from lmprobe.sharing import _compute_shard_boundaries
+
+        result = _compute_shard_boundaries(10, 0, 1000)
+        assert result == [10]
+
+    def test_negative_row_bytes(self):
+        from lmprobe.sharing import _compute_shard_boundaries
+
+        result = _compute_shard_boundaries(5, -1, 1000)
+        assert result == [5]
+
+    def test_single_shard(self):
+        from lmprobe.sharing import _compute_shard_boundaries
+
+        result = _compute_shard_boundaries(3, 100, 1000)
+        assert result == [3]
+
+    def test_multiple_shards(self):
+        from lmprobe.sharing import _compute_shard_boundaries
+
+        result = _compute_shard_boundaries(10, 100, 300)
+        assert sum(result) == 10
+        assert all(s <= 3 for s in result)
+
+
+class TestNewDeterministicShuffle:
+    """Cover _deterministic_seed and _shuffle_indices."""
+
+    def test_seed_is_deterministic(self):
+        from lmprobe.sharing import _deterministic_seed
+
+        s1 = _deterministic_seed("user/test")
+        s2 = _deterministic_seed("user/test")
+        assert s1 == s2
+
+    def test_different_repos_different_seeds(self):
+        from lmprobe.sharing import _deterministic_seed
+
+        s1 = _deterministic_seed("user/a")
+        s2 = _deterministic_seed("user/b")
+        assert s1 != s2
+
+    def test_shuffle_is_permutation(self):
+        from lmprobe.sharing import _shuffle_indices
+
+        result = _shuffle_indices(5, seed=42)
+        assert sorted(result) == [0, 1, 2, 3, 4]
+
+    def test_shuffle_is_deterministic(self):
+        from lmprobe.sharing import _shuffle_indices
+
+        r1 = _shuffle_indices(10, seed=42)
+        r2 = _shuffle_indices(10, seed=42)
+        assert r1 == r2
+
+
+class TestNewParallelPreload:
+    """Cover _parallel_preload basic execution."""
+
+    def test_basic_execution(self):
+        from lmprobe.sharing import _parallel_preload
+
+        prompts = ["a", "b", "c"]
+
+        def load_fn(idx, prompt):
+            return (idx, prompt.upper())
+
+        result = _parallel_preload(
+            prompts, load_fn, lambda: None, workers=2,
+        )
+        assert result == ["A", "B", "C"]
+
+    def test_with_executor(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from lmprobe.sharing import _parallel_preload
+
+        prompts = ["x", "y"]
+
+        def load_fn(idx, prompt):
+            return (idx, len(prompt))
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = _parallel_preload(
+                prompts, load_fn, lambda: 0, workers=1,
+                executor=pool,
+            )
+        assert result == [1, 1]
+
+
+class TestNewConsolidatePreloadValidation:
+    """Cover preload parameter validation in _consolidate_and_shard."""
+
+    def test_invalid_preload_raises(self, populated_cache):
+        tensor_types = {
+            "raw_layers": [],
+            "pooled": {"last_token": [0]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        with pytest.raises(ValueError, match="preload must be one of"):
+            _consolidate_and_shard(
+                model_name=TEST_MODEL,
+                prompts=populated_cache,
+                kept_indices=[0, 1, 2],
+                tensor_types=tensor_types,
+                labels=None,
+                shard_max_bytes=1_000_000_000,
+                repo_id="user/test",
+                preload="invalid",
+            )
+
+
+@requires_pyarrow
+class TestNewExtractMetadataFromParquet:
+    """Cover _extract_metadata_from_parquet roundtrip and edge cases."""
+
+    def test_roundtrip(self, tmp_path):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from lmprobe.sharing import (
+            _embed_metadata_in_schema,
+            _extract_metadata_from_parquet,
+        )
+
+        info = {
+            "format_version": "2.0",
+            "model": {"name": "test/model"},
+            "num_prompts": 5,
+            "tensors": {"hidden_layers": {"layers": [0, 1]}},
+        }
+
+        table = pa.table({"x": pa.array([1, 2])})
+        table = _embed_metadata_in_schema(table, info)
+        path = tmp_path / "test.parquet"
+        pq.write_table(table, str(path))
+
+        extracted = _extract_metadata_from_parquet(path)
+        assert extracted is not None
+        assert extracted["format_version"] == "2.0"
+        assert extracted["model"]["name"] == "test/model"
+        assert extracted["num_prompts"] == 5
+        assert extracted["tensors"]["hidden_layers"]["layers"] == [0, 1]
+
+    def test_no_metadata_returns_none(self, tmp_path):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from lmprobe.sharing import _extract_metadata_from_parquet
+
+        table = pa.table({"x": pa.array([1])})
+        path = tmp_path / "plain.parquet"
+        pq.write_table(table, str(path))
+
+        assert _extract_metadata_from_parquet(path) is None
+
+    def test_numeric_format_version_coerced_to_string(self, tmp_path):
+        """Numeric format_version is coerced to string on extraction."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from lmprobe.sharing import _extract_metadata_from_parquet
+
+        # Manually embed a numeric format_version
+        meta = {
+            b"lmprobe:format_version": b"2",
+        }
+        table = pa.table({"x": pa.array([1])})
+        table = table.replace_schema_metadata(meta)
+        path = tmp_path / "numver.parquet"
+        pq.write_table(table, str(path))
+
+        extracted = _extract_metadata_from_parquet(path)
+        assert extracted is not None
+        assert extracted["format_version"] == "2"
+        assert isinstance(extracted["format_version"], str)
+
+
+@requires_pyarrow
+class TestNewLoadDatasetMetadata:
+    """Cover _load_dataset_metadata v1 format error."""
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_v1_format_raises(self, mock_deps, tmp_path):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from lmprobe.sharing import _load_dataset_metadata
+
+        # Write a parquet file with NO lmprobe metadata (v1-style)
+        (tmp_path / "index").mkdir(parents=True)
+        table = pa.table({"text": pa.array(["a"])})
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(tmp_path / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            with pytest.raises(ValueError, match="v1 format"):
+                _load_dataset_metadata("user/v1-dataset")
+
+
+@requires_pyarrow
+class TestNewFetchDatasetMetadata:
+    """Cover fetch_dataset_metadata."""
+
+    def _setup_v2_parquet(self, tmp_path):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from lmprobe.sharing import _embed_metadata_in_schema
+
+        (tmp_path / "index").mkdir(parents=True)
+
+        lmprobe_info = {
+            "format_version": "2.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 2,
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0, 1],
+                    "dim": HIDDEN_DIM,
+                    "layout": "per_layer",
+                    "pooling": "last_token",
+                    "shards": [{"num_prompts": 2}],
+                }
+            },
+            "provenance": {},
+        }
+
+        table = pa.table({
+            "text": pa.array(["hello", "world"], type=pa.string()),
+            "label": pa.array([1, 0], type=pa.int32()),
+            "num_tokens": pa.array([3, 4], type=pa.int32()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1], type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+        return tmp_path
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_returns_dataset_metadata(self, mock_deps, tmp_path):
+        from lmprobe.sharing import DatasetMetadata, fetch_dataset_metadata
+
+        remote_dir = self._setup_v2_parquet(tmp_path / "remote")
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            meta = fetch_dataset_metadata("user/test")
+
+        assert isinstance(meta, DatasetMetadata)
+        assert meta.model_name == TEST_MODEL
+        assert meta.available_layers == [0, 1]
+        assert meta.num_prompts == 2
+        assert meta.format_version == "2.0"
+        assert meta.prompts == ["hello", "world"]
+        assert "hidden_layers" in meta.tensor_descriptors
+
+
+@requires_pyarrow
+class TestNewLoadLabelsForPrompts:
+    """Cover _load_labels_for_prompts."""
+
+    def _setup_parquet_with_labels(self, tmp_path, labels):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from lmprobe.sharing import _embed_metadata_in_schema
+
+        (tmp_path / "index").mkdir(parents=True)
+
+        lmprobe_info = {
+            "format_version": "2.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "tensors": {},
+            "provenance": {},
+        }
+
+        table = pa.table({
+            "text": pa.array(["a", "b", "c"], type=pa.string()),
+            "label": pa.array(labels, type=pa.int32()),
+            "num_tokens": pa.array([1, 1, 1], type=pa.int32()),
+            "shard_index": pa.array([0, 0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1, 2], type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+        return tmp_path
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_returns_labels_array(self, mock_deps, tmp_path):
+        import numpy as np
+
+        from lmprobe.sharing import _load_labels_for_prompts
+
+        remote_dir = self._setup_parquet_with_labels(
+            tmp_path / "remote", [1, 0, 1]
+        )
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            labels = _load_labels_for_prompts(
+                "user/test", ["a", "b", "c"]
+            )
+
+        assert labels is not None
+        np.testing.assert_array_equal(labels, [1, 0, 1])
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_returns_none_for_missing_prompt(self, mock_deps, tmp_path):
+        from lmprobe.sharing import _load_labels_for_prompts
+
+        remote_dir = self._setup_parquet_with_labels(
+            tmp_path / "remote", [1, 0, 1]
+        )
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            labels = _load_labels_for_prompts(
+                "user/test", ["a", "missing"]
+            )
+
+        assert labels is None
+
+
+@requires_pyarrow
+class TestNewLoadActivations:
+    """Cover load_activations function."""
+
+    def _setup_remote(self, tmp_path):
+        """Create a minimal v2 dataset for testing load_activations."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from safetensors.torch import save_file
+
+        from lmprobe.sharing import _embed_metadata_in_schema
+
+        (tmp_path / "tensors").mkdir(parents=True)
+        (tmp_path / "index").mkdir(parents=True)
+
+        prompts = ["p0", "p1", "p2"]
+        tensor = torch.randn(3, HIDDEN_DIM)
+        save_file(
+            {"hidden.layer_0": tensor},
+            str(tmp_path / "tensors" / "hidden_layer000_shard000.safetensors"),
+        )
+
+        lmprobe_info = {
+            "format_version": "2.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 3,
+            "prompt_ordering": "random",
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "layout": "per_layer",
+                    "pooling": "last_token",
+                    "row_bytes": HIDDEN_DIM * 4,
+                    "shards": [{"num_prompts": 3}],
+                }
+            },
+            "provenance": {},
+        }
+
+        table = pa.table({
+            "text": pa.array(prompts, type=pa.string()),
+            "label": pa.array([1, 0, 1], type=pa.int32()),
+            "num_tokens": pa.array([5, 5, 5], type=pa.int32()),
+            "shard_index": pa.array([0, 0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1, 2], type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+
+        return tmp_path, prompts, tensor
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_load_activations_as_dict(self, mock_deps, tmp_path, cache_dir):
+        from lmprobe.sharing import load_activations
+
+        remote_dir, prompts, tensor = self._setup_remote(tmp_path / "remote")
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            result = load_activations(
+                "user/test", show_progress=False
+            )
+
+        assert isinstance(result, dict)
+        assert 0 in result
+        assert result[0].shape == (3, HIDDEN_DIM)
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_load_activations_as_array(self, mock_deps, tmp_path, cache_dir):
+        from lmprobe.sharing import load_activations
+
+        remote_dir, prompts, tensor = self._setup_remote(tmp_path / "remote")
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            result = load_activations(
+                "user/test", as_dict=False, show_progress=False,
+            )
+
+        import numpy as np
+
+        assert isinstance(result, np.ndarray)
+        assert result.shape == (3, 1, HIDDEN_DIM)
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_load_activations_with_labels(
+        self, mock_deps, tmp_path, cache_dir,
+    ):
+        from lmprobe.sharing import load_activations
+
+        remote_dir, prompts, tensor = self._setup_remote(tmp_path / "remote")
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            result, labels = load_activations(
+                "user/test", return_labels=True, show_progress=False,
+            )
+
+        import numpy as np
+
+        assert isinstance(result, dict)
+        assert labels is not None
+        assert len(labels) == 3
+        np.testing.assert_array_equal(labels, [1, 0, 1])
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_load_activations_invalid_layer_raises(
+        self, mock_deps, tmp_path, cache_dir,
+    ):
+        from lmprobe.sharing import load_activations
+
+        remote_dir, prompts, tensor = self._setup_remote(tmp_path / "remote")
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            with pytest.raises(ValueError, match="Layers.*not in dataset"):
+                load_activations(
+                    "user/test", layers=[99], show_progress=False,
+                )
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_load_activations_specific_prompts(
+        self, mock_deps, tmp_path, cache_dir,
+    ):
+        from lmprobe.sharing import load_activations
+
+        remote_dir, prompts, tensor = self._setup_remote(tmp_path / "remote")
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(remote_dir / filename)
+
+        with patch(
+            "huggingface_hub.hf_hub_download", side_effect=mock_download,
+        ):
+            result = load_activations(
+                "user/test", prompts=["p0", "p1"],
+                show_progress=False,
+            )
+
+        assert 0 in result
+        assert result[0].shape == (2, HIDDEN_DIM)
+
+
+@requires_pyarrow
+class TestNewWriteParquetExtraTypes:
+    """Cover extra column type inference in _write_parquet_index."""
+
+    def test_list_of_int_columns(self, tmp_path):
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir()
+        prompt_metadata = [
+            {"text": "a", "label": 1, "num_tokens": 3,
+             "shard_index": 0, "row_offset": 0,
+             "token_shard_ids": [0, 0, 1]},
+            {"text": "b", "label": 0, "num_tokens": 2,
+             "shard_index": 0, "row_offset": 1,
+             "token_shard_ids": [0, 1]},
+        ]
+        _write_parquet_index(tmp_path, prompt_metadata)
+
+        table = pq.read_table(str(tmp_path / PARQUET_PATH))
+        assert "token_shard_ids" in table.column_names
+        assert table.column("token_shard_ids").to_pylist() == [
+            [0, 0, 1], [0, 1],
+        ]
+
+    def test_list_of_float_columns(self, tmp_path):
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir()
+        prompt_metadata = [
+            {"text": "a", "label": 1, "num_tokens": 3,
+             "shard_index": 0, "row_offset": 0,
+             "token_perplexity": [1.5, 2.3]},
+            {"text": "b", "label": 0, "num_tokens": 2,
+             "shard_index": 0, "row_offset": 1,
+             "token_perplexity": [0.9]},
+        ]
+        _write_parquet_index(tmp_path, prompt_metadata)
+
+        table = pq.read_table(str(tmp_path / PARQUET_PATH))
+        assert "token_perplexity" in table.column_names
+
+    def test_list_of_string_columns(self, tmp_path):
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir()
+        prompt_metadata = [
+            {"text": "a", "label": 1, "num_tokens": 3,
+             "shard_index": 0, "row_offset": 0,
+             "token_strings": ["hello", "world"]},
+            {"text": "b", "label": 0, "num_tokens": 2,
+             "shard_index": 0, "row_offset": 1,
+             "token_strings": ["foo"]},
+        ]
+        _write_parquet_index(tmp_path, prompt_metadata)
+
+        table = pq.read_table(str(tmp_path / PARQUET_PATH))
+        assert "token_strings" in table.column_names
+        assert table.column("token_strings").to_pylist() == [
+            ["hello", "world"], ["foo"],
+        ]
+
+    def test_null_labels(self, tmp_path):
+        """All-None labels still produce a valid Parquet column."""
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir()
+        prompt_metadata = [
+            {"text": "a", "label": None, "num_tokens": 3,
+             "shard_index": 0, "row_offset": 0},
+        ]
+        _write_parquet_index(tmp_path, prompt_metadata)
+
+        table = pq.read_table(str(tmp_path / PARQUET_PATH))
+        assert table.num_rows == 1
+
+    def test_embedded_metadata_in_parquet(self, tmp_path):
+        """lmprobe_info is embedded in Parquet schema when provided."""
+
+        from lmprobe.sharing import _extract_metadata_from_parquet
+
+        (tmp_path / "index").mkdir()
+        lmprobe_info = {
+            "format_version": "2.0",
+            "model": {"name": "test"},
+            "tensors": {},
+        }
+        prompt_metadata = [
+            {"text": "x", "label": 1, "num_tokens": 3,
+             "shard_index": 0, "row_offset": 0},
+        ]
+        _write_parquet_index(tmp_path, prompt_metadata, lmprobe_info)
+
+        extracted = _extract_metadata_from_parquet(
+            tmp_path / PARQUET_PATH,
+        )
+        assert extracted is not None
+        assert extracted["format_version"] == "2.0"
+
+    def test_shard_index_logits_column(self, tmp_path):
+        """shard_index_logits and row_offset_logits as per-type columns."""
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir()
+        prompt_metadata = [
+            {"text": "a", "label": 1, "num_tokens": 3,
+             "shard_index": 0, "row_offset": 0,
+             "shard_index_logits": 1, "row_offset_logits": 0},
+            {"text": "b", "label": 0, "num_tokens": 4,
+             "shard_index": 0, "row_offset": 1,
+             "shard_index_logits": 1, "row_offset_logits": 1},
+        ]
+        _write_parquet_index(tmp_path, prompt_metadata)
+
+        table = pq.read_table(str(tmp_path / PARQUET_PATH))
+        assert "shard_index_logits" in table.column_names
+        assert "row_offset_logits" in table.column_names
+        assert table.column("shard_index_logits").to_pylist() == [1, 1]
+
+    def test_all_none_extra_column(self, tmp_path):
+        """Extra column with all None values defaults to string type."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        (tmp_path / "index").mkdir()
+        prompt_metadata = [
+            {"text": "a", "label": 1, "num_tokens": 3,
+             "shard_index": 0, "row_offset": 0,
+             "optional_field": None},
+            {"text": "b", "label": 0, "num_tokens": 4,
+             "shard_index": 0, "row_offset": 1,
+             "optional_field": None},
+        ]
+        _write_parquet_index(tmp_path, prompt_metadata)
+
+        table = pq.read_table(str(tmp_path / PARQUET_PATH))
+        assert "optional_field" in table.column_names
+        assert table.column("optional_field").type == pa.string()
+
+
+class TestNewFilterTensorTypesEdgeCases:
+    """Cover _filter_tensor_types unknown key warning and perplexity."""
+
+    def test_unknown_key_logged(self, caplog):
+        import logging
+
+        available = {
+            "raw_layers": [0],
+            "pooled": {},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+            "has_token_perplexity": False,
+        }
+        with caplog.at_level(logging.WARNING, logger="lmprobe.sharing"):
+            result = _filter_tensor_types(available, ["bogus_key"])
+        assert "Unknown tensor filter key" in caplog.text
+        # Result should have nothing enabled
+        assert result["raw_layers"] == []
+        assert result["pooled"] == {}
+        assert result["has_logits"] is False
+
+    def test_perplexity_filter(self):
+        available = {
+            "raw_layers": [0],
+            "pooled": {"last_token": [0]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": True,
+            "has_token_perplexity": True,
+        }
+        result = _filter_tensor_types(available, ["perplexity"])
+        assert result["has_perplexity"] is True
+        assert result["has_token_perplexity"] is True
+        # Other types should be excluded
+        assert result["raw_layers"] == []
+        assert result["pooled"] == {}
+
+
+class TestNewPushNoTensorsRaises:
+    """Cover push_dataset error when no tensor types remain after filter."""
+
+    @requires_pyarrow
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    def test_no_tensor_types_raises(
+        self, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """Filtering to nonexistent tensor types raises ValueError."""
+        with pytest.raises(ValueError, match="No tensor types available"):
+            push_dataset(
+                repo_id="user/test",
+                model_name=TEST_MODEL,
+                prompts=populated_cache,
+                tensors=["logits_topk"],  # cache has no logits
+            )
+
+
+@requires_pyarrow
+class TestNewPushDatasetShuffleParam:
+    """Cover push_dataset shuffle=False param forwarding."""
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    @patch("lmprobe.sharing._check_pyarrow")
+    @patch("huggingface_hub.HfApi")
+    def test_push_shuffle_false(
+        self, MockHfApi, mock_pyarrow, mock_deps, populated_cache,
+    ):
+        """shuffle=False is forwarded and preserves order."""
+        mock_api = MagicMock()
+        MockHfApi.return_value = mock_api
+
+        uploaded_files = {}
+
+        def capture_upload(repo_id, folder_path, **kwargs):
+            import pyarrow.parquet as pq
+
+            folder = Path(folder_path)
+            parquet_file = folder / PARQUET_PATH
+            if parquet_file.exists():
+                table = pq.read_table(str(parquet_file))
+                uploaded_files["texts"] = table.column("text").to_pylist()
+
+        mock_api.upload_large_folder.side_effect = capture_upload
+
+        push_dataset(
+            repo_id="user/noshuffle",
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            exist_ok=True,
+            shuffle=False,
+        )
+
+        assert uploaded_files["texts"] == populated_cache
+
+
+class TestNewManifestHelpers:
+    """Cover _new_manifest, _save_manifest, _load_manifest."""
+
+    def test_new_manifest_structure(self):
+        m = _new_manifest("user/test")
+        assert m["format"] == "stream_manifest_v1"
+        assert m["repo_id"] == "user/test"
+        assert m["completed_shards"] == []
+        assert m["metadata_uploaded"] is False
+
+    def test_save_and_load_manifest(self, tmp_path):
+        m = _new_manifest("user/test")
+        m["completed_shards"] = ["shard_0"]
+        _save_manifest(tmp_path, m)
+
+        loaded = _load_manifest(tmp_path)
+        assert loaded is not None
+        assert loaded["completed_shards"] == ["shard_0"]
+
+    def test_load_missing_manifest(self, tmp_path):
+        assert _load_manifest(tmp_path) is None
+
+
+class TestNewStagingDirPath:
+    """Cover _staging_dir_path deterministic hashing."""
+
+    def test_deterministic(self, cache_dir):
+        p1 = _staging_dir_path("user/test", "model", ["a", "b"])
+        p2 = _staging_dir_path("user/test", "model", ["a", "b"])
+        assert p1 == p2
+
+    def test_different_params_different_path(self, cache_dir):
+        p1 = _staging_dir_path("user/test", "model", ["a"])
+        p2 = _staging_dir_path("user/test", "model", ["a", "b"])
+        assert p1 != p2
+
+    def test_stream_changes_path(self, cache_dir):
+        p1 = _staging_dir_path("user/test", "model", ["a"])
+        p2 = _staging_dir_path("user/test", "model", ["a"], stream=True)
+        assert p1 != p2
+
+    def test_labels_change_path(self, cache_dir):
+        p1 = _staging_dir_path("user/test", "model", ["a"])
+        p2 = _staging_dir_path("user/test", "model", ["a"], labels=[1])
+        assert p1 != p2
+
+
+class TestNewMakeHiddenLoader:
+    """Cover _make_hidden_loader and preload paths."""
+
+    def test_pooled_loader(self, populated_cache):
+        from lmprobe.sharing import _make_hidden_loader
+
+        loader = _make_hidden_loader(
+            TEST_MODEL, [0], use_raw=False,
+            hidden_strategy="last_token",
+        )
+        idx, result = loader(0, populated_cache[0])
+        assert idx == 0
+        assert isinstance(result, dict)
+        assert "hidden.layer_0" in result
+
+    def test_pooled_loader_with_extract_key(self, populated_cache):
+        from lmprobe.sharing import _make_hidden_loader
+
+        loader = _make_hidden_loader(
+            TEST_MODEL, [0], use_raw=False,
+            hidden_strategy="last_token",
+            extract_key="hidden.layer_0",
+        )
+        idx, result = loader(0, populated_cache[0])
+        assert idx == 0
+        assert result is not None
+        assert result.shape[-1] == HIDDEN_DIM
+
+    def test_no_strategy_returns_empty(self, populated_cache):
+        from lmprobe.sharing import _make_hidden_loader
+
+        loader = _make_hidden_loader(
+            TEST_MODEL, [0], use_raw=False,
+            hidden_strategy=None,
+        )
+        idx, result = loader(0, populated_cache[0])
+        assert idx == 0
+        assert result == {}
+
+    def test_raw_loader(self, populated_raw_cache):
+        from lmprobe.sharing import _make_hidden_loader
+
+        prompts, seq_lens, layers, _ = populated_raw_cache
+        loader = _make_hidden_loader(
+            TEST_MODEL, layers, use_raw=True,
+            hidden_strategy=None,
+        )
+        idx, result = loader(0, prompts[0])
+        assert idx == 0
+        assert "hidden.layer_0" in result
+
+
+class TestNewPreloadLayer:
+    """Cover _preload_layer."""
+
+    def test_preload_one_layer(self, populated_cache):
+        from lmprobe.sharing import _preload_layer
+
+        result = _preload_layer(
+            TEST_MODEL, populated_cache, layer=0,
+            use_raw=False, hidden_strategy="last_token",
+            workers=2,
+        )
+        assert len(result) == 3
+        for tensor in result:
+            assert tensor is not None
+            assert tensor.shape[-1] == HIDDEN_DIM
+
+
+class TestNewPreloadFull:
+    """Cover _preload_full."""
+
+    def test_preload_all_layers(self, populated_cache):
+        from lmprobe.sharing import _preload_full
+
+        result = _preload_full(
+            TEST_MODEL, populated_cache, layers=[0, 1],
+            use_raw=False, hidden_strategy="last_token",
+            workers=2,
+        )
+        assert len(result) == 3
+        for entry in result:
+            assert "hidden.layer_0" in entry
+            assert "hidden.layer_1" in entry
+
+
+class TestNewConsolidatePreloadModes:
+    """Cover preload='per_layer' and preload='full' in _consolidate_and_shard."""
+
+    def test_preload_per_layer(self, populated_cache):
+        tensor_types = {
+            "raw_layers": [],
+            "pooled": {"last_token": [0, 1]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/test-per-layer",
+            preload="per_layer",
+            preload_workers=2,
+        )
+        assert len(prompt_metadata) == 3
+        assert "hidden_layers" in tensor_descriptors
+        for layer in [0, 1]:
+            fname = f"tensors/hidden_layer{layer:03d}_shard000.safetensors"
+            assert (tmpdir / fname).exists()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_preload_full(self, populated_cache):
+        tensor_types = {
+            "raw_layers": [],
+            "pooled": {"last_token": [0, 1]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+        }
+        tmpdir, tensor_descriptors, prompt_metadata = _consolidate_and_shard(
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            kept_indices=[0, 1, 2],
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/test-full",
+            preload="full",
+            preload_workers=2,
+        )
+        assert len(prompt_metadata) == 3
+        assert "hidden_layers" in tensor_descriptors
+        for layer in [0, 1]:
+            fname = f"tensors/hidden_layer{layer:03d}_shard000.safetensors"
+            assert (tmpdir / fname).exists()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@requires_pyarrow
+class TestNewLoadActivationDatasetColocated:
+    """Cover v1.0 co-located layout in load_activation_dataset."""
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_colocated_layout(self, mock_deps, tmp_path):
+        """load_activation_dataset handles co-located (v1.0) layout."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from safetensors.torch import save_file
+
+        from lmprobe.sharing import _embed_metadata_in_schema
+
+        (tmp_path / "tensors").mkdir(parents=True)
+        (tmp_path / "index").mkdir(parents=True)
+
+        tensor = torch.randn(2, HIDDEN_DIM)
+        save_file(
+            {"hidden.layer_0": tensor},
+            str(tmp_path / "tensors" / "shard_000.safetensors"),
+        )
+
+        lmprobe_info = {
+            "format_version": "2.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 2,
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "layout": "co_located",
+                    "pooling": "last_token",
+                    "row_bytes": HIDDEN_DIM * 4,
+                    "shards": [
+                        {
+                            "file": "tensors/shard_000.safetensors",
+                            "num_prompts": 2,
+                        }
+                    ],
+                }
+            },
+            "provenance": {},
+        }
+
+        table = pa.table({
+            "text": pa.array(["p0", "p1"], type=pa.string()),
+            "label": pa.array([1, 0], type=pa.int32()),
+            "num_tokens": pa.array([5, 5], type=pa.int32()),
+            "shard_index": pa.array([0, 0], type=pa.int32()),
+            "row_offset": pa.array([0, 1], type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(tmp_path / filename)
+
+        import warnings as _w
+
+        with (
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=mock_download,
+            ),
+            _w.catch_warnings(record=True),
+        ):
+            result, info = load_activation_dataset(
+                "user/test-colocated",
+                layers=[0],
+            )
+
+        assert "hidden.layer_0" in result
+        assert result["hidden.layer_0"].shape == (2, HIDDEN_DIM)
+        assert torch.allclose(result["hidden.layer_0"], tensor)
+
+    @patch("lmprobe.sharing._check_hub_deps")
+    def test_colocated_layer_filter_warns(self, mock_deps, tmp_path):
+        """layers param on co-located dataset produces a warning."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from safetensors.torch import save_file
+
+        from lmprobe.sharing import _embed_metadata_in_schema
+
+        (tmp_path / "tensors").mkdir(parents=True)
+        (tmp_path / "index").mkdir(parents=True)
+
+        save_file(
+            {"hidden.layer_0": torch.randn(1, HIDDEN_DIM)},
+            str(tmp_path / "tensors" / "shard_000.safetensors"),
+        )
+
+        lmprobe_info = {
+            "format_version": "2.0",
+            "model": {"name": TEST_MODEL, "revision": None},
+            "num_prompts": 1,
+            "tensors": {
+                "hidden_layers": {
+                    "type": "hidden",
+                    "layers": [0],
+                    "dim": HIDDEN_DIM,
+                    "dtype": "float32",
+                    "layout": "co_located",
+                    "pooling": "last_token",
+                    "row_bytes": HIDDEN_DIM * 4,
+                    "shards": [
+                        {
+                            "file": "tensors/shard_000.safetensors",
+                            "num_prompts": 1,
+                        }
+                    ],
+                }
+            },
+            "provenance": {},
+        }
+
+        table = pa.table({
+            "text": pa.array(["p0"], type=pa.string()),
+            "label": pa.array([1], type=pa.int32()),
+            "num_tokens": pa.array([5], type=pa.int32()),
+            "shard_index": pa.array([0], type=pa.int32()),
+            "row_offset": pa.array([0], type=pa.int32()),
+        })
+        table = _embed_metadata_in_schema(table, lmprobe_info)
+        pq.write_table(table, str(tmp_path / PARQUET_PATH))
+
+        def mock_download(repo_id, filename, **kwargs):
+            return str(tmp_path / filename)
+
+        import warnings as _w
+
+        with (
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=mock_download,
+            ),
+            _w.catch_warnings(record=True) as caught,
+        ):
+            _w.simplefilter("always")
+            load_activation_dataset(
+                "user/test-colocated-warn",
+                layers=[0],
+            )
+
+        warn_texts = [str(w.message) for w in caught]
+        assert any(
+            "co-located" in t for t in warn_texts
+        ), f"Expected co-located warning, got: {warn_texts}"
+
+
+class TestNewComputeShardPlanEdgeCases:
+    """Cover _compute_shard_plan edge cases like skipping prompts."""
+
+    def test_skipped_prompts_warning(self, cache_dir, caplog):
+        """Prompts not in cache during metadata scan are skipped."""
+        import logging
+
+        # Create cache with only 1 of 3 prompts
+        prompts = ["cached", "missing1", "missing2"]
+        save_prompt_pooled_activations(
+            TEST_MODEL, "cached", [0], torch.randn(1, HIDDEN_DIM), "last_token"
+        )
+
+        tensor_types = {
+            "pooled": {"last_token": [0]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "raw_layers": [],
+        }
+
+        with caplog.at_level(logging.WARNING, logger="lmprobe.sharing"):
+            plan = _compute_shard_plan(
+                model_name=TEST_MODEL,
+                prompts=prompts,
+                kept_indices=[0, 1, 2],
+                tensor_types=tensor_types,
+                labels=None,
+                shard_max_bytes=1_000_000_000,
+                repo_id="user/test-skip",
+            )
+
+        assert len(plan["prompt_metadata"]) == 1
+        assert "Skipped" in caplog.text
+
+    def test_all_prompts_missing_raises(self, cache_dir):
+        """All prompts missing during metadata scan raises ValueError."""
+        tensor_types = {
+            "pooled": {"last_token": [0]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "raw_layers": [],
+        }
+
+        with pytest.raises(ValueError, match="No prompts could be loaded"):
+            _compute_shard_plan(
+                model_name=TEST_MODEL,
+                prompts=["missing"],
+                kept_indices=[0],
+                tensor_types=tensor_types,
+                labels=None,
+                shard_max_bytes=1_000_000_000,
+                repo_id="user/test-none",
+            )
+
+    def test_no_shuffle_preserves_order(self, populated_cache):
+        tensor_types = {
+            "pooled": {"last_token": [0]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "raw_layers": [],
+        }
+
+        plan = _compute_shard_plan(
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            kept_indices=list(range(len(populated_cache))),
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/test-noshuffle",
+            shuffle=False,
+        )
+
+        output_texts = [p["text"] for p in plan["prompt_metadata"]]
+        assert output_texts == populated_cache
+
+    def test_metadata_forwarded(self, populated_cache):
+        """Extra metadata dicts appear in prompt_metadata."""
+        tensor_types = {
+            "pooled": {"last_token": [0]},
+            "has_logits": False,
+            "logits_top_k": None,
+            "raw_layers": [],
+        }
+        meta = [
+            {"source": "train"},
+            {"source": "train"},
+            {"source": "test"},
+        ]
+
+        plan = _compute_shard_plan(
+            model_name=TEST_MODEL,
+            prompts=populated_cache,
+            kept_indices=list(range(len(populated_cache))),
+            tensor_types=tensor_types,
+            labels=None,
+            shard_max_bytes=1_000_000_000,
+            repo_id="user/test-meta",
+            metadata=meta,
+            shuffle=False,
+        )
+
+        for pm in plan["prompt_metadata"]:
+            assert "source" in pm

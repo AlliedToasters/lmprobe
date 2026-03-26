@@ -1,6 +1,10 @@
 """Tests for layers='sweep' mode (Issue #76)."""
 
+import pytest
+
 from lmprobe import LayerSweepResult, LinearProbe
+
+pytestmark = pytest.mark.nnsight
 
 
 class TestSweepMode:

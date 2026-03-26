@@ -1,6 +1,10 @@
 """Tests for LinearProbe.sweep_layers() per-layer probe sweep."""
 
+import pytest
+
 from lmprobe import LayerSweepResult, LinearProbe
+
+pytestmark = pytest.mark.nnsight
 
 
 class TestSweepLayers:

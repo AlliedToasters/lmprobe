@@ -6,6 +6,8 @@ import pytest
 from lmprobe import LinearProbe
 from lmprobe.classifiers import EnsembleClassifier, build_classifier
 
+pytestmark = pytest.mark.nnsight
+
 
 class TestEnsembleClassifierUnit:
     """Unit tests for EnsembleClassifier with synthetic data."""

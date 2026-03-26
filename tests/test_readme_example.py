@@ -8,6 +8,9 @@ This is the PRIMARY test for the library. All other tests support this one.
 """
 
 import numpy as np
+import pytest
+
+pytestmark = pytest.mark.nnsight
 
 
 def test_readme_example_runs(tiny_model):
