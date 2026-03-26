@@ -751,7 +751,8 @@ class SGDGPUClassifier:
         self._check_fitted()
         assert self.coef_ is not None and self.intercept_ is not None
         X = np.asarray(X, dtype=np.float32)
-        return X @ self.coef_ + self.intercept_[0]
+        scores: np.ndarray = X @ self.coef_ + self.intercept_[0]
+        return scores
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict class labels.
