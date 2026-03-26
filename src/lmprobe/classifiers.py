@@ -573,6 +573,17 @@ class SGDGPUClassifier:
     datasets (100k+ samples). Accepts numpy arrays (sklearn-compatible
     interface) and handles GPU memory management automatically.
 
+    .. note::
+
+        **Binary classification only.** Uses a single output neuron with
+        BCEWithLogitsLoss. ``predict_proba`` returns shape ``(n, 2)``.
+
+    .. note::
+
+        **Regularization convention.** Uses ``weight_decay`` (direct
+        regularization strength), unlike sklearn's ``C`` (inverse).
+        Roughly: ``C ≈ 1 / (n_samples * weight_decay)``.
+
     Parameters
     ----------
     lr : float
@@ -582,7 +593,9 @@ class SGDGPUClassifier:
     batch_size : int
         Minibatch size for SGD.
     weight_decay : float
-        L2 regularization strength (passed to SGD optimizer).
+        L2 regularization strength (passed to SGD optimizer as weight decay).
+        Higher values = stronger regularization. See note above for
+        relationship to sklearn's ``C`` parameter.
     device : str
         PyTorch device. ``"auto"`` selects CUDA if available, else CPU.
     random_state : int | None
@@ -591,9 +604,9 @@ class SGDGPUClassifier:
     Attributes
     ----------
     coef_ : np.ndarray
-        Fitted weights, shape ``(n_features,)``. Stored on CPU.
+        Fitted weights, shape ``(n_features,)``. Stored on CPU as float32.
     intercept_ : np.ndarray
-        Fitted bias, shape ``(1,)``. Stored on CPU.
+        Fitted bias, shape ``(1,)``. Stored on CPU as float32.
     classes_ : np.ndarray
         Class labels ``[0, 1]``.
     """
@@ -738,7 +751,7 @@ class SGDGPUClassifier:
             Logit scores, shape ``(n_samples,)``.
         """
         self._check_fitted()
-        X = np.asarray(X, dtype=np.float64)
+        X = np.asarray(X, dtype=np.float32)
         return X @ self.coef_ + self.intercept_[0]
 
     def predict(self, X: np.ndarray) -> np.ndarray:
