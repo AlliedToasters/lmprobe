@@ -4,6 +4,8 @@ import pytest
 
 from lmprobe import LinearProbe
 
+pytestmark = pytest.mark.nnsight
+
 
 def test_warmup_basic(tiny_model):
     """warmup() runs without error and populates the cache."""
@@ -56,7 +58,7 @@ def test_warmup_requires_model():
         random_state=42,
     )
 
-    with pytest.raises(ValueError, match="No model or dataset specified"):
+    with pytest.raises(ValueError, match="No model specified"):
         probe.warmup(["test prompt"])
 
 

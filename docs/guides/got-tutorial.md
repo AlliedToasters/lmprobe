@@ -73,43 +73,48 @@ print(f"cities: {len(cities_texts)} prompts")
 
 ## Step 2: Train a probe
 
-Split into train/test and fit a probe. Activations are pulled from HuggingFace on demand and cached locally — the first run downloads shards for the selected layer; subsequent runs are instant.
+Split into train/test, load activations from HuggingFace, and fit a probe. `load_activations()` downloads only the shards for the requested layer; subsequent runs hit local cache.
 
 ```python
+import numpy as np
 from sklearn.model_selection import train_test_split
-from lmprobe import Probe
+from lmprobe import load_activations, Probe
 
 train_texts, test_texts, train_labels, test_labels = train_test_split(
     cities_texts, cities_labels, test_size=0.2, random_state=42, stratify=cities_labels
 )
 
-probe = Probe(
-    dataset=DATASET,
-    layers=9,                         # best layer for cities (found via sweep below)
-    pooling="last_token",
-    classifier="logistic_regression",
-    random_state=42,
-)
+# Load layer 9 activations for all cities prompts
+all_cities = train_texts + test_texts
+acts = load_activations(DATASET, layers=[9], prompts=all_cities)
 
-probe.fit(train_texts, train_labels)
-metrics = probe.evaluate(test_texts, test_labels)
-print(f"Accuracy: {metrics['accuracy']:.1%},  AUROC: {metrics['auroc']:.3f}")
-# Accuracy: 95.6%,  AUROC: 0.987
+# Split activations to match train/test
+n_train = len(train_texts)
+X_train, X_test = acts[9][:n_train], acts[9][n_train:]
+
+probe = Probe(classifier="logistic_regression", random_state=42)
+probe.fit_from_activations(X_train, train_labels)
+
+accuracy = probe.score_from_activations(X_test, test_labels)
+print(f"Accuracy: {accuracy:.1%}")
+# Accuracy: 95.6%
 ```
 
 ---
 
 ## Step 3: Find the best layer
 
-Layer 9 wasn't hand-picked — it came from a sweep. `Probe.sweep_layers()` requires a local model, so with a dataset-backed probe we loop manually:
+Layer 9 wasn't hand-picked — it came from a sweep. Load all layers at once and iterate:
 
 ```python
+all_acts = load_activations(DATASET, prompts=all_cities)
+
 scores = {}
-for layer in range(24):
-    p = Probe(dataset=DATASET, layers=layer, pooling="last_token",
-              classifier="logistic_regression", random_state=42)
-    p.fit(train_texts, train_labels)
-    scores[layer] = p.score(test_texts, test_labels)
+for layer, X in all_acts.items():
+    X_train, X_test = X[:n_train], X[n_train:]
+    p = Probe(classifier="logistic_regression", random_state=42)
+    p.fit_from_activations(X_train, train_labels)
+    scores[layer] = p.score_from_activations(X_test, test_labels)
 
 best_layer = max(scores, key=scores.get)
 print(f"Best layer: {best_layer}  ({scores[best_layer]:.1%})")
@@ -124,12 +129,13 @@ Signal emerges sharply around layer 7 and remains high through the middle layers
 ## Step 4: Compare classifiers
 
 ```python
+X_train, X_test = all_acts[9][:n_train], all_acts[9][n_train:]
+
 for clf in ["logistic_regression", "ridge", "svm", "lda", "mass_mean"]:
-    p = Probe(dataset=DATASET, layers=9, classifier=clf, random_state=42)
-    p.fit(train_texts, train_labels)
-    m = p.evaluate(test_texts, test_labels)
-    auroc = f"{m['auroc']:.3f}" if "auroc" in m else "n/a"
-    print(f"  {clf:22s}  acc={m['accuracy']:.1%}  auroc={auroc}")
+    p = Probe(classifier=clf, random_state=42)
+    p.fit_from_activations(X_train, train_labels)
+    acc = p.score_from_activations(X_test, test_labels)
+    print(f"  {clf:22s}  acc={acc:.1%}")
 ```
 
 ![Classifier comparison](../assets/got_classifiers.png)
@@ -151,11 +157,14 @@ for cat in categories:
     t, l = filter_category(cat)
     tr_t, te_t, tr_l, te_l = train_test_split(t, l, test_size=0.2, random_state=42, stratify=l)
 
+    cat_acts = load_activations(DATASET, prompts=tr_t + te_t)
+    n_tr = len(tr_t)
+
     best_acc, best_layer = 0, 0
-    for layer in range(24):
-        p = Probe(dataset=DATASET, layers=layer, classifier="logistic_regression", random_state=42)
-        p.fit(tr_t, tr_l)
-        acc = p.score(te_t, te_l)
+    for layer, X in cat_acts.items():
+        p = Probe(classifier="logistic_regression", random_state=42)
+        p.fit_from_activations(X[:n_tr], tr_l)
+        acc = p.score_from_activations(X[n_tr:], te_l)
         if acc > best_acc:
             best_acc, best_layer = acc, layer
 
@@ -176,10 +185,8 @@ After your first run, activated layers are in your local cache. If you plan to s
 from lmprobe import pull_dataset
 
 n = pull_dataset(DATASET)   # downloads all shards (~few GB)
-print(f"Pulled {n} prompts — all subsequent training runs from local cache")
+print(f"Pulled {n} prompts — all subsequent load_activations() calls from local cache")
 ```
-
-After this, every `Probe(dataset=DATASET, ...)` call hits the local cache with zero network calls.
 
 ---
 

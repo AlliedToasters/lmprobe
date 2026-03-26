@@ -16,16 +16,16 @@ We provide three pooling parameters with a clear hierarchy:
 
 ```python
 # Simple: same strategy for train and inference (most common)
-probe = LinearProbe(pooling="last_token")
+probe = Probe(pooling="last_token")
 
 # Advanced: override for specific phases
-probe = LinearProbe(
+probe = Probe(
     pooling="last_token",        # base strategy
     inference_pooling="max",     # override for predict()
 )
 
 # Explicit: set both independently
-probe = LinearProbe(
+probe = Probe(
     train_pooling="last_token",
     inference_pooling="all",
 )
@@ -53,7 +53,7 @@ Using `train_pooling="all"` treats each token as an independent training example
 
 ```python
 # 10 prompts × 100 tokens = 1,000 training examples
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-8B-Instruct",
     train_pooling="all",
     inference_pooling="max",
@@ -89,7 +89,7 @@ Goal: **Detect the property of interest**, potentially at any point in generatio
 ```python
 # Train on the final token where the "intent" is crystallized
 # At inference, flag if ANY token crosses the threshold
-probe = LinearProbe(
+probe = Probe(
     pooling="last_token",
     inference_pooling="max",
 )
@@ -98,7 +98,7 @@ probe = LinearProbe(
 ### Example: Per-Token Visualization
 
 ```python
-probe = LinearProbe(
+probe = Probe(
     pooling="last_token",
     inference_pooling="all",
 )

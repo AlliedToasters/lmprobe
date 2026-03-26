@@ -68,6 +68,37 @@ class TestRetryWithBackoff:
         warning_msg = mock_logger.warning.call_args[0][0]
         assert "batch 3/10" in warning_msg
 
+    def test_error_logged_on_final_failure(self):
+        """Final failure should log an error message."""
+        fn = MagicMock(side_effect=ConnectionError("permanent"))
+        with patch("lmprobe.retry.time.sleep"):
+            with patch("lmprobe.retry.logger") as mock_logger:
+                with pytest.raises(ConnectionError):
+                    retry_with_backoff(fn, max_retries=2, base_delay=0.01, context="op X")
+        error_msg = mock_logger.error.call_args[0][0]
+        assert "All" in error_msg
+        assert "op X" in error_msg
+
+    def test_error_logged_without_context(self):
+        """Error log works when no context string is given."""
+        fn = MagicMock(side_effect=ValueError("fail"))
+        with patch("lmprobe.retry.time.sleep"):
+            with patch("lmprobe.retry.logger") as mock_logger:
+                with pytest.raises(ValueError):
+                    retry_with_backoff(fn, max_retries=1, base_delay=0.01)
+        error_msg = mock_logger.error.call_args[0][0]
+        assert "All" in error_msg
+
+    def test_jitter_applied(self):
+        """Verify jitter is applied to delay."""
+        fn = MagicMock(side_effect=[ConnectionError("1"), 42])
+        with patch("lmprobe.retry.time.sleep") as mock_sleep:
+            with patch("lmprobe.retry.random.uniform", return_value=0.25):
+                retry_with_backoff(fn, max_retries=1, base_delay=2.0)
+        delay = mock_sleep.call_args[0][0]
+        # base_delay * 2^0 = 2.0, jitter = 2.0 * 0.25 = 0.5, total = 2.5
+        assert delay == pytest.approx(2.5)
+
 
 class TestCachedExtractorRetry:
     """Test that CachedExtractor uses retry for remote extraction."""

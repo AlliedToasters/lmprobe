@@ -17,6 +17,8 @@ Example
 >>> predictions = probe.predict(test_prompts)
 """
 
+from typing import Any
+
 from .activation_baseline import ActivationBaseline
 from .baseline import BaselineProbe
 from .battery import BaselineBattery, BaselineResult, BaselineResults
@@ -30,6 +32,7 @@ except Exception:
     __version__ = "unknown"
 __all__ = [
     "ActivationBaseline",
+    "ActivationStore",
     "BaselineBattery",
     "BaselineProbe",
     "BaselineResult",
@@ -47,7 +50,6 @@ __all__ = [
     "load_layer_last_token",
     "ModelCacheInfo",
     "PerLayerScaler",
-    "ProbeCard",
     "UnifiedCache",
     "WarmupStats",
     "cache_info",
@@ -59,8 +61,7 @@ __all__ = [
     "load_activation_dataset",
     "load_activations",
     "migrate_dataset",
-    "plot_layer_importance",
-    "plot_layer_importance_heatmap",
+    "upgrade_dataset_format",
     "pull_dataset",
     "push_dataset",
     "evict",
@@ -92,15 +93,12 @@ def set_max_threads(n: int) -> None:
         os.environ[var] = str(n)
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     """Lazy import for optional modules."""
-    if name in ("plot_layer_importance", "plot_layer_importance_heatmap"):
-        from .plotting import plot_layer_importance, plot_layer_importance_heatmap
+    if name == "ActivationStore":
+        from .activation_store import ActivationStore
 
-        return {
-            "plot_layer_importance": plot_layer_importance,
-            "plot_layer_importance_heatmap": plot_layer_importance_heatmap,
-        }[name]
+        return ActivationStore
     if name == "PerLayerScaler":
         from .scaling import PerLayerScaler
 
@@ -144,10 +142,6 @@ def __getattr__(name: str):
             "WarmupStats": WarmupStats,
             "CachedLogits": CachedLogits,
         }[name]
-    if name == "ProbeCard":
-        from .hub import ProbeCard
-
-        return ProbeCard
     if name in ("load_layer_across_prompts", "load_layer_last_token"):
         from .cache import load_layer_across_prompts, load_layer_last_token
 
@@ -172,7 +166,7 @@ def __getattr__(name: str):
     if name in (
         "push_dataset", "pull_dataset", "load_activation_dataset",
         "load_activations", "fetch_dataset_metadata", "DatasetMetadata",
-        "migrate_dataset",
+        "migrate_dataset", "upgrade_dataset_format",
     ):
         from .sharing import (
             DatasetMetadata,
@@ -182,6 +176,7 @@ def __getattr__(name: str):
             migrate_dataset,
             pull_dataset,
             push_dataset,
+            upgrade_dataset_format,
         )
 
         return {
@@ -192,5 +187,6 @@ def __getattr__(name: str):
             "fetch_dataset_metadata": fetch_dataset_metadata,
             "DatasetMetadata": DatasetMetadata,
             "migrate_dataset": migrate_dataset,
+            "upgrade_dataset_format": upgrade_dataset_format,
         }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

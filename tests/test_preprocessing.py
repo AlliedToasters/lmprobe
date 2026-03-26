@@ -1,6 +1,10 @@
 """Tests for preprocessing pipeline parameter (Issue #74)."""
 
+import pytest
+
 from lmprobe import LinearProbe
+
+pytestmark = pytest.mark.nnsight
 
 
 class TestPreprocessing:

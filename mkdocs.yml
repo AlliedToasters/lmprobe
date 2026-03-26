@@ -61,10 +61,10 @@ nav:
     - Ensemble: reference/ensemble.md
     - Baseline: reference/baseline.md
     - Datasets: reference/datasets.md
+    - Dataset Format Spec: reference/dataset-format.md
     - Pooling: reference/pooling.md
     - Classifiers: reference/classifiers.md
     - Cache: reference/cache.md
-    - Plotting: reference/plotting.md
     - Scaling: reference/scaling.md
   - Design:
     - API Philosophy: design/001-api-philosophy.md

@@ -138,6 +138,25 @@ def parse_pooling_strategy(strategy: str) -> ParsedPooling:
     )
 
 
+def _last_token_indices(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Return the index of the last non-padding token per row.
+
+    Parameters
+    ----------
+    attention_mask : torch.Tensor
+        Shape (batch, seq_len). 1 for real tokens, 0 for padding.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape (batch,) with the last non-zero index per row.
+    """
+    batch_size = attention_mask.shape[0]
+    return torch.stack(
+        [attention_mask[i].nonzero(as_tuple=True)[0][-1] for i in range(batch_size)]
+    )
+
+
 def pool_last_token(
     activations: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
@@ -161,15 +180,8 @@ def pool_last_token(
         # No padding, just take the last token
         return activations[:, -1, :]
 
-    # Find the last non-padding position for each sequence
-    # Works for both left-padding and right-padding
-    batch_size = activations.shape[0]
-    last_indices = torch.stack(
-        [attention_mask[i].nonzero(as_tuple=True)[0][-1] for i in range(batch_size)]
-    )
-
-    # Gather the last token for each sequence
-    batch_indices = torch.arange(batch_size, device=activations.device)
+    last_indices = _last_token_indices(attention_mask)
+    batch_indices = torch.arange(activations.shape[0], device=activations.device)
     return activations[batch_indices, last_indices, :]
 
 
@@ -418,11 +430,8 @@ def reduce_scores(
     if base == "last_token":
         if attention_mask is None:
             return scores[:, -1] if scores.dim() == 3 else scores[:, -1]
-        batch_size = scores.shape[0]
-        last_indices = torch.stack(
-            [attention_mask[i].nonzero(as_tuple=True)[0][-1] for i in range(batch_size)]
-        )
-        batch_indices = torch.arange(batch_size, device=scores.device)
+        last_indices = _last_token_indices(attention_mask)
+        batch_indices = torch.arange(scores.shape[0], device=scores.device)
         if scores.dim() == 3:
             return scores[batch_indices, last_indices, :]
         return scores[batch_indices, last_indices]

@@ -8,6 +8,9 @@ This is the PRIMARY test for the library. All other tests support this one.
 """
 
 import numpy as np
+import pytest
+
+pytestmark = pytest.mark.nnsight
 
 
 def test_readme_example_runs(tiny_model):
@@ -16,7 +19,7 @@ def test_readme_example_runs(tiny_model):
     This test mirrors the exact usage pattern from README.md,
     substituting the tiny test model for the full Llama model.
     """
-    from lmprobe import LinearProbe
+    from lmprobe import Probe
 
     positive_prompts = [
         "Who wants to go for a walk?",
@@ -34,7 +37,7 @@ def test_readme_example_runs(tiny_model):
     ]
 
     # Configure the probe (mirrors README, with test-appropriate values)
-    probe = LinearProbe(
+    probe = Probe(
         model=tiny_model,
         layers=-1,  # Last layer (tiny model has few layers)
         pooling="last_token",
@@ -72,9 +75,9 @@ def test_readme_example_runs(tiny_model):
 
 def test_readme_save_load(tiny_model, tmp_path):
     """The save/load functionality from README works."""
-    from lmprobe import LinearProbe
+    from lmprobe import Probe
 
-    probe = LinearProbe(
+    probe = Probe(
         model=tiny_model,
         layers=-1,
         pooling="last_token",
@@ -89,7 +92,7 @@ def test_readme_save_load(tiny_model, tmp_path):
     save_path = tmp_path / "test_probe.pkl"
     probe.save(str(save_path))
 
-    loaded_probe = LinearProbe.load(str(save_path))
+    loaded_probe = Probe.load(str(save_path))
 
     # Loaded probe should produce same predictions
     original_pred = probe.predict(["test input"])
@@ -100,9 +103,9 @@ def test_readme_save_load(tiny_model, tmp_path):
 
 def test_readme_different_pooling(tiny_model):
     """Different train vs inference pooling from README works."""
-    from lmprobe import LinearProbe
+    from lmprobe import Probe
 
-    probe = LinearProbe(
+    probe = Probe(
         model=tiny_model,
         layers=-1,
         pooling="last_token",
@@ -120,9 +123,9 @@ def test_readme_different_pooling(tiny_model):
 
 def test_readme_per_token_scores(tiny_model):
     """Per-token scoring with inference_pooling='all' works."""
-    from lmprobe import LinearProbe
+    from lmprobe import Probe
 
-    probe = LinearProbe(
+    probe = Probe(
         model=tiny_model,
         layers=-1,
         pooling="last_token",
@@ -144,9 +147,9 @@ def test_readme_per_token_scores(tiny_model):
 
 def test_readme_multilayer(tiny_model):
     """Multi-layer probing (concatenation) works."""
-    from lmprobe import LinearProbe
+    from lmprobe import Probe
 
-    probe = LinearProbe(
+    probe = Probe(
         model=tiny_model,
         layers=[-2, -1],  # Last two layers, concatenated
         pooling="last_token",

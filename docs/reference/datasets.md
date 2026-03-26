@@ -23,6 +23,15 @@ See the [HuggingFace Datasets guide](../guides/datasets.md) for a walkthrough.
 
 ---
 
+## Loading
+
+::: lmprobe.sharing.load_activations
+    options:
+      show_root_heading: true
+      show_source: false
+
+---
+
 ## Publishing
 
 ::: lmprobe.sharing.push_dataset
@@ -41,6 +50,16 @@ See the [HuggingFace Datasets guide](../guides/datasets.md) for a walkthrough.
       show_source: false
 
 ::: lmprobe.sharing.fetch_dataset_metadata
+    options:
+      show_root_heading: true
+      show_source: false
+
+::: lmprobe.sharing.migrate_dataset
+    options:
+      show_root_heading: true
+      show_source: false
+
+::: lmprobe.sharing.upgrade_dataset_format
     options:
       show_root_heading: true
       show_source: false

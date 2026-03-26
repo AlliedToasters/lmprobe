@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import math
 import pickle
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -97,7 +97,7 @@ class ProbeEnsemble:
         configs: list[dict],
         weights: list[float] | None = None,
         voting: str = "soft",
-        **shared_kwargs,
+        **shared_kwargs: Any,
     ) -> ProbeEnsemble:
         """Create an ensemble from per-probe config dicts.
 
@@ -190,6 +190,7 @@ class ProbeEnsemble:
 
         all_layers = sorted(set(all_layer_sets))
 
+        assert any_probe.model is not None
         warmup_extractor = ActivationExtractor(
             model_name=any_probe.model,
             device=any_probe.device,
@@ -248,7 +249,8 @@ class ProbeEnsemble:
         ):
             all_prompts = list(positive_prompts)
         else:
-            all_prompts = list(positive_prompts) + list(negative_prompts)
+            assert negative_prompts is not None
+            all_prompts = list(positive_prompts) + list(negative_prompts)  # type: ignore[arg-type]
 
         # Validate sample_weight length
         if sample_weight is not None:
@@ -288,12 +290,12 @@ class ProbeEnsemble:
                     stacklevel=2,
                 )
             for probe in self.probes_:
-                kwargs = {}
+                fit_kwargs: dict[str, Any] = {}
                 if remote is not None:
-                    kwargs["remote"] = remote
+                    fit_kwargs["remote"] = remote
                 if sample_weight is not None:
-                    kwargs["sample_weight"] = sample_weight
-                probe.fit(positive_prompts, negative_prompts, **kwargs)
+                    fit_kwargs["sample_weight"] = sample_weight
+                probe.fit(positive_prompts, negative_prompts, **fit_kwargs)
 
         self._fitted = True
         return self
@@ -308,6 +310,7 @@ class ProbeEnsemble:
     ) -> None:
         """Fit each probe on a bootstrap resample of the training data."""
         # Build combined prompts and labels
+        labels: np.ndarray
         if isinstance(negative_prompts, (np.ndarray, list)) and (
             len(negative_prompts) > 0
             and isinstance(negative_prompts[0], (int, np.integer))
@@ -315,8 +318,9 @@ class ProbeEnsemble:
             prompts = list(positive_prompts)
             labels = np.asarray(negative_prompts)
         else:
-            prompts = list(positive_prompts) + list(negative_prompts)
-            labels = np.array(
+            assert negative_prompts is not None
+            prompts = list(positive_prompts) + list(negative_prompts)  # type: ignore[arg-type]
+            labels = np.asarray(
                 [1] * len(positive_prompts) + [0] * len(negative_prompts)
             )
 
@@ -339,12 +343,12 @@ class ProbeEnsemble:
             resampled_prompts = [prompts[i] for i in indices]
             resampled_labels = labels[indices]
 
-            kwargs = {}
+            fit_kwargs: dict[str, Any] = {}
             if remote is not None:
-                kwargs["remote"] = remote
+                fit_kwargs["remote"] = remote
             if sample_weight is not None:
-                kwargs["sample_weight"] = sample_weight[indices]
-            probe.fit(resampled_prompts, resampled_labels, **kwargs)
+                fit_kwargs["sample_weight"] = sample_weight[indices]
+            probe.fit(resampled_prompts, resampled_labels, **fit_kwargs)
 
     @staticmethod
     def _group_balanced_resample(
@@ -425,7 +429,8 @@ class ProbeEnsemble:
             p = probe.predict_proba(prompts, **kwargs)
             probas.append(self.weights_[i] * p)
 
-        return np.sum(probas, axis=0)
+        result: np.ndarray = np.sum(probas, axis=0)
+        return result
 
     def predict(
         self,
@@ -455,7 +460,9 @@ class ProbeEnsemble:
             proba = self.predict_proba(prompts, remote=remote)
             # Get classes from first probe
             classes = self.probes_[0].classes_
-            return classes[proba.argmax(axis=1)]
+            assert classes is not None
+            result: np.ndarray = classes[proba.argmax(axis=1)]
+            return result
         else:
             # Hard voting: majority vote
             self._warmup_cache(prompts)
@@ -471,8 +478,9 @@ class ProbeEnsemble:
             # For each sample, take the mode
             from scipy.stats import mode
 
-            result = mode(all_preds, axis=0, keepdims=False)
-            return result.mode
+            mode_result = mode(all_preds, axis=0, keepdims=False)
+            out: np.ndarray = mode_result.mode
+            return out
 
     def score(
         self,
@@ -538,7 +546,8 @@ class ProbeEnsemble:
 
         # (n_probes, n_samples)
         stacked = np.array(per_probe_pos_proba)
-        return np.std(stacked, axis=0)
+        out: np.ndarray = np.std(stacked, axis=0)
+        return out
 
     def save(self, path: str) -> None:
         """Save the fitted ensemble to disk.

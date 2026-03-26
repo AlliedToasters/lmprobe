@@ -84,10 +84,10 @@ At `__init__` time (when model is loaded):
 
 ```python
 # Error: layer out of range
-LinearProbe(model="gpt2", layers=50)  # GPT-2 has 12 layers → ValueError
+Probe(model="gpt2", layers=50)  # GPT-2 has 12 layers → ValueError
 
 # Warning: probing layer 0 (usually not useful)
-LinearProbe(model="...", layers=0)  # UserWarning: Layer 0 is immediately post-embedding
+Probe(model="...", layers=0)  # UserWarning: Layer 0 is immediately post-embedding
 ```
 
 ### Deferred Validation with `remote=True`
@@ -99,7 +99,7 @@ When using remote execution via nnsight, the model architecture may not be known
 
 ```python
 # Remote model - validation deferred
-probe = LinearProbe(
+probe = Probe(
     model="meta-llama/Llama-3.1-70B-Instruct",
     layers="middle",
     remote=True,  # Model not loaded locally

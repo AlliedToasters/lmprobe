@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy.sparse import issparse
+from scipy.sparse import issparse, spmatrix
 from sklearn.base import clone
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.dummy import DummyClassifier
@@ -220,8 +220,9 @@ class BaselineProbe:
             Predicted class labels, shape (n_prompts,).
         """
         self._check_fitted()
+        assert self.classifier_ is not None
         X = self._transform(prompts)
-        return self.classifier_.predict(X)
+        return np.asarray(self.classifier_.predict(X))
 
     def predict_proba(self, prompts: list[str]) -> np.ndarray:
         """Predict class probabilities for prompts.
@@ -242,6 +243,7 @@ class BaselineProbe:
             If the classifier doesn't support predict_proba.
         """
         self._check_fitted()
+        assert self.classifier_ is not None
 
         if not hasattr(self.classifier_, "predict_proba"):
             raise AttributeError(
@@ -250,7 +252,7 @@ class BaselineProbe:
             )
 
         X = self._transform(prompts)
-        return self.classifier_.predict_proba(X)
+        return np.asarray(self.classifier_.predict_proba(X))
 
     def score(self, prompts: list[str], labels: list[int] | np.ndarray) -> float:
         """Compute classification accuracy.
@@ -277,6 +279,7 @@ class BaselineProbe:
         feature_method = self.base_method if self.method == "shuffled_labels" else self.method
 
         if feature_method in ("bow", "tfidf"):
+            assert self.vectorizer_ is not None
             X = self.vectorizer_.transform(prompts)
             return self._ensure_dense_if_needed(X)
         elif feature_method == "sentence_length":
@@ -289,10 +292,10 @@ class BaselineProbe:
             # random/majority
             return np.zeros((len(prompts), 1))
 
-    def _ensure_dense_if_needed(self, X: np.ndarray) -> np.ndarray:
+    def _ensure_dense_if_needed(self, X: np.ndarray | spmatrix) -> np.ndarray | spmatrix:
         """Convert sparse matrix to dense if classifier requires it."""
         if issparse(X) and isinstance(self._classifier_template, LinearDiscriminantAnalysis):
-            return X.toarray()
+            return X.toarray()  # type: ignore[union-attr]
         return X
 
     def _extract_sentence_length_features(self, prompts: list[str]) -> np.ndarray:
@@ -317,6 +320,7 @@ class BaselineProbe:
         Results are cached per-prompt to disk to avoid redundant NDIF calls
         and enable cross-run reuse.
         """
+        assert self.model is not None
         import torch
         from tqdm import tqdm
 
@@ -395,7 +399,9 @@ class BaselineProbe:
                 logits = model.lm_head.output.save()
 
             # Unwrap proxy if needed
-            logits_val = logits.value if hasattr(logits, "value") else logits
+            from .extraction import _unwrap_proxy
+
+            logits_val = _unwrap_proxy(logits)
 
             # Compute per-token cross-entropy loss
             # Shift logits and labels for next-token prediction
@@ -448,6 +454,7 @@ class BaselineProbe:
 
         Returns number of prompts computed this way.
         """
+        assert self.model is not None
         import torch
 
         from .cache import save_prompt_perplexity
@@ -471,11 +478,14 @@ class BaselineProbe:
         from .logit_utils import compute_perplexity_from_activations
 
         with torch.no_grad():
-            ppl_tensors = compute_perplexity_from_activations(
+            ppl_results = compute_perplexity_from_activations(
                 self.model, prompts_with_acts, last_layer, device="cpu",
             )
 
         # Save results and update features array
+        # ppl_results is list[Tensor] when return_per_token=False (the default)
+        assert isinstance(ppl_results, list)
+        ppl_tensors: list[torch.Tensor] = ppl_results
         prompt_to_idx = dict(zip(uncached_prompts, uncached_indices))
         for prompt, ppl_tensor in zip(prompts_with_acts, ppl_tensors):
             save_prompt_perplexity(self.model, prompt, ppl_tensor)
@@ -518,7 +528,8 @@ class BaselineProbe:
             # Use a small, fast model by default
             self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-        embeddings = self._st_model.encode(prompts, show_progress_bar=False)
+        assert self._st_model is not None
+        embeddings: np.ndarray = self._st_model.encode(prompts, show_progress_bar=False)
         return embeddings
 
     def _check_fitted(self) -> None:
@@ -538,7 +549,8 @@ class BaselineProbe:
         """
         if self.vectorizer_ is None:
             return None
-        return self.vectorizer_.get_feature_names_out().tolist()
+        names: list[str] = self.vectorizer_.get_feature_names_out().tolist()
+        return names
 
     def get_top_features(self, n: int = 20) -> dict[str, list[tuple[str, float]]] | None:
         """Get top features by classifier weight for each class.
@@ -563,6 +575,8 @@ class BaselineProbe:
             return None
 
         feature_names = self.get_feature_names()
+        if feature_names is None:
+            return None
         coef = self.classifier_.coef_.ravel()
 
         # Get indices sorted by weight

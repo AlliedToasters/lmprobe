@@ -6,6 +6,8 @@ import pytest
 from lmprobe import LinearProbe
 from lmprobe.classifiers import EnsembleClassifier, build_classifier
 
+pytestmark = pytest.mark.nnsight
+
 
 class TestEnsembleClassifierUnit:
     """Unit tests for EnsembleClassifier with synthetic data."""
@@ -164,67 +166,11 @@ class TestEnsembleBuildClassifier:
 
 
 class TestEnsembleWithLinearProbe:
-    """Integration tests: ensemble classifier through the LinearProbe API."""
+    """Integration tests: ensemble classifier through the LinearProbe API.
 
-    def test_ensemble_fit_predict(self, tiny_model):
-        """Ensemble classifier works through LinearProbe fit/predict."""
-        probe = LinearProbe(
-            model=tiny_model,
-            layers=-1,
-            classifier="ensemble",
-            device="cpu",
-            remote=False,
-            random_state=42,
-        )
-
-        probe.fit(
-            ["positive one", "positive two"],
-            ["negative one", "negative two"],
-        )
-        predictions = probe.predict(["test input"])
-
-        assert predictions.shape == (1,)
-        assert predictions[0] in [0, 1]
-
-    def test_ensemble_predict_proba(self, tiny_model):
-        """predict_proba works through LinearProbe with ensemble."""
-        probe = LinearProbe(
-            model=tiny_model,
-            layers=-1,
-            classifier="ensemble",
-            device="cpu",
-            remote=False,
-            random_state=42,
-        )
-
-        probe.fit(
-            ["positive one", "positive two"],
-            ["negative one", "negative two"],
-        )
-        probas = probe.predict_proba(["test one", "test two"])
-
-        assert probas.shape == (2, 2)
-        np.testing.assert_allclose(probas.sum(axis=1), 1.0, atol=1e-10)
-
-    def test_ensemble_score(self, tiny_model):
-        """score() works through LinearProbe with ensemble."""
-        probe = LinearProbe(
-            model=tiny_model,
-            layers=-1,
-            classifier="ensemble",
-            device="cpu",
-            remote=False,
-            random_state=42,
-        )
-
-        probe.fit(
-            ["positive one", "positive two"],
-            ["negative one", "negative two"],
-        )
-        accuracy = probe.score(["test one", "test two"], [1, 0])
-
-        assert isinstance(accuracy, float)
-        assert 0.0 <= accuracy <= 1.0
+    Basic fit/predict/score are covered by test_classifiers.py parametrized tests.
+    Only ensemble-specific kwargs tested here.
+    """
 
     def test_ensemble_with_custom_kwargs(self, tiny_model):
         """Custom C_values and solver work through classifier_kwargs."""

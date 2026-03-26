@@ -7,7 +7,7 @@ from specified layers. Supports both local and remote execution.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from tqdm import tqdm
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from nnsight import LanguageModel
 
 
-def _require_nnsight():
+def _require_nnsight() -> Any:
     """Import and return the nnsight module, raising a clear error if not installed."""
     try:
         import nnsight
@@ -29,7 +29,7 @@ def _require_nnsight():
 
 
 # Global model cache to avoid loading the same model multiple times
-# Key: (model_name, device), Value: LanguageModel
+# Key: (model_name, device, remote), Value: LanguageModel
 _MODEL_CACHE: dict = {}
 
 
@@ -130,7 +130,7 @@ def get_num_layers_from_config(model_name: str) -> int:
     # Try common ones in order of prevalence
     for attr in ("num_hidden_layers", "n_layer", "num_layers", "n_layers"):
         if hasattr(config, attr):
-            return getattr(config, attr)
+            return int(getattr(config, attr))
 
     raise ValueError(
         f"Could not determine layer count from config for {model_name}. "
@@ -204,17 +204,17 @@ def resolve_auto_candidates(
             resolved.append(idx)
     else:
         # Integer mode
-        for idx in candidates:
-            idx = int(idx)
+        for c in candidates:
+            layer_idx = int(c)
             # Handle negative indexing
-            if idx < 0:
-                idx = num_layers + idx
-            if not (0 <= idx < num_layers):
+            if layer_idx < 0:
+                layer_idx = num_layers + layer_idx
+            if not (0 <= layer_idx < num_layers):
                 raise ValueError(
-                    f"Layer index {idx} out of range for model with {num_layers} layers. "
+                    f"Layer index {layer_idx} out of range for model with {num_layers} layers. "
                     f"Valid range: [0, {num_layers - 1}] or [-{num_layers}, -1]"
                 )
-            resolved.append(idx)
+            resolved.append(layer_idx)
 
     # Remove duplicates and sort
     return sorted(set(resolved))
@@ -344,6 +344,7 @@ def load_model(
         check_cuda_compatibility(device)
 
         # Local execution - load weights to specified device
+        device_map: str | dict[str, str]
         if device == "auto":
             device_map = "auto"
         elif device == "cpu":
@@ -380,7 +381,7 @@ def _build_remote_extract_fn(
     layer_indices: list[int],
     with_logits: bool = False,
     logit_top_k: int | None = None,
-):
+) -> Any:
     """Build a trace function for remote nnsight execution.
 
     nnsight's remote tracing serializes the source code inside the
@@ -462,6 +463,8 @@ def _build_remote_extract_fn(
     tmp.close()
 
     spec = importlib.util.spec_from_file_location("_lmprobe_remote", tmp_path)
+    assert spec is not None, f"Failed to create module spec from {tmp_path}"
+    assert spec.loader is not None, f"Module spec has no loader for {tmp_path}"
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
@@ -471,7 +474,7 @@ def _build_remote_extract_fn(
     # (i.e., after the wrapper returns).
     _extract_fn = mod.extract
 
-    def _wrapper(model, tokenized):
+    def _wrapper(model: Any, tokenized: Any) -> Any:
         try:
             return _extract_fn(model, tokenized)
         finally:
@@ -485,11 +488,16 @@ def _build_remote_extract_fn(
     return _wrapper
 
 
+def _unwrap_proxy(x: Any) -> Any:
+    """Unwrap an nnsight proxy to a plain tensor if needed."""
+    return x.value if hasattr(x, "value") else x
+
+
 def _unwrap_layer_outputs(raw_outputs: list) -> list[torch.Tensor]:
     """Unwrap proxy / tuple layer outputs into plain tensors."""
     tensors = []
     for raw in raw_outputs:
-        val = raw.value if hasattr(raw, "value") else raw
+        val = _unwrap_proxy(raw)
         if isinstance(val, tuple):
             val = val[0]
         tensors.append(val)
@@ -551,13 +559,9 @@ def _extract_batch(
             else:
                 output = entry["output"]
 
-            if isinstance(output, tuple):
-                tensor = output[0]
-            else:
-                tensor = output
-
-            if hasattr(tensor, "value"):
-                tensor = tensor.value
+            tensor = _unwrap_proxy(output)
+            if isinstance(tensor, tuple):
+                tensor = tensor[0]
 
             activation_tensors.append(tensor)
 
@@ -573,7 +577,7 @@ def _extract_batch_with_logits(
     layer_indices: list[int],
     remote: bool = False,
     logit_top_k: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Extract activations AND logits for a single batch of prompts.
 
     This function captures both layer activations and the lm_head output
@@ -588,6 +592,7 @@ def _extract_batch_with_logits(
         List of text prompts (should be a small batch).
     layer_indices : list[int]
         List of layer indices to extract from (must be positive).
+        Pass an empty list to extract logits only (no activations).
     remote : bool
         Whether to use remote execution.
     logit_top_k : int | None
@@ -598,8 +603,9 @@ def _extract_batch_with_logits(
 
     Returns
     -------
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
-        - activations: Shape (batch, seq_len, hidden_dim * num_layers)
+    tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]
+        - activations: Shape (batch, seq_len, hidden_dim * num_layers),
+          or None when layer_indices is empty
         - attention_mask: Shape (batch, seq_len)
         - logits: Shape (batch, seq_len, vocab_size) when logit_top_k is None,
           or (batch, seq_len, K) top-k values when logit_top_k is set
@@ -625,48 +631,44 @@ def _extract_batch_with_logits(
         if logit_top_k is not None:
             # logits_proxy is a (values, indices) tuple from server-side topk
             vals_proxy, idxs_proxy = logits_proxy
-            logits_val = (
-                vals_proxy.value if hasattr(vals_proxy, "value") else vals_proxy
-            )
-            logits_indices = (
-                idxs_proxy.value if hasattr(idxs_proxy, "value") else idxs_proxy
-            )
+            logits_val = _unwrap_proxy(vals_proxy)
+            logits_indices = _unwrap_proxy(idxs_proxy)
         else:
-            logits_val = (
-                logits_proxy.value
-                if hasattr(logits_proxy, "value")
-                else logits_proxy
-            )
+            logits_val = _unwrap_proxy(logits_proxy)
     else:
         modules_to_cache = [model.model.layers[i] for i in layer_indices]
 
-        with model.trace(tokenized, remote=False) as tracer:
-            cache = tracer.cache(modules=modules_to_cache).save()
-            logits = model.lm_head.output.save()
+        if modules_to_cache:
+            with model.trace(tokenized, remote=False) as tracer:
+                cache = tracer.cache(modules=modules_to_cache).save()
+                logits = model.lm_head.output.save()
+        else:
+            with model.trace(tokenized, remote=False) as tracer:
+                logits = model.lm_head.output.save()
 
         activation_tensors = []
-        for layer_idx in layer_indices:
-            key = f"model.model.layers.{layer_idx}"
-            entry = cache[key]
+        if modules_to_cache:
+            for layer_idx in layer_indices:
+                key = f"model.model.layers.{layer_idx}"
+                entry = cache[key]
 
-            if hasattr(entry, "output"):
-                output = entry.output
-            else:
-                output = entry["output"]
+                if hasattr(entry, "output"):
+                    output = entry.output
+                else:
+                    output = entry["output"]
 
-            if isinstance(output, tuple):
-                tensor = output[0]
-            else:
-                tensor = output
+                tensor = _unwrap_proxy(output)
+                if isinstance(tensor, tuple):
+                    tensor = tensor[0]
 
-            if hasattr(tensor, "value"):
-                tensor = tensor.value
+                activation_tensors.append(tensor)
 
-            activation_tensors.append(tensor)
+        logits_val = _unwrap_proxy(logits)
 
-        logits_val = logits.value if hasattr(logits, "value") else logits
-
-    combined = torch.cat(activation_tensors, dim=-1)
+    if activation_tensors:
+        combined = torch.cat(activation_tensors, dim=-1)
+    else:
+        combined = None
     attention_mask = tokenized["attention_mask"]
 
     return combined, attention_mask, logits_val, logits_indices
@@ -921,7 +923,7 @@ class ActivationExtractor:
         return self._backend.model
 
     @property
-    def tokenizer(self):
+    def tokenizer(self) -> Any:
         """Get the model's tokenizer."""
         return self._backend.tokenizer
 
@@ -944,7 +946,7 @@ class ActivationExtractor:
         self,
         prompts: list[str],
         layer_indices: list[int],
-        **kwargs,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract activations for a single batch of prompts.
 
@@ -970,8 +972,8 @@ class ActivationExtractor:
         self,
         prompts: list[str],
         layer_indices: list[int],
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Extract activations AND logits for a single batch of prompts.
 
         Delegates to the configured backend.
@@ -981,18 +983,49 @@ class ActivationExtractor:
         prompts : list[str]
             List of text prompts.
         layer_indices : list[int]
-            Layer indices to extract from.
+            Layer indices to extract from. Pass an empty list to
+            extract logits only (no activations).
         **kwargs
             Backend-specific parameters (e.g., logit_top_k).
 
         Returns
         -------
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
-            (activations, attention_mask, logits, logits_indices)
+        tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]
+            (activations, attention_mask, logits, logits_indices).
+            activations is None when layer_indices is empty.
         """
         return self._backend.extract_batch_with_logits(
             prompts, layer_indices, **kwargs
         )
+
+    def extract_logits_only(
+        self,
+        prompts: list[str],
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Extract only logits, skipping layer activation extraction.
+
+        This is a convenience wrapper around ``extract_batch_with_logits``
+        with ``layer_indices=[]``. Use this when you only need logit
+        outputs (e.g., for validation via token probabilities) and want
+        to avoid downloading large activation tensors.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            List of text prompts.
+        **kwargs
+            Backend-specific parameters (e.g., logit_top_k, remote).
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+            (logits, attention_mask, logits_indices).
+        """
+        _, attention_mask, logits, logits_indices = (
+            self._backend.extract_batch_with_logits(prompts, [], **kwargs)
+        )
+        return logits, attention_mask, logits_indices
 
     def extract(
         self,

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lmprobe"
-version = "0.8.9"
+version = "0.9.0"
 description = "Train probes on language model activations for AI safety monitoring"
 readme = "README.md"
 license = "MIT"
@@ -21,7 +21,7 @@ keywords = [
     "language-models",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -52,32 +52,26 @@ s3 = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "diff-cover>=9.0",
     "ruff>=0.1",
     "black>=23.0",
     "moto[s3]>=5.0",
+    "mypy>=1.10",
 ]
 auto = [
     "skglm>=0.3",
-]
-plot = [
-    "matplotlib>=3.5",
-    "seaborn>=0.12",
 ]
 embeddings = [
     "sentence-transformers>=2.0",
 ]
 hub = [
     "huggingface_hub>=0.20",
-    "skops>=0.9",
 ]
 docs = [
     "mkdocs-material>=9.0",
     "mkdocstrings[python]>=0.24",
     "mkdocs-section-index>=0.3",
 ]
-
-[project.scripts]
-lmprobe = "lmprobe.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/AlliedToasters/lmprobe"
@@ -92,6 +86,8 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
     "remote: marks tests that require NDIF remote execution (deselect with '-m \"not remote\"')",
+    "nnsight: marks tests that load a model via nnsight (disables coverage.py tracing)",
+    "gpu: marks tests that require a compatible CUDA GPU (deselect with '-m \"not gpu\"')",
 ]
 
 [tool.ruff]
@@ -105,3 +101,14 @@ ignore = ["N803", "N806"]  # Allow uppercase X, X_train etc. (sklearn convention
 [tool.black]
 line-length = 100
 target-version = ["py310"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true

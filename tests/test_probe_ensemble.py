@@ -5,30 +5,13 @@ import tempfile
 
 import numpy as np
 import pytest
+from conftest import NEGATIVE_PROMPTS as NEG
+from conftest import POSITIVE_PROMPTS as POS
+from conftest import TEST_PROMPTS
 
 from lmprobe import Probe, ProbeEnsemble
 
-# ── Fixtures ──────────────────────────────────────────────────────────
-
-POS = [
-    "Who wants to go for a walk?",
-    "My tail is wagging with delight.",
-    "Fetch the ball!",
-    "Good boy!",
-    "Slobbering, chewing, growling, barking.",
-]
-
-NEG = [
-    "Enjoys lounging in the sun beam all day.",
-    "Purring, stalking, pouncing, scratching.",
-    "Uses a litterbox, throws sand all over the room.",
-    "Tail raised, back arched, eyes alert, whiskers forward.",
-]
-
-TEST_PROMPTS = [
-    "Arf! Arf! Let's go outside!",
-    "Knocking things off the counter for sport.",
-]
+pytestmark = pytest.mark.nnsight
 
 
 @pytest.fixture

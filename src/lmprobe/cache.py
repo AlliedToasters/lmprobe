@@ -31,13 +31,19 @@ Features:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .extraction import ActivationExtractor
+
 import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -593,6 +599,17 @@ def _prepare_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return t
 
 
+def _touch_and_load(
+    key: str, tensor_keys: list[str] | None = None,
+) -> dict[str, torch.Tensor] | None:
+    """If *key* exists in the backend, touch it and load tensors. Otherwise return None."""
+    backend = get_backend()
+    if backend.exists(key):
+        backend.touch(key)
+        return _load_tensors_from_backend(key, tensor_keys)
+    return None
+
+
 def _save_tensors_to_backend(key: str, tensors: dict[str, torch.Tensor]) -> None:
     """Save tensors to the backend as safetensors bytes."""
     from safetensors.torch import save
@@ -1054,44 +1071,11 @@ def _load_sf_keys(path: Path) -> set[str]:
         return set(f.keys())
 
 
-def _load_sf_tensor(path: Path, key: str) -> torch.Tensor:
-    """Load a single tensor by key."""
-    from safetensors import safe_open
-
-    with safe_open(str(path), framework="pt") as f:
-        return f.get_tensor(key)
-
-
-def _load_sf_tensors(path: Path, keys: list[str]) -> dict[str, torch.Tensor]:
-    """Load multiple tensors by key."""
-    from safetensors import safe_open
-
-    result = {}
-    with safe_open(str(path), framework="pt") as f:
-        available = set(f.keys())
-        for k in keys:
-            if k not in available:
-                raise KeyError(
-                    f"Corrupted or incomplete cache file {path}: "
-                    f"missing key {k!r}. Available keys: {sorted(available)}. "
-                    f"Delete this file and re-run to rebuild the cache."
-                )
-            result[k] = f.get_tensor(k)
-    return result
-
-
 def _load_sf_all(path: Path) -> dict[str, torch.Tensor]:
     """Load all tensors from safetensors file."""
     from safetensors.torch import load_file
 
     return load_file(str(path))
-
-
-def _merge_save(path: Path, new_tensors: dict[str, torch.Tensor]) -> None:
-    """Load existing safetensors, merge with new tensors, and save atomically."""
-    existing = _load_sf_all(path) if path.exists() else {}
-    existing.update(new_tensors)
-    _safe_save_file(existing, path)
 
 
 # =============================================================================
@@ -1356,7 +1340,7 @@ def _load_shard_manifest(model_name: str, repo_id: str | None = None) -> dict | 
             return _load_shard_manifest(model_name, repo_id=None)
         return None
 
-    manifest = json.loads(backend.read_text(key))
+    manifest: dict[str, Any] = json.loads(backend.read_text(key))
     _shard_manifests[cache_key] = manifest
     return manifest
 
@@ -1371,7 +1355,7 @@ def _load_shard_index(model_name: str) -> dict | None:
     if not backend.exists(key):
         return None
 
-    index = json.loads(backend.read_text(key))
+    index: dict[str, Any] = json.loads(backend.read_text(key))
     _shard_indices[model_name] = index
     return index
 
@@ -1392,6 +1376,47 @@ def _lookup_shard(
         return None
     prompt_hash = _hash_string(prompt)
     return index.get(prompt_hash)
+
+
+def _resolve_shard_tensor_info(
+    model_name: str,
+    prompt: str,
+    tensor_type: str,
+) -> tuple[dict, dict, dict]:
+    """Look up shard entry, manifest, and tensor descriptor.
+
+    Parameters
+    ----------
+    model_name : str
+    prompt : str
+    tensor_type : str
+        E.g. "hidden_layers" or "logits_topk".
+
+    Returns
+    -------
+    tuple[dict, dict, dict]
+        (entry, manifest, tensor_info)
+
+    Raises
+    ------
+    FileNotFoundError
+        If entry, manifest, or tensor_type is missing.
+    """
+    entry = _lookup_shard(model_name, prompt)
+    if entry is None:
+        raise FileNotFoundError(
+            f"No shard entry found for prompt: {prompt!r}"
+        )
+
+    manifest = _load_shard_manifest(model_name, repo_id=entry.get("repo_id"))
+    if manifest is None:
+        raise FileNotFoundError("No shard manifest found")
+
+    t_info = manifest.get("tensors", {}).get(tensor_type)
+    if t_info is None:
+        raise FileNotFoundError(f"No {tensor_type} in shard manifest")
+
+    return entry, manifest, t_info
 
 
 def _discover_from_shard(model_name: str, prompt: str) -> CachedPromptInfo | None:
@@ -1439,6 +1464,73 @@ def _discover_from_shard(model_name: str, prompt: str) -> CachedPromptInfo | Non
     )
 
 
+# =============================================================================
+# Shared shard tensor helpers
+# =============================================================================
+
+_SHARD_LAYER_RE = re.compile(r"^hidden\.layer_(\d+)$")
+
+
+def _parse_shard_layer_nums(keys: Iterable[str]) -> list[int]:
+    """Extract sorted layer numbers from shard tensor keys like ``hidden.layer_N``."""
+    layers = []
+    for k in keys:
+        m = _SHARD_LAYER_RE.match(k)
+        if m:
+            layers.append(int(m.group(1)))
+    return sorted(layers)
+
+
+def _slice_hidden_from_tensors(
+    tensors: dict[str, torch.Tensor],
+    layers: list[int] | None,
+    slice_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> list[tuple[int, torch.Tensor]]:
+    """Extract hidden layer slices from a pre-loaded tensor dict.
+
+    Parameters
+    ----------
+    tensors : dict
+        Mapping ``"hidden.layer_N"`` → tensor (from a safetensors shard).
+    layers : list[int] | None
+        Layer numbers to extract.  ``None`` extracts all available layers.
+    slice_fn : callable
+        Applied to each layer tensor (e.g. row-offset extraction).
+
+    Returns
+    -------
+    list[tuple[int, torch.Tensor]]
+        Sorted ``(layer_num, sliced_tensor)`` pairs.
+    """
+    layers_set = set(layers) if layers is not None else None
+    result = []
+    for k, v in tensors.items():
+        m = _SHARD_LAYER_RE.match(k)
+        if not m:
+            continue
+        layer = int(m.group(1))
+        if layers_set is not None and layer not in layers_set:
+            continue
+        result.append((layer, slice_fn(v)))
+    result.sort(key=lambda x: x[0])
+    return result
+
+
+def _slice_logits_from_tensors(
+    tensors: dict[str, torch.Tensor],
+    row_offset: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract top-k logit values and indices from a pre-loaded tensor dict."""
+    values = tensors["logits_topk.values"][row_offset : row_offset + 1]
+    indices = tensors["logits_topk.indices"][row_offset : row_offset + 1]
+    return values, indices
+
+
+# =============================================================================
+# Shard loading (per-prompt API)
+# =============================================================================
+
+
 def _resolve_hidden_shard(
     model_name: str, prompt: str
 ) -> tuple[dict, dict, list[dict], int, str, str | None]:
@@ -1446,25 +1538,15 @@ def _resolve_hidden_shard(
 
     Returns (entry, t_info, shards, shard_idx, storage, layout).
     """
-    entry = _lookup_shard(model_name, prompt)
-    if entry is None:
-        raise FileNotFoundError(
-            f"No shard entry found for prompt: {prompt!r}"
-        )
+    entry, _manifest, t_info = _resolve_shard_tensor_info(
+        model_name, prompt, "hidden_layers",
+    )
 
-    manifest = _load_shard_manifest(model_name, repo_id=entry.get("repo_id"))
-    if manifest is None:
-        raise FileNotFoundError("No shard manifest found")
+    storage: str = t_info.get("storage", "pooled")
+    layout: str | None = t_info.get("layout")
+    shard_idx: int = entry.get("shard_index", 0)
 
-    t_info = manifest["tensors"].get("hidden_layers")
-    if t_info is None:
-        raise FileNotFoundError("No hidden_layers in shard manifest")
-
-    storage = t_info.get("storage", "pooled")
-    layout = t_info.get("layout")
-    shard_idx = entry.get("shard_index_hidden", entry.get("shard_index"))
-
-    shards = t_info["shards"]
+    shards: list[dict[str, Any]] = t_info["shards"]
     if shard_idx >= len(shards):
         raise FileNotFoundError(
             f"Shard index {shard_idx} out of range (have {len(shards)} shards)"
@@ -1527,8 +1609,6 @@ def _load_colocated_slices(
 
     Handles first-access logging and path validation.
     """
-    import re
-
     from safetensors import safe_open
 
     n_shards = len(shards)
@@ -1547,19 +1627,10 @@ def _load_colocated_slices(
             "Re-run pull_dataset() to re-download."
         )
 
-    layers_set = set(layers)
-    layer_slices = []
     with safe_open(shard_path, framework="pt") as f:
-        for sf_key in f.keys():
-            match = re.match(r"^hidden\.layer_(\d+)$", sf_key)
-            if not match:
-                continue
-            layer = int(match.group(1))
-            if layer not in layers_set:
-                continue
-            layer_slices.append((layer, slice_fn(f.get_tensor(sf_key))))
+        tensors = {k: f.get_tensor(k) for k in f.keys()}
 
-    return layer_slices
+    return _slice_hidden_from_tensors(tensors, layers, slice_fn)
 
 
 def _load_hidden_layer_slices(
@@ -1590,7 +1661,7 @@ def _shard_local_token_offset(
 
     Returns (local_tok_off, num_tok).
     """
-    tok_off = entry.get("token_offset_hidden", entry.get("token_offset"))
+    tok_off = entry.get("token_offset")
     num_tok = entry["num_tokens"]
     shard_token_base = sum(
         s.get("num_tokens", 0) for s in shards[:shard_idx]
@@ -1646,9 +1717,7 @@ def _load_pooled_from_shard(
     if storage == "full_sequence" and has_token_shard_ids:
         # Split full_sequence datasets: shard_index_hidden points to the
         # last-token shard which stores one row per prompt.
-        row_offset = entry.get(
-            "row_offset_hidden", entry.get("row_offset", 0)
-        )
+        row_offset: int = entry.get("row_offset", 0)
 
         def slice_fn(t: torch.Tensor) -> torch.Tensor:
             return t[row_offset : row_offset + 1]
@@ -1664,9 +1733,7 @@ def _load_pooled_from_shard(
 
     else:
         # Pooled storage: one row per prompt.
-        row_offset = entry.get(
-            "row_offset_hidden", entry.get("row_offset")
-        )
+        row_offset = entry.get("row_offset", 0)
 
         def slice_fn(t: torch.Tensor) -> torch.Tensor:  # noqa: F811
             return t[row_offset : row_offset + 1]
@@ -1687,22 +1754,12 @@ def _load_logits_from_shard(
     """
     from safetensors import safe_open
 
-    entry = _lookup_shard(model_name, prompt)
-    if entry is None:
-        raise FileNotFoundError(
-            f"No shard entry found for prompt: {prompt!r}"
-        )
+    entry, _manifest, t_info = _resolve_shard_tensor_info(
+        model_name, prompt, "logits_topk",
+    )
 
-    manifest = _load_shard_manifest(model_name, repo_id=entry.get("repo_id"))
-    if manifest is None:
-        raise FileNotFoundError("No shard manifest found")
-
-    t_info = manifest["tensors"].get("logits_topk")
-    if t_info is None:
-        raise FileNotFoundError("No logits_topk in shard manifest")
-
-    shard_idx = entry.get("shard_index_logits", entry.get("shard_index"))
-    row_offset = entry.get("row_offset_logits", entry.get("row_offset"))
+    shard_idx: int = entry.get("shard_index_logits", entry.get("shard_index", 0))
+    row_offset: int = entry.get("row_offset_logits", entry.get("row_offset", 0))
 
     shards = t_info["shards"]
     if shard_idx >= len(shards):
@@ -1719,10 +1776,9 @@ def _load_logits_from_shard(
         )
 
     with safe_open(shard_path, framework="pt") as f:
-        values = f.get_tensor("logits_topk.values")[row_offset : row_offset + 1]
-        indices = f.get_tensor("logits_topk.indices")[row_offset : row_offset + 1]
+        tensors = {k: f.get_tensor(k) for k in f.keys()}
 
-    return values, indices
+    return _slice_logits_from_tensors(tensors, row_offset)
 
 
 # =============================================================================
@@ -1829,20 +1885,16 @@ def load_prompt_activations(
 
     Returns (activations, attention_mask). Checks v2 then v1, then shard registry.
     """
-    backend = get_backend()
     key = _prompt_cache_key(model_name, prompt)
+    keys_to_load = [_raw_layer_key(li) for li in layers] + [_ATTENTION_MASK_KEY]
 
-    if backend.exists(key):
-        # Touch for LRU
-        backend.touch(key)
-        keys_to_load = [_raw_layer_key(li) for li in layers] + [_ATTENTION_MASK_KEY]
-        tensors = _load_tensors_from_backend(key, keys_to_load)
+    tensors = _touch_and_load(key, keys_to_load)
+    if tensors is not None:
         layer_acts = [tensors[_raw_layer_key(li)] for li in layers]
-        activations = torch.cat(layer_acts, dim=-1)
-        return activations, tensors[_ATTENTION_MASK_KEY]
+        return torch.cat(layer_acts, dim=-1), tensors[_ATTENTION_MASK_KEY]
 
     # v1 fallback (local only)
-    if isinstance(backend, LocalCacheBackend):
+    if isinstance(get_backend(), LocalCacheBackend):
         cache_dir = get_prompt_cache_dir(model_name, prompt)
         if cache_dir.exists() and (cache_dir / "attention_mask.pt").exists():
             layer_acts = []
@@ -1960,10 +2012,12 @@ def load_layer_last_token(
     """
     acts_list, masks_list = load_layer_across_prompts(model_name, prompts, layer)
 
+    from .pooling import _last_token_indices
+
     vectors = []
     for acts, mask in zip(acts_list, masks_list):
         # acts: (1, seq_len, hidden_dim), mask: (1, seq_len)
-        last_pos = mask[0].nonzero(as_tuple=True)[0][-1].item()
+        last_pos = int(_last_token_indices(mask)[0].item())
         vectors.append(acts[0, last_pos, :])
 
     return torch.stack(vectors, dim=0)
@@ -2096,26 +2150,22 @@ def is_prompt_perplexity_cached(model_name: str, prompt: str) -> bool:
 
 def load_prompt_perplexity(model_name: str, prompt: str) -> torch.Tensor:
     """Load cached perplexity features (3,) for a single prompt."""
-    backend = get_backend()
+    ppl_keys = [_PERPLEXITY_KEY]
 
-    # Check sidecar file first (#120)
-    sidecar_key = _prompt_perplexity_key(model_name, prompt)
-    if backend.exists(sidecar_key):
-        backend.touch(sidecar_key)
-        tensors = _load_tensors_from_backend(sidecar_key, [_PERPLEXITY_KEY])
-        return tensors[_PERPLEXITY_KEY]
-
-    # Fall back to main file (backward compat with pre-sidecar entries)
-    key = _prompt_cache_key(model_name, prompt)
-    if backend.exists(key):
-        backend.touch(key)
-        tensors = _load_tensors_from_backend(key, [_PERPLEXITY_KEY])
-        return tensors[_PERPLEXITY_KEY]
+    # Sidecar file first (#120), then main file
+    for cache_key in (
+        _prompt_perplexity_key(model_name, prompt),
+        _prompt_cache_key(model_name, prompt),
+    ):
+        tensors = _touch_and_load(cache_key, ppl_keys)
+        if tensors is not None:
+            return tensors[_PERPLEXITY_KEY]
 
     # v1 (local only)
-    if isinstance(backend, LocalCacheBackend):
+    if isinstance(get_backend(), LocalCacheBackend):
         cache_dir = get_prompt_cache_dir(model_name, prompt)
-        return torch.load(cache_dir / "perplexity.pt", weights_only=True)
+        result: torch.Tensor = torch.load(cache_dir / "perplexity.pt", weights_only=True)
+        return result
 
     raise FileNotFoundError(
         f"No cached perplexity found for prompt: {prompt!r}"
@@ -2179,13 +2229,9 @@ def load_prompt_token_perplexity(
         (token_perplexity, token_ids) where token_perplexity has shape
         (num_real_tokens - 1,) and token_ids has shape (num_real_tokens,).
     """
-    backend = get_backend()
-    sidecar_key = _prompt_perplexity_key(model_name, prompt)
-    if backend.exists(sidecar_key):
-        backend.touch(sidecar_key)
-        tensors = _load_tensors_from_backend(
-            sidecar_key, [_TOKEN_PERPLEXITY_KEY, _TOKEN_IDS_KEY]
-        )
+    tok_keys = [_TOKEN_PERPLEXITY_KEY, _TOKEN_IDS_KEY]
+    tensors = _touch_and_load(_prompt_perplexity_key(model_name, prompt), tok_keys)
+    if tensors is not None:
         return tensors[_TOKEN_PERPLEXITY_KEY], tensors[_TOKEN_IDS_KEY]
 
     raise FileNotFoundError(
@@ -2246,8 +2292,9 @@ def _select_positions(
 ) -> torch.Tensor:
     """Slice token positions ("last" or "all") from a (1, seq_len, ...) tensor."""
     if positions == "last":
-        mask = attention_mask[0]  # (seq_len,)
-        last_pos = mask.nonzero(as_tuple=True)[0][-1].item()
+        from .pooling import _last_token_indices
+
+        last_pos = int(_last_token_indices(attention_mask)[0].item())
         return tensor[:, last_pos : last_pos + 1, :]
     if positions == "all":
         return tensor
@@ -2366,41 +2413,26 @@ def load_prompt_logits(
         If top_k is set: (values, indices) where values has shape (1, positions, K)
         and indices has shape (1, positions, K) with dtype int32.
     """
-    backend = get_backend()
+    topk_keys = [_LOGITS_TOP_K_VALUES_KEY, _LOGITS_TOP_K_INDICES_KEY]
+    load_keys = topk_keys if top_k is not None else [_LOGITS_KEY]
 
-    # Check sidecar file first (#120)
-    sidecar_key = _prompt_logits_key(model_name, prompt)
-    if backend.exists(sidecar_key):
-        backend.touch(sidecar_key)
-        if top_k is not None:
-            tensors = _load_tensors_from_backend(
-                sidecar_key, [_LOGITS_TOP_K_VALUES_KEY, _LOGITS_TOP_K_INDICES_KEY]
-            )
-            return tensors[_LOGITS_TOP_K_VALUES_KEY], tensors[_LOGITS_TOP_K_INDICES_KEY]
-        else:
-            tensors = _load_tensors_from_backend(sidecar_key, [_LOGITS_KEY])
-            return tensors[_LOGITS_KEY], None
-
-    # Fall back to main file (backward compat with pre-sidecar entries)
-    key = _prompt_cache_key(model_name, prompt)
-    if backend.exists(key):
-        backend.touch(key)
-        if top_k is not None:
-            tensors = _load_tensors_from_backend(
-                key, [_LOGITS_TOP_K_VALUES_KEY, _LOGITS_TOP_K_INDICES_KEY]
-            )
-            return tensors[_LOGITS_TOP_K_VALUES_KEY], tensors[_LOGITS_TOP_K_INDICES_KEY]
-        else:
-            tensors = _load_tensors_from_backend(key, [_LOGITS_KEY])
+    # Sidecar file first (#120), then main file
+    for cache_key in (
+        _prompt_logits_key(model_name, prompt),
+        _prompt_cache_key(model_name, prompt),
+    ):
+        tensors = _touch_and_load(cache_key, load_keys)
+        if tensors is not None:
+            if top_k is not None:
+                return tensors[_LOGITS_TOP_K_VALUES_KEY], tensors[_LOGITS_TOP_K_INDICES_KEY]
             return tensors[_LOGITS_KEY], None
 
     # Shard registry fallback (logits_topk only)
     if top_k is not None:
-        entry = _lookup_shard(model_name, prompt)
-        if entry is not None:
-            manifest = _load_shard_manifest(model_name, repo_id=entry.get("repo_id"))
-            if manifest and "logits_topk" in manifest.get("tensors", {}):
-                return _load_logits_from_shard(model_name, prompt)
+        try:
+            return _load_logits_from_shard(model_name, prompt)
+        except FileNotFoundError:
+            pass
 
     raise FileNotFoundError(
         f"No cached logits found for prompt: {prompt!r}"
@@ -2467,24 +2499,22 @@ def load_prompt_pooled_activations(
     model_name: str, prompt: str, layers: list[int], pooling: str
 ) -> torch.Tensor:
     """Load pooled activations for a single prompt. Shape: (1, n_layers * hidden_dim)."""
-    backend = get_backend()
     key = _prompt_cache_key(model_name, prompt)
+    tensor_keys = [_pooled_layer_key(pooling, li) for li in layers]
 
-    if backend.exists(key):
-        backend.touch(key)
-        tensor_keys = [_pooled_layer_key(pooling, li) for li in layers]
-        tensors = _load_tensors_from_backend(key, tensor_keys)
+    tensors = _touch_and_load(key, tensor_keys)
+    if tensors is not None:
         return torch.cat([tensors[k] for k in tensor_keys], dim=-1)
 
     # v1 (local only)
-    if isinstance(backend, LocalCacheBackend):
+    if isinstance(get_backend(), LocalCacheBackend):
         cache_dir = get_prompt_cache_dir(model_name, prompt)
         pooled_dir = cache_dir / get_pooled_cache_key(pooling)
         if pooled_dir.exists():
-            layer_acts = []
-            for layer in layers:
-                acts = torch.load(pooled_dir / f"layer_{layer}.pt", weights_only=True)
-                layer_acts.append(acts)
+            layer_acts = [
+                torch.load(pooled_dir / f"layer_{layer}.pt", weights_only=True)
+                for layer in layers
+            ]
             return torch.cat(layer_acts, dim=-1)
 
     # Shard registry fallback
@@ -2963,7 +2993,8 @@ def get_cached_layers(cache_dir: Path) -> set[int]:
 
 def load_layer(cache_dir: Path, layer: int) -> torch.Tensor:
     """Load a single layer's activations from legacy .pt cache."""
-    return torch.load(cache_dir / f"layer_{layer}.pt", weights_only=True)
+    result: torch.Tensor = torch.load(cache_dir / f"layer_{layer}.pt", weights_only=True)
+    return result
 
 
 def save_layer(cache_dir: Path, layer: int, activations: torch.Tensor) -> None:
@@ -2974,7 +3005,8 @@ def save_layer(cache_dir: Path, layer: int, activations: torch.Tensor) -> None:
 
 def load_attention_mask(cache_dir: Path) -> torch.Tensor:
     """Load attention mask from legacy .pt cache."""
-    return torch.load(cache_dir / "attention_mask.pt", weights_only=True)
+    result: torch.Tensor = torch.load(cache_dir / "attention_mask.pt", weights_only=True)
+    return result
 
 
 def save_attention_mask(cache_dir: Path, attention_mask: torch.Tensor) -> None:
@@ -3004,7 +3036,8 @@ def get_perplexity_cache_path(model_name: str, prompts: list[str]) -> Path:
 def load_perplexity_cache(cache_path: Path) -> torch.Tensor | None:
     """Load cached perplexity features (legacy batch format)."""
     if cache_path.exists():
-        return torch.load(cache_path, weights_only=True)
+        result: torch.Tensor = torch.load(cache_path, weights_only=True)
+        return result
     return None
 
 
@@ -3060,7 +3093,7 @@ def compute_cache_key(
         "layers": sorted(layer_indices),
     }
     serialized = json.dumps(data, sort_keys=True, ensure_ascii=True)
-    return hashlib.sha256(serialized.encode()).hexdigest()[:32]
+    return _hash_string(serialized, length=32)
 
 
 def get_cache_path(cache_key: str) -> Path:
@@ -3086,7 +3119,7 @@ class CachedExtractor:
         The underlying extractor.
     """
 
-    def __init__(self, extractor):
+    def __init__(self, extractor: ActivationExtractor) -> None:
         self.extractor = extractor
 
     def extract(
@@ -3189,10 +3222,15 @@ class CachedExtractor:
 
                     try:
                         if effective_retries > 0:
+                            _bp = batch_prompts
+
+                            def _extract_fn() -> tuple[torch.Tensor, torch.Tensor]:
+                                return self.extractor.extract_batch(
+                                    _bp, layer_indices, remote=remote
+                                )
+
                             batch_acts, batch_mask = retry_with_backoff(
-                                lambda bp=batch_prompts: self.extractor.extract_batch(
-                                    bp, layer_indices, remote=remote
-                                ),
+                                _extract_fn,
                                 max_retries=effective_retries,
                                 context=f"batch {batch_num}/{num_batches}",
                             )

@@ -53,20 +53,31 @@ lmprobe/
 ├── src/
 │   └── lmprobe/
 │       ├── __init__.py
-│       ├── probe.py          # LinearProbe main class
-│       ├── extraction.py     # Activation extraction via nnsight
-│       ├── pooling.py        # Pooling strategies
-│       ├── cache.py          # Activation caching
-│       └── classifiers.py    # Built-in classifier factory
+│       ├── probe.py              # Probe (alias: LinearProbe) main class
+│       ├── extraction.py         # Activation extraction via nnsight
+│       ├── pooling.py            # Pooling strategies
+│       ├── cache.py              # Activation caching
+│       ├── classifiers.py        # Built-in classifier factory
+│       ├── sharing.py            # HuggingFace dataset push/pull/load (v2 format)
+│       ├── unified_cache.py      # UnifiedCache for bulk extraction
+│       ├── scaling.py            # PerLayerScaler
+│       ├── ensemble.py           # ProbeEnsemble
+│       ├── baseline.py           # BaselineProbe (text baselines)
+│       ├── activation_baseline.py # ActivationBaseline
+│       ├── battery.py            # BaselineBattery
+│       └── backends.py           # Backend resolution
 ├── tests/
-│   ├── conftest.py           # Shared fixtures (tiny model)
-│   ├── test_readme_example.py # NORTH STAR: README example must pass
+│   ├── conftest.py               # Shared fixtures (tiny model)
+│   ├── test_readme_example.py    # NORTH STAR: README example must pass
 │   ├── test_probe.py
 │   ├── test_extraction.py
 │   ├── test_pooling.py
-│   └── test_cache.py
+│   ├── test_cache.py
+│   └── test_sharing.py           # Dataset sharing tests
 ├── docs/
-│   └── design/               # Design decision documents
+│   ├── design/                   # Design decision documents
+│   ├── guides/                   # User guides
+│   └── reference/                # API reference (incl. dataset-format.md)
 ├── pyproject.toml
 └── CLAUDE.md
 ```
@@ -124,7 +135,7 @@ The `remote=True` functionality uses nnsight to connect to NDIF (National Deep I
 2. **API key requirement**: Requires `NDIF_API_KEY` environment variable
 
 **What needs testing:**
-- `LinearProbe(..., remote=True)` connects successfully
+- `Probe(..., remote=True)` connects successfully
 - `probe.fit(..., remote=True)` extracts activations from remote models
 - `probe.predict(..., remote=False)` override works (train remote, predict local)
 - Large models (e.g., `meta-llama/Llama-3.1-70B-Instruct`) work via remote
@@ -145,7 +156,7 @@ pytest tests/test_remote.py -v  # (test file to be created)
 ```python
 # Example test
 def test_fit_predict_roundtrip(tiny_model):
-    probe = LinearProbe(
+    probe = Probe(
         model=tiny_model,
         layers=-1,
         remote=False,
@@ -175,7 +186,7 @@ the library's public API is working as advertised.
 
 def test_readme_example_runs(tiny_model):
     """The README example code runs without error."""
-    from lmprobe import LinearProbe
+    from lmprobe import Probe
 
     positive_prompts = [
         "Who wants to go for a walk?",
@@ -192,7 +203,7 @@ def test_readme_example_runs(tiny_model):
         "Tail raised, back arched, eyes alert, whiskers forward.",
     ]
 
-    probe = LinearProbe(
+    probe = Probe(
         model=tiny_model,  # Use tiny model instead of Llama for tests
         layers=-1,         # Last layer (tiny model has few layers)
         pooling="last_token",
@@ -233,7 +244,7 @@ def test_readme_example_runs(tiny_model):
 When implementing, make tests pass in this order:
 
 1. `test_readme_example.py` — The north star (full integration)
-2. `test_probe.py` — LinearProbe unit tests
+2. `test_probe.py` — Probe unit tests
 3. `test_extraction.py` — Activation extraction tests
 4. `test_pooling.py` — Pooling strategy tests
 5. `test_cache.py` — Caching tests
@@ -254,9 +265,10 @@ pytest --cov=lmprobe
 ## Quick Reference
 
 ```python
-from lmprobe import LinearProbe
+from lmprobe import Probe
 
-probe = LinearProbe(
+# Train from a model (extracts activations live)
+probe = Probe(
     model="meta-llama/Llama-3.1-8B-Instruct",
     layers=16,                          # int | list[int] | "all" | "middle"
     pooling="last_token",               # or override with train_pooling / inference_pooling
@@ -269,8 +281,12 @@ probe = LinearProbe(
 probe.fit(positive_prompts, negative_prompts)
 predictions = probe.predict(new_prompts)
 
-# Override remote at call time
-predictions = probe.predict(new_prompts, remote=True)
+# Train from a dataset (no model needed)
+from lmprobe import load_activations
+
+acts, labels = load_activations("user/my-dataset", layers=[16], return_labels=True)
+probe = Probe(classifier="logistic_regression", random_state=42)
+probe.fit_from_activations(acts[16], labels)
 ```
 
 ## Common Tasks
@@ -286,22 +302,10 @@ predictions = probe.predict(new_prompts, remote=True)
 2. If not, add architecture-specific extraction in `src/lmprobe/extraction.py`
 3. Document any quirks in `docs/models/`
 
-## Future Work: Additional Baselines
+## Baselines
 
-The `BaselineProbe` class currently supports `bow`, `tfidf`, `random`, and `majority` methods.
-Future baselines to consider (see GitHub issue for details):
+`BaselineProbe` supports: `bow`, `tfidf`, `random`, `majority`, `sentence_length`, `sentence_transformers`, `shuffled_labels`, and `perplexity`.
 
-### Surface-level baselines
-- **Sentence length** — surprisingly predictive for some tasks
-- **Perplexity/logprob** — model's own token probabilities; critical for truthfulness tasks (Marks & Tegmark showed probable ≠ true)
+`ActivationBaseline` supports: `random_direction`, `pca`, and `layer_0`.
 
-### Activation baselines
-- **Random direction** — project activations onto random unit vector and classify; tests whether any direction works or learned direction is special
-- **PCA top-k** — classify using projection onto top principal components; tests if signal is in obvious variance or requires learning
-- **Layer 0 (embeddings)** — if input embeddings work as well as middle layers, probe might just be recovering token identity
-
-### External embedding baselines
-- **Sentence-transformers** — off-the-shelf semantic embeddings + logistic regression; tests whether finding something model-specific or just general semantics
-
-### Sanity checks
-- **Shuffled labels** — train probe on permuted labels, should get ~50%; validates probe isn't overfitting to noise
+`BaselineBattery` runs all applicable baselines at once and returns ranked results.

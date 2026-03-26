@@ -7,7 +7,7 @@ classifiers with proper random_state propagation.
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from sklearn.linear_model import (
@@ -31,6 +31,7 @@ BUILTIN_CLASSIFIERS = frozenset({
     "ridge_regression",
     "svm",
     "sgd",
+    "sgd_gpu",
     "mass_mean",
     "lda",
     "ensemble",
@@ -41,6 +42,16 @@ CLASSIFICATION_CLASSIFIERS = BUILTIN_CLASSIFIERS - {"ridge_regression"}
 
 # Classifiers that only work with regression tasks
 REGRESSION_CLASSIFIERS = frozenset({"ridge_regression"})
+
+
+def _stable_sigmoid_proba(scores: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid → (n_samples, 2) class probabilities."""
+    prob_positive = np.empty_like(scores, dtype=np.float64)
+    pos = scores >= 0
+    neg = ~pos
+    prob_positive[pos] = 1 / (1 + np.exp(-scores[pos]))
+    prob_positive[neg] = np.exp(scores[neg]) / (1 + np.exp(scores[neg]))
+    return np.column_stack([1 - prob_positive, prob_positive])
 
 
 def build_classifier(
@@ -105,6 +116,8 @@ def build_classifier(
         defaults = dict(loss="log_loss", random_state=random_state)
         defaults.update(extra)
         return SGDClassifier(**defaults)
+    elif name == "sgd_gpu":
+        return SGDGPUClassifier(random_state=random_state, **extra)
     elif name == "mass_mean":
         return MassMeanClassifier()
     elif name == "ensemble":
@@ -229,7 +242,7 @@ class MassMeanClassifier:
     Marks & Tegmark, "The Geometry of Truth" (2023)
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         # No parameters - this makes get_params/set_params trivial
         self.coef_: np.ndarray | None = None
         self.intercept_: float | None = None
@@ -304,7 +317,8 @@ class MassMeanClassifier:
         if self.coef_ is None:
             raise RuntimeError("Classifier has not been fitted. Call fit() first.")
 
-        return X @ self.coef_ + self.intercept_
+        result: np.ndarray = X @ self.coef_ + self.intercept_
+        return result
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict class labels.
@@ -320,7 +334,7 @@ class MassMeanClassifier:
             Predicted labels, shape (n_samples,).
         """
         scores = self.decision_function(X)
-        return (scores > 0).astype(int)
+        return (scores >= 0).astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Predict class probabilities using Platt-scaled decision scores.
@@ -342,17 +356,11 @@ class MassMeanClassifier:
         scores = self.decision_function(X)
 
         if self._calibrator is not None:
-            return self._calibrator.predict_proba(scores.reshape(-1, 1))
+            result: np.ndarray = self._calibrator.predict_proba(scores.reshape(-1, 1))
+            return result
 
         # Fallback: numerically stable sigmoid (should not normally be reached)
-        prob_positive = np.empty_like(scores, dtype=np.float64)
-        pos = scores >= 0
-        neg = ~pos
-        prob_positive[pos] = 1 / (1 + np.exp(-scores[pos]))
-        prob_positive[neg] = np.exp(scores[neg]) / (1 + np.exp(scores[neg]))
-        prob_negative = 1 - prob_positive
-
-        return np.column_stack([prob_negative, prob_positive])
+        return _stable_sigmoid_proba(scores)
 
     def score(self, X: np.ndarray, y: np.ndarray) -> float:
         """Compute accuracy.
@@ -387,7 +395,7 @@ class MassMeanClassifier:
         """
         return {}
 
-    def set_params(self, **params) -> MassMeanClassifier:
+    def set_params(self, **params: Any) -> MassMeanClassifier:
         """Set parameters for this estimator (sklearn compatibility).
 
         Parameters
@@ -439,8 +447,8 @@ class EnsembleClassifier:
         solver: str = "lbfgs",
         max_iter: int = 1000,
         random_state: int | None = None,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         self.C_values = C_values if C_values is not None else self._DEFAULT_C_VALUES
         self.solver = solver
         self.max_iter = max_iter
@@ -501,7 +509,8 @@ class EnsembleClassifier:
             raise RuntimeError("Classifier has not been fitted. Call fit() first.")
 
         probas = np.array([e.predict_proba(X) for e in self.estimators_])
-        return probas.mean(axis=0)
+        result: np.ndarray = probas.mean(axis=0)
+        return result
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict by thresholding averaged probabilities at 0.5.
@@ -517,7 +526,9 @@ class EnsembleClassifier:
             Predicted labels, shape (n_samples,).
         """
         proba = self.predict_proba(X)
-        return self.classes_[np.argmax(proba, axis=1)]
+        assert self.classes_ is not None, "Classifier has not been fitted."
+        result: np.ndarray = self.classes_[np.argmax(proba, axis=1)]
+        return result
 
     def score(self, X: np.ndarray, y: np.ndarray) -> float:
         """Compute accuracy.
@@ -545,8 +556,370 @@ class EnsembleClassifier:
             "random_state": self.random_state,
         }
 
-    def set_params(self, **params) -> EnsembleClassifier:
+    def set_params(self, **params: Any) -> EnsembleClassifier:
         """Set parameters for this estimator (sklearn compatibility)."""
+        for key, value in params.items():
+            setattr(self, key, value)
+        return self
+
+
+class SGDGPUClassifier:
+    """GPU-accelerated SGD classifier for large-scale linear probe training.
+
+    Implements minibatch SGD with L2 regularization using PyTorch, providing
+    significant speedups over sklearn's LBFGS solver on large activation
+    datasets (100k+ samples). Accepts numpy arrays (sklearn-compatible
+    interface) and handles GPU memory management automatically.
+
+    .. note::
+
+        **Binary classification only.** Uses a single output neuron with
+        BCEWithLogitsLoss. ``predict_proba`` returns shape ``(n, 2)``.
+
+    .. note::
+
+        **Regularization convention.** Uses ``weight_decay`` (direct
+        regularization strength), unlike sklearn's ``C`` (inverse).
+        Roughly: ``C ≈ 1 / (n_samples * weight_decay)``.
+
+    Parameters
+    ----------
+    lr : float
+        Learning rate for SGD optimizer.
+    epochs : int
+        Number of training epochs.
+    batch_size : int
+        Minibatch size for SGD.
+    weight_decay : float
+        L2 regularization strength (passed to SGD optimizer as weight decay).
+        Higher values = stronger regularization. See note above for
+        relationship to sklearn's ``C`` parameter.
+    device : str
+        PyTorch device. ``"auto"`` selects CUDA if available, else CPU.
+    scheduler : str | None
+        Learning rate schedule. Options:
+
+        - ``None`` (default) — constant LR (current behavior)
+        - ``"cosine"`` — ``CosineAnnealingLR`` decaying to 0 over ``epochs``
+        - ``"reduce_on_plateau"`` — ``ReduceLROnPlateau`` (patience=5,
+          factor=0.5) reducing LR when epoch loss stalls
+    verbose : bool
+        If True, print training loss every 10 epochs (or every epoch if
+        ``epochs <= 10``).
+    early_stopping : int | None
+        Patience for early stopping. If set, training stops when epoch loss
+        has not improved for this many consecutive epochs. The best weights
+        (lowest loss) are restored.
+    random_state : int | None
+        Random seed for reproducibility.
+
+    Attributes
+    ----------
+    coef_ : np.ndarray
+        Fitted weights, shape ``(n_features,)``. Stored on CPU as float32.
+    intercept_ : np.ndarray
+        Fitted bias, shape ``(1,)``. Stored on CPU as float32.
+    classes_ : np.ndarray
+        Class labels ``[0, 1]``.
+    train_loss_ : list[float]
+        Per-epoch training loss history. Available after ``fit()``.
+    """
+
+    _VALID_SCHEDULERS = frozenset({None, "cosine", "reduce_on_plateau"})
+
+    def __init__(
+        self,
+        lr: float = 0.01,
+        epochs: int = 100,
+        batch_size: int = 256,
+        weight_decay: float = 1e-4,
+        device: str = "auto",
+        scheduler: str | None = None,
+        verbose: bool = False,
+        early_stopping: int | None = None,
+        random_state: int | None = None,
+    ) -> None:
+        if scheduler not in self._VALID_SCHEDULERS:
+            valid = sorted(s for s in self._VALID_SCHEDULERS if s)
+            raise ValueError(
+                f"Unknown scheduler: {scheduler!r}. "
+                f"Valid options: {valid} or None"
+            )
+        self.lr = lr
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.weight_decay = weight_decay
+        self.device = device
+        self.scheduler = scheduler
+        self.verbose = verbose
+        self.early_stopping = early_stopping
+        self.random_state = random_state
+        self.coef_: np.ndarray | None = None
+        self.intercept_: np.ndarray | None = None
+        self.classes_: np.ndarray | None = None
+        self.train_loss_: list[float] = []
+
+    def _resolve_device(self) -> Any:
+        import torch
+
+        if self.device == "auto":
+            if torch.cuda.is_available():
+                try:
+                    # Verify the GPU can actually run kernels (capability check)
+                    t = torch.tensor([1.0], device="cuda")
+                    _ = t + t
+                    del t
+                    return torch.device("cuda")
+                except (RuntimeError, torch.cuda.CudaError):
+                    pass
+            return torch.device("cpu")
+        return torch.device(self.device)
+
+    def _check_fitted(self) -> None:
+        if self.coef_ is None:
+            raise RuntimeError(
+                "SGDGPUClassifier has not been fitted. Call fit() first."
+            )
+
+    def _build_scheduler(self, optimizer: Any) -> Any:
+        """Build the LR scheduler if configured.
+
+        Returns None for constant LR (no scheduler).
+        """
+        import torch.optim.lr_scheduler as sched
+
+        if self.scheduler is None:
+            return None
+        elif self.scheduler == "cosine":
+            return sched.CosineAnnealingLR(optimizer, T_max=self.epochs)
+        elif self.scheduler == "reduce_on_plateau":
+            return sched.ReduceLROnPlateau(
+                optimizer, mode="min", patience=5, factor=0.5,
+            )
+        else:  # pragma: no cover — validated in __init__
+            raise ValueError(f"Unknown scheduler: {self.scheduler!r}")
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        sample_weight: np.ndarray | None = None,
+    ) -> SGDGPUClassifier:
+        """Fit the classifier using minibatch SGD.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Training features, shape ``(n_samples, n_features)``.
+        y : np.ndarray
+            Labels, shape ``(n_samples,)``.
+        sample_weight : np.ndarray | None
+            Per-sample weights. If None, all samples are equally weighted.
+
+        Returns
+        -------
+        SGDGPUClassifier
+            Self, for method chaining.
+        """
+        import torch
+
+        device = self._resolve_device()
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+        n_samples, n_features = X.shape
+
+        # Reproducibility
+        if self.random_state is not None:
+            torch.manual_seed(self.random_state)
+
+        # Build model
+        model = torch.nn.Linear(n_features, 1).to(device)
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=self.lr, weight_decay=self.weight_decay,
+        )
+        lr_scheduler = self._build_scheduler(optimizer)
+        loss_fn = torch.nn.BCEWithLogitsLoss(reduction="none")
+
+        # Prepare data
+        X_t = torch.from_numpy(X)
+        y_t = torch.from_numpy(y)
+        w_t = (
+            torch.from_numpy(np.asarray(sample_weight, dtype=np.float32))
+            if sample_weight is not None
+            else None
+        )
+
+        # Shuffle indices
+        rng = np.random.default_rng(self.random_state)
+
+        # Convergence tracking
+        self.train_loss_ = []
+        best_loss = float("inf")
+        best_state: dict[str, Any] | None = None
+        epochs_without_improvement = 0
+        verbose_interval = 1 if self.epochs <= 10 else 10
+
+        for epoch in range(self.epochs):
+            perm = torch.from_numpy(rng.permutation(n_samples))
+            epoch_loss_sum = 0.0
+            epoch_samples = 0
+
+            for start in range(0, n_samples, self.batch_size):
+                idx = perm[start : start + self.batch_size]
+                xb = X_t[idx].to(device)
+                yb = y_t[idx].to(device)
+
+                logits = model(xb).squeeze(-1)
+                loss = loss_fn(logits, yb)
+
+                if w_t is not None:
+                    wb = w_t[idx].to(device)
+                    loss = loss * wb
+
+                loss = loss.mean()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                batch_size_actual = len(idx)
+                epoch_loss_sum += loss.item() * batch_size_actual
+                epoch_samples += batch_size_actual
+
+            epoch_loss = epoch_loss_sum / epoch_samples
+            self.train_loss_.append(epoch_loss)
+
+            # LR scheduler step
+            if lr_scheduler is not None:
+                if self.scheduler == "reduce_on_plateau":
+                    lr_scheduler.step(epoch_loss)
+                else:
+                    lr_scheduler.step()
+
+            # Verbose logging
+            if self.verbose and (epoch % verbose_interval == 0 or epoch == self.epochs - 1):
+                current_lr = optimizer.param_groups[0]["lr"]
+                print(f"Epoch {epoch:4d}/{self.epochs}  loss={epoch_loss:.6f}  lr={current_lr:.2e}")
+
+            # Early stopping
+            if self.early_stopping is not None:
+                if epoch_loss < best_loss:
+                    best_loss = epoch_loss
+                    best_state = {
+                        k: v.clone() for k, v in model.state_dict().items()
+                    }
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                    if epochs_without_improvement >= self.early_stopping:
+                        if self.verbose:
+                            print(
+                                f"Early stopping at epoch {epoch} "
+                                f"(no improvement for {self.early_stopping} epochs)"
+                            )
+                        break
+
+        # Restore best weights if early stopping was used and we found a best
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        # Extract weights to CPU numpy
+        with torch.no_grad():
+            self.coef_ = model.weight.detach().cpu().numpy().ravel()
+            self.intercept_ = model.bias.detach().cpu().numpy()
+
+        self.classes_ = np.array([0, 1])
+
+        # Clean up GPU memory
+        del model, optimizer, lr_scheduler, X_t, y_t, w_t, best_state
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return self
+
+    def decision_function(self, X: np.ndarray) -> np.ndarray:
+        """Compute raw logit scores.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features, shape ``(n_samples, n_features)``.
+
+        Returns
+        -------
+        np.ndarray
+            Logit scores, shape ``(n_samples,)``.
+        """
+        self._check_fitted()
+        assert self.coef_ is not None and self.intercept_ is not None
+        X = np.asarray(X, dtype=np.float32)
+        scores: np.ndarray = X @ self.coef_ + self.intercept_[0]
+        return scores
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict class labels.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features, shape ``(n_samples, n_features)``.
+
+        Returns
+        -------
+        np.ndarray
+            Predicted labels, shape ``(n_samples,)``.
+        """
+        scores = self.decision_function(X)
+        return (scores >= 0).astype(int)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Predict class probabilities.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features, shape ``(n_samples, n_features)``.
+
+        Returns
+        -------
+        np.ndarray
+            Probabilities, shape ``(n_samples, 2)``.
+        """
+        scores = self.decision_function(X)
+        return _stable_sigmoid_proba(scores)
+
+    def score(self, X: np.ndarray, y: np.ndarray) -> float:
+        """Accuracy on the given data.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features.
+        y : np.ndarray
+            True labels.
+
+        Returns
+        -------
+        float
+            Accuracy.
+        """
+        return float((self.predict(X) == np.asarray(y)).mean())
+
+    def get_params(self, deep: bool = True) -> dict:
+        """Get parameters for sklearn clone compatibility."""
+        return {
+            "lr": self.lr,
+            "epochs": self.epochs,
+            "batch_size": self.batch_size,
+            "weight_decay": self.weight_decay,
+            "device": self.device,
+            "scheduler": self.scheduler,
+            "verbose": self.verbose,
+            "early_stopping": self.early_stopping,
+            "random_state": self.random_state,
+        }
+
+    def set_params(self, **params: Any) -> SGDGPUClassifier:
+        """Set parameters for sklearn clone compatibility."""
         for key, value in params.items():
             setattr(self, key, value)
         return self
@@ -616,7 +989,7 @@ class GroupLassoClassifier:
                 "Install it with: pip install lmprobe[auto]"
             )
 
-    def _build_estimator(self):
+    def _build_estimator(self) -> Any:
         """Build the underlying skglm estimator."""
         from skglm import GeneralizedLinearEstimator
         from skglm.datafits import LogisticGroup
@@ -665,15 +1038,16 @@ class GroupLassoClassifier:
         y_transformed = np.where(y == 0, -1, 1)
 
         # Build and fit estimator
-        self._estimator = self._build_estimator()
-        self._estimator.fit(X, y_transformed)
+        estimator = self._build_estimator()
+        estimator.fit(X, y_transformed)
+        self._estimator = estimator
 
         # Extract coefficients (skglm returns (1, n_features), flatten to (n_features,))
-        coef = self._estimator.coef_
+        coef = estimator.coef_
         if coef.ndim == 2:
             coef = coef.flatten()
         self.coef_ = coef
-        self.intercept_ = getattr(self._estimator, "intercept_", None)
+        self.intercept_ = getattr(estimator, "intercept_", None)
 
         # Compute group norms and identify selected groups
         coef_by_group = self.coef_.reshape(self.n_layers, self.hidden_dim)
@@ -731,15 +1105,7 @@ class GroupLassoClassifier:
         intercept = self.intercept_ if self.intercept_ is not None else 0
         scores = X @ self.coef_ + intercept
 
-        # Numerically stable sigmoid to get P(y=1)
-        prob_positive = np.empty_like(scores, dtype=np.float64)
-        pos = scores >= 0
-        neg = ~pos
-        prob_positive[pos] = 1 / (1 + np.exp(-scores[pos]))
-        prob_positive[neg] = np.exp(scores[neg]) / (1 + np.exp(scores[neg]))
-        prob_negative = 1 - prob_positive
-
-        return np.column_stack([prob_negative, prob_positive])
+        return _stable_sigmoid_proba(scores)
 
     def score(self, X: np.ndarray, y: np.ndarray) -> float:
         """Compute accuracy.
