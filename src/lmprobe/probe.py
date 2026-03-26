@@ -603,6 +603,48 @@ class Probe:
 
         return Pipeline(steps)
 
+    @staticmethod
+    def _fit_layer_scaler(
+        X: np.ndarray,
+        n_layers: int,
+        scaling_strategy: str | None,
+        *,
+        single_layer_standard: bool = False,
+    ):
+        """Create and fit a layer scaler.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Activations, shape (n_samples, n_features).
+        n_layers : int
+            Number of layers concatenated in X.
+        scaling_strategy : str | None
+            Scaling strategy name, or None to skip.
+        single_layer_standard : bool
+            If True and n_layers == 1 and scaling_strategy is None,
+            use StandardScaler (prevents convergence issues, #40).
+
+        Returns
+        -------
+        tuple[scaler, np.ndarray]
+            (fitted scaler or None, transformed X).
+        """
+        if single_layer_standard and n_layers == 1:
+            # Single-layer probes always use StandardScaler to prevent
+            # convergence issues with unscaled activations (#40)
+            from sklearn.preprocessing import StandardScaler
+
+            scaler = StandardScaler()
+            return scaler, scaler.fit_transform(X)
+        elif scaling_strategy is not None and n_layers >= 1:
+            from .scaling import PerLayerScaler
+
+            hidden_dim_per_layer = X.shape[1] // n_layers
+            scaler = PerLayerScaler(n_layers, hidden_dim_per_layer, scaling_strategy)
+            return scaler, scaler.fit_transform(X)
+        return None, X
+
     def _compute_mass_mean_direction(
         self,
         X: np.ndarray,
@@ -989,19 +1031,9 @@ class Probe:
             scaling_strategy = None
 
         # Apply per-layer normalization if enabled
-        if scaling_strategy is not None and n_layers > 1:
-            from .scaling import PerLayerScaler
-
-            hidden_dim_per_layer = X.shape[1] // n_layers
-            self.scaler_ = PerLayerScaler(n_layers, hidden_dim_per_layer, scaling_strategy)
-            X = self.scaler_.fit_transform(X)
-        elif n_layers == 1:
-            # Apply StandardScaler for single-layer probes to prevent
-            # convergence issues with unscaled activations (#40)
-            from sklearn.preprocessing import StandardScaler
-
-            self.scaler_ = StandardScaler()
-            X = self.scaler_.fit_transform(X)
+        self.scaler_, X = self._fit_layer_scaler(
+            X, n_layers, scaling_strategy, single_layer_standard=True,
+        )
 
         # Save pre-preprocessing activations for mass-mean augmentation
         if self.mass_mean_augment:
@@ -1065,7 +1097,6 @@ class Probe:
 
         from .cache import CachedExtractor
         from .classifiers import build_group_lasso_classifier
-        from .scaling import PerLayerScaler
 
         remote = self._get_remote(remote)
 
@@ -1093,13 +1124,9 @@ class Probe:
 
         # Apply per-layer normalization if enabled (before Group Lasso)
         scaling_strategy = self._get_scaling_strategy()
-        if scaling_strategy is not None and n_candidate_layers > 1:
-            candidate_scaler = PerLayerScaler(
-                n_candidate_layers, hidden_dim_per_layer, scaling_strategy
-            )
-            X_candidates_scaled = candidate_scaler.fit_transform(X_candidates)
-        else:
-            X_candidates_scaled = X_candidates
+        candidate_scaler, X_candidates_scaled = self._fit_layer_scaler(
+            X_candidates, n_candidate_layers, scaling_strategy,
+        )
 
         # Phase 1: Train Group Lasso classifier
         group_lasso_clf = build_group_lasso_classifier(
@@ -1141,15 +1168,9 @@ class Probe:
 
         # Apply per-layer normalization to selected layers if enabled
         n_selected = len(self.selected_layers_)
-        if scaling_strategy is not None and n_selected > 1:
-            self.scaler_ = PerLayerScaler(n_selected, hidden_dim_per_layer, scaling_strategy)
-            X_selected = self.scaler_.fit_transform(X_selected)
-        elif scaling_strategy is not None and n_selected == 1:
-            # Single layer: still normalize but store scaler
-            self.scaler_ = PerLayerScaler(1, hidden_dim_per_layer, scaling_strategy)
-            X_selected = self.scaler_.fit_transform(X_selected)
-        else:
-            self.scaler_ = None
+        self.scaler_, X_selected = self._fit_layer_scaler(
+            X_selected, n_selected, scaling_strategy,
+        )
 
         # Create extractor for selected layers (needed for inference later)
         selected_extractor = ActivationExtractor(
@@ -1193,7 +1214,6 @@ class Probe:
         import warnings
 
         from .cache import CachedExtractor
-        from .scaling import PerLayerScaler
 
         remote = self._get_remote(remote)
 
@@ -1224,12 +1244,9 @@ class Probe:
 
         # Apply per-layer normalization if enabled
         scaling_strategy = self._get_scaling_strategy()
-        if scaling_strategy is not None and n_candidate_layers > 1:
-            scaler = PerLayerScaler(n_candidate_layers, hidden_dim_per_layer, scaling_strategy)
-            X_candidates_scaled = scaler.fit_transform(X_candidates)
-        else:
-            scaler = None
-            X_candidates_scaled = X_candidates
+        scaler, X_candidates_scaled = self._fit_layer_scaler(
+            X_candidates, n_candidate_layers, scaling_strategy,
+        )
 
         # Phase 1: Train classifier on all candidate layers
         self.classifier_ = clone(self._classifier_template)
@@ -1269,15 +1286,9 @@ class Probe:
 
         # Apply normalization to selected layers if enabled
         n_selected = len(self.selected_layers_)
-        if scaling_strategy is not None and n_selected > 1:
-            self.scaler_ = PerLayerScaler(n_selected, hidden_dim_per_layer, scaling_strategy)
-            X_selected = self.scaler_.fit_transform(X_selected)
-        elif scaling_strategy is not None and n_selected == 1:
-            # Single layer: still normalize but store scaler
-            self.scaler_ = PerLayerScaler(1, hidden_dim_per_layer, scaling_strategy)
-            X_selected = self.scaler_.fit_transform(X_selected)
-        else:
-            self.scaler_ = None
+        self.scaler_, X_selected = self._fit_layer_scaler(
+            X_selected, n_selected, scaling_strategy,
+        )
 
         # Create extractor for selected layers (needed for inference later)
         selected_extractor = ActivationExtractor(
@@ -1370,6 +1381,60 @@ class Probe:
                 "Probe has not been fitted. Call fit() first."
             )
 
+    def _apply_inference_transforms(self, X: np.ndarray) -> np.ndarray:
+        """Apply scaler, preprocessing pipeline, and mass-mean augmentation.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Input activations, shape (n_samples, n_features).
+
+        Returns
+        -------
+        np.ndarray
+            Transformed activations.
+        """
+        if self.scaler_ is not None:
+            X = self.scaler_.transform(X)
+        X_pre = X.copy() if self._mass_mean_direction_ is not None else None
+        if self.preprocessing_pipeline_ is not None:
+            X = self.preprocessing_pipeline_.transform(X)
+        if self._mass_mean_direction_ is not None:
+            X = self._augment_mass_mean(X, X_pre)
+        return X
+
+    def _apply_to_per_token_or_flat(
+        self, X: np.ndarray, fn,
+    ) -> np.ndarray:
+        """Apply a classifier function, handling 3D per-token activations.
+
+        If X is 3D (batch, seq_len, hidden_dim), flattens to 2D, applies
+        inference transforms + fn, then reshapes back. Otherwise applies
+        directly to 2D input.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Activations, shape (batch, hidden_dim) or (batch, seq_len, hidden_dim).
+        fn : callable
+            Classifier method (e.g., predict, predict_proba) to apply.
+
+        Returns
+        -------
+        np.ndarray
+            Result with batch dimensions restored.
+        """
+        if X.ndim == 3:
+            batch_size, seq_len, hidden_dim = X.shape
+            X_flat = self._apply_inference_transforms(X.reshape(-1, hidden_dim))
+            result_flat = fn(X_flat)
+            if result_flat.ndim == 1:
+                return result_flat.reshape(batch_size, seq_len)
+            else:
+                return result_flat.reshape(batch_size, seq_len, -1)
+        else:
+            return fn(self._apply_inference_transforms(X))
+
     def predict(
         self,
         prompts: list[str],
@@ -1402,16 +1467,13 @@ class Probe:
 
             # Handle different output shapes
             if probs.ndim == 1:
-                # Binary, single value per sample
                 return (probs > 0.5).astype(int)
             elif probs.ndim == 2:
-                # (n_samples, n_classes)
                 return self.classes_[probs.argmax(axis=1)]
             else:
                 # (n_samples, seq_len, n_classes) - per-token
                 return self.classes_[probs.argmax(axis=-1)]
         else:
-            # Use classifier's native predict method
             X, attention_mask = self._extract_and_pool(
                 prompts,
                 self._inference_pooling,
@@ -1419,44 +1481,14 @@ class Probe:
                 batch_size=batch_size,
             )
 
-            if X.ndim == 3:
-                # Per-token: (batch, seq_len, hidden_dim)
-                batch_size, seq_len, hidden_dim = X.shape
-                X_flat = X.reshape(-1, hidden_dim)
+            preds = self._apply_to_per_token_or_flat(X, self.classifier_.predict)
 
-                # Apply scaling if fitted
-                if self.scaler_ is not None:
-                    X_flat = self.scaler_.transform(X_flat)
-                # Save pre-preprocessing copy for mass-mean augmentation
-                X_flat_pre = X_flat.copy() if self._mass_mean_direction_ is not None else None
-                # Apply preprocessing if fitted
-                if self.preprocessing_pipeline_ is not None:
-                    X_flat = self.preprocessing_pipeline_.transform(X_flat)
-                # Apply mass-mean augmentation if fitted
-                if self._mass_mean_direction_ is not None:
-                    X_flat = self._augment_mass_mean(X_flat, X_flat_pre)
-
-                preds_flat = self.classifier_.predict(X_flat)
-                preds = preds_flat.reshape(batch_size, seq_len)
-
-                # For per-token, return majority vote per sample
-                # (assuming score-level pooling isn't needed for non-proba classifiers)
+            if preds.ndim == 2:
+                # Per-token: majority vote per sample
                 return np.array([
                     np.bincount(p.astype(int)).argmax() for p in preds
                 ])
-            else:
-                # Apply scaling if fitted
-                if self.scaler_ is not None:
-                    X = self.scaler_.transform(X)
-                # Save pre-preprocessing copy for mass-mean augmentation
-                X_pre = X.copy() if self._mass_mean_direction_ is not None else None
-                # Apply preprocessing if fitted
-                if self.preprocessing_pipeline_ is not None:
-                    X = self.preprocessing_pipeline_.transform(X)
-                # Apply mass-mean augmentation if fitted
-                if self._mass_mean_direction_ is not None:
-                    X = self._augment_mass_mean(X, X_pre)
-                return self.classifier_.predict(X)
+            return preds
 
     def predict_proba(
         self,
@@ -1497,38 +1529,14 @@ class Probe:
             batch_size=batch_size,
         )
 
-        # Parse the inference pooling strategy to determine if score-level
-        parsed = parse_pooling_strategy(self._inference_pooling)
-        is_score_pooling = parsed.is_score_pooling
+        probs = self._apply_to_per_token_or_flat(
+            X, self.classifier_.predict_proba,
+        )
 
-        if X.ndim == 3:
-            # Per-token activations: (batch, seq_len, hidden_dim)
-            batch_size, seq_len, hidden_dim = X.shape
-
-            # Reshape to (batch * seq_len, hidden_dim) for classification
-            X_flat = X.reshape(-1, hidden_dim)
-
-            # Apply scaling if fitted
-            if self.scaler_ is not None:
-                X_flat = self.scaler_.transform(X_flat)
-            # Save pre-preprocessing copy for mass-mean augmentation
-            X_flat_pre = X_flat.copy() if self._mass_mean_direction_ is not None else None
-            # Apply preprocessing if fitted
-            if self.preprocessing_pipeline_ is not None:
-                X_flat = self.preprocessing_pipeline_.transform(X_flat)
-            # Apply mass-mean augmentation if fitted
-            if self._mass_mean_direction_ is not None:
-                X_flat = self._augment_mass_mean(X_flat, X_flat_pre)
-
-            # Classify all tokens
-            probs_flat = self.classifier_.predict_proba(X_flat)
-
-            # Reshape back to (batch, seq_len, n_classes)
-            n_classes = probs_flat.shape[1]
-            probs = probs_flat.reshape(batch_size, seq_len, n_classes)
-
-            if is_score_pooling:
-                # Apply score-level pooling (e.g., max, min, score:mean)
+        # Apply score-level pooling if needed (e.g., max, min, score:mean)
+        if probs.ndim == 3:
+            parsed = parse_pooling_strategy(self._inference_pooling)
+            if parsed.is_score_pooling:
                 probs_tensor = torch.from_numpy(probs)
                 reduced = reduce_scores(
                     probs_tensor,
@@ -1536,23 +1544,8 @@ class Probe:
                     attention_mask,
                 )
                 return reduced.float().numpy()
-            else:
-                # Return per-token probabilities
-                return probs
-        else:
-            # Normal case: (batch, hidden_dim)
-            # Apply scaling if fitted
-            if self.scaler_ is not None:
-                X = self.scaler_.transform(X)
-            # Save pre-preprocessing copy for mass-mean augmentation
-            X_pre = X.copy() if self._mass_mean_direction_ is not None else None
-            # Apply preprocessing if fitted
-            if self.preprocessing_pipeline_ is not None:
-                X = self.preprocessing_pipeline_.transform(X)
-            # Apply mass-mean augmentation if fitted
-            if self._mass_mean_direction_ is not None:
-                X = self._augment_mass_mean(X, X_pre)
-            return self.classifier_.predict_proba(X)
+
+        return probs
 
     def score(
         self,
@@ -2055,9 +2048,7 @@ class Probe:
             Predictions, shape (n_samples,).
         """
         self._check_fitted()
-        X = self._to_numpy(X)
-        if self._mass_mean_direction_ is not None:
-            X = self._augment_mass_mean(X, X)
+        X = self._apply_inference_transforms(self._to_numpy(X))
         return self.classifier_.predict(X)
 
     def predict_proba_from_activations(self, X) -> np.ndarray:
@@ -2085,9 +2076,7 @@ class Probe:
             raise ValueError(
                 "predict_proba is not available for regression tasks."
             )
-        X = self._to_numpy(X)
-        if self._mass_mean_direction_ is not None:
-            X = self._augment_mass_mean(X, X)
+        X = self._apply_inference_transforms(self._to_numpy(X))
         return self.classifier_.predict_proba(X)
 
     def score_from_activations(self, X, y) -> float:
@@ -2108,10 +2097,8 @@ class Probe:
             Accuracy (classification) or R-squared (regression).
         """
         self._check_fitted()
-        X = self._to_numpy(X)
+        X = self._apply_inference_transforms(self._to_numpy(X))
         y = self._to_numpy(y)
-        if self._mass_mean_direction_ is not None:
-            X = self._augment_mass_mean(X, X)
         return self.classifier_.score(X, y)
 
     def save(self, path: str) -> None:

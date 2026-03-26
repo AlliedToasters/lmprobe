@@ -69,6 +69,30 @@ _tokenizer_cache: dict[str, Any] = {}
 
 
 # =============================================================================
+# Safetensors loading helpers
+# =============================================================================
+
+
+def _load_all_safetensors(path: str | Path) -> dict[str, torch.Tensor]:
+    """Load all tensors from a safetensors file as a dict."""
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="pt") as f:
+        return {k: f.get_tensor(k) for k in f.keys()}
+
+
+def _accumulate_safetensors(
+    path: str | Path, accumulator: dict[str, list[torch.Tensor]]
+) -> None:
+    """Load all tensors and append each to lists in *accumulator*."""
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="pt") as f:
+        for key in f.keys():
+            accumulator.setdefault(key, []).append(f.get_tensor(key))
+
+
+# =============================================================================
 # Shared metadata helpers
 # =============================================================================
 
@@ -2964,7 +2988,6 @@ def _unpack_shard_prompts(
         For split full_sequence datasets: shard_idx -> {layer: path}.
         Needed when a prompt spans multiple shards.
     """
-    from safetensors import safe_open
     from tqdm import tqdm
 
     from .cache import (
@@ -2986,12 +3009,9 @@ def _unpack_shard_prompts(
         # Per-layer layout: load each per-layer file
         tensors_data: dict[str, torch.Tensor] = {}
         for layer, layer_path in shard_path.items():
-            with safe_open(layer_path, framework="pt") as f:
-                for k in f.keys():
-                    tensors_data[k] = f.get_tensor(k)
+            tensors_data.update(_load_all_safetensors(layer_path))
     else:
-        with safe_open(shard_path, framework="pt") as f:
-            tensors_data = {k: f.get_tensor(k) for k in f.keys()}
+        tensors_data = _load_all_safetensors(shard_path)
 
     # For split full_sequence datasets, load all shard tensors upfront
     # so we can reconstruct complete sequences from multiple shards.
@@ -3005,9 +3025,7 @@ def _unpack_shard_prompts(
         for shard_idx, layer_paths in all_layer_paths.items():
             shard_data: dict[str, torch.Tensor] = {}
             for layer, layer_path in layer_paths.items():
-                with safe_open(layer_path, framework="pt") as f:
-                    for k in f.keys():
-                        shard_data[k] = f.get_tensor(k)
+                shard_data.update(_load_all_safetensors(layer_path))
             all_shard_tensors[shard_idx] = shard_data
 
     for pi in tqdm(
@@ -3248,8 +3266,6 @@ def load_activation_dataset(
     else:
         load_types = list(tensor_descriptors.keys())
 
-    from safetensors import safe_open
-
     result: dict[str, torch.Tensor] = {}
 
     for t_type in load_types:
@@ -3273,11 +3289,7 @@ def load_activation_dataset(
                         repo_id, fname,
                         repo_type="dataset", token=token,
                     )
-                    with safe_open(shard_path, framework="pt") as f:
-                        for sf_key in f.keys():
-                            shard_data.setdefault(sf_key, []).append(
-                                f.get_tensor(sf_key)
-                            )
+                    _accumulate_safetensors(shard_path, shard_data)
         else:
             # v1.0 co-located layout
             if layers is not None:
@@ -3291,11 +3303,7 @@ def load_activation_dataset(
                     repo_id, shard["file"],
                     repo_type="dataset", token=token,
                 )
-                with safe_open(shard_path, framework="pt") as f:
-                    for sf_key in f.keys():
-                        shard_data.setdefault(sf_key, []).append(
-                            f.get_tensor(sf_key)
-                        )
+                _accumulate_safetensors(shard_path, shard_data)
 
         for sf_key, parts in shard_data.items():
             result[sf_key] = torch.cat(parts, dim=0)
@@ -3479,7 +3487,6 @@ def migrate_dataset(
     _check_pyarrow()
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
-    from safetensors import safe_open
     from safetensors.torch import save_file
     from tqdm import tqdm
 
@@ -3661,8 +3668,7 @@ def migrate_dataset(
                     repo_id, fname,
                     repo_type="dataset", token=token,
                 )
-                with safe_open(shard_path, framework="pt") as sf:
-                    shard_tensor = sf.get_tensor(key)
+                shard_tensor = _load_all_safetensors(shard_path)[key]
 
                 lt_idx = old_shard_lt_indices[old_si]
 

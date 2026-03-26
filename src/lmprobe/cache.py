@@ -1395,6 +1395,47 @@ def _lookup_shard(
     return index.get(prompt_hash)
 
 
+def _resolve_shard_tensor_info(
+    model_name: str,
+    prompt: str,
+    tensor_type: str,
+) -> tuple[dict, dict, dict]:
+    """Look up shard entry, manifest, and tensor descriptor.
+
+    Parameters
+    ----------
+    model_name : str
+    prompt : str
+    tensor_type : str
+        E.g. "hidden_layers" or "logits_topk".
+
+    Returns
+    -------
+    tuple[dict, dict, dict]
+        (entry, manifest, tensor_info)
+
+    Raises
+    ------
+    FileNotFoundError
+        If entry, manifest, or tensor_type is missing.
+    """
+    entry = _lookup_shard(model_name, prompt)
+    if entry is None:
+        raise FileNotFoundError(
+            f"No shard entry found for prompt: {prompt!r}"
+        )
+
+    manifest = _load_shard_manifest(model_name, repo_id=entry.get("repo_id"))
+    if manifest is None:
+        raise FileNotFoundError("No shard manifest found")
+
+    t_info = manifest.get("tensors", {}).get(tensor_type)
+    if t_info is None:
+        raise FileNotFoundError(f"No {tensor_type} in shard manifest")
+
+    return entry, manifest, t_info
+
+
 def _discover_from_shard(model_name: str, prompt: str) -> CachedPromptInfo | None:
     """Build CachedPromptInfo from shard manifest metadata (no data loading)."""
     entry = _lookup_shard(model_name, prompt)
@@ -1514,19 +1555,9 @@ def _resolve_hidden_shard(
 
     Returns (entry, t_info, shards, shard_idx, storage, layout).
     """
-    entry = _lookup_shard(model_name, prompt)
-    if entry is None:
-        raise FileNotFoundError(
-            f"No shard entry found for prompt: {prompt!r}"
-        )
-
-    manifest = _load_shard_manifest(model_name, repo_id=entry.get("repo_id"))
-    if manifest is None:
-        raise FileNotFoundError("No shard manifest found")
-
-    t_info = manifest["tensors"].get("hidden_layers")
-    if t_info is None:
-        raise FileNotFoundError("No hidden_layers in shard manifest")
+    entry, _manifest, t_info = _resolve_shard_tensor_info(
+        model_name, prompt, "hidden_layers",
+    )
 
     storage = t_info.get("storage", "pooled")
     layout = t_info.get("layout")
@@ -1740,19 +1771,9 @@ def _load_logits_from_shard(
     """
     from safetensors import safe_open
 
-    entry = _lookup_shard(model_name, prompt)
-    if entry is None:
-        raise FileNotFoundError(
-            f"No shard entry found for prompt: {prompt!r}"
-        )
-
-    manifest = _load_shard_manifest(model_name, repo_id=entry.get("repo_id"))
-    if manifest is None:
-        raise FileNotFoundError("No shard manifest found")
-
-    t_info = manifest["tensors"].get("logits_topk")
-    if t_info is None:
-        raise FileNotFoundError("No logits_topk in shard manifest")
+    entry, _manifest, t_info = _resolve_shard_tensor_info(
+        model_name, prompt, "logits_topk",
+    )
 
     shard_idx = entry.get("shard_index_logits", entry.get("shard_index"))
     row_offset = entry.get("row_offset_logits", entry.get("row_offset"))
@@ -2448,11 +2469,10 @@ def load_prompt_logits(
 
     # Shard registry fallback (logits_topk only)
     if top_k is not None:
-        entry = _lookup_shard(model_name, prompt)
-        if entry is not None:
-            manifest = _load_shard_manifest(model_name, repo_id=entry.get("repo_id"))
-            if manifest and "logits_topk" in manifest.get("tensors", {}):
-                return _load_logits_from_shard(model_name, prompt)
+        try:
+            return _load_logits_from_shard(model_name, prompt)
+        except FileNotFoundError:
+            pass
 
     raise FileNotFoundError(
         f"No cached logits found for prompt: {prompt!r}"
