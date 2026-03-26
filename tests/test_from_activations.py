@@ -99,3 +99,45 @@ class TestFitFromActivations:
 
         assert hasattr(probe, "classes_")
         assert len(probe.classes_) == 2
+
+    def test_scaler_applied_single_layer(self):
+        """fit_from_activations applies StandardScaler for single-layer (n_layers=1)."""
+        X = np.random.randn(40, 64) * 1000  # Large-scale activations
+        y = np.array([0] * 20 + [1] * 20)
+
+        probe = LinearProbe(random_state=42)
+        probe.fit_from_activations(X, y, n_layers=1)
+
+        # StandardScaler should be fitted
+        assert probe.scaler_ is not None
+        # Predictions should work (inference applies scaler too)
+        preds = probe.predict_from_activations(X)
+        assert preds.shape == (40,)
+
+    def test_scaler_consistency_with_fit(self, tiny_model):
+        """fit_from_activations produces same scaler behavior as fit()."""
+        # First, fit with prompts to get the scaling behavior
+        probe1 = LinearProbe(
+            model=tiny_model, layers=-1, classifier="logistic_regression",
+            device="cpu", remote=False, random_state=42,
+        )
+        probe1.fit(["positive one", "positive two"], ["negative one", "negative two"])
+        assert probe1.scaler_ is not None  # Single-layer → StandardScaler
+
+        # Now fit from activations — should also have scaler
+        X = np.random.randn(20, 64)
+        y = np.array([0] * 10 + [1] * 10)
+        probe2 = LinearProbe(random_state=42)
+        probe2.fit_from_activations(X, y, n_layers=1)
+        assert probe2.scaler_ is not None
+
+    def test_preprocessing_pipeline_applied(self):
+        """User-specified preprocessing is applied in fit_from_activations."""
+        X = np.random.randn(40, 64)
+        y = np.array([0] * 20 + [1] * 20)
+
+        probe = LinearProbe(
+            preprocessing="standard", random_state=42,
+        )
+        probe.fit_from_activations(X, y)
+        assert probe.preprocessing_pipeline_ is not None

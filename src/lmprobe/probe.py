@@ -1707,11 +1707,14 @@ class Probe:
         X: Any,
         y: Any,
         sample_weight: np.ndarray | list[float] | None = None,
+        n_layers: int = 1,
     ) -> Probe:
         """Fit the probe from pre-computed activation tensors.
 
-        Skips all extraction and pooling logic, going straight to
-        classifier fitting.
+        Skips activation extraction and pooling, but applies the same
+        normalization and preprocessing pipeline as ``fit()``:
+        StandardScaler for single-layer, PerLayerScaler for multi-layer,
+        and any user-specified ``preprocessing``.
 
         Parameters
         ----------
@@ -1722,6 +1725,10 @@ class Probe:
         sample_weight : np.ndarray | list[float] | None
             Per-sample weights passed to the classifier's ``fit()`` method.
             If None, all samples are weighted equally.
+        n_layers : int
+            Number of concatenated layers in X. Controls scaling behavior:
+            1 (default) applies StandardScaler, >1 applies PerLayerScaler
+            when ``normalize_layers`` is set.
 
         Returns
         -------
@@ -1731,10 +1738,28 @@ class Probe:
         X = self._to_numpy(X)
         y = self._to_numpy(y)
 
+        # Apply per-layer normalization (StandardScaler for single-layer,
+        # PerLayerScaler for multi-layer) — same as fit()
+        scaling_strategy = self._get_scaling_strategy()
+        if scaling_strategy is not None and self._preprocessing_includes_standard():
+            scaling_strategy = None
+        self.scaler_, X = self._fit_layer_scaler(
+            X, n_layers, scaling_strategy, single_layer_standard=True,
+        )
+
+        # Save pre-preprocessing activations for mass-mean augmentation
+        if self.mass_mean_augment:
+            X_pre_preprocessing = X.copy()
+            self._compute_mass_mean_direction(X_pre_preprocessing, y)
+
+        # Apply user-specified preprocessing (StandardScaler, PCA, etc.)
+        self.preprocessing_pipeline_ = self._build_preprocessing_pipeline()
+        if self.preprocessing_pipeline_ is not None:
+            X = self.preprocessing_pipeline_.fit_transform(X)
+
         # Apply mass-mean augmentation if enabled
         if self.mass_mean_augment:
-            self._compute_mass_mean_direction(X, y)
-            X = self._augment_mass_mean(X, X)
+            X = self._augment_mass_mean(X, X_pre_preprocessing)
 
         # Clone and fit classifier
         self.classifier_ = clone(self._classifier_template)
