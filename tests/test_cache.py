@@ -2405,7 +2405,8 @@ class TestEvictFunction:
         old = cache_mod._CACHE_MAX_BYTES
         try:
             cache_mod._CACHE_MAX_BYTES = None
-            save_prompt_activations(self.model, "test", [0], torch.randn(1, 5, 32), torch.ones(1, 5))
+            acts = torch.randn(1, 5, 32)
+            save_prompt_activations(self.model, "test", [0], acts, torch.ones(1, 5))
             evict()  # Should not raise or delete anything
             assert is_prompt_fully_cached(self.model, "test", {0})
         finally:

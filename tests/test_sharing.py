@@ -5054,7 +5054,6 @@ class TestNewWriteParquetExtraTypes:
 
     def test_embedded_metadata_in_parquet(self, tmp_path):
         """lmprobe_info is embedded in Parquet schema when provided."""
-        import pyarrow.parquet as pq
 
         from lmprobe.sharing import _extract_metadata_from_parquet
 

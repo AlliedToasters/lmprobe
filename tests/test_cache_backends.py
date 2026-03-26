@@ -166,7 +166,6 @@ class TestLocalCacheBackend(CacheBackendTests):
 
     def test_write_bytes_cleans_up_tmp_on_oserror(self, backend, tmp_path):
         """On OSError during rename, tmp file is cleaned up."""
-        import os
 
         backend.write_bytes("model/setup.bin", b"initial")
 
@@ -176,7 +175,6 @@ class TestLocalCacheBackend(CacheBackendTests):
             pass
 
         # Instead, test via direct path manipulation
-        from pathlib import Path
 
         key = "model/fail.bin"
         path = backend._path(key)

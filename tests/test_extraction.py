@@ -1,11 +1,9 @@
 """Tests for extraction module."""
 
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-
 
 # ---------------------------------------------------------------------------
 # _require_nnsight

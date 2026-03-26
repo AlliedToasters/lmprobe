@@ -47,10 +47,10 @@ class TestCheckCudaCompatibility:
             mock_cuda.device_count.return_value = 1
             mock_cuda.get_device_capability.return_value = (6, 1)
             mock_cuda.get_device_name.return_value = "NVIDIA GeForce GTX 1060"
-            with patch(
-                "lmprobe._device_utils.torch.tensor",
-                side_effect=RuntimeError("no kernel image is available for execution on the device"),
-            ):
+            err = RuntimeError(
+                "no kernel image is available for execution on the device"
+            )
+            with patch("lmprobe._device_utils.torch.tensor", side_effect=err):
                 with pytest.raises(
                     RuntimeError, match="GTX 1060.*sm_61.*not supported by this PyTorch build"
                 ):

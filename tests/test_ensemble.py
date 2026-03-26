@@ -7,12 +7,11 @@ import warnings
 import numpy as np
 import pytest
 
-from lmprobe import Probe
-from lmprobe.ensemble import ProbeEnsemble
-
 # Re-use shared fixtures from conftest
 from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_PROMPTS
 
+from lmprobe import Probe
+from lmprobe.ensemble import ProbeEnsemble
 
 # ---------------------------------------------------------------------------
 # Helpers
