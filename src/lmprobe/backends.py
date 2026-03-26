@@ -200,7 +200,7 @@ class NnsightBackend(ExtractionBackend):
 
 
 # Global cache for locally-loaded HuggingFace models
-# Key: (model_name, device), Value: (model, tokenizer)
+# Key: (model_name, device, dtype), Value: (model, tokenizer)
 _LOCAL_MODEL_CACHE: dict[tuple[Any, ...], tuple[Any, PreTrainedTokenizerBase]] = {}
 
 

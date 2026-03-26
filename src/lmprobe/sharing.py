@@ -248,7 +248,7 @@ def _staging_dir_path(
     if not shuffle:
         key_parts.append(["shuffle", False])
     content = json.dumps(key_parts, sort_keys=True)
-    key = hashlib.sha256(content.encode()).hexdigest()[:16]
+    key = _hash_string(content)
     return get_cache_dir() / "staging" / key
 
 

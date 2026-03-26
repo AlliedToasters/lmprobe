@@ -2012,10 +2012,12 @@ def load_layer_last_token(
     """
     acts_list, masks_list = load_layer_across_prompts(model_name, prompts, layer)
 
+    from .pooling import _last_token_indices
+
     vectors = []
     for acts, mask in zip(acts_list, masks_list):
         # acts: (1, seq_len, hidden_dim), mask: (1, seq_len)
-        last_pos = int(mask[0].nonzero(as_tuple=True)[0][-1].item())
+        last_pos = int(_last_token_indices(mask)[0].item())
         vectors.append(acts[0, last_pos, :])
 
     return torch.stack(vectors, dim=0)
@@ -2290,8 +2292,9 @@ def _select_positions(
 ) -> torch.Tensor:
     """Slice token positions ("last" or "all") from a (1, seq_len, ...) tensor."""
     if positions == "last":
-        mask = attention_mask[0]  # (seq_len,)
-        last_pos = int(mask.nonzero(as_tuple=True)[0][-1].item())
+        from .pooling import _last_token_indices
+
+        last_pos = int(_last_token_indices(attention_mask)[0].item())
         return tensor[:, last_pos : last_pos + 1, :]
     if positions == "all":
         return tensor
@@ -3090,7 +3093,7 @@ def compute_cache_key(
         "layers": sorted(layer_indices),
     }
     serialized = json.dumps(data, sort_keys=True, ensure_ascii=True)
-    return hashlib.sha256(serialized.encode()).hexdigest()[:32]
+    return _hash_string(serialized, length=32)
 
 
 def get_cache_path(cache_key: str) -> Path:

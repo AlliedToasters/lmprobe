@@ -29,7 +29,7 @@ def _require_nnsight() -> Any:
 
 
 # Global model cache to avoid loading the same model multiple times
-# Key: (model_name, device), Value: LanguageModel
+# Key: (model_name, device, remote), Value: LanguageModel
 _MODEL_CACHE: dict = {}
 
 
