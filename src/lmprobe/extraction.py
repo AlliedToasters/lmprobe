@@ -577,7 +577,7 @@ def _extract_batch_with_logits(
     layer_indices: list[int],
     remote: bool = False,
     logit_top_k: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Extract activations AND logits for a single batch of prompts.
 
     This function captures both layer activations and the lm_head output
@@ -592,6 +592,7 @@ def _extract_batch_with_logits(
         List of text prompts (should be a small batch).
     layer_indices : list[int]
         List of layer indices to extract from (must be positive).
+        Pass an empty list to extract logits only (no activations).
     remote : bool
         Whether to use remote execution.
     logit_top_k : int | None
@@ -602,8 +603,9 @@ def _extract_batch_with_logits(
 
     Returns
     -------
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
-        - activations: Shape (batch, seq_len, hidden_dim * num_layers)
+    tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]
+        - activations: Shape (batch, seq_len, hidden_dim * num_layers),
+          or None when layer_indices is empty
         - attention_mask: Shape (batch, seq_len)
         - logits: Shape (batch, seq_len, vocab_size) when logit_top_k is None,
           or (batch, seq_len, K) top-k values when logit_top_k is set
@@ -636,29 +638,37 @@ def _extract_batch_with_logits(
     else:
         modules_to_cache = [model.model.layers[i] for i in layer_indices]
 
-        with model.trace(tokenized, remote=False) as tracer:
-            cache = tracer.cache(modules=modules_to_cache).save()
-            logits = model.lm_head.output.save()
+        if modules_to_cache:
+            with model.trace(tokenized, remote=False) as tracer:
+                cache = tracer.cache(modules=modules_to_cache).save()
+                logits = model.lm_head.output.save()
+        else:
+            with model.trace(tokenized, remote=False) as tracer:
+                logits = model.lm_head.output.save()
 
         activation_tensors = []
-        for layer_idx in layer_indices:
-            key = f"model.model.layers.{layer_idx}"
-            entry = cache[key]
+        if modules_to_cache:
+            for layer_idx in layer_indices:
+                key = f"model.model.layers.{layer_idx}"
+                entry = cache[key]
 
-            if hasattr(entry, "output"):
-                output = entry.output
-            else:
-                output = entry["output"]
+                if hasattr(entry, "output"):
+                    output = entry.output
+                else:
+                    output = entry["output"]
 
-            tensor = _unwrap_proxy(output)
-            if isinstance(tensor, tuple):
-                tensor = tensor[0]
+                tensor = _unwrap_proxy(output)
+                if isinstance(tensor, tuple):
+                    tensor = tensor[0]
 
-            activation_tensors.append(tensor)
+                activation_tensors.append(tensor)
 
         logits_val = _unwrap_proxy(logits)
 
-    combined = torch.cat(activation_tensors, dim=-1)
+    if activation_tensors:
+        combined = torch.cat(activation_tensors, dim=-1)
+    else:
+        combined = None
     attention_mask = tokenized["attention_mask"]
 
     return combined, attention_mask, logits_val, logits_indices
@@ -963,7 +973,7 @@ class ActivationExtractor:
         prompts: list[str],
         layer_indices: list[int],
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Extract activations AND logits for a single batch of prompts.
 
         Delegates to the configured backend.
@@ -973,18 +983,49 @@ class ActivationExtractor:
         prompts : list[str]
             List of text prompts.
         layer_indices : list[int]
-            Layer indices to extract from.
+            Layer indices to extract from. Pass an empty list to
+            extract logits only (no activations).
         **kwargs
             Backend-specific parameters (e.g., logit_top_k).
 
         Returns
         -------
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
-            (activations, attention_mask, logits, logits_indices)
+        tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]
+            (activations, attention_mask, logits, logits_indices).
+            activations is None when layer_indices is empty.
         """
         return self._backend.extract_batch_with_logits(
             prompts, layer_indices, **kwargs
         )
+
+    def extract_logits_only(
+        self,
+        prompts: list[str],
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Extract only logits, skipping layer activation extraction.
+
+        This is a convenience wrapper around ``extract_batch_with_logits``
+        with ``layer_indices=[]``. Use this when you only need logit
+        outputs (e.g., for validation via token probabilities) and want
+        to avoid downloading large activation tensors.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            List of text prompts.
+        **kwargs
+            Backend-specific parameters (e.g., logit_top_k, remote).
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+            (logits, attention_mask, logits_indices).
+        """
+        _, attention_mask, logits, logits_indices = (
+            self._backend.extract_batch_with_logits(prompts, [], **kwargs)
+        )
+        return logits, attention_mask, logits_indices
 
     def extract(
         self,

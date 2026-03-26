@@ -484,7 +484,7 @@ class UnifiedCache:
                         raise
 
                     # Move batch tensors to CPU to free any GPU memory
-                    batch_acts = batch_acts.cpu()
+                    batch_acts = batch_acts.cpu() if batch_acts is not None else None
                     batch_mask = batch_mask.cpu()
                     batch_logits = batch_logits.cpu() if batch_logits is not None else None
                     if batch_logits_indices is not None:
@@ -515,10 +515,11 @@ class UnifiedCache:
                     # large batch tensor can be freed before saving.
                     # Slicing creates views that keep the original alive;
                     # .clone() breaks that reference.
-                    prompt_acts_list: list[torch.Tensor | None] = [
-                        batch_acts[j : j + 1].clone()
-                        for j in range(len(batch_prompts))
-                    ]
+                    prompt_acts_list: list[torch.Tensor | None] = (
+                        [batch_acts[j : j + 1].clone()
+                         for j in range(len(batch_prompts))]
+                        if batch_acts is not None else [None] * len(batch_prompts)
+                    )
                     prompt_mask_list: list[torch.Tensor | None] = [
                         batch_mask[j : j + 1].clone()
                         for j in range(len(batch_prompts))
