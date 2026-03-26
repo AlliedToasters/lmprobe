@@ -86,6 +86,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
     "remote: marks tests that require NDIF remote execution (deselect with '-m \"not remote\"')",
+    "nnsight: marks tests that load a model via nnsight (disables coverage.py tracing)",
 ]
 
 [tool.ruff]

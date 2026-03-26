@@ -11,6 +11,8 @@ import pytest
 
 from lmprobe import LinearProbe
 
+pytestmark = pytest.mark.nnsight
+
 
 class TestPerLayerScaler:
     """Tests for the PerLayerScaler class."""

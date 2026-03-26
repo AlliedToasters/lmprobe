@@ -28,6 +28,8 @@ from lmprobe.backends import (
     resolve_backend,
 )
 
+pytestmark = pytest.mark.nnsight
+
 # ── ExtractionBackend ABC ────────────────────────────────────────────────────
 
 class TestExtractionBackendABC:

@@ -15,6 +15,8 @@ from lmprobe.logit_utils import (
     download_lm_head_weights,
 )
 
+pytestmark = pytest.mark.nnsight
+
 # ---------------------------------------------------------------------------
 # _detect_norm_type
 # ---------------------------------------------------------------------------

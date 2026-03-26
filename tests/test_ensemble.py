@@ -13,6 +13,8 @@ from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_PROMPTS
 from lmprobe import Probe
 from lmprobe.ensemble import ProbeEnsemble
 
+pytestmark = pytest.mark.nnsight
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

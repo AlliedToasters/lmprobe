@@ -4,6 +4,8 @@ import pytest
 
 from lmprobe import LinearProbe
 
+pytestmark = pytest.mark.nnsight
+
 
 def test_warmup_basic(tiny_model):
     """warmup() runs without error and populates the cache."""

@@ -5,6 +5,8 @@ import pytest
 
 from lmprobe.extraction import resolve_auto_candidates
 
+pytestmark = pytest.mark.nnsight
+
 
 class TestResolveAutoCandidates:
     """Tests for resolve_auto_candidates function."""

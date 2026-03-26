@@ -15,6 +15,8 @@ from lmprobe.classifiers import (
     validate_classifier,
 )
 
+pytestmark = pytest.mark.nnsight
+
 
 class TestBuiltinClassifiers:
     """Tests for all built-in classifiers."""

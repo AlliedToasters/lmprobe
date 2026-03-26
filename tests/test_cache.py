@@ -47,6 +47,8 @@ from lmprobe.cache import (
 )
 from lmprobe.cache_backends import LocalCacheBackend
 
+pytestmark = pytest.mark.nnsight
+
 
 class TestLegacyCacheStorage:
     """Tests for legacy v1 .pt cache storage functions."""

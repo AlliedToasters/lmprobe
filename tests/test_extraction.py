@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+pytestmark = pytest.mark.nnsight
+
 # ---------------------------------------------------------------------------
 # _require_nnsight
 # ---------------------------------------------------------------------------
