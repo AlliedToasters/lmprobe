@@ -594,6 +594,17 @@ def _prepare_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return t
 
 
+def _touch_and_load(
+    key: str, tensor_keys: list[str] | None = None,
+) -> dict[str, torch.Tensor] | None:
+    """If *key* exists in the backend, touch it and load tensors. Otherwise return None."""
+    backend = get_backend()
+    if backend.exists(key):
+        backend.touch(key)
+        return _load_tensors_from_backend(key, tensor_keys)
+    return None
+
+
 def _save_tensors_to_backend(key: str, tensors: dict[str, torch.Tensor]) -> None:
     """Save tensors to the backend as safetensors bytes."""
     from safetensors.torch import save
@@ -1055,44 +1066,11 @@ def _load_sf_keys(path: Path) -> set[str]:
         return set(f.keys())
 
 
-def _load_sf_tensor(path: Path, key: str) -> torch.Tensor:
-    """Load a single tensor by key."""
-    from safetensors import safe_open
-
-    with safe_open(str(path), framework="pt") as f:
-        return f.get_tensor(key)
-
-
-def _load_sf_tensors(path: Path, keys: list[str]) -> dict[str, torch.Tensor]:
-    """Load multiple tensors by key."""
-    from safetensors import safe_open
-
-    result = {}
-    with safe_open(str(path), framework="pt") as f:
-        available = set(f.keys())
-        for k in keys:
-            if k not in available:
-                raise KeyError(
-                    f"Corrupted or incomplete cache file {path}: "
-                    f"missing key {k!r}. Available keys: {sorted(available)}. "
-                    f"Delete this file and re-run to rebuild the cache."
-                )
-            result[k] = f.get_tensor(k)
-    return result
-
-
 def _load_sf_all(path: Path) -> dict[str, torch.Tensor]:
     """Load all tensors from safetensors file."""
     from safetensors.torch import load_file
 
     return load_file(str(path))
-
-
-def _merge_save(path: Path, new_tensors: dict[str, torch.Tensor]) -> None:
-    """Load existing safetensors, merge with new tensors, and save atomically."""
-    existing = _load_sf_all(path) if path.exists() else {}
-    existing.update(new_tensors)
-    _safe_save_file(existing, path)
 
 
 # =============================================================================
@@ -1902,20 +1880,16 @@ def load_prompt_activations(
 
     Returns (activations, attention_mask). Checks v2 then v1, then shard registry.
     """
-    backend = get_backend()
     key = _prompt_cache_key(model_name, prompt)
+    keys_to_load = [_raw_layer_key(li) for li in layers] + [_ATTENTION_MASK_KEY]
 
-    if backend.exists(key):
-        # Touch for LRU
-        backend.touch(key)
-        keys_to_load = [_raw_layer_key(li) for li in layers] + [_ATTENTION_MASK_KEY]
-        tensors = _load_tensors_from_backend(key, keys_to_load)
+    tensors = _touch_and_load(key, keys_to_load)
+    if tensors is not None:
         layer_acts = [tensors[_raw_layer_key(li)] for li in layers]
-        activations = torch.cat(layer_acts, dim=-1)
-        return activations, tensors[_ATTENTION_MASK_KEY]
+        return torch.cat(layer_acts, dim=-1), tensors[_ATTENTION_MASK_KEY]
 
     # v1 fallback (local only)
-    if isinstance(backend, LocalCacheBackend):
+    if isinstance(get_backend(), LocalCacheBackend):
         cache_dir = get_prompt_cache_dir(model_name, prompt)
         if cache_dir.exists() and (cache_dir / "attention_mask.pt").exists():
             layer_acts = []
@@ -2169,24 +2143,19 @@ def is_prompt_perplexity_cached(model_name: str, prompt: str) -> bool:
 
 def load_prompt_perplexity(model_name: str, prompt: str) -> torch.Tensor:
     """Load cached perplexity features (3,) for a single prompt."""
-    backend = get_backend()
+    ppl_keys = [_PERPLEXITY_KEY]
 
-    # Check sidecar file first (#120)
-    sidecar_key = _prompt_perplexity_key(model_name, prompt)
-    if backend.exists(sidecar_key):
-        backend.touch(sidecar_key)
-        tensors = _load_tensors_from_backend(sidecar_key, [_PERPLEXITY_KEY])
-        return tensors[_PERPLEXITY_KEY]
-
-    # Fall back to main file (backward compat with pre-sidecar entries)
-    key = _prompt_cache_key(model_name, prompt)
-    if backend.exists(key):
-        backend.touch(key)
-        tensors = _load_tensors_from_backend(key, [_PERPLEXITY_KEY])
-        return tensors[_PERPLEXITY_KEY]
+    # Sidecar file first (#120), then main file
+    for cache_key in (
+        _prompt_perplexity_key(model_name, prompt),
+        _prompt_cache_key(model_name, prompt),
+    ):
+        tensors = _touch_and_load(cache_key, ppl_keys)
+        if tensors is not None:
+            return tensors[_PERPLEXITY_KEY]
 
     # v1 (local only)
-    if isinstance(backend, LocalCacheBackend):
+    if isinstance(get_backend(), LocalCacheBackend):
         cache_dir = get_prompt_cache_dir(model_name, prompt)
         return torch.load(cache_dir / "perplexity.pt", weights_only=True)
 
@@ -2252,13 +2221,9 @@ def load_prompt_token_perplexity(
         (token_perplexity, token_ids) where token_perplexity has shape
         (num_real_tokens - 1,) and token_ids has shape (num_real_tokens,).
     """
-    backend = get_backend()
-    sidecar_key = _prompt_perplexity_key(model_name, prompt)
-    if backend.exists(sidecar_key):
-        backend.touch(sidecar_key)
-        tensors = _load_tensors_from_backend(
-            sidecar_key, [_TOKEN_PERPLEXITY_KEY, _TOKEN_IDS_KEY]
-        )
+    tok_keys = [_TOKEN_PERPLEXITY_KEY, _TOKEN_IDS_KEY]
+    tensors = _touch_and_load(_prompt_perplexity_key(model_name, prompt), tok_keys)
+    if tensors is not None:
         return tensors[_TOKEN_PERPLEXITY_KEY], tensors[_TOKEN_IDS_KEY]
 
     raise FileNotFoundError(
@@ -2439,32 +2404,18 @@ def load_prompt_logits(
         If top_k is set: (values, indices) where values has shape (1, positions, K)
         and indices has shape (1, positions, K) with dtype int32.
     """
-    backend = get_backend()
+    topk_keys = [_LOGITS_TOP_K_VALUES_KEY, _LOGITS_TOP_K_INDICES_KEY]
+    load_keys = topk_keys if top_k is not None else [_LOGITS_KEY]
 
-    # Check sidecar file first (#120)
-    sidecar_key = _prompt_logits_key(model_name, prompt)
-    if backend.exists(sidecar_key):
-        backend.touch(sidecar_key)
-        if top_k is not None:
-            tensors = _load_tensors_from_backend(
-                sidecar_key, [_LOGITS_TOP_K_VALUES_KEY, _LOGITS_TOP_K_INDICES_KEY]
-            )
-            return tensors[_LOGITS_TOP_K_VALUES_KEY], tensors[_LOGITS_TOP_K_INDICES_KEY]
-        else:
-            tensors = _load_tensors_from_backend(sidecar_key, [_LOGITS_KEY])
-            return tensors[_LOGITS_KEY], None
-
-    # Fall back to main file (backward compat with pre-sidecar entries)
-    key = _prompt_cache_key(model_name, prompt)
-    if backend.exists(key):
-        backend.touch(key)
-        if top_k is not None:
-            tensors = _load_tensors_from_backend(
-                key, [_LOGITS_TOP_K_VALUES_KEY, _LOGITS_TOP_K_INDICES_KEY]
-            )
-            return tensors[_LOGITS_TOP_K_VALUES_KEY], tensors[_LOGITS_TOP_K_INDICES_KEY]
-        else:
-            tensors = _load_tensors_from_backend(key, [_LOGITS_KEY])
+    # Sidecar file first (#120), then main file
+    for cache_key in (
+        _prompt_logits_key(model_name, prompt),
+        _prompt_cache_key(model_name, prompt),
+    ):
+        tensors = _touch_and_load(cache_key, load_keys)
+        if tensors is not None:
+            if top_k is not None:
+                return tensors[_LOGITS_TOP_K_VALUES_KEY], tensors[_LOGITS_TOP_K_INDICES_KEY]
             return tensors[_LOGITS_KEY], None
 
     # Shard registry fallback (logits_topk only)
@@ -2539,24 +2490,22 @@ def load_prompt_pooled_activations(
     model_name: str, prompt: str, layers: list[int], pooling: str
 ) -> torch.Tensor:
     """Load pooled activations for a single prompt. Shape: (1, n_layers * hidden_dim)."""
-    backend = get_backend()
     key = _prompt_cache_key(model_name, prompt)
+    tensor_keys = [_pooled_layer_key(pooling, li) for li in layers]
 
-    if backend.exists(key):
-        backend.touch(key)
-        tensor_keys = [_pooled_layer_key(pooling, li) for li in layers]
-        tensors = _load_tensors_from_backend(key, tensor_keys)
+    tensors = _touch_and_load(key, tensor_keys)
+    if tensors is not None:
         return torch.cat([tensors[k] for k in tensor_keys], dim=-1)
 
     # v1 (local only)
-    if isinstance(backend, LocalCacheBackend):
+    if isinstance(get_backend(), LocalCacheBackend):
         cache_dir = get_prompt_cache_dir(model_name, prompt)
         pooled_dir = cache_dir / get_pooled_cache_key(pooling)
         if pooled_dir.exists():
-            layer_acts = []
-            for layer in layers:
-                acts = torch.load(pooled_dir / f"layer_{layer}.pt", weights_only=True)
-                layer_acts.append(acts)
+            layer_acts = [
+                torch.load(pooled_dir / f"layer_{layer}.pt", weights_only=True)
+                for layer in layers
+            ]
             return torch.cat(layer_acts, dim=-1)
 
     # Shard registry fallback
