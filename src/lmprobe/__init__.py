@@ -32,6 +32,7 @@ except Exception:
     __version__ = "unknown"
 __all__ = [
     "ActivationBaseline",
+    "ActivationStore",
     "BaselineBattery",
     "BaselineProbe",
     "BaselineResult",
@@ -94,6 +95,10 @@ def set_max_threads(n: int) -> None:
 
 def __getattr__(name: str) -> Any:
     """Lazy import for optional modules."""
+    if name == "ActivationStore":
+        from .activation_store import ActivationStore
+
+        return ActivationStore
     if name == "PerLayerScaler":
         from .scaling import PerLayerScaler
 
