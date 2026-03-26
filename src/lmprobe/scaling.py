@@ -71,6 +71,21 @@ class PerLayerScaler:
         self.means_: np.ndarray | None = None
         self.stds_: np.ndarray | None = None
 
+    def _validate_and_reshape(self, X: np.ndarray) -> np.ndarray:
+        """Validate feature count and reshape to (n_samples, n_layers, hidden_dim)."""
+        expected = self.n_layers * self.hidden_dim
+        if X.shape[1] != expected:
+            raise ValueError(
+                f"Expected {expected} features "
+                f"({self.n_layers} layers x {self.hidden_dim} hidden_dim), "
+                f"got {X.shape[1]}"
+            )
+        return X.reshape(X.shape[0], self.n_layers, self.hidden_dim)
+
+    def _check_fitted(self) -> None:
+        if self.means_ is None or self.stds_ is None:
+            raise RuntimeError("PerLayerScaler has not been fitted. Call fit() first.")
+
     def fit(self, X: np.ndarray) -> PerLayerScaler:
         """Compute per-layer means and standard deviations.
 
@@ -89,30 +104,17 @@ class PerLayerScaler:
         ValueError
             If X has wrong number of features.
         """
-        expected_features = self.n_layers * self.hidden_dim
-        if X.shape[1] != expected_features:
-            raise ValueError(
-                f"Expected {expected_features} features "
-                f"({self.n_layers} layers x {self.hidden_dim} hidden_dim), "
-                f"got {X.shape[1]}"
-            )
-
-        # Reshape to (n_samples, n_layers, hidden_dim)
-        X_reshaped = X.reshape(X.shape[0], self.n_layers, self.hidden_dim)
+        X_reshaped = self._validate_and_reshape(X)
 
         if self.strategy == "per_neuron":
-            # Each neuron gets its own mean/std
-            # Mean over samples, shape: (n_layers, hidden_dim)
             self.means_ = X_reshaped.mean(axis=0)
             self.stds_ = X_reshaped.std(axis=0)
         else:  # per_layer
-            # All neurons in a layer share one mean/std
-            # Reshape to (n_layers, n_samples * hidden_dim) and compute stats
             X_flat = X_reshaped.transpose(1, 0, 2).reshape(self.n_layers, -1)
-            self.means_ = X_flat.mean(axis=1)  # shape: (n_layers,)
-            self.stds_ = X_flat.std(axis=1)  # shape: (n_layers,)
+            self.means_ = X_flat.mean(axis=1)
+            self.stds_ = X_flat.std(axis=1)
 
-        # Avoid division by zero: replace zero std with 1
+        # Avoid division by zero
         self.stds_ = np.where(self.stds_ == 0, 1.0, self.stds_)
 
         return self
@@ -137,28 +139,14 @@ class PerLayerScaler:
         ValueError
             If X has wrong number of features.
         """
-        if self.means_ is None or self.stds_ is None:
-            raise RuntimeError("PerLayerScaler has not been fitted. Call fit() first.")
-
-        expected_features = self.n_layers * self.hidden_dim
-        if X.shape[1] != expected_features:
-            raise ValueError(
-                f"Expected {expected_features} features "
-                f"({self.n_layers} layers x {self.hidden_dim} hidden_dim), "
-                f"got {X.shape[1]}"
-            )
-
-        # Reshape to (n_samples, n_layers, hidden_dim)
-        X_reshaped = X.reshape(X.shape[0], self.n_layers, self.hidden_dim)
+        self._check_fitted()
+        X_reshaped = self._validate_and_reshape(X)
 
         if self.strategy == "per_neuron":
-            # means_ and stds_ are (n_layers, hidden_dim)
             X_scaled = (X_reshaped - self.means_) / self.stds_
         else:  # per_layer
-            # means_ and stds_ are (n_layers,), need to broadcast
-            # Reshape to (1, n_layers, 1) for broadcasting
-            means = self.means_[:, np.newaxis]  # (n_layers, 1)
-            stds = self.stds_[:, np.newaxis]  # (n_layers, 1)
+            means = self.means_[:, np.newaxis]
+            stds = self.stds_[:, np.newaxis]
             X_scaled = (X_reshaped - means) / stds
 
         # Reshape back to (n_samples, n_layers * hidden_dim)
@@ -198,25 +186,14 @@ class PerLayerScaler:
         RuntimeError
             If scaler has not been fitted.
         """
-        if self.means_ is None or self.stds_ is None:
-            raise RuntimeError("PerLayerScaler has not been fitted. Call fit() first.")
-
-        expected_features = self.n_layers * self.hidden_dim
-        if X.shape[1] != expected_features:
-            raise ValueError(
-                f"Expected {expected_features} features, got {X.shape[1]}"
-            )
-
-        # Reshape to (n_samples, n_layers, hidden_dim)
-        X_reshaped = X.reshape(X.shape[0], self.n_layers, self.hidden_dim)
+        self._check_fitted()
+        X_reshaped = self._validate_and_reshape(X)
 
         if self.strategy == "per_neuron":
-            # means_ and stds_ are (n_layers, hidden_dim)
             X_original = X_reshaped * self.stds_ + self.means_
         else:  # per_layer
-            # means_ and stds_ are (n_layers,), need to broadcast
-            means = self.means_[:, np.newaxis]  # (n_layers, 1)
-            stds = self.stds_[:, np.newaxis]  # (n_layers, 1)
+            means = self.means_[:, np.newaxis]
+            stds = self.stds_[:, np.newaxis]
             X_original = X_reshaped * stds + means
 
         # Reshape back
@@ -238,8 +215,7 @@ class PerLayerScaler:
         RuntimeError
             If scaler has not been fitted.
         """
-        if self.means_ is None or self.stds_ is None:
-            raise RuntimeError("PerLayerScaler has not been fitted. Call fit() first.")
+        self._check_fitted()
 
         if self.strategy == "per_neuron":
             return {

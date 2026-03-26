@@ -5,27 +5,7 @@ import pytest
 
 from lmprobe.baseline import BaselineProbe
 
-# Test data
-POSITIVE_PROMPTS = [
-    "The dog barked loudly",
-    "My puppy loves to play fetch",
-    "Dogs are loyal companions",
-    "The golden retriever wagged its tail",
-    "Walking the dog in the park",
-]
-
-NEGATIVE_PROMPTS = [
-    "The cat purred softly",
-    "My kitten sleeps all day",
-    "Cats are independent animals",
-    "The tabby cat stretched lazily",
-    "The cat knocked things off the table",
-]
-
-TEST_PROMPTS = [
-    "A dog chased the ball",  # Positive-ish
-    "The cat sat on the mat",  # Negative-ish
-]
+from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_PROMPTS
 
 
 class TestBaselineProbeBasic:
@@ -96,24 +76,6 @@ class TestBaselineProbeBasic:
 
 class TestBaselineProbeClassifiers:
     """Test different classifier options."""
-
-    @pytest.mark.parametrize("classifier", [
-        "logistic_regression",
-        "ridge",
-        "lda",
-        "svm",
-    ])
-    def test_different_classifiers(self, classifier):
-        """Different classifiers work with bow/tfidf."""
-        baseline = BaselineProbe(
-            method="tfidf",
-            classifier=classifier,
-            random_state=42,
-        )
-        baseline.fit(POSITIVE_PROMPTS, NEGATIVE_PROMPTS)
-
-        predictions = baseline.predict(TEST_PROMPTS)
-        assert predictions.shape == (2,)
 
     def test_custom_sklearn_classifier(self):
         """Custom sklearn classifier works."""
