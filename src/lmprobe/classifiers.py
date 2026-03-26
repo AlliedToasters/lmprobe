@@ -334,7 +334,7 @@ class MassMeanClassifier:
             Predicted labels, shape (n_samples,).
         """
         scores = self.decision_function(X)
-        return (scores > 0).astype(int)
+        return (scores >= 0).astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Predict class probabilities using Platt-scaled decision scores.
