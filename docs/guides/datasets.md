@@ -127,6 +127,45 @@ push_dataset(
 )
 ```
 
+### Custom shard ordering
+
+By default, `push_dataset` shuffles prompts before sharding so each shard contains a representative mix. If you want **domain-contiguous shards** — so downstream consumers can selectively load just the domains they need — sort your prompts first and pass `shuffle=False`:
+
+```python
+import pandas as pd
+from lmprobe import push_dataset
+
+df = pd.read_parquet("my_dataset.parquet")
+
+# Sort prompts so each domain lands in contiguous shards
+df = df.sort_values(["domain", "pair_id"]).reset_index(drop=True)
+
+push_dataset(
+    repo_id="username/my-activations",
+    model_name="meta-llama/Llama-3.1-8B-Instruct",
+    prompts=df["statement"].tolist(),
+    labels=df["label"].tolist(),
+    metadata=[{"domain": r["domain"]} for _, r in df.iterrows()],
+    shuffle=False,  # preserve sort order in shards
+    stream=True,    # incremental upload for large datasets
+)
+```
+
+This is the recommended approach for shard grouping — sorting in userland is one line of pandas and handles multi-key grouping, variable group sizes, and custom orderings without lmprobe needing to understand your metadata semantics.
+
+**Tuning shard size for clean boundaries.** The default shard size is 1 GB (`shard_max_bytes`). If your per-domain data is much smaller than 1 GB, multiple domains will end up in the same shard — consumers wanting a single domain would still download a shard containing others. Set `shard_max_bytes` to roughly match the size of one domain group for cleaner boundaries:
+
+```python
+# Example: ~100 MB per domain → set shard size to match
+push_dataset(
+    ...,
+    shuffle=False,
+    shard_max_bytes=100 * 1024 * 1024,  # 100 MB
+)
+```
+
+Use `shuffle=True` (the default) unless you have a specific reason to control shard boundaries.
+
 ---
 
 ## Stage 3: Train a probe from the dataset
