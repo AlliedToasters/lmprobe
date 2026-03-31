@@ -63,6 +63,11 @@ _shard_manifests: dict[tuple[str, str | None], dict] = {}
 # Indices keyed by model_name (merged across repos; each entry carries repo_id).
 _shard_indices: dict[str, dict] = {}
 
+# Lock protecting _backend, _shard_manifests, and _shard_indices from
+# concurrent initialisation in threaded callers (e.g. parallel metadata scan).
+# RLock because _load_shard_manifest can recurse (repo_id fallback).
+_cache_lock = threading.RLock()
+
 # =============================================================================
 # Logging
 # =============================================================================
@@ -206,15 +211,20 @@ def get_backend() -> CacheBackend:
     if _backend is not None:
         return _backend
 
-    # Check LMPROBE_CACHE_BACKEND env var first
-    env_backend = os.getenv("LMPROBE_CACHE_BACKEND")
-    if env_backend:
-        _backend = _parse_backend_uri(env_backend)
-        return _backend
+    with _cache_lock:
+        # Double-check after acquiring the lock.
+        if _backend is not None:
+            return _backend
 
-    # Default: local filesystem backend using LMPROBE_CACHE_DIR
-    _backend = LocalCacheBackend(get_cache_dir())
-    return _backend
+        # Check LMPROBE_CACHE_BACKEND env var first
+        env_backend = os.getenv("LMPROBE_CACHE_BACKEND")
+        if env_backend:
+            _backend = _parse_backend_uri(env_backend)
+            return _backend
+
+        # Default: local filesystem backend using LMPROBE_CACHE_DIR
+        _backend = LocalCacheBackend(get_cache_dir())
+        return _backend
 
 
 def set_cache_backend(backend: CacheBackend | str | None) -> None:
@@ -1366,18 +1376,23 @@ def _load_shard_manifest(model_name: str, repo_id: str | None = None) -> dict | 
     if cache_key in _shard_manifests:
         return _shard_manifests[cache_key]
 
-    # Try repo-specific manifest first, fall back to legacy unkeyed manifest
-    backend = get_backend()
-    key = _shard_manifest_key(model_name, repo_id=repo_id)
-    if not backend.exists(key):
-        if repo_id is not None:
-            # Fall back to legacy (no repo_id) manifest
-            return _load_shard_manifest(model_name, repo_id=None)
-        return None
+    with _cache_lock:
+        # Double-check after lock.
+        if cache_key in _shard_manifests:
+            return _shard_manifests[cache_key]
 
-    manifest: dict[str, Any] = json.loads(backend.read_text(key))
-    _shard_manifests[cache_key] = manifest
-    return manifest
+        # Try repo-specific manifest first, fall back to legacy unkeyed manifest
+        backend = get_backend()
+        key = _shard_manifest_key(model_name, repo_id=repo_id)
+        if not backend.exists(key):
+            if repo_id is not None:
+                # Fall back to legacy (no repo_id) manifest
+                return _load_shard_manifest(model_name, repo_id=None)
+            return None
+
+        manifest: dict[str, Any] = json.loads(backend.read_text(key))
+        _shard_manifests[cache_key] = manifest
+        return manifest
 
 
 def _load_shard_index(model_name: str) -> dict | None:
@@ -1385,14 +1400,19 @@ def _load_shard_index(model_name: str) -> dict | None:
     if model_name in _shard_indices:
         return _shard_indices[model_name]
 
-    backend = get_backend()
-    key = _shard_index_key(model_name)
-    if not backend.exists(key):
-        return None
+    with _cache_lock:
+        # Double-check after lock.
+        if model_name in _shard_indices:
+            return _shard_indices[model_name]
 
-    index: dict[str, Any] = json.loads(backend.read_text(key))
-    _shard_indices[model_name] = index
-    return index
+        backend = get_backend()
+        key = _shard_index_key(model_name)
+        if not backend.exists(key):
+            return None
+
+        index: dict[str, Any] = json.loads(backend.read_text(key))
+        _shard_indices[model_name] = index
+        return index
 
 
 def _lookup_shard(
