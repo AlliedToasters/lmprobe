@@ -479,7 +479,7 @@ def extract(
                 if retry_fn is not None:
                     batch_acts, batch_mask, batch_logits, batch_logits_indices = (
                         retry_fn(
-                            lambda bp=batch_prompts: extraction_backend.extract_batch_with_logits(
+                            lambda bp=batch_prompts: extraction_backend.extract_batch_with_logits(  # type: ignore[misc]
                                 bp, layer_indices,
                                 remote=remote,
                                 logit_top_k=effective_top_k,
@@ -517,6 +517,7 @@ def extract(
             num_tokens = batch_mask.sum(dim=-1).int().tolist()
 
             # Save per-layer batch files
+            assert batch_acts is not None
             _save_batch(
                 batch_acts=batch_acts,
                 batch_mask=batch_mask,
@@ -762,9 +763,9 @@ def _preload_layer_from_batches(
 
         for j in range(batch_info.prompt_end - batch_info.prompt_start):
             orig_idx = batch_info.prompt_start + j
-            shuffled_pos = orig_to_shuffled.get(orig_idx)
-            if shuffled_pos is None:
+            if orig_idx not in orig_to_shuffled:
                 continue
+            shuffled_pos = orig_to_shuffled[orig_idx]
 
             # Extract this prompt's real tokens (remove padding)
             prompt_mask = mask[j]  # (padded_seq_len,)
@@ -1018,8 +1019,9 @@ def push_extraction(
             for j in range(shard_size):
                 if offset + j < n:
                     t = data[offset + j]
-                    if t is not None and t.shape[0] > 0:
-                        rows.append(t[-1:])  # last token: (1, dim)
+                    if t is not None:
+                        if t.shape[0] > 0:
+                            rows.append(t[-1:])  # last token: (1, dim)
             if rows:
                 save_file({key: torch.cat(rows, dim=0)}, str(tmpdir / fname))
             offset += shard_size
@@ -1033,8 +1035,9 @@ def push_extraction(
             for j in range(shard_size):
                 if offset + j < n:
                     t = data[offset + j]
-                    if t is not None and t.shape[0] > 1:
-                        rows.append(t[:-1])  # all but last: (num_tokens-1, dim)
+                    if t is not None:
+                        if t.shape[0] > 1:
+                            rows.append(t[:-1])  # all but last: (num_tokens-1, dim)
             if rows:
                 save_file({key: torch.cat(rows, dim=0)}, str(tmpdir / fname))
             offset += shard_size
