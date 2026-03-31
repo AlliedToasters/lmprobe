@@ -659,7 +659,10 @@ def _load_tensors_from_backend(
                         raise KeyError(
                             f"Corrupted or incomplete cache entry {key}: "
                             f"missing key {k!r}. Available keys: {sorted(available)}. "
-                            f"Delete this entry and re-run to rebuild the cache."
+                            f"If you used verify_cache=False, the cached entry "
+                            f"may have been created with a different layer config. "
+                            f"Re-run with verify_cache=True or delete this entry "
+                            f"and re-extract."
                         )
                     result[k] = f.get_tensor(k)
         return result
@@ -774,7 +777,10 @@ def _load_tensors_selective(
                 f"Corrupted or incomplete cache entry {key}: "
                 f"missing key {tensor_name!r}. "
                 f"Available keys: {sorted(available)}. "
-                f"Delete this entry and re-run to rebuild the cache."
+                f"If you used verify_cache=False, the cached entry "
+                f"may have been created with a different layer config. "
+                f"Re-run with verify_cache=True or delete this entry "
+                f"and re-extract."
             )
 
         # Check mask cache for attention_mask tensors
@@ -867,13 +873,12 @@ def batch_check_cache_status(
     compute_perplexity: bool = False,
     cache_logits: bool = False,
     logit_top_k: int | None = None,
+    verify_cache: bool = True,
 ) -> tuple[list[str], list[str], list[str], int, set[int] | None]:
     """Check cache status for many prompts using batch operations.
 
-    Uses a single LIST call to discover existing keys, then reads
-    safetensors headers (not full files) when needed to check layer
-    coverage. This is O(1) LIST + O(cached) header reads instead
-    of O(N) HEAD requests.
+    Uses a single LIST call to discover existing keys, then optionally
+    reads safetensors headers (not full files) to check layer coverage.
 
     Parameters
     ----------
@@ -891,6 +896,12 @@ def batch_check_cache_status(
         Whether logits need to be cached.
     logit_top_k : int or None
         Top-k for logit caching.
+    verify_cache : bool
+        If True (default), read safetensors headers to verify layer
+        coverage — O(cached) partial GETs on S3. If False, trust the
+        LIST hit and skip header verification. Use False when you know
+        the cache was populated with the same layer config (e.g.
+        consecutive runs of the same extraction script).
 
     Returns
     -------
@@ -931,16 +942,20 @@ def batch_check_cache_status(
         act_cached = False
         cached_layers: set[int] | None = None
         if main_key in existing_keys:
-            tensor_keys = _cached_tensor_keys(main_key)
-            if pooling is not None:
-                cached_layers = _parse_pooled_layer_keys(tensor_keys, pooling)
-                act_cached = required_layers.issubset(cached_layers)
+            if verify_cache:
+                tensor_keys = _cached_tensor_keys(main_key)
+                if pooling is not None:
+                    cached_layers = _parse_pooled_layer_keys(tensor_keys, pooling)
+                    act_cached = required_layers.issubset(cached_layers)
+                else:
+                    cached_layers = _parse_raw_layer_keys(tensor_keys)
+                    act_cached = (
+                        required_layers.issubset(cached_layers)
+                        and _ATTENTION_MASK_KEY in tensor_keys
+                    )
             else:
-                cached_layers = _parse_raw_layer_keys(tensor_keys)
-                act_cached = (
-                    required_layers.issubset(cached_layers)
-                    and _ATTENTION_MASK_KEY in tensor_keys
-                )
+                # Trust the LIST hit — skip header read
+                act_cached = True
         elif isinstance(backend, LocalCacheBackend):
             # v1 fallback for local backend
             if pooling is not None:
@@ -976,8 +991,11 @@ def batch_check_cache_status(
         if compute_perplexity:
             ppl_cached = ppl_key in existing_keys
             if not ppl_cached and main_key in existing_keys:
-                tensor_keys = _cached_tensor_keys(main_key)
-                ppl_cached = _PERPLEXITY_KEY in tensor_keys
+                if verify_cache:
+                    tensor_keys = _cached_tensor_keys(main_key)
+                    ppl_cached = _PERPLEXITY_KEY in tensor_keys
+                # When not verifying, ppl sidecar key not present means
+                # we need extraction — only the sidecar LIST hit is trusted
             if not ppl_cached and isinstance(backend, LocalCacheBackend):
                 ppl_cached = is_prompt_perplexity_cached(model_name, prompt)
             if not ppl_cached:
@@ -988,15 +1006,22 @@ def batch_check_cache_status(
             logits_cached = False
             want_topk = logit_top_k is not None
             if logits_key in existing_keys:
-                tensor_keys = _cached_tensor_keys(logits_key)
-                logits_cached = _has_logits_in_keys(
-                    tensor_keys, top_k=want_topk if want_topk else False
-                )
+                if verify_cache:
+                    tensor_keys = _cached_tensor_keys(logits_key)
+                    logits_cached = _has_logits_in_keys(
+                        tensor_keys, top_k=want_topk if want_topk else False
+                    )
+                else:
+                    # Trust the LIST hit for logits sidecar
+                    logits_cached = True
             if not logits_cached and main_key in existing_keys:
-                tensor_keys = _cached_tensor_keys(main_key)
-                logits_cached = _has_logits_in_keys(
-                    tensor_keys, top_k=want_topk if want_topk else False
-                )
+                if verify_cache:
+                    tensor_keys = _cached_tensor_keys(main_key)
+                    logits_cached = _has_logits_in_keys(
+                        tensor_keys, top_k=want_topk if want_topk else False
+                    )
+                # When not verifying and logits sidecar wasn't found,
+                # we can't assume main file has logits — need extraction
             if not logits_cached:
                 need_logits.append(prompt)
 
