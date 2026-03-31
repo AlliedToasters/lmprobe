@@ -120,7 +120,7 @@ class TestZeroCostWhenDisabled:
         iterations = 10_000
         t0 = time.perf_counter()
         for _ in range(iterations):
-            with profile_op("noop") as acc:
+            with profile_op("noop"):
                 pass
         elapsed = time.perf_counter() - t0
         # Should be < 1ms for 10k iterations (just a bool check + yield)

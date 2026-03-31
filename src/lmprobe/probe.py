@@ -22,7 +22,6 @@ from .cache import (
     load_pooled_batch,
 )
 from .classifiers import resolve_classifier
-from .profiling import profile_op, profile_section
 from .extraction import ActivationExtractor
 from .pooling import (
     get_pooling_fn,
@@ -30,6 +29,7 @@ from .pooling import (
     reduce_scores,
     resolve_pooling,
 )
+from .profiling import profile_op, profile_section
 
 if TYPE_CHECKING:
     from sklearn.base import BaseEstimator
