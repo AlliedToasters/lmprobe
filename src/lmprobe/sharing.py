@@ -814,6 +814,7 @@ def _compute_shard_plan(
     repo_id: str,
     metadata: list[dict] | None = None,
     shuffle: bool = True,
+    preload_workers: int = 8,
 ) -> dict[str, Any]:
     """Compute the shard plan without loading any tensor data.
 
@@ -850,12 +851,19 @@ def _compute_shard_plan(
         hidden_layers = raw_layers
 
     # --- Phase 1: Metadata-only pass (no tensor loading) ---
-    prompt_metadata: list[dict] = []
-    valid_prompts: list[str] = []
-    per_prompt_tokens: list[int] = []
-    skipped_count = 0
+    # Parallelise the per-prompt metadata reads using a thread pool.
+    # Each read is a small S3 GET (~4 KB safetensors header) that is
+    # IO-bound, so threads scale well.
 
-    for idx in tqdm(kept_indices, desc="Scanning cache metadata", unit="prompt"):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Pre-load tokenizer once before threads if token_perplexity is needed
+    if has_token_perplexity and _tokenizer_cache.get("instance") is None:
+        from transformers import AutoTokenizer
+        _tokenizer_cache["instance"] = AutoTokenizer.from_pretrained(model_name)
+
+    def _scan_one(idx: int) -> tuple[int, dict | None]:
+        """Scan metadata for a single prompt.  Returns (idx, meta_entry | None)."""
         prompt = prompts[idx]
         label = labels[idx] if labels is not None else None
         extra_meta: dict[str, Any] = {}
@@ -864,23 +872,19 @@ def _compute_shard_plan(
 
         info = discover_cached(model_name, prompt)
         if info is None:
-            skipped_count += 1
             logger.debug(f"[SHARING] Skipping prompt index {idx}: not in cache")
-            continue
+            return (idx, None)
 
         num_tokens = info.num_tokens
 
         if use_raw and hidden_layers:
             if num_tokens is None:
-                skipped_count += 1
                 logger.debug(
                     f"[SHARING] Skipping prompt index {idx}: "
                     f"no num_tokens metadata for raw mode"
                 )
-                continue
-            per_prompt_tokens.append(num_tokens)
+                return (idx, None)
 
-        valid_prompts.append(prompt)
         meta_entry: dict[str, Any] = {
             "text": prompt,
             "label": label,
@@ -907,11 +911,6 @@ def _compute_shard_plan(
                 )
                 meta_entry["token_ids"] = tok_ids.tolist()
                 meta_entry["token_perplexity"] = tok_ppl.tolist()
-                if _tokenizer_cache.get("instance") is None:
-                    from transformers import AutoTokenizer
-                    _tokenizer_cache["instance"] = (
-                        AutoTokenizer.from_pretrained(model_name)
-                    )
                 tokenizer = _tokenizer_cache["instance"]
                 meta_entry["token_strings"] = [
                     tokenizer.decode([tid])
@@ -924,7 +923,34 @@ def _compute_shard_plan(
                     f"perplexity columns"
                 )
 
-        prompt_metadata.append(meta_entry)
+        return (idx, meta_entry)
+
+    # Run the scan in parallel, preserving insertion order of kept_indices.
+    ordered_results: list[tuple[int, dict | None]] = [None] * len(kept_indices)  # type: ignore[list-item]
+    with ThreadPoolExecutor(max_workers=preload_workers) as pool:
+        futures = {
+            pool.submit(_scan_one, idx): pos
+            for pos, idx in enumerate(kept_indices)
+        }
+        with tqdm(total=len(kept_indices), desc="Scanning cache metadata", unit="prompt") as pbar:
+            for fut in as_completed(futures):
+                pos = futures[fut]
+                ordered_results[pos] = fut.result()
+                pbar.update(1)
+
+    # Collect results in original order
+    prompt_metadata: list[dict] = []
+    valid_prompts: list[str] = []
+    per_prompt_tokens: list[int] = []
+    skipped_count = 0
+    for idx, entry in ordered_results:
+        if entry is None:
+            skipped_count += 1
+            continue
+        valid_prompts.append(prompts[idx])
+        prompt_metadata.append(entry)
+        if use_raw and hidden_layers:
+            per_prompt_tokens.append(entry["num_tokens"])
 
     if skipped_count > 0:
         logger.warning(
@@ -1341,6 +1367,7 @@ def _consolidate_and_shard(
         repo_id=repo_id,
         metadata=metadata,
         shuffle=shuffle,
+        preload_workers=preload_workers,
     )
 
     prompt_metadata = plan["prompt_metadata"]
@@ -2387,6 +2414,7 @@ def _push_dataset_streaming(
             repo_id=repo_id,
             metadata=metadata,
             shuffle=shuffle,
+            preload_workers=preload_workers,
         )
         tensor_descriptors = plan["tensor_descriptors"]
         prompt_metadata = plan["prompt_metadata"]
