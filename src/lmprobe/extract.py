@@ -1018,9 +1018,9 @@ def push_extraction(
             rows: list[torch.Tensor] = []
             for j in range(shard_size):
                 if offset + j < n:
-                    entry: torch.Tensor | None = data[offset + j]
-                    if entry is not None and entry.shape[0] > 0:
-                        rows.append(entry[-1:])  # last token: (1, dim)
+                    lt_act: torch.Tensor | None = data[offset + j]
+                    if lt_act is not None and lt_act.shape[0] > 0:
+                        rows.append(lt_act[-1:])  # last token: (1, dim)
             if rows:
                 save_file({key: torch.cat(rows, dim=0)}, str(tmpdir / fname))
             offset += shard_size
@@ -1033,9 +1033,9 @@ def push_extraction(
             rows = []
             for j in range(shard_size):
                 if offset + j < n:
-                    entry2: torch.Tensor | None = data[offset + j]
-                    if entry2 is not None and entry2.shape[0] > 1:
-                        rows.append(entry2[:-1])  # all but last
+                    rest_act: torch.Tensor | None = data[offset + j]
+                    if rest_act is not None and rest_act.shape[0] > 1:
+                        rows.append(rest_act[:-1])  # all but last
             if rows:
                 save_file({key: torch.cat(rows, dim=0)}, str(tmpdir / fname))
             offset += shard_size
