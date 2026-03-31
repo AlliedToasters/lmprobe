@@ -283,7 +283,7 @@ class UnifiedCache:
         return self._layer_indices
 
     def _check_cache_status(
-        self, prompts: list[str]
+        self, prompts: list[str], verify_cache: bool = True
     ) -> tuple[list[str], list[str], list[str]]:
         """Check which prompts need extraction.
 
@@ -291,6 +291,12 @@ class UnifiedCache:
         instead of per-prompt HEAD requests. For large prompt sets
         (e.g. 3000 prompts), this reduces S3 latency from minutes
         to seconds.
+
+        Parameters
+        ----------
+        verify_cache : bool
+            If True (default), read safetensors headers to verify layer
+            coverage. If False, trust LIST hits and skip header reads.
 
         Returns
         -------
@@ -315,6 +321,7 @@ class UnifiedCache:
             compute_perplexity=self.compute_perplexity,
             cache_logits=self.cache_logits,
             logit_top_k=self.logit_top_k,
+            verify_cache=verify_cache,
         )
 
         if partial_cache_count > 0:
@@ -337,6 +344,7 @@ class UnifiedCache:
         prompts: list[str],
         remote: bool | None = None,
         max_retries: int | None = None,
+        verify_cache: bool = True,
     ) -> WarmupStats:
         """Extract and cache activations/perplexity for prompts.
 
@@ -352,6 +360,13 @@ class UnifiedCache:
         max_retries : int | None
             Maximum number of retry attempts per batch for transient errors.
             Defaults to 3 for remote extraction, 0 for local.
+        verify_cache : bool
+            If True (default), read safetensors headers to verify that
+            cached entries have the correct layers. If False, trust the
+            cache key existence and skip header verification. Use False
+            when you know the cache was populated with the same layer
+            config (e.g. consecutive runs of the same extraction script)
+            to avoid O(cached) S3 partial GETs.
 
         Returns
         -------
@@ -370,7 +385,7 @@ class UnifiedCache:
 
         # Check cache status
         need_activations, need_perplexity, need_logits = self._check_cache_status(
-            prompts
+            prompts, verify_cache=verify_cache
         )
 
         # Compute which prompts need unified extraction

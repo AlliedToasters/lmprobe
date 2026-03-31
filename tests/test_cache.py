@@ -1232,6 +1232,55 @@ class TestBatchCheckCacheStatus:
         )
         assert need_act == []
 
+    def test_verify_cache_false_trusts_list_hit(self):
+        """verify_cache=False skips header reads and trusts LIST hits."""
+        prompt = "verify test"
+        # Save only layer 0
+        acts = torch.randn(1, 5, 32)
+        mask = torch.ones(1, 5)
+        save_prompt_activations(self.model, prompt, [0], acts, mask)
+
+        # With verify=True, this is detected as partial (missing layer 1)
+        need_act, _, _, partial, _ = batch_check_cache_status(
+            self.model, [prompt], required_layers={0, 1}, verify_cache=True
+        )
+        assert need_act == [prompt]
+        assert partial == 1
+
+        # With verify=False, the LIST hit is trusted — prompt is "cached"
+        need_act, _, _, partial, _ = batch_check_cache_status(
+            self.model, [prompt], required_layers={0, 1}, verify_cache=False
+        )
+        assert need_act == []
+        assert partial == 0
+
+    def test_verify_cache_false_uncached_still_detected(self):
+        """verify_cache=False still detects prompts with no cache entry."""
+        need_act, _, _, _, _ = batch_check_cache_status(
+            self.model, ["no-cache"], required_layers={0}, verify_cache=False
+        )
+        assert need_act == ["no-cache"]
+
+    def test_verify_cache_false_logits(self):
+        """verify_cache=False trusts logits sidecar LIST hit."""
+        prompt = "logits verify"
+        # Save logits sidecar
+        logits = torch.randn(1, 5, 100)
+        mask = torch.ones(1, 5)
+        save_prompt_logits(self.model, prompt, logits, mask)
+        # Save activations so activation check passes
+        acts = torch.randn(1, 5, 32)
+        save_prompt_activations(self.model, prompt, [0], acts, mask)
+
+        _, _, need_log, _, _ = batch_check_cache_status(
+            self.model,
+            [prompt],
+            required_layers={0},
+            cache_logits=True,
+            verify_cache=False,
+        )
+        assert need_log == []
+
     def test_header_only_read(self):
         """_get_tensor_keys_header_only correctly parses safetensors header."""
         from lmprobe.cache import _get_tensor_keys_header_only, get_backend
