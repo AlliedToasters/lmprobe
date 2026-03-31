@@ -38,6 +38,7 @@ from .extraction import (
     resolve_layers,
 )
 from .pooling import TRAIN_POOLING_STRATEGIES, get_pooling_fn
+from .profiling import profile_op, profile_section
 
 if TYPE_CHECKING:
     from .backends import ExtractionBackend
@@ -373,6 +374,9 @@ class UnifiedCache:
         WarmupStats
             Statistics about the warmup operation.
         """
+        _prof_ctx = profile_op("UnifiedCache.warmup")
+        _prof = _prof_ctx.__enter__()
+
         start_time = time.time()
         remote = self.remote if remote is None else remote
 
@@ -384,9 +388,10 @@ class UnifiedCache:
         layer_indices = sorted(self.layer_indices)
 
         # Check cache status
-        need_activations, need_perplexity, need_logits = self._check_cache_status(
-            prompts, verify_cache=verify_cache
-        )
+        with profile_section(_prof, "check_cache"):
+            need_activations, need_perplexity, need_logits = self._check_cache_status(
+                prompts, verify_cache=verify_cache
+            )
 
         # Compute which prompts need unified extraction
         # (prompts that need BOTH or where we can get both cheaply)
@@ -672,6 +677,10 @@ class UnifiedCache:
             f"{perplexity_extracted} perplexity + "
             f"{logits_extracted} logits extracted in {elapsed:.1f}s"
         )
+
+        if _prof is not None:
+            _prof.sections["extraction"] = elapsed - _prof.sections.get("check_cache", 0)
+        _prof_ctx.__exit__(None, None, None)
 
         evict()
         return stats
