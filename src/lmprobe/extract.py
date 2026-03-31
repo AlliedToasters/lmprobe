@@ -156,11 +156,27 @@ def load_manifest(source: str | Path) -> ExtractionManifest:
 
 
 # ---------------------------------------------------------------------------
-# Batch file I/O
+# Batch file I/O  (N_batches × N_layers layout)
+#
+# Each NDIF batch produces one safetensors file **per layer**, stored under
+# ``layer_{idx}/batch_{idx}.safetensors``.  Each file contains just two
+# tensors: ``activations: (batch, seq, dim)`` and ``mask: (batch, seq)``.
+#
+# This layout means every file is read exactly once during shard
+# construction — no selective loading or range reads needed.
 # ---------------------------------------------------------------------------
 
-def _batch_filename(idx: int) -> str:
-    return f"batch_{idx:06d}.safetensors"
+def _batch_filename(batch_idx: int) -> str:
+    return f"batch_{batch_idx:06d}.safetensors"
+
+
+def _layer_dir(layer: int) -> str:
+    return f"layer_{layer:03d}"
+
+
+def _layer_batch_path(layer: int, batch_idx: int) -> str:
+    """Relative path for a layer/batch file within the extraction dir."""
+    return f"{_layer_dir(layer)}/{_batch_filename(batch_idx)}"
 
 
 def _save_batch(
@@ -168,64 +184,77 @@ def _save_batch(
     batch_mask: torch.Tensor,
     layer_indices: list[int],
     hidden_dim: int,
-    path: Path,
+    output_dir: Path,
+    batch_idx: int,
     batch_logits: torch.Tensor | None = None,
     batch_logits_indices: torch.Tensor | None = None,
 ) -> None:
-    """Save a batch of activations as per-layer-keyed safetensors.
+    """Save a batch as one safetensors file per layer.
 
-    The NDIF response shape ``(batch, seq, hidden_dim * num_layers)`` is split
-    into separate keys ``layer_{i}: (batch, seq, hidden_dim)`` so that each
-    layer is contiguous and can be loaded via a single range read.
+    The NDIF response shape ``(batch, seq, hidden_dim * num_layers)`` is
+    split and each layer is written to its own file under
+    ``layer_{idx}/batch_{idx}.safetensors``.  Each file is a complete,
+    self-contained safetensors with two keys: ``activations`` and ``mask``.
     """
     from safetensors.torch import save_file
 
     batch_size, seq_len = batch_acts.shape[:2]
     num_layers = len(layer_indices)
 
-    # Reshape from (batch, seq, hidden_dim * num_layers) to per-layer tensors
+    # Reshape: (batch, seq, dim*layers) → (batch, seq, layers, dim)
     per_layer = batch_acts.view(batch_size, seq_len, num_layers, hidden_dim)
 
-    tensors: dict[str, torch.Tensor] = {}
     for i, layer_idx in enumerate(layer_indices):
-        # .contiguous() ensures each layer is a single contiguous block
-        tensors[f"layer_{layer_idx}"] = per_layer[:, :, i, :].contiguous()
+        layer_path = output_dir / _layer_batch_path(layer_idx, batch_idx)
+        layer_path.parent.mkdir(parents=True, exist_ok=True)
 
-    tensors["attention_mask"] = batch_mask
+        tensors: dict[str, torch.Tensor] = {
+            "activations": per_layer[:, :, i, :].contiguous(),
+            "mask": batch_mask,
+        }
+        save_file(tensors, str(layer_path))
 
+    # Save logits separately (not per-layer — they're layer-independent)
     if batch_logits is not None:
-        tensors["logits"] = batch_logits
-    if batch_logits_indices is not None:
-        tensors["logits_indices"] = batch_logits_indices
+        logits_dir = output_dir / "logits"
+        logits_dir.mkdir(parents=True, exist_ok=True)
+        logits_tensors: dict[str, torch.Tensor] = {"logits": batch_logits}
+        if batch_logits_indices is not None:
+            logits_tensors["logits_indices"] = batch_logits_indices
+        from safetensors.torch import save_file as _save
 
-    save_file(tensors, str(path))
+        _save(logits_tensors, str(logits_dir / _batch_filename(batch_idx)))
 
 
 def load_batch_layer(
-    path: str | Path,
+    source: str | Path,
     layer: int,
+    batch_idx: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Load a single layer from a batch file.
+    """Load activations for one layer from one batch file.
 
     Parameters
     ----------
-    path : str | Path
-        Path to the batch safetensors file.
+    source : str | Path
+        Extraction directory (containing ``layer_*`` subdirectories).
     layer : int
-        Layer index to load.
+        Layer index.
+    batch_idx : int
+        Batch index.
 
     Returns
     -------
     tuple[torch.Tensor, torch.Tensor]
-        ``(activations, attention_mask)`` where activations has shape
-        ``(batch_size, seq_len, hidden_dim)`` and attention_mask has shape
+        ``(activations, mask)`` where activations has shape
+        ``(batch_size, seq_len, hidden_dim)`` and mask has shape
         ``(batch_size, seq_len)``.
     """
     from safetensors import safe_open
 
+    path = Path(source) / _layer_batch_path(layer, batch_idx)
     with safe_open(str(path), framework="pt") as f:
-        acts = f.get_tensor(f"layer_{layer}")
-        mask = f.get_tensor("attention_mask")
+        acts = f.get_tensor("activations")
+        mask = f.get_tensor("mask")
     return acts, mask
 
 
@@ -487,21 +516,21 @@ def extract(
             # Compute num_tokens from attention_mask
             num_tokens = batch_mask.sum(dim=-1).int().tolist()
 
-            # Save batch file
-            batch_file = _batch_filename(batch_idx)
+            # Save per-layer batch files
             _save_batch(
                 batch_acts=batch_acts,
                 batch_mask=batch_mask,
                 layer_indices=layer_indices,
                 hidden_dim=hidden_dim,
-                path=out_path / batch_file,
+                output_dir=out_path,
+                batch_idx=batch_idx,
                 batch_logits=batch_logits if cache_logits else None,
                 batch_logits_indices=batch_logits_indices if cache_logits else None,
             )
 
             # Update manifest
             manifest.batches.append(BatchInfo(
-                file=batch_file,
+                file=_batch_filename(batch_idx),
                 prompt_start=start,
                 prompt_end=end,
                 num_tokens=num_tokens,
@@ -651,18 +680,18 @@ def consolidate_cache(
         # Compute num_tokens from original masks
         num_tokens = [int(m.sum().item()) for m in mask_list]
 
-        # Save batch file
-        batch_file = _batch_filename(batch_idx)
+        # Save per-layer batch files
         _save_batch(
             batch_acts=batch_acts,
             batch_mask=batch_mask,
             layer_indices=layer_indices,
             hidden_dim=hidden_dim,
-            path=out_path / batch_file,
+            output_dir=out_path,
+            batch_idx=batch_idx,
         )
 
         manifest.batches.append(BatchInfo(
-            file=batch_file,
+            file=_batch_filename(batch_idx),
             prompt_start=start,
             prompt_end=end,
             num_tokens=num_tokens,
@@ -725,9 +754,9 @@ def _preload_layer_from_batches(
         if batch_info.status != "complete":
             continue
 
-        # Load this layer from the batch file
-        batch_path = source_dir / batch_info.file
-        acts, mask = load_batch_layer(batch_path, layer)
+        # Load this layer's batch file (one file per layer per batch)
+        batch_idx = batch_info.prompt_start // manifest.batch_size
+        acts, mask = load_batch_layer(source_dir, layer, batch_idx)
         # acts: (batch_size, padded_seq_len, hidden_dim)
         # mask: (batch_size, padded_seq_len)
 

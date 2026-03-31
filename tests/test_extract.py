@@ -13,7 +13,6 @@ from conftest import POSITIVE_PROMPTS
 
 from lmprobe.extract import (
     ExtractionManifest,
-    _batch_filename,
     _save_batch,
     consolidate_cache,
     extract,
@@ -73,7 +72,7 @@ class TestExtractionManifest:
 
 class TestBatchFileIO:
     def test_save_and_load_batch(self, tmp_path):
-        """Batch file saves per-layer keys and loads them back."""
+        """Batch saves one file per layer and loads them back."""
         batch_size, seq_len, hidden_dim = 4, 16, 32
         layers = [0, 2, 5]
         num_layers = len(layers)
@@ -81,49 +80,46 @@ class TestBatchFileIO:
         # Create fake batch data
         batch_acts = torch.randn(batch_size, seq_len, hidden_dim * num_layers)
         batch_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
-        # Mask out some padding
         batch_mask[:, -3:] = 0
 
-        path = tmp_path / _batch_filename(0)
-        _save_batch(batch_acts, batch_mask, layers, hidden_dim, path)
+        _save_batch(batch_acts, batch_mask, layers, hidden_dim, tmp_path, batch_idx=0)
 
-        # Verify per-layer keys exist
+        # Verify per-layer files exist
         from safetensors import safe_open
 
-        with safe_open(str(path), framework="pt") as f:
-            keys = set(f.keys())
-            assert "layer_0" in keys
-            assert "layer_2" in keys
-            assert "layer_5" in keys
-            assert "attention_mask" in keys
+        for layer in layers:
+            from lmprobe.extract import _layer_batch_path
+            layer_file = tmp_path / _layer_batch_path(layer, 0)
+            assert layer_file.exists()
 
-            # Each layer should be (batch, seq, hidden_dim)
-            assert f.get_tensor("layer_0").shape == (batch_size, seq_len, hidden_dim)
-            assert f.get_tensor("layer_2").shape == (batch_size, seq_len, hidden_dim)
+            with safe_open(str(layer_file), framework="pt") as f:
+                keys = set(f.keys())
+                assert "activations" in keys
+                assert "mask" in keys
+                assert f.get_tensor("activations").shape == (batch_size, seq_len, hidden_dim)
 
         # Load via helper
-        acts, mask = load_batch_layer(path, layer=2)
+        acts, mask = load_batch_layer(tmp_path, layer=2, batch_idx=0)
         assert acts.shape == (batch_size, seq_len, hidden_dim)
         assert mask.shape == (batch_size, seq_len)
 
     def test_layer_content_matches(self, tmp_path):
-        """Per-layer content matches the original concatenated tensor."""
+        """Per-layer file content matches the original concatenated tensor."""
         batch_size, seq_len, hidden_dim = 2, 8, 16
         layers = [0, 1]
 
         batch_acts = torch.randn(batch_size, seq_len, hidden_dim * 2)
         batch_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
 
-        path = tmp_path / _batch_filename(0)
-        _save_batch(batch_acts, batch_mask, layers, hidden_dim, path)
+        _save_batch(batch_acts, batch_mask, layers, hidden_dim, tmp_path, batch_idx=0)
 
         # Layer 0 should match first hidden_dim columns
-        acts_0, _ = load_batch_layer(path, layer=0)
+        acts_0, _ = load_batch_layer(tmp_path, layer=0, batch_idx=0)
         expected_0 = batch_acts[:, :, :hidden_dim]
         assert torch.allclose(acts_0, expected_0)
 
         # Layer 1 should match second hidden_dim columns
-        acts_1, _ = load_batch_layer(path, layer=1)
+        acts_1, _ = load_batch_layer(tmp_path, layer=1, batch_idx=0)
         expected_1 = batch_acts[:, :, hidden_dim:]
         assert torch.allclose(acts_1, expected_1)
 
@@ -168,16 +164,18 @@ class TestExtract:
         assert manifest.hidden_dim > 0
         assert len(manifest.layers) == 1
 
-        # Check batch files exist
+        # Check per-layer batch files exist
+        layer = manifest.layers[0]
         for batch_info in manifest.batches:
-            batch_path = result / batch_info.file
-            assert batch_path.exists()
             assert batch_info.status == "complete"
             assert len(batch_info.num_tokens) == batch_info.prompt_end - batch_info.prompt_start
+            batch_idx = batch_info.prompt_start // 2  # batch_size=2
+            from lmprobe.extract import _layer_batch_path
+            layer_file = result / _layer_batch_path(layer, batch_idx)
+            assert layer_file.exists()
 
         # Load a layer from first batch and verify shape
-        layer = manifest.layers[0]
-        acts, mask = load_batch_layer(result / manifest.batches[0].file, layer)
+        acts, mask = load_batch_layer(result, layer, batch_idx=0)
         assert acts.shape[0] == 2  # batch_size
         assert acts.shape[2] == manifest.hidden_dim
 
@@ -262,9 +260,9 @@ class TestConsolidateCache:
         assert len(manifest.batches) == 2
         assert manifest.prompts == prompts
 
-        # Verify batch file content
+        # Verify batch file content via N×L layout
         layer = manifest.layers[0]
-        acts, mask = load_batch_layer(result / manifest.batches[0].file, layer)
+        acts, mask = load_batch_layer(result, layer, batch_idx=0)
         assert acts.shape[0] == 2  # batch_size
         assert acts.shape[2] == manifest.hidden_dim
 
@@ -324,12 +322,8 @@ class TestConsolidateCache:
 
         # Activations should match (same model, same prompts)
         layer = m_extract.layers[0]
-        acts_e, mask_e = load_batch_layer(
-            extract_dir / m_extract.batches[0].file, layer
-        )
-        acts_c, mask_c = load_batch_layer(
-            consol_dir / m_consol.batches[0].file, layer
-        )
+        acts_e, mask_e = load_batch_layer(extract_dir, layer, batch_idx=0)
+        acts_c, mask_c = load_batch_layer(consol_dir, layer, batch_idx=0)
 
         assert acts_e.shape == acts_c.shape
         # Mask should match (both derive from same tokenization)
