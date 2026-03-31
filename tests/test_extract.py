@@ -8,7 +8,6 @@ Tests verify:
 """
 
 import torch
-
 from conftest import POSITIVE_PROMPTS
 
 from lmprobe.extract import (

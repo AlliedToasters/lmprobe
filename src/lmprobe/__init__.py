@@ -171,7 +171,10 @@ def __getattr__(name: str) -> Any:
             "discover_cached": discover_cached,
             "list_cached_prompts": list_cached_prompts,
         }[name]
-    if name in ("extract", "consolidate_cache", "load_manifest", "ExtractionManifest", "push_extraction"):
+    if name in (
+        "extract", "consolidate_cache", "load_manifest",
+        "ExtractionManifest", "push_extraction",
+    ):
         from .extract import (
             ExtractionManifest,
             consolidate_cache,
