@@ -22,6 +22,7 @@ from .cache import (
     load_pooled_batch,
 )
 from .classifiers import resolve_classifier
+from .profiling import profile_op, profile_section
 from .extraction import ActivationExtractor
 from .pooling import (
     get_pooling_fn,
@@ -934,70 +935,79 @@ class Probe:
 
         # Extract and pool activations
         assert self._train_pooling is not None
-        _t_extract_start = time.monotonic()
-        X, _ = self._extract_and_pool(
-            prompts,
-            self._train_pooling,
-            remote=remote,
-            invalidate_cache=invalidate_cache,
-            max_retries=max_retries,
-            batch_size=batch_size,
-        )
-        _t_extract_elapsed = time.monotonic() - _t_extract_start
-
-        # Handle "all" pooling for training (expand to per-token examples)
-        X, labels = self._expand_all_pooling(X, labels)
-
-        # Auto-disable normalize_layers when preprocessing includes StandardScaler
-        assert self._extractor is not None
-        n_layers = len(self._extractor.layer_indices)
-        scaling_strategy = self._get_scaling_strategy()
-        if scaling_strategy is not None and self._preprocessing_includes_standard():
-            import warnings
-
-            warnings.warn(
-                "normalize_layers auto-disabled because preprocessing includes "
-                "StandardScaler. The double normalization is redundant and can "
-                "slightly hurt accuracy. Set normalize_layers=False to silence "
-                "this warning.",
-                UserWarning,
-                stacklevel=2,
-            )
-            scaling_strategy = None
-
-        # Apply per-layer normalization if enabled
-        self.scaler_, X = self._fit_layer_scaler(
-            X, n_layers, scaling_strategy, single_layer_standard=True,
-        )
-
-        # Save pre-preprocessing activations for mass-mean augmentation
-        if self.mass_mean_augment:
-            X_pre_preprocessing = X.copy()
-            self._compute_mass_mean_direction(X_pre_preprocessing, labels)
-
-        # Apply user-specified preprocessing (StandardScaler, PCA, etc.)
-        self.preprocessing_pipeline_ = self._build_preprocessing_pipeline()
-        if self.preprocessing_pipeline_ is not None:
-            X = self.preprocessing_pipeline_.fit_transform(X)
-
-        # Apply mass-mean augmentation if enabled
-        if self.mass_mean_augment:
-            X = self._augment_mass_mean(X, X_pre_preprocessing)
-
-        # Clone and fit classifier
-        _t_train_start = time.monotonic()
-        self.classifier_ = clone(self._classifier_template)
-        fit_kwargs = {}
-        if sample_weight is not None:
-            # Handle "all" pooling expansion (labels are repeated per token)
-            if self._train_pooling == "all" and len(sample_weight) != len(labels):
-                sample_weight = np.repeat(
-                    sample_weight, X.shape[0] // len(sample_weight)
+        with profile_op("Probe.fit") as _prof:
+            _t_extract_start = time.monotonic()
+            with profile_section(_prof, "extract_and_pool"):
+                X, _ = self._extract_and_pool(
+                    prompts,
+                    self._train_pooling,
+                    remote=remote,
+                    invalidate_cache=invalidate_cache,
+                    max_retries=max_retries,
+                    batch_size=batch_size,
                 )
-            fit_kwargs["sample_weight"] = sample_weight
-        self.classifier_.fit(X, labels, **fit_kwargs)
-        self.classes_ = getattr(self.classifier_, "classes_", None)
-        _t_train_elapsed = time.monotonic() - _t_train_start
+            _t_extract_elapsed = time.monotonic() - _t_extract_start
+
+            # Handle "all" pooling for training (expand to per-token examples)
+            X, labels = self._expand_all_pooling(X, labels)
+
+            # Auto-disable normalize_layers when preprocessing includes StandardScaler
+            assert self._extractor is not None
+            n_layers = len(self._extractor.layer_indices)
+            scaling_strategy = self._get_scaling_strategy()
+            if scaling_strategy is not None and self._preprocessing_includes_standard():
+                import warnings
+
+                warnings.warn(
+                    "normalize_layers auto-disabled because preprocessing includes "
+                    "StandardScaler. The double normalization is redundant and can "
+                    "slightly hurt accuracy. Set normalize_layers=False to silence "
+                    "this warning.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                scaling_strategy = None
+
+            # Apply per-layer normalization if enabled
+            with profile_section(_prof, "scale"):
+                self.scaler_, X = self._fit_layer_scaler(
+                    X, n_layers, scaling_strategy, single_layer_standard=True,
+                )
+
+            # Save pre-preprocessing activations for mass-mean augmentation
+            if self.mass_mean_augment:
+                X_pre_preprocessing = X.copy()
+                self._compute_mass_mean_direction(X_pre_preprocessing, labels)
+
+            # Apply user-specified preprocessing (StandardScaler, PCA, etc.)
+            with profile_section(_prof, "preprocess"):
+                self.preprocessing_pipeline_ = self._build_preprocessing_pipeline()
+                if self.preprocessing_pipeline_ is not None:
+                    X = self.preprocessing_pipeline_.fit_transform(X)
+
+            # Apply mass-mean augmentation if enabled
+            if self.mass_mean_augment:
+                X = self._augment_mass_mean(X, X_pre_preprocessing)
+
+            # Clone and fit classifier
+            _t_train_start = time.monotonic()
+            with profile_section(_prof, "fit"):
+                self.classifier_ = clone(self._classifier_template)
+                fit_kwargs = {}
+                if sample_weight is not None:
+                    # Handle "all" pooling expansion (labels are repeated per token)
+                    if self._train_pooling == "all" and len(sample_weight) != len(labels):
+                        sample_weight = np.repeat(
+                            sample_weight, X.shape[0] // len(sample_weight)
+                        )
+                    fit_kwargs["sample_weight"] = sample_weight
+                self.classifier_.fit(X, labels, **fit_kwargs)
+                self.classes_ = getattr(self.classifier_, "classes_", None)
+            _t_train_elapsed = time.monotonic() - _t_train_start
+
+        # Store profile results
+        if _prof is not None:
+            self.last_profile_ = _prof.as_dict()
 
         # Log timing breakdown
         def _fmt_time(seconds: float) -> str:
@@ -1439,31 +1449,37 @@ class Probe:
         self._check_fitted()
         self._check_classification_task()
 
-        # Extract activations
-        assert self._inference_pooling is not None
-        X, attention_mask = self._extract_and_pool(
-            prompts,
-            self._inference_pooling,
-            remote=remote,
-            batch_size=batch_size,
-        )
-
-        assert self.classifier_ is not None
-        probs = self._apply_to_per_token_or_flat(
-            X, self.classifier_.predict_proba,
-        )
-
-        # Apply score-level pooling if needed (e.g., max, min, score:mean)
-        if probs.ndim == 3:
-            parsed = parse_pooling_strategy(self._inference_pooling)
-            if parsed.is_score_pooling:
-                probs_tensor = torch.from_numpy(probs)
-                reduced = reduce_scores(
-                    probs_tensor,
+        with profile_op("Probe.predict_proba") as _prof:
+            # Extract activations
+            assert self._inference_pooling is not None
+            with profile_section(_prof, "extract_and_pool"):
+                X, attention_mask = self._extract_and_pool(
+                    prompts,
                     self._inference_pooling,
-                    attention_mask,
+                    remote=remote,
+                    batch_size=batch_size,
                 )
-                return reduced.float().numpy()
+
+            assert self.classifier_ is not None
+            with profile_section(_prof, "predict"):
+                probs = self._apply_to_per_token_or_flat(
+                    X, self.classifier_.predict_proba,
+                )
+
+            # Apply score-level pooling if needed (e.g., max, min, score:mean)
+            if probs.ndim == 3:
+                parsed = parse_pooling_strategy(self._inference_pooling)
+                if parsed.is_score_pooling:
+                    probs_tensor = torch.from_numpy(probs)
+                    reduced = reduce_scores(
+                        probs_tensor,
+                        self._inference_pooling,
+                        attention_mask,
+                    )
+                    return reduced.float().numpy()
+
+        if _prof is not None:
+            self.last_profile_ = _prof.as_dict()
 
         return probs
 
@@ -1532,62 +1548,71 @@ class Probe:
         self._check_fitted()
         labels = np.asarray(labels)
 
-        # Sweep mode: evaluate each layer and return per-layer + summary
-        if self.sweep_result_ is not None:
-            layer_results = {}
-            scores = self.sweep_result_.score(prompts, labels)
-            for layer_idx, probe in sorted(self.sweep_result_.probes.items()):
-                layer_preds = probe.predict(prompts, remote=remote)
-                layer_metrics: dict = {
-                    "accuracy": float(accuracy_score(labels, layer_preds)),
-                    "f1": float(f1_score(labels, layer_preds, zero_division=0)),
-                    "precision": float(precision_score(labels, layer_preds, zero_division=0)),
-                    "recall": float(recall_score(labels, layer_preds, zero_division=0)),
+        with profile_op("Probe.evaluate") as _prof:
+            # Sweep mode: evaluate each layer and return per-layer + summary
+            if self.sweep_result_ is not None:
+                layer_results = {}
+                scores = self.sweep_result_.score(prompts, labels)
+                for layer_idx, probe in sorted(self.sweep_result_.probes.items()):
+                    layer_preds = probe.predict(prompts, remote=remote)
+                    layer_metrics: dict = {
+                        "accuracy": float(accuracy_score(labels, layer_preds)),
+                        "f1": float(f1_score(labels, layer_preds, zero_division=0)),
+                        "precision": float(precision_score(labels, layer_preds, zero_division=0)),
+                        "recall": float(recall_score(labels, layer_preds, zero_division=0)),
+                    }
+                    if hasattr(probe.classifier_, "predict_proba"):
+                        auroc = self._try_auroc(labels, probe.predict_proba(prompts, remote=remote))
+                        if auroc is not None:
+                            layer_metrics["auroc"] = auroc
+                    layer_results[layer_idx] = layer_metrics
+
+                best_layer = max(scores, key=lambda k: scores[k])
+                results: dict = {
+                    "layer_results": layer_results,
+                    "best_layer": best_layer,
+                    "best_accuracy": scores[best_layer],
+                    **layer_results[best_layer],  # top-level metrics from best layer
                 }
-                if hasattr(probe.classifier_, "predict_proba"):
-                    auroc = self._try_auroc(labels, probe.predict_proba(prompts, remote=remote))
+
+                # Update this probe to use the best layer's probe
+                self._copy_state_from_probe(self.sweep_result_[best_layer])
+
+                self._evaluation_results_ = results
+                if _prof is not None:
+                    self.last_profile_ = _prof.as_dict()
+                return results
+
+            with profile_section(_prof, "extract_and_predict"):
+                predictions = self.predict(prompts, remote=remote)
+
+            with profile_section(_prof, "score"):
+                results = {
+                    "accuracy": float(accuracy_score(labels, predictions)),
+                    "f1": float(f1_score(labels, predictions, zero_division=0)),
+                    "precision": float(precision_score(labels, predictions, zero_division=0)),
+                    "recall": float(recall_score(labels, predictions, zero_division=0)),
+                }
+
+                # AUROC if predict_proba is available
+                if self.task == "classification" and hasattr(self.classifier_, "predict_proba"):
+                    auroc = self._try_auroc(labels, self.predict_proba(prompts, remote=remote))
                     if auroc is not None:
-                        layer_metrics["auroc"] = auroc
-                layer_results[layer_idx] = layer_metrics
+                        results["auroc"] = auroc
 
-            best_layer = max(scores, key=lambda k: scores[k])
-            results: dict = {
-                "layer_results": layer_results,
-                "best_layer": best_layer,
-                "best_accuracy": scores[best_layer],
-                **layer_results[best_layer],  # top-level metrics from best layer
-            }
+            # Metadata
+            import hashlib
 
-            # Update this probe to use the best layer's probe
-            self._copy_state_from_probe(self.sweep_result_[best_layer])
+            label_strs = [str(val) for val in labels]
+            combined = "\n".join(sorted(list(prompts) + label_strs))
+            results["n_eval"] = len(prompts)
+            results["eval_hash"] = "sha256:" + hashlib.sha256(combined.encode()).hexdigest()
 
             self._evaluation_results_ = results
-            return results
 
-        predictions = self.predict(prompts, remote=remote)
+        if _prof is not None:
+            self.last_profile_ = _prof.as_dict()
 
-        results = {
-            "accuracy": float(accuracy_score(labels, predictions)),
-            "f1": float(f1_score(labels, predictions, zero_division=0)),
-            "precision": float(precision_score(labels, predictions, zero_division=0)),
-            "recall": float(recall_score(labels, predictions, zero_division=0)),
-        }
-
-        # AUROC if predict_proba is available
-        if self.task == "classification" and hasattr(self.classifier_, "predict_proba"):
-            auroc = self._try_auroc(labels, self.predict_proba(prompts, remote=remote))
-            if auroc is not None:
-                results["auroc"] = auroc
-
-        # Metadata
-        import hashlib
-
-        label_strs = [str(val) for val in labels]
-        combined = "\n".join(sorted(list(prompts) + label_strs))
-        results["n_eval"] = len(prompts)
-        results["eval_hash"] = "sha256:" + hashlib.sha256(combined.encode()).hexdigest()
-
-        self._evaluation_results_ = results
         return results
 
     def compute_layer_importance(
@@ -1738,50 +1763,57 @@ class Probe:
         X = self._to_numpy(X)
         y = self._to_numpy(y)
 
-        # Apply per-layer normalization (StandardScaler for single-layer,
-        # PerLayerScaler for multi-layer) — same as fit()
-        scaling_strategy = self._get_scaling_strategy()
-        if scaling_strategy is not None and self._preprocessing_includes_standard():
-            scaling_strategy = None
-        self.scaler_, X = self._fit_layer_scaler(
-            X, n_layers, scaling_strategy, single_layer_standard=True,
-        )
-
-        # Save pre-preprocessing activations for mass-mean augmentation
-        if self.mass_mean_augment:
-            X_pre_preprocessing = X.copy()
-            self._compute_mass_mean_direction(X_pre_preprocessing, y)
-
-        # Apply user-specified preprocessing (StandardScaler, PCA, etc.)
-        self.preprocessing_pipeline_ = self._build_preprocessing_pipeline()
-        if self.preprocessing_pipeline_ is not None:
-            X = self.preprocessing_pipeline_.fit_transform(X)
-
-        # Apply mass-mean augmentation if enabled
-        if self.mass_mean_augment:
-            X = self._augment_mass_mean(X, X_pre_preprocessing)
-
-        # Clone and fit classifier
-        self.classifier_ = clone(self._classifier_template)
-        fit_kwargs = {}
-        if sample_weight is not None:
-            sample_weight = np.asarray(sample_weight, dtype=float)
-            if len(sample_weight) != len(y):
-                raise ValueError(
-                    f"sample_weight length ({len(sample_weight)}) must match "
-                    f"the number of training samples ({len(y)})."
+        with profile_op("Probe.fit_from_activations") as _prof:
+            # Apply per-layer normalization (StandardScaler for single-layer,
+            # PerLayerScaler for multi-layer) — same as fit()
+            scaling_strategy = self._get_scaling_strategy()
+            if scaling_strategy is not None and self._preprocessing_includes_standard():
+                scaling_strategy = None
+            with profile_section(_prof, "scale"):
+                self.scaler_, X = self._fit_layer_scaler(
+                    X, n_layers, scaling_strategy, single_layer_standard=True,
                 )
-            fit_kwargs["sample_weight"] = sample_weight
-        self.classifier_.fit(X, y, **fit_kwargs)
 
-        # Set classes_ for classification, None for regression
-        if self.task == "classification":
-            if hasattr(self.classifier_, "classes_"):
-                self.classes_ = self.classifier_.classes_
+            # Save pre-preprocessing activations for mass-mean augmentation
+            if self.mass_mean_augment:
+                X_pre_preprocessing = X.copy()
+                self._compute_mass_mean_direction(X_pre_preprocessing, y)
+
+            # Apply user-specified preprocessing (StandardScaler, PCA, etc.)
+            with profile_section(_prof, "preprocess"):
+                self.preprocessing_pipeline_ = self._build_preprocessing_pipeline()
+                if self.preprocessing_pipeline_ is not None:
+                    X = self.preprocessing_pipeline_.fit_transform(X)
+
+            # Apply mass-mean augmentation if enabled
+            if self.mass_mean_augment:
+                X = self._augment_mass_mean(X, X_pre_preprocessing)
+
+            # Clone and fit classifier
+            with profile_section(_prof, "fit"):
+                self.classifier_ = clone(self._classifier_template)
+                fit_kwargs = {}
+                if sample_weight is not None:
+                    sample_weight = np.asarray(sample_weight, dtype=float)
+                    if len(sample_weight) != len(y):
+                        raise ValueError(
+                            f"sample_weight length ({len(sample_weight)}) must match "
+                            f"the number of training samples ({len(y)})."
+                        )
+                    fit_kwargs["sample_weight"] = sample_weight
+                self.classifier_.fit(X, y, **fit_kwargs)
+
+            # Set classes_ for classification, None for regression
+            if self.task == "classification":
+                if hasattr(self.classifier_, "classes_"):
+                    self.classes_ = self.classifier_.classes_
+                else:
+                    self.classes_ = np.unique(y)
             else:
-                self.classes_ = np.unique(y)
-        else:
-            self.classes_ = None
+                self.classes_ = None
+
+        if _prof is not None:
+            self.last_profile_ = _prof.as_dict()
 
         return self
 
@@ -1800,8 +1832,14 @@ class Probe:
         """
         self._check_fitted()
         assert self.classifier_ is not None
-        X = self._apply_inference_transforms(self._to_numpy(X))
-        return np.asarray(self.classifier_.predict(X))
+        with profile_op("Probe.predict_from_activations") as _prof:
+            with profile_section(_prof, "transform"):
+                X = self._apply_inference_transforms(self._to_numpy(X))
+            with profile_section(_prof, "predict"):
+                result = np.asarray(self.classifier_.predict(X))
+        if _prof is not None:
+            self.last_profile_ = _prof.as_dict()
+        return result
 
     def predict_proba_from_activations(self, X: Any) -> np.ndarray:
         """Predict probabilities from pre-computed activation tensors.
@@ -1826,8 +1864,14 @@ class Probe:
         self._check_fitted()
         self._check_classification_task()
         assert self.classifier_ is not None
-        X = self._apply_inference_transforms(self._to_numpy(X))
-        return np.asarray(self.classifier_.predict_proba(X))
+        with profile_op("Probe.predict_proba_from_activations") as _prof:
+            with profile_section(_prof, "transform"):
+                X = self._apply_inference_transforms(self._to_numpy(X))
+            with profile_section(_prof, "predict"):
+                result = np.asarray(self.classifier_.predict_proba(X))
+        if _prof is not None:
+            self.last_profile_ = _prof.as_dict()
+        return result
 
     def score_from_activations(self, X: Any, y: Any) -> float:
         """Score the probe on pre-computed activation tensors.

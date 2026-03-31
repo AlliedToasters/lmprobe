@@ -11,6 +11,8 @@ from typing import Any  # noqa: UP035
 
 import numpy as np
 
+from .profiling import profile_op, profile_section
+
 
 def _lazy_load_activations() -> tuple:
     from .sharing import fetch_dataset_metadata, load_activations
@@ -63,6 +65,7 @@ class ActivationStore:
         self._labels: np.ndarray | None = None
         self._prompt_to_idx: dict[str, int] = {}
         self._loaded = False
+        self.last_profile_: dict[str, float] | None = None
 
     @classmethod
     def _from_data(
@@ -107,22 +110,31 @@ class ActivationStore:
         ActivationStore
             A loaded store ready for indexing.
         """
-        meta = fetch_dataset_metadata(dataset, token=token)
-        if layers is None:
-            layers = meta.available_layers
-        prompts = meta.prompts
+        with profile_op("ActivationStore.from_dataset") as _prof:
+            with profile_section(_prof, "metadata"):
+                meta = fetch_dataset_metadata(dataset, token=token)
+                if layers is None:
+                    layers = meta.available_layers
+                prompts = meta.prompts
 
-        result = load_activations(
-            dataset,
-            layers=layers,
-            pooling=pooling,
-            token=token,
-            as_dict=True,
-            return_labels=True,
-            show_progress=True,
-        )
-        acts, labels = result
-        return cls._from_data(prompts, acts, labels)
+            with profile_section(_prof, "load"):
+                result = load_activations(
+                    dataset,
+                    layers=layers,
+                    pooling=pooling,
+                    token=token,
+                    as_dict=True,
+                    return_labels=True,
+                    show_progress=True,
+                )
+                acts, labels = result
+
+            with profile_section(_prof, "index"):
+                store = cls._from_data(prompts, acts, labels)
+
+        if _prof is not None:
+            store.last_profile_ = _prof.as_dict()
+        return store
 
     @classmethod
     def from_cache(
@@ -154,21 +166,28 @@ class ActivationStore:
         ActivationStore
             A loaded store ready for indexing.
         """
-        sorted_layers = sorted(layers)
-        pooled = load_pooled_batch(
-            model_name, prompts, sorted_layers, pooling, fallback_to_raw=True,
-        )
-        # pooled is torch.Tensor shape (n_prompts, n_layers * hidden_dim)
-        stacked = pooled.detach().cpu().float().numpy()
-        hidden_dim = stacked.shape[-1] // len(sorted_layers)
+        with profile_op("ActivationStore.from_cache") as _prof:
+            sorted_layers = sorted(layers)
+            with profile_section(_prof, "load"):
+                pooled = load_pooled_batch(
+                    model_name, prompts, sorted_layers, pooling, fallback_to_raw=True,
+                )
+                # pooled is torch.Tensor shape (n_prompts, n_layers * hidden_dim)
+                stacked = pooled.detach().cpu().float().numpy()
+                hidden_dim = stacked.shape[-1] // len(sorted_layers)
 
-        data = {
-            layer: stacked[:, i * hidden_dim : (i + 1) * hidden_dim]
-            for i, layer in enumerate(sorted_layers)
-        }
+            with profile_section(_prof, "index"):
+                data = {
+                    layer: stacked[:, i * hidden_dim : (i + 1) * hidden_dim]
+                    for i, layer in enumerate(sorted_layers)
+                }
 
-        labels_arr = np.asarray(labels) if labels is not None else None
-        return cls._from_data(prompts, data, labels_arr)
+                labels_arr = np.asarray(labels) if labels is not None else None
+                store = cls._from_data(prompts, data, labels_arr)
+
+        if _prof is not None:
+            store.last_profile_ = _prof.as_dict()
+        return store
 
     def _check_loaded(self) -> None:
         if not self._loaded:
@@ -303,14 +322,17 @@ class ActivationStore:
         tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
             ``(X_train, y_train, X_test, y_test)``
         """
-        X_train = self.get_activations(prompts=train_prompts, layer=layer)
-        X_test = self.get_activations(prompts=test_prompts, layer=layer)
-        y_train = self.get_labels(prompts=train_prompts)
-        y_test = self.get_labels(prompts=test_prompts)
-        if y_train is None or y_test is None:
-            raise RuntimeError(
-                "get_fold() requires labels. Pass labels when creating the store."
-            )
+        with profile_op("ActivationStore.get_fold") as _prof:
+            X_train = self.get_activations(prompts=train_prompts, layer=layer)
+            X_test = self.get_activations(prompts=test_prompts, layer=layer)
+            y_train = self.get_labels(prompts=train_prompts)
+            y_test = self.get_labels(prompts=test_prompts)
+            if y_train is None or y_test is None:
+                raise RuntimeError(
+                    "get_fold() requires labels. Pass labels when creating the store."
+                )
+        if _prof is not None:
+            self.last_profile_ = _prof.as_dict()
         return X_train, y_train, X_test, y_test
 
     def clear(self) -> None:

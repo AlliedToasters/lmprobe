@@ -24,6 +24,7 @@ from .baseline import BaselineProbe
 from .battery import BaselineBattery, BaselineResult, BaselineResults
 from .ensemble import ProbeEnsemble
 from .probe import LayerSweepResult, LinearProbe, Probe
+from .profiling import is_profiling, set_profiling
 
 try:
     from importlib.metadata import version as _get_version
@@ -69,6 +70,8 @@ __all__ = [
     "set_cache_dtype",
     "set_cache_limit",
     "set_max_threads",
+    "set_profiling",
+    "is_profiling",
 ]
 
 

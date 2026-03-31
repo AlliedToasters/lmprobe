@@ -57,6 +57,8 @@ from .cache import (
     write_shard_registry,
 )
 
+from .profiling import profile_op, profile_section
+
 logger = logging.getLogger(__name__)
 
 FORMAT_VERSION = "2.0"
@@ -3367,53 +3369,57 @@ def load_activations(
     """
     from .cache import load_pooled_batch
 
-    meta = fetch_dataset_metadata(dataset, token=token)
+    with profile_op("load_activations") as _prof:
+        with profile_section(_prof, "metadata"):
+            meta = fetch_dataset_metadata(dataset, token=token)
 
-    if layers is None:
-        layers = meta.available_layers
-    else:
-        missing = set(layers) - set(meta.available_layers)
-        if missing:
-            raise ValueError(
-                f"Layers {sorted(missing)} not in dataset. "
-                f"Available: {meta.available_layers}"
+            if layers is None:
+                layers = meta.available_layers
+            else:
+                missing = set(layers) - set(meta.available_layers)
+                if missing:
+                    raise ValueError(
+                        f"Layers {sorted(missing)} not in dataset. "
+                        f"Available: {meta.available_layers}"
+                    )
+            layers = sorted(layers)
+
+            if prompts is None:
+                prompts = meta.prompts
+
+        with profile_section(_prof, "download"):
+            pull_dataset(dataset, layers=layers, target_prompts=prompts,
+                         token=token, materialize=False, show_progress=show_progress)
+
+        with profile_section(_prof, "load"):
+            hidden_dim = meta.tensor_descriptors.get(
+                "hidden_layers", {}
+            ).get("dim")
+
+            pooled = load_pooled_batch(
+                meta.model_name, prompts, layers, pooling, fallback_to_raw=True,
+                show_progress=show_progress,
             )
-    layers = sorted(layers)
+            stacked = pooled.detach().cpu().float().numpy()  # (n_prompts, n_layers*dim)
 
-    if prompts is None:
-        prompts = meta.prompts
+            if hidden_dim is None:
+                hidden_dim = stacked.shape[-1] // len(layers)
 
-    pull_dataset(dataset, layers=layers, target_prompts=prompts,
-                 token=token, materialize=False, show_progress=show_progress)
+        activations: dict[int, np.ndarray] | np.ndarray
+        if as_dict:
+            activations = {
+                layer: stacked[:, i * hidden_dim : (i + 1) * hidden_dim]
+                for i, layer in enumerate(layers)
+            }
+        else:
+            activations = stacked.reshape(len(prompts), len(layers), hidden_dim)
 
-    hidden_dim = meta.tensor_descriptors.get(
-        "hidden_layers", {}
-    ).get("dim")
+        if not return_labels:
+            return activations
 
-    pooled = load_pooled_batch(
-        meta.model_name, prompts, layers, pooling, fallback_to_raw=True,
-        show_progress=show_progress,
-    )
-    stacked = pooled.detach().cpu().float().numpy()  # (n_prompts, n_layers*dim)
-
-    if hidden_dim is None:
-        hidden_dim = stacked.shape[-1] // len(layers)
-
-    activations: dict[int, np.ndarray] | np.ndarray
-    if as_dict:
-        activations = {
-            layer: stacked[:, i * hidden_dim : (i + 1) * hidden_dim]
-            for i, layer in enumerate(layers)
-        }
-    else:
-        activations = stacked.reshape(len(prompts), len(layers), hidden_dim)
-
-    if not return_labels:
-        return activations
-
-    # Load labels from the Parquet index
-    labels = _load_labels_for_prompts(dataset, prompts, token=token)
-    return activations, labels
+        # Load labels from the Parquet index
+        labels = _load_labels_for_prompts(dataset, prompts, token=token)
+        return activations, labels
 
 
 def _load_labels_for_prompts(
