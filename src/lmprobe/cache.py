@@ -51,6 +51,7 @@ from pathlib import Path
 import torch
 
 from .cache_backends import CacheBackend, LocalCacheBackend
+from .profiling import profile_op, profile_section
 
 # =============================================================================
 # Shard registry types (lazy caching for pull_dataset)
@@ -912,11 +913,15 @@ def batch_check_cache_status(
         - partial_cache_count: number of prompts with partial layer cache
         - partial_cache_found_layers: example set of cached layers (or None)
     """
+    _prof_ctx = profile_op("batch_check_cache_status")
+    _prof = _prof_ctx.__enter__()
+
     backend = get_backend()
     model_hash = _hash_string(model_name)
 
     # Single LIST call to get all existing keys for this model
-    existing_keys = _list_model_cache_keys(model_name)
+    with profile_section(_prof, "list_keys"):
+        existing_keys = _list_model_cache_keys(model_name)
 
     # Local cache for tensor keys to avoid re-reading the same file
     _tensor_keys_cache: dict[str, set[str]] = {}
@@ -932,6 +937,7 @@ def batch_check_cache_status(
     partial_cache_count = 0
     partial_cache_found_layers: set[int] | None = None
 
+    _t_header_start = __import__("time").perf_counter()
     for prompt in prompts:
         prompt_hash = _hash_string(prompt)
         main_key = f"{model_hash}/{prompt_hash}.safetensors"
@@ -1024,6 +1030,10 @@ def batch_check_cache_status(
                 # we can't assume main file has logits — need extraction
             if not logits_cached:
                 need_logits.append(prompt)
+
+    if _prof is not None:
+        _prof.sections["header_reads"] = __import__("time").perf_counter() - _t_header_start
+    _prof_ctx.__exit__(None, None, None)
 
     return (
         need_activations,
@@ -2084,33 +2094,34 @@ def load_pooled_batch(
 
     from .pooling import get_pooling_fn
 
-    rows: list[torch.Tensor] = []
-    missing: list[str] = []
-    pool_fn = get_pooling_fn(pooling) if fallback_to_raw else None
-    for prompt in tqdm(prompts, desc="Loading activations", disable=not show_progress):
-        try:
-            rows.append(load_prompt_pooled_activations(
-                model_name, prompt, layers, pooling
-            ))
-            continue
-        except FileNotFoundError:
-            if not fallback_to_raw:
-                raise
+    with profile_op("load_pooled_batch") as _prof:
+        rows: list[torch.Tensor] = []
+        missing: list[str] = []
+        pool_fn = get_pooling_fn(pooling) if fallback_to_raw else None
+        for prompt in tqdm(prompts, desc="Loading activations", disable=not show_progress):
+            try:
+                rows.append(load_prompt_pooled_activations(
+                    model_name, prompt, layers, pooling
+                ))
+                continue
+            except FileNotFoundError:
+                if not fallback_to_raw:
+                    raise
 
-        # Fallback: load raw activations and pool manually.
-        try:
-            acts, mask = load_prompt_activations(model_name, prompt, layers)
-            rows.append(pool_fn(acts, mask))  # type: ignore[misc]
-        except FileNotFoundError:
-            missing.append(prompt)
+            # Fallback: load raw activations and pool manually.
+            try:
+                acts, mask = load_prompt_activations(model_name, prompt, layers)
+                rows.append(pool_fn(acts, mask))  # type: ignore[misc]
+            except FileNotFoundError:
+                missing.append(prompt)
 
-    if missing:
-        preview = missing[:3]
-        suffix = f" ... and {len(missing) - 3} more" if len(missing) > 3 else ""
-        raise FileNotFoundError(
-            f"No cached activations for {len(missing)} prompt(s): "
-            f"{preview!r}{suffix}"
-        )
+        if missing:
+            preview = missing[:3]
+            suffix = f" ... and {len(missing) - 3} more" if len(missing) > 3 else ""
+            raise FileNotFoundError(
+                f"No cached activations for {len(missing)} prompt(s): "
+                f"{preview!r}{suffix}"
+            )
 
     return torch.cat(rows, dim=0)
 
