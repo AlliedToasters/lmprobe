@@ -46,8 +46,9 @@ class TestExtractionManifest:
         assert m2.prompts == ["hello", "world"]
         assert m2.labels == [0, 1]
 
-    def test_manifest_write_read(self, tmp_path):
-        """Manifest writes to and reads from disk."""
+    def test_manifest_write_read(self, tmp_path, monkeypatch):
+        """Manifest writes to and reads from cache backend."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
         from lmprobe.extract import _write_manifest
 
         m = ExtractionManifest(
@@ -57,8 +58,8 @@ class TestExtractionManifest:
             total_prompts=2,
             prompts=["a", "b"],
         )
-        _write_manifest(m, tmp_path)
-        m2 = load_manifest(tmp_path)
+        _write_manifest(m, "test_manifest")
+        m2 = load_manifest("test_manifest")
         assert m2.model_name == "test-model"
         assert m2.prompts == ["a", "b"]
 
@@ -69,55 +70,55 @@ class TestExtractionManifest:
 
 
 class TestBatchFileIO:
-    def test_save_and_load_batch(self, tmp_path):
+    def test_save_and_load_batch(self, tmp_path, monkeypatch):
         """Batch saves one file per layer and loads them back."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
         batch_size, seq_len, hidden_dim = 4, 16, 32
         layers = [0, 2, 5]
         num_layers = len(layers)
 
-        # Create fake batch data
         batch_acts = torch.randn(batch_size, seq_len, hidden_dim * num_layers)
         batch_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
         batch_mask[:, -3:] = 0
 
-        _save_batch(batch_acts, batch_mask, layers, hidden_dim, tmp_path, batch_idx=0)
+        prefix = "test_batch"
+        _save_batch(batch_acts, batch_mask, layers, hidden_dim, prefix, batch_idx=0)
 
-        # Verify per-layer files exist
-        from safetensors import safe_open
+        # Verify per-layer files exist via backend
+        from lmprobe.cache import get_backend
+        from lmprobe.extract import _layer_batch_path
 
+        backend = get_backend()
         for layer in layers:
-            from lmprobe.extract import _layer_batch_path
-            layer_file = tmp_path / _layer_batch_path(layer, 0)
-            assert layer_file.exists()
-
-            with safe_open(str(layer_file), framework="pt") as f:
-                keys = set(f.keys())
-                assert "activations" in keys
-                assert "mask" in keys
-                assert f.get_tensor("activations").shape == (batch_size, seq_len, hidden_dim)
+            key = f"{prefix}/{_layer_batch_path(layer, 0)}"
+            assert backend.exists(key)
 
         # Load via helper
-        acts, mask = load_batch_layer(tmp_path, layer=2, batch_idx=0)
+        acts, mask = load_batch_layer(prefix, layer=2, batch_idx=0)
         assert acts.shape == (batch_size, seq_len, hidden_dim)
         assert mask.shape == (batch_size, seq_len)
 
-    def test_layer_content_matches(self, tmp_path):
+    def test_layer_content_matches(self, tmp_path, monkeypatch):
         """Per-layer file content matches the original concatenated tensor."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
         batch_size, seq_len, hidden_dim = 2, 8, 16
         layers = [0, 1]
 
         batch_acts = torch.randn(batch_size, seq_len, hidden_dim * 2)
         batch_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
 
-        _save_batch(batch_acts, batch_mask, layers, hidden_dim, tmp_path, batch_idx=0)
+        prefix = "test_content"
+        _save_batch(batch_acts, batch_mask, layers, hidden_dim, prefix, batch_idx=0)
 
         # Layer 0 should match first hidden_dim columns
-        acts_0, _ = load_batch_layer(tmp_path, layer=0, batch_idx=0)
+        acts_0, _ = load_batch_layer(prefix, layer=0, batch_idx=0)
         expected_0 = batch_acts[:, :, :hidden_dim]
         assert torch.allclose(acts_0, expected_0)
 
         # Layer 1 should match second hidden_dim columns
-        acts_1, _ = load_batch_layer(tmp_path, layer=1, batch_idx=0)
+        acts_1, _ = load_batch_layer(prefix, layer=1, batch_idx=0)
         expected_1 = batch_acts[:, :, hidden_dim:]
         assert torch.allclose(acts_1, expected_1)
 
@@ -134,22 +135,21 @@ class TestExtract:
 
         prompts = POSITIVE_PROMPTS[:3]
         labels = [1, 1, 1]
-        output = tmp_path / "extraction"
+        output_prefix = "test_extraction"
 
         result = extract(
             model_name=tiny_model,
             prompts=prompts,
             layers=-1,  # last layer only
             labels=labels,
-            output_dir=output,
+            output_dir=output_prefix,
             batch_size=2,
             remote=False,
             device="cpu",
             backend="local",
         )
 
-        assert result == output
-        assert result.exists()
+        assert result == output_prefix
 
         # Check manifest
         manifest = load_manifest(result)
@@ -162,15 +162,18 @@ class TestExtract:
         assert manifest.hidden_dim > 0
         assert len(manifest.layers) == 1
 
-        # Check per-layer batch files exist
+        # Check per-layer batch files exist via backend
+        from lmprobe.cache import get_backend
+        from lmprobe.extract import _layer_batch_path
+
+        backend = get_backend()
         layer = manifest.layers[0]
         for batch_info in manifest.batches:
             assert batch_info.status == "complete"
             assert len(batch_info.num_tokens) == batch_info.prompt_end - batch_info.prompt_start
-            batch_idx = batch_info.prompt_start // 2  # batch_size=2
-            from lmprobe.extract import _layer_batch_path
-            layer_file = result / _layer_batch_path(layer, batch_idx)
-            assert layer_file.exists()
+            bi = batch_info.prompt_start // 2  # batch_size=2
+            key = f"{result}/{_layer_batch_path(layer, bi)}"
+            assert backend.exists(key)
 
         # Load a layer from first batch and verify shape
         acts, mask = load_batch_layer(result, layer, batch_idx=0)
@@ -182,21 +185,21 @@ class TestExtract:
         monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
 
         prompts = POSITIVE_PROMPTS[:4]
-        output = tmp_path / "extraction"
+        output_prefix = "test_resume"
 
         # First run
         extract(
             model_name=tiny_model,
             prompts=prompts,
             layers=-1,
-            output_dir=output,
+            output_dir=output_prefix,
             batch_size=2,
             remote=False,
             device="cpu",
             backend="local",
         )
 
-        manifest1 = load_manifest(output)
+        manifest1 = load_manifest(output_prefix)
         assert len(manifest1.batches) == 2
 
         # Second run — should skip both batches
@@ -204,14 +207,14 @@ class TestExtract:
             model_name=tiny_model,
             prompts=prompts,
             layers=-1,
-            output_dir=output,
+            output_dir=output_prefix,
             batch_size=2,
             remote=False,
             device="cpu",
             backend="local",
         )
 
-        manifest2 = load_manifest(output)
+        manifest2 = load_manifest(output_prefix)
         # Should still have 2 batches (not 4)
         assert len(manifest2.batches) == 2
 
@@ -243,16 +246,16 @@ class TestConsolidateCache:
         uc.warmup(prompts, remote=False)
 
         # Now consolidate
-        output = tmp_path / "consolidated"
+        consol_prefix = "consolidated"
         result = consolidate_cache(
             model_name=tiny_model,
             prompts=prompts,
             layers=-1,
-            output_dir=output,
+            output_dir=consol_prefix,
             batch_size=2,
         )
 
-        assert result == output
+        assert result == consol_prefix
         manifest = load_manifest(result)
         assert manifest.total_prompts == 3
         assert len(manifest.batches) == 2
@@ -276,11 +279,11 @@ class TestConsolidateCache:
         prompts = POSITIVE_PROMPTS[:2]
 
         # Extract directly
-        extract_dir = extract(
+        extract_prefix = extract(
             model_name=tiny_model,
             prompts=prompts,
             layers=-1,
-            output_dir=tmp_path / "extracted",
+            output_dir="extracted",
             batch_size=2,
             remote=False,
             device="cpu",
@@ -301,17 +304,17 @@ class TestConsolidateCache:
         )
         uc.warmup(prompts, remote=False)
 
-        consol_dir = consolidate_cache(
+        consol_prefix = consolidate_cache(
             model_name=tiny_model,
             prompts=prompts,
             layers=-1,
-            output_dir=tmp_path / "consolidated",
+            output_dir="consolidated",
             batch_size=2,
         )
 
         # Both should have same structure
-        m_extract = load_manifest(extract_dir)
-        m_consol = load_manifest(consol_dir)
+        m_extract = load_manifest(extract_prefix)
+        m_consol = load_manifest(consol_prefix)
 
         assert m_extract.layers == m_consol.layers
         assert m_extract.hidden_dim == m_consol.hidden_dim
@@ -320,8 +323,8 @@ class TestConsolidateCache:
 
         # Activations should match (same model, same prompts)
         layer = m_extract.layers[0]
-        acts_e, mask_e = load_batch_layer(extract_dir, layer, batch_idx=0)
-        acts_c, mask_c = load_batch_layer(consol_dir, layer, batch_idx=0)
+        acts_e, mask_e = load_batch_layer(extract_prefix, layer, batch_idx=0)
+        acts_c, mask_c = load_batch_layer(consol_prefix, layer, batch_idx=0)
 
         assert acts_e.shape == acts_c.shape
         # Mask should match (both derive from same tokenization)
@@ -341,20 +344,20 @@ class TestPreloadFromBatches:
         monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
 
         prompts = POSITIVE_PROMPTS[:4]
-        output = tmp_path / "extraction"
+        prefix = "test_preload"
 
         extract(
             model_name=tiny_model,
             prompts=prompts,
             layers=-1,
-            output_dir=output,
+            output_dir=prefix,
             batch_size=2,
             remote=False,
             device="cpu",
             backend="local",
         )
 
-        manifest = load_manifest(output)
+        manifest = load_manifest(prefix)
         layer = manifest.layers[0]
 
         # Identity permutation (no shuffle)
@@ -362,7 +365,7 @@ class TestPreloadFromBatches:
 
         from lmprobe.extract import _preload_layer_from_batches
 
-        data = _preload_layer_from_batches(manifest, output, layer, perm)
+        data = _preload_layer_from_batches(manifest, prefix, layer, perm)
 
         assert len(data) == 4
         for i, t in enumerate(data):
@@ -372,7 +375,7 @@ class TestPreloadFromBatches:
 
         # With a different permutation, data should be reordered
         perm_reversed = list(reversed(range(len(prompts))))
-        data_rev = _preload_layer_from_batches(manifest, output, layer, perm_reversed)
+        data_rev = _preload_layer_from_batches(manifest, prefix, layer, perm_reversed)
 
         # data_rev[0] should match data[3] (reversed)
         assert torch.allclose(data_rev[0], data[3])

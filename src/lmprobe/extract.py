@@ -26,6 +26,8 @@ from tqdm import tqdm
 from .backends import resolve_backend
 from .cache import (
     _hash_string,
+    _load_tensors_from_backend,
+    _save_tensors_to_backend,
     get_backend,
     load_prompt_activations,
 )
@@ -68,6 +70,7 @@ class ExtractionManifest:
     metadata: list[dict] | None = None
     batches: list[BatchInfo] = field(default_factory=list)
     created_at: str = ""
+    dtype: str = "float32"
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -77,6 +80,7 @@ class ExtractionManifest:
             "hidden_dim": self.hidden_dim,
             "total_prompts": self.total_prompts,
             "batch_size": self.batch_size,
+            "dtype": self.dtype,
             "prompts": self.prompts,
             "batches": [
                 {
@@ -120,22 +124,25 @@ class ExtractionManifest:
             metadata=d.get("metadata"),
             batches=batches,
             created_at=d.get("created_at", ""),
+            dtype=d.get("dtype", "float32"),
         )
 
 
-def _write_manifest(manifest: ExtractionManifest, output_dir: Path) -> None:
-    """Write manifest JSON to the output directory."""
-    path = output_dir / MANIFEST_FILENAME
-    path.write_text(json.dumps(manifest.to_dict(), ensure_ascii=False))
+def _write_manifest(manifest: ExtractionManifest, prefix: str) -> None:
+    """Write manifest JSON to the cache backend under *prefix*."""
+    key = f"{prefix}/{MANIFEST_FILENAME}"
+    backend = get_backend()
+    backend.write_text(key, json.dumps(manifest.to_dict(), ensure_ascii=False))
 
 
-def load_manifest(source: str | Path) -> ExtractionManifest:
-    """Load an extraction manifest from a directory.
+def load_manifest(source: str) -> ExtractionManifest:
+    """Load an extraction manifest.
 
     Parameters
     ----------
-    source : str | Path
-        Path to the extraction directory containing ``manifest.json``.
+    source : str
+        Key prefix within the cache backend (e.g.
+        ``"_extractions/abc123_20260101T000000Z"``).
 
     Returns
     -------
@@ -147,12 +154,13 @@ def load_manifest(source: str | Path) -> ExtractionManifest:
     FileNotFoundError
         If the manifest file does not exist.
     """
-    path = Path(source) / MANIFEST_FILENAME
-    if not path.exists():
+    key = f"{source}/{MANIFEST_FILENAME}"
+    backend = get_backend()
+    if not backend.exists(key):
         raise FileNotFoundError(
-            f"No manifest found at {path}. Is this an extraction directory?"
+            f"No manifest found at {key}. Is this an extraction prefix?"
         )
-    return ExtractionManifest.from_dict(json.loads(path.read_text()))
+    return ExtractionManifest.from_dict(json.loads(backend.read_text(key)))
 
 
 # ---------------------------------------------------------------------------
@@ -184,20 +192,21 @@ def _save_batch(
     batch_mask: torch.Tensor,
     layer_indices: list[int],
     hidden_dim: int,
-    output_dir: Path,
+    prefix: str,
     batch_idx: int,
     batch_logits: torch.Tensor | None = None,
     batch_logits_indices: torch.Tensor | None = None,
 ) -> None:
-    """Save a batch as one safetensors file per layer.
+    """Save a batch as one safetensors file per layer via the cache backend.
 
     The NDIF response shape ``(batch, seq, hidden_dim * num_layers)`` is
     split and each layer is written to its own file under
-    ``layer_{idx}/batch_{idx}.safetensors``.  Each file is a complete,
-    self-contained safetensors with two keys: ``activations`` and ``mask``.
-    """
-    from safetensors.torch import save_file
+    ``{prefix}/layer_{idx}/batch_{idx}.safetensors``.  Each file is a
+    complete, self-contained safetensors with two keys: ``activations``
+    and ``mask``.
 
+    Works with any cache backend (local filesystem or S3).
+    """
     batch_size, seq_len = batch_acts.shape[:2]
     num_layers = len(layer_indices)
 
@@ -205,29 +214,24 @@ def _save_batch(
     per_layer = batch_acts.view(batch_size, seq_len, num_layers, hidden_dim)
 
     for i, layer_idx in enumerate(layer_indices):
-        layer_path = output_dir / _layer_batch_path(layer_idx, batch_idx)
-        layer_path.parent.mkdir(parents=True, exist_ok=True)
-
+        key = f"{prefix}/{_layer_batch_path(layer_idx, batch_idx)}"
         tensors: dict[str, torch.Tensor] = {
             "activations": per_layer[:, :, i, :].contiguous(),
             "mask": batch_mask,
         }
-        save_file(tensors, str(layer_path))
+        _save_tensors_to_backend(key, tensors)
 
     # Save logits separately (not per-layer — they're layer-independent)
     if batch_logits is not None:
-        logits_dir = output_dir / "logits"
-        logits_dir.mkdir(parents=True, exist_ok=True)
+        logits_key = f"{prefix}/logits/{_batch_filename(batch_idx)}"
         logits_tensors: dict[str, torch.Tensor] = {"logits": batch_logits}
         if batch_logits_indices is not None:
             logits_tensors["logits_indices"] = batch_logits_indices
-        from safetensors.torch import save_file as _save
-
-        _save(logits_tensors, str(logits_dir / _batch_filename(batch_idx)))
+        _save_tensors_to_backend(logits_key, logits_tensors)
 
 
 def load_batch_layer(
-    source: str | Path,
+    source: str,
     layer: int,
     batch_idx: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -235,8 +239,8 @@ def load_batch_layer(
 
     Parameters
     ----------
-    source : str | Path
-        Extraction directory (containing ``layer_*`` subdirectories).
+    source : str
+        Extraction prefix within the cache backend.
     layer : int
         Layer index.
     batch_idx : int
@@ -249,13 +253,9 @@ def load_batch_layer(
         ``(batch_size, seq_len, hidden_dim)`` and mask has shape
         ``(batch_size, seq_len)``.
     """
-    from safetensors import safe_open
-
-    path = Path(source) / _layer_batch_path(layer, batch_idx)
-    with safe_open(str(path), framework="pt") as f:
-        acts = f.get_tensor("activations")
-        mask = f.get_tensor("mask")
-    return acts, mask
+    key = f"{source}/{_layer_batch_path(layer, batch_idx)}"
+    tensors = _load_tensors_from_backend(key, ["activations", "mask"])
+    return tensors["activations"], tensors["mask"]
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +313,7 @@ def extract(
     *,
     labels: list[int | str | None] | None = None,
     metadata: list[dict] | None = None,
-    output_dir: str | Path | None = None,
+    output_dir: str | None = None,
     batch_size: int = 32,
     remote: bool = True,
     device: str = "auto",
@@ -323,7 +323,7 @@ def extract(
     cache_logits: bool = False,
     logit_top_k: int | None = None,
     max_retries: int = 3,
-) -> Path:
+) -> str:
     """Extract activations and save raw batch responses to disk.
 
     Saves NDIF batch responses as per-layer-keyed safetensors files,
@@ -343,7 +343,7 @@ def extract(
         Per-prompt labels, stored in the manifest.
     metadata : list[dict] | None
         Per-prompt metadata dicts, stored in the manifest.
-    output_dir : str | Path | None
+    output_dir : str | None
         Directory to write batch files and manifest.  If None, creates
         a timestamped directory under the cache backend root.
     batch_size : int
@@ -377,24 +377,20 @@ def extract(
     layer_indices = sorted(resolve_layers(layers, num_model_layers))
     hidden_dim = _get_hidden_size(model_name)
 
-    # Create output directory
-    out_path: Path
+    # Compute output prefix (key prefix within cache backend)
     if output_dir is None:
         model_hash = _hash_string(model_name)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        be = get_backend()
-        base = Path(getattr(be, "_base_dir", "."))
-        out_path = base / "_extractions" / f"{model_hash}_{timestamp}"
+        prefix = f"_extractions/{model_hash}_{timestamp}"
     else:
-        out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
+        prefix = str(output_dir)
 
     # Load existing manifest for resumability
-    manifest_path = out_path / MANIFEST_FILENAME
+    manifest_key = f"{prefix}/{MANIFEST_FILENAME}"
     completed_batches: set[int] = set()
-    if manifest_path.exists():
+    if get_backend().exists(manifest_key):
         existing = ExtractionManifest.from_dict(
-            json.loads(manifest_path.read_text())
+            json.loads(get_backend().read_text(manifest_key))
         )
         for b in existing.batches:
             if b.status == "complete":
@@ -516,14 +512,23 @@ def extract(
             # Compute num_tokens from attention_mask
             num_tokens = batch_mask.sum(dim=-1).int().tolist()
 
-            # Save per-layer batch files
+            # Detect dtype from first batch
             assert batch_acts is not None
+            if batches_extracted == 0 and batches_skipped == 0:
+                _dtype_map_rev = {
+                    torch.float32: "float32",
+                    torch.float16: "float16",
+                    torch.bfloat16: "bfloat16",
+                }
+                manifest.dtype = _dtype_map_rev.get(batch_acts.dtype, "float32")
+
+            # Save per-layer batch files
             _save_batch(
                 batch_acts=batch_acts,
                 batch_mask=batch_mask,
                 layer_indices=layer_indices,
                 hidden_dim=hidden_dim,
-                output_dir=out_path,
+                prefix=prefix,
                 batch_idx=batch_idx,
                 batch_logits=batch_logits if cache_logits else None,
                 batch_logits_indices=batch_logits_indices if cache_logits else None,
@@ -539,7 +544,7 @@ def extract(
             ))
 
             # Write manifest after each batch for resumability
-            _write_manifest(manifest, out_path)
+            _write_manifest(manifest, prefix)
 
             batches_extracted += 1
 
@@ -555,7 +560,7 @@ def extract(
         f"{batches_skipped} skipped (cached), {elapsed:.1f}s"
     )
 
-    return out_path  # noqa: RET504
+    return prefix
 
 
 # ---------------------------------------------------------------------------
@@ -570,9 +575,9 @@ def consolidate_cache(
     *,
     labels: list[int | str | None] | None = None,
     metadata: list[dict] | None = None,
-    output_dir: str | Path | None = None,
+    output_dir: str | None = None,
     batch_size: int = 32,
-) -> Path:
+) -> str:
     """Convert promptwise cache entries into batch-format files.
 
     Reads per-prompt cache files and writes batch-format safetensors
@@ -594,7 +599,7 @@ def consolidate_cache(
         Per-prompt labels, stored in the manifest.
     metadata : list[dict] | None
         Per-prompt metadata dicts, stored in the manifest.
-    output_dir : str | Path | None
+    output_dir : str | None
         Output directory.  If None, creates a timestamped directory.
     batch_size : int
         Number of prompts per batch file.
@@ -616,16 +621,13 @@ def consolidate_cache(
     layer_indices = sorted(resolve_layers(layers, num_model_layers))
     hidden_dim = _get_hidden_size(model_name)
 
-    # Create output directory
-    out_path: Path
+    # Compute output prefix
     if output_dir is None:
         model_hash = _hash_string(model_name)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        base = Path(getattr(get_backend(), "_base_dir", "."))
-        out_path = base / "_extractions" / f"{model_hash}_{timestamp}"
+        prefix = f"_extractions/{model_hash}_{timestamp}"
     else:
-        out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
+        prefix = str(output_dir)
 
     manifest = ExtractionManifest(
         model_name=model_name,
@@ -654,13 +656,19 @@ def consolidate_cache(
         end = min(start + batch_size, len(prompts))
         batch_prompts = prompts[start:end]
 
-        # Load each prompt's activations from cache (one read per prompt)
+        # Load each prompt's activations from cache in parallel
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _load_one(prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
+            return load_prompt_activations(model_name, prompt, layer_indices)
+
         acts_list: list[torch.Tensor] = []
         mask_list: list[torch.Tensor] = []
-        for prompt in batch_prompts:
-            acts, mask = load_prompt_activations(model_name, prompt, layer_indices)
-            acts_list.append(acts)    # (1, seq_len, hidden_dim * num_layers)
-            mask_list.append(mask)    # (1, seq_len)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(_load_one, batch_prompts))
+        for a, m in results:
+            acts_list.append(a)    # (1, seq_len, hidden_dim * num_layers)
+            mask_list.append(m)    # (1, seq_len)
 
         # Pad to uniform sequence length within batch
         max_seq = max(a.shape[1] for a in acts_list)
@@ -681,13 +689,22 @@ def consolidate_cache(
         # Compute num_tokens from original masks
         num_tokens = [int(m.sum().item()) for m in mask_list]
 
+        # Detect dtype from first batch
+        if batch_idx == 0:
+            _dtype_map_rev = {
+                torch.float32: "float32",
+                torch.float16: "float16",
+                torch.bfloat16: "bfloat16",
+            }
+            manifest.dtype = _dtype_map_rev.get(batch_acts.dtype, "float32")
+
         # Save per-layer batch files
         _save_batch(
             batch_acts=batch_acts,
             batch_mask=batch_mask,
             layer_indices=layer_indices,
             hidden_dim=hidden_dim,
-            output_dir=out_path,
+            prefix=prefix,
             batch_idx=batch_idx,
         )
 
@@ -700,7 +717,7 @@ def consolidate_cache(
         ))
 
         # Write manifest after each batch for resumability
-        _write_manifest(manifest, out_path)
+        _write_manifest(manifest, prefix)
 
         # Free memory
         del acts_list, mask_list, padded_acts, padded_masks, batch_acts, batch_mask
@@ -711,7 +728,7 @@ def consolidate_cache(
         f"[CONSOLIDATE] Complete: {num_batches} batch files written in {elapsed:.1f}s"
     )
 
-    return out_path
+    return prefix
 
 
 # ---------------------------------------------------------------------------
@@ -721,7 +738,7 @@ def consolidate_cache(
 
 def _preload_layer_from_batches(
     manifest: ExtractionManifest,
-    source_dir: Path,
+    source_prefix: str,
     layer: int,
     shuffled_prompt_indices: list[int],
 ) -> list[torch.Tensor | None]:
@@ -730,12 +747,23 @@ def _preload_layer_from_batches(
     Returns a list indexed by *shuffled* position, where each entry is
     a ``(num_tokens, hidden_dim)`` tensor (padding removed).
 
+    .. warning:: Memory usage
+
+       This loads an entire layer across **all** prompts into memory.
+       For large models this can be significant:
+
+       - 70B (dim=8192, 23K prompts, ~30 avg tokens): ~5 GB per layer
+       - 405B (dim=16384, 23K prompts, ~30 avg tokens): ~18 GB per layer
+
+       Ensure the machine has sufficient RAM, or reduce the number of
+       prompts processed at once.
+
     Parameters
     ----------
     manifest : ExtractionManifest
         Extraction manifest.
-    source_dir : Path
-        Directory containing batch safetensors files.
+    source_prefix : str
+        Key prefix within the cache backend.
     layer : int
         Layer index to load.
     shuffled_prompt_indices : list[int]
@@ -757,7 +785,7 @@ def _preload_layer_from_batches(
 
         # Load this layer's batch file (one file per layer per batch)
         batch_idx = batch_info.prompt_start // manifest.batch_size
-        acts, mask = load_batch_layer(source_dir, layer, batch_idx)
+        acts, mask = load_batch_layer(source_prefix, layer, batch_idx)
         # acts: (batch_size, padded_seq_len, hidden_dim)
         # mask: (batch_size, padded_seq_len)
 
@@ -779,7 +807,7 @@ def _preload_layer_from_batches(
 
 
 def push_extraction(
-    source: str | Path,
+    source: str,
     repo_id: str,
     *,
     shard_max_bytes: int | None = None,
@@ -846,8 +874,8 @@ def push_extraction(
     if shard_max_bytes is None:
         shard_max_bytes = DEFAULT_SHARD_BYTES
 
-    source_dir = Path(source)
-    manifest = load_manifest(source_dir)
+    source_prefix = str(source)
+    manifest = load_manifest(source_prefix)
 
     prompts = manifest.prompts
     labels = manifest.labels
@@ -982,7 +1010,7 @@ def push_extraction(
             "type": "hidden",
             "layers": hidden_layers,
             "dim": hidden_dim,
-            "dtype": "float32",
+            "dtype": manifest.dtype,
             "storage": "full_sequence",
             "layout": "per_layer",
             "file_pattern": "tensors/hidden_layer{layer:03d}_shard{shard:03d}.safetensors",
@@ -1005,7 +1033,7 @@ def push_extraction(
 
     for layer in tqdm(hidden_layers, desc="Layers", unit="layer"):
         # Load this layer from all batch files
-        data = _preload_layer_from_batches(manifest, source_dir, layer, perm)
+        data = _preload_layer_from_batches(manifest, source_prefix, layer, perm)
         # data[shuffled_pos] = (num_tokens, hidden_dim) or None
 
         key = f"hidden.layer_{layer}"
