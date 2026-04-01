@@ -649,14 +649,14 @@ def consolidate_cache(
     labels: list[int | str | None] | None = None,
     metadata: list[dict] | None = None,
     output_dir: str | None = None,
+    output_uri: str | None = None,
     batch_size: int = 32,
 ) -> str:
     """Convert promptwise cache entries into batch-format files.
 
     Reads per-prompt cache files from the cache backend (S3 or local) and
-    writes batch-format safetensors to the **local filesystem** at
-    *output_dir*.  This ensures batch files end up where the user expects
-    regardless of the active cache backend.
+    writes batch-format safetensors to either the local filesystem
+    (*output_dir*) or the cache backend (*output_uri*).
 
     Each prompt file is read **once** (not once per layer), so this
     performs N S3 GETs instead of N × L.
@@ -674,21 +674,33 @@ def consolidate_cache(
     metadata : list[dict] | None
         Per-prompt metadata dicts, stored in the manifest.
     output_dir : str | None
-        Local filesystem directory for output.  If None, creates a
-        timestamped directory under the current working directory.
+        Local filesystem directory for output.  Mutually exclusive with
+        *output_uri*.
+    output_uri : str | None
+        Cache-backend key prefix for output (e.g. a path relative to the
+        S3 cache root).  Batch files and manifest are written via the
+        active cache backend.  Mutually exclusive with *output_dir*.
     batch_size : int
         Number of prompts per batch file.
 
     Returns
     -------
     str
-        Path to the output directory (always a local filesystem path).
+        Local path (when *output_dir* is used) or backend key prefix
+        (when *output_uri* is used).
 
     Raises
     ------
     FileNotFoundError
         If a prompt has no cached activations.
+    ValueError
+        If both *output_dir* and *output_uri* are specified.
     """
+    if output_dir is not None and output_uri is not None:
+        raise ValueError(
+            "Specify either output_dir (local) or output_uri (backend), not both."
+        )
+
     start_time = time.time()
 
     # Resolve layers
@@ -696,16 +708,22 @@ def consolidate_cache(
     layer_indices = sorted(resolve_layers(layers, num_model_layers))
     hidden_dim = _get_hidden_size(model_name)
 
-    # Compute local output path
-    if output_dir is None:
+    # Determine write mode: local filesystem or cache backend
+    local_root: Path | None = None
+    if output_uri is not None:
+        # Write via cache backend (e.g. S3)
+        prefix = output_uri
+    elif output_dir is not None:
+        local_root = Path(output_dir)
+        local_root.mkdir(parents=True, exist_ok=True)
+        prefix = str(local_root)
+    else:
+        # Default: local timestamped directory
         model_hash = _hash_string(model_name)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         local_root = Path(f"_extractions/{model_hash}_{timestamp}")
-    else:
-        local_root = Path(output_dir)
-
-    local_root.mkdir(parents=True, exist_ok=True)
-    prefix = str(local_root)
+        local_root.mkdir(parents=True, exist_ok=True)
+        prefix = str(local_root)
 
     manifest = ExtractionManifest(
         model_name=model_name,
@@ -776,7 +794,7 @@ def consolidate_cache(
             }
             manifest.dtype = _dtype_map_rev.get(batch_acts.dtype, "float32")
 
-        # Save per-layer batch files to local filesystem
+        # Save per-layer batch files (local or backend depending on mode)
         _save_batch(
             batch_acts=batch_acts,
             batch_mask=batch_mask,
