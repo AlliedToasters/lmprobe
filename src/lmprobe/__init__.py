@@ -54,8 +54,13 @@ __all__ = [
     "UnifiedCache",
     "WarmupStats",
     "cache_info",
+    "consolidate_cache",
     "clear_model_cache",
     "discover_cached",
+    "extract",
+    "ExtractionManifest",
+    "load_manifest",
+    "push_extraction",
     "enable_cache_logging",
     "list_cached_prompts",
     "fetch_dataset_metadata",
@@ -165,6 +170,25 @@ def __getattr__(name: str) -> Any:
             "ManifestEntry": ManifestEntry,
             "discover_cached": discover_cached,
             "list_cached_prompts": list_cached_prompts,
+        }[name]
+    if name in (
+        "extract", "consolidate_cache", "load_manifest",
+        "ExtractionManifest", "push_extraction",
+    ):
+        from .extract import (
+            ExtractionManifest,
+            consolidate_cache,
+            extract,
+            load_manifest,
+            push_extraction,
+        )
+
+        return {
+            "extract": extract,
+            "consolidate_cache": consolidate_cache,
+            "load_manifest": load_manifest,
+            "ExtractionManifest": ExtractionManifest,
+            "push_extraction": push_extraction,
         }[name]
     if name in (
         "push_dataset", "pull_dataset", "load_activation_dataset",
