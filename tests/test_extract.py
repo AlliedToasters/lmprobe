@@ -245,17 +245,17 @@ class TestConsolidateCache:
         )
         uc.warmup(prompts, remote=False)
 
-        # Now consolidate
-        consol_prefix = "consolidated"
+        # Now consolidate — writes to local filesystem
+        consol_dir = str(tmp_path / "consolidated")
         result = consolidate_cache(
             model_name=tiny_model,
             prompts=prompts,
             layers=-1,
-            output_dir=consol_prefix,
+            output_dir=consol_dir,
             batch_size=2,
         )
 
-        assert result == consol_prefix
+        assert result == consol_dir
         manifest = load_manifest(result)
         assert manifest.total_prompts == 3
         assert len(manifest.batches) == 2
@@ -271,6 +271,51 @@ class TestConsolidateCache:
         for batch_info in manifest.batches:
             for nt in batch_info.num_tokens:
                 assert nt > 0
+
+    def test_consolidate_writes_local_files(self, tiny_model, tmp_path, monkeypatch):
+        """consolidate_cache() writes files to local filesystem, not backend."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
+
+        prompts = POSITIVE_PROMPTS[:2]
+
+        from lmprobe.unified_cache import UnifiedCache
+
+        uc = UnifiedCache(
+            model=tiny_model,
+            layers=-1,
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_pooled=False,
+            backend="local",
+        )
+        uc.warmup(prompts, remote=False)
+
+        out_dir = tmp_path / "local_output"
+        result = consolidate_cache(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=-1,
+            output_dir=str(out_dir),
+            batch_size=2,
+        )
+
+        # Verify files exist on local filesystem
+        from pathlib import Path
+
+        local_root = Path(result)
+        assert (local_root / "manifest.json").exists()
+
+        manifest = load_manifest(result)
+        layer = manifest.layers[0]
+        from lmprobe.extract import _layer_batch_path
+
+        layer_file = local_root / _layer_batch_path(layer, 0)
+        assert layer_file.exists()
+
+        # Verify files are NOT inside the cache directory
+        cache_dir = tmp_path / "cache"
+        assert not str(local_root).startswith(str(cache_dir))
 
     def test_consolidate_matches_extract(self, tiny_model, tmp_path, monkeypatch):
         """consolidate_cache output matches extract output for same prompts."""
@@ -308,7 +353,7 @@ class TestConsolidateCache:
             model_name=tiny_model,
             prompts=prompts,
             layers=-1,
-            output_dir="consolidated",
+            output_dir=str(tmp_path / "consolidated"),
             batch_size=2,
         )
 

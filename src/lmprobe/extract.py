@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Local vs backend I/O detection
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # Manifest helpers
 # ---------------------------------------------------------------------------
 
@@ -128,21 +133,45 @@ class ExtractionManifest:
         )
 
 
-def _write_manifest(manifest: ExtractionManifest, prefix: str) -> None:
-    """Write manifest JSON to the cache backend under *prefix*."""
-    key = f"{prefix}/{MANIFEST_FILENAME}"
-    backend = get_backend()
-    backend.write_text(key, json.dumps(manifest.to_dict(), ensure_ascii=False))
+def _write_manifest(
+    manifest: ExtractionManifest,
+    prefix: str,
+    *,
+    local_root: Path | None = None,
+) -> None:
+    """Write manifest JSON.
+
+    Parameters
+    ----------
+    manifest : ExtractionManifest
+        Manifest to write.
+    prefix : str
+        Key prefix (backend) or subdirectory name (local).
+    local_root : Path | None
+        If provided, write to ``local_root / manifest.json`` on the local
+        filesystem.  Otherwise, write via the cache backend.
+    """
+    text = json.dumps(manifest.to_dict(), ensure_ascii=False)
+    if local_root is not None:
+        local_root.mkdir(parents=True, exist_ok=True)
+        (local_root / MANIFEST_FILENAME).write_text(text, encoding="utf-8")
+    else:
+        key = f"{prefix}/{MANIFEST_FILENAME}"
+        backend = get_backend()
+        backend.write_text(key, text)
 
 
 def load_manifest(source: str) -> ExtractionManifest:
     """Load an extraction manifest.
 
+    Auto-detects whether *source* is a local filesystem path or a cache
+    backend key prefix.  If ``source/manifest.json`` exists on the local
+    filesystem, it is read directly; otherwise the cache backend is used.
+
     Parameters
     ----------
     source : str
-        Key prefix within the cache backend (e.g.
-        ``"_extractions/abc123_20260101T000000Z"``).
+        Local directory path or key prefix within the cache backend.
 
     Returns
     -------
@@ -154,11 +183,20 @@ def load_manifest(source: str) -> ExtractionManifest:
     FileNotFoundError
         If the manifest file does not exist.
     """
+    # Try local filesystem first
+    local_path = Path(source) / MANIFEST_FILENAME
+    if local_path.exists():
+        return ExtractionManifest.from_dict(
+            json.loads(local_path.read_text(encoding="utf-8"))
+        )
+
+    # Fall back to cache backend
     key = f"{source}/{MANIFEST_FILENAME}"
     backend = get_backend()
     if not backend.exists(key):
         raise FileNotFoundError(
-            f"No manifest found at {key}. Is this an extraction prefix?"
+            f"No manifest found at {source} (checked local filesystem "
+            f"and cache backend). Is this an extraction prefix?"
         )
     return ExtractionManifest.from_dict(json.loads(backend.read_text(key)))
 
@@ -196,17 +234,24 @@ def _save_batch(
     batch_idx: int,
     batch_logits: torch.Tensor | None = None,
     batch_logits_indices: torch.Tensor | None = None,
+    *,
+    local_root: Path | None = None,
 ) -> None:
-    """Save a batch as one safetensors file per layer via the cache backend.
+    """Save a batch as one safetensors file per layer.
 
     The NDIF response shape ``(batch, seq, hidden_dim * num_layers)`` is
     split and each layer is written to its own file under
-    ``{prefix}/layer_{idx}/batch_{idx}.safetensors``.  Each file is a
-    complete, self-contained safetensors with two keys: ``activations``
-    and ``mask``.
+    ``layer_{idx}/batch_{idx}.safetensors``.
 
-    Works with any cache backend (local filesystem or S3).
+    Parameters
+    ----------
+    local_root : Path | None
+        If provided, write files to the local filesystem under this
+        directory.  Otherwise, write via the cache backend using *prefix*
+        as key prefix.
     """
+    from safetensors.torch import save_file
+
     batch_size, seq_len = batch_acts.shape[:2]
     num_layers = len(layer_indices)
 
@@ -214,20 +259,32 @@ def _save_batch(
     per_layer = batch_acts.view(batch_size, seq_len, num_layers, hidden_dim)
 
     for i, layer_idx in enumerate(layer_indices):
-        key = f"{prefix}/{_layer_batch_path(layer_idx, batch_idx)}"
+        rel_path = _layer_batch_path(layer_idx, batch_idx)
         tensors: dict[str, torch.Tensor] = {
             "activations": per_layer[:, :, i, :].contiguous(),
             "mask": batch_mask,
         }
-        _save_tensors_to_backend(key, tensors)
+        if local_root is not None:
+            out = local_root / rel_path
+            out.parent.mkdir(parents=True, exist_ok=True)
+            save_file(tensors, str(out))
+        else:
+            key = f"{prefix}/{rel_path}"
+            _save_tensors_to_backend(key, tensors)
 
     # Save logits separately (not per-layer — they're layer-independent)
     if batch_logits is not None:
-        logits_key = f"{prefix}/logits/{_batch_filename(batch_idx)}"
+        logits_rel = f"logits/{_batch_filename(batch_idx)}"
         logits_tensors: dict[str, torch.Tensor] = {"logits": batch_logits}
         if batch_logits_indices is not None:
             logits_tensors["logits_indices"] = batch_logits_indices
-        _save_tensors_to_backend(logits_key, logits_tensors)
+        if local_root is not None:
+            out = local_root / logits_rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            save_file(logits_tensors, str(out))
+        else:
+            logits_key = f"{prefix}/logits/{_batch_filename(batch_idx)}"
+            _save_tensors_to_backend(logits_key, logits_tensors)
 
 
 def load_batch_layer(
@@ -237,10 +294,13 @@ def load_batch_layer(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Load activations for one layer from one batch file.
 
+    Auto-detects whether *source* is a local filesystem path or a cache
+    backend key prefix (same logic as :func:`load_manifest`).
+
     Parameters
     ----------
     source : str
-        Extraction prefix within the cache backend.
+        Local directory path or extraction prefix within the cache backend.
     layer : int
         Layer index.
     batch_idx : int
@@ -253,7 +313,20 @@ def load_batch_layer(
         ``(batch_size, seq_len, hidden_dim)`` and mask has shape
         ``(batch_size, seq_len)``.
     """
-    key = f"{source}/{_layer_batch_path(layer, batch_idx)}"
+    rel_path = _layer_batch_path(layer, batch_idx)
+    local_file = Path(source) / rel_path
+
+    if local_file.exists():
+        from safetensors import safe_open
+
+        result: dict[str, torch.Tensor] = {}
+        with safe_open(str(local_file), framework="pt") as f:
+            result["activations"] = f.get_tensor("activations")
+            result["mask"] = f.get_tensor("mask")
+        return result["activations"], result["mask"]
+
+    # Fall back to cache backend
+    key = f"{source}/{rel_path}"
     tensors = _load_tensors_from_backend(key, ["activations", "mask"])
     return tensors["activations"], tensors["mask"]
 
@@ -580,9 +653,10 @@ def consolidate_cache(
 ) -> str:
     """Convert promptwise cache entries into batch-format files.
 
-    Reads per-prompt cache files and writes batch-format safetensors
-    with per-layer keys.  Enables the faster ``push_dataset(source=...)``
-    path for already-cached data without re-extraction from NDIF.
+    Reads per-prompt cache files from the cache backend (S3 or local) and
+    writes batch-format safetensors to the **local filesystem** at
+    *output_dir*.  This ensures batch files end up where the user expects
+    regardless of the active cache backend.
 
     Each prompt file is read **once** (not once per layer), so this
     performs N S3 GETs instead of N × L.
@@ -600,14 +674,15 @@ def consolidate_cache(
     metadata : list[dict] | None
         Per-prompt metadata dicts, stored in the manifest.
     output_dir : str | None
-        Output directory.  If None, creates a timestamped directory.
+        Local filesystem directory for output.  If None, creates a
+        timestamped directory under the current working directory.
     batch_size : int
         Number of prompts per batch file.
 
     Returns
     -------
-    Path
-        Path to the output directory.
+    str
+        Path to the output directory (always a local filesystem path).
 
     Raises
     ------
@@ -621,13 +696,16 @@ def consolidate_cache(
     layer_indices = sorted(resolve_layers(layers, num_model_layers))
     hidden_dim = _get_hidden_size(model_name)
 
-    # Compute output prefix
+    # Compute local output path
     if output_dir is None:
         model_hash = _hash_string(model_name)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        prefix = f"_extractions/{model_hash}_{timestamp}"
+        local_root = Path(f"_extractions/{model_hash}_{timestamp}")
     else:
-        prefix = str(output_dir)
+        local_root = Path(output_dir)
+
+    local_root.mkdir(parents=True, exist_ok=True)
+    prefix = str(local_root)
 
     manifest = ExtractionManifest(
         model_name=model_name,
@@ -698,7 +776,7 @@ def consolidate_cache(
             }
             manifest.dtype = _dtype_map_rev.get(batch_acts.dtype, "float32")
 
-        # Save per-layer batch files
+        # Save per-layer batch files to local filesystem
         _save_batch(
             batch_acts=batch_acts,
             batch_mask=batch_mask,
@@ -706,6 +784,7 @@ def consolidate_cache(
             hidden_dim=hidden_dim,
             prefix=prefix,
             batch_idx=batch_idx,
+            local_root=local_root,
         )
 
         manifest.batches.append(BatchInfo(
@@ -717,7 +796,7 @@ def consolidate_cache(
         ))
 
         # Write manifest after each batch for resumability
-        _write_manifest(manifest, prefix)
+        _write_manifest(manifest, prefix, local_root=local_root)
 
         # Free memory
         del acts_list, mask_list, padded_acts, padded_masks, batch_acts, batch_mask
