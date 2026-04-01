@@ -725,6 +725,24 @@ def consolidate_cache(
         local_root.mkdir(parents=True, exist_ok=True)
         prefix = str(local_root)
 
+    # Load existing manifest for resumability
+    completed_batches: set[int] = set()
+    existing_batch_infos: dict[int, BatchInfo] = {}
+    try:
+        existing = load_manifest(prefix)
+        for b in existing.batches:
+            if b.status == "complete":
+                bi = b.prompt_start // batch_size
+                completed_batches.add(bi)
+                existing_batch_infos[bi] = b
+        if completed_batches:
+            logger.info(
+                f"[CONSOLIDATE] Resuming: {len(completed_batches)} "
+                f"batches already complete"
+            )
+    except FileNotFoundError:
+        pass
+
     manifest = ExtractionManifest(
         model_name=model_name,
         layers=layer_indices,
@@ -738,6 +756,7 @@ def consolidate_cache(
     )
 
     num_batches = (len(prompts) + batch_size - 1) // batch_size
+    batches_skipped = 0
 
     logger.info(
         f"[CONSOLIDATE] Converting {len(prompts)} cached prompts into "
@@ -751,6 +770,12 @@ def consolidate_cache(
         start = batch_idx * batch_size
         end = min(start + batch_size, len(prompts))
         batch_prompts = prompts[start:end]
+
+        # Skip completed batches (resumability)
+        if batch_idx in completed_batches:
+            manifest.batches.append(existing_batch_infos[batch_idx])
+            batches_skipped += 1
+            continue
 
         # Load each prompt's activations from cache in parallel
         from concurrent.futures import ThreadPoolExecutor
@@ -822,7 +847,8 @@ def consolidate_cache(
 
     elapsed = time.time() - start_time
     logger.info(
-        f"[CONSOLIDATE] Complete: {num_batches} batch files written in {elapsed:.1f}s"
+        f"[CONSOLIDATE] Complete: {num_batches - batches_skipped} batch files "
+        f"written, {batches_skipped} skipped (cached), {elapsed:.1f}s"
     )
 
     return prefix

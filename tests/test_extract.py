@@ -439,6 +439,97 @@ class TestConsolidateCache:
         # Activations should be close (float rounding may differ slightly)
         assert torch.allclose(acts_e, acts_c, atol=1e-5)
 
+    def test_consolidate_resumability(self, tiny_model, tmp_path, monkeypatch):
+        """consolidate_cache() skips already-completed batches on resume."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
+
+        prompts = POSITIVE_PROMPTS[:4]
+
+        from lmprobe.unified_cache import UnifiedCache
+
+        uc = UnifiedCache(
+            model=tiny_model,
+            layers=-1,
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_pooled=False,
+            backend="local",
+        )
+        uc.warmup(prompts, remote=False)
+
+        out_dir = str(tmp_path / "resume_test")
+
+        # First run
+        consolidate_cache(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=-1,
+            output_dir=out_dir,
+            batch_size=2,
+        )
+
+        manifest1 = load_manifest(out_dir)
+        assert len(manifest1.batches) == 2
+
+        # Second run — should skip both batches
+        consolidate_cache(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=-1,
+            output_dir=out_dir,
+            batch_size=2,
+        )
+
+        manifest2 = load_manifest(out_dir)
+        # Should still have 2 batches (not 4)
+        assert len(manifest2.batches) == 2
+
+    def test_consolidate_resumability_uri(self, tiny_model, tmp_path, monkeypatch):
+        """consolidate_cache(output_uri=...) resumes from backend manifest."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
+
+        prompts = POSITIVE_PROMPTS[:4]
+
+        from lmprobe.unified_cache import UnifiedCache
+
+        uc = UnifiedCache(
+            model=tiny_model,
+            layers=-1,
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_pooled=False,
+            backend="local",
+        )
+        uc.warmup(prompts, remote=False)
+
+        uri = "resume_uri_test"
+
+        # First run
+        consolidate_cache(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=-1,
+            output_uri=uri,
+            batch_size=2,
+        )
+
+        manifest1 = load_manifest(uri)
+        assert len(manifest1.batches) == 2
+
+        # Second run — should skip
+        consolidate_cache(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=-1,
+            output_uri=uri,
+            batch_size=2,
+        )
+
+        manifest2 = load_manifest(uri)
+        assert len(manifest2.batches) == 2
+
 
 # ---------------------------------------------------------------------------
 # _preload_layer_from_batches test
