@@ -317,6 +317,68 @@ class TestConsolidateCache:
         cache_dir = tmp_path / "cache"
         assert not str(local_root).startswith(str(cache_dir))
 
+    def test_consolidate_output_uri_writes_to_backend(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """consolidate_cache(output_uri=...) writes via cache backend."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
+
+        prompts = POSITIVE_PROMPTS[:2]
+
+        from lmprobe.unified_cache import UnifiedCache
+
+        uc = UnifiedCache(
+            model=tiny_model,
+            layers=-1,
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_pooled=False,
+            backend="local",
+        )
+        uc.warmup(prompts, remote=False)
+
+        uri_prefix = "consolidated_s3_test"
+        result = consolidate_cache(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=-1,
+            output_uri=uri_prefix,
+            batch_size=2,
+        )
+
+        assert result == uri_prefix
+
+        # Files should be in the cache backend, not on local filesystem
+        from lmprobe.cache import get_backend
+        from lmprobe.extract import _layer_batch_path
+
+        backend = get_backend()
+        assert backend.exists(f"{uri_prefix}/manifest.json")
+
+        manifest = load_manifest(result)
+        layer = manifest.layers[0]
+        key = f"{uri_prefix}/{_layer_batch_path(layer, 0)}"
+        assert backend.exists(key)
+
+        # load_batch_layer should find it via backend fallback
+        acts, mask = load_batch_layer(result, layer, batch_idx=0)
+        assert acts.shape[0] == 2
+        assert acts.shape[2] == manifest.hidden_dim
+
+    def test_consolidate_exclusive_params(self, tiny_model):
+        """consolidate_cache raises if both output_dir and output_uri given."""
+        import pytest
+
+        with pytest.raises(ValueError, match="not both"):
+            consolidate_cache(
+                model_name=tiny_model,
+                prompts=["hello"],
+                layers=-1,
+                output_dir="/tmp/foo",
+                output_uri="bar",
+            )
+
     def test_consolidate_matches_extract(self, tiny_model, tmp_path, monkeypatch):
         """consolidate_cache output matches extract output for same prompts."""
         monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
@@ -376,6 +438,97 @@ class TestConsolidateCache:
         assert torch.equal(mask_e, mask_c)
         # Activations should be close (float rounding may differ slightly)
         assert torch.allclose(acts_e, acts_c, atol=1e-5)
+
+    def test_consolidate_resumability(self, tiny_model, tmp_path, monkeypatch):
+        """consolidate_cache() skips already-completed batches on resume."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
+
+        prompts = POSITIVE_PROMPTS[:4]
+
+        from lmprobe.unified_cache import UnifiedCache
+
+        uc = UnifiedCache(
+            model=tiny_model,
+            layers=-1,
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_pooled=False,
+            backend="local",
+        )
+        uc.warmup(prompts, remote=False)
+
+        out_dir = str(tmp_path / "resume_test")
+
+        # First run
+        consolidate_cache(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=-1,
+            output_dir=out_dir,
+            batch_size=2,
+        )
+
+        manifest1 = load_manifest(out_dir)
+        assert len(manifest1.batches) == 2
+
+        # Second run — should skip both batches
+        consolidate_cache(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=-1,
+            output_dir=out_dir,
+            batch_size=2,
+        )
+
+        manifest2 = load_manifest(out_dir)
+        # Should still have 2 batches (not 4)
+        assert len(manifest2.batches) == 2
+
+    def test_consolidate_resumability_uri(self, tiny_model, tmp_path, monkeypatch):
+        """consolidate_cache(output_uri=...) resumes from backend manifest."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
+
+        prompts = POSITIVE_PROMPTS[:4]
+
+        from lmprobe.unified_cache import UnifiedCache
+
+        uc = UnifiedCache(
+            model=tiny_model,
+            layers=-1,
+            compute_perplexity=False,
+            device="cpu",
+            remote=False,
+            cache_pooled=False,
+            backend="local",
+        )
+        uc.warmup(prompts, remote=False)
+
+        uri = "resume_uri_test"
+
+        # First run
+        consolidate_cache(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=-1,
+            output_uri=uri,
+            batch_size=2,
+        )
+
+        manifest1 = load_manifest(uri)
+        assert len(manifest1.batches) == 2
+
+        # Second run — should skip
+        consolidate_cache(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=-1,
+            output_uri=uri,
+            batch_size=2,
+        )
+
+        manifest2 = load_manifest(uri)
+        assert len(manifest2.batches) == 2
 
 
 # ---------------------------------------------------------------------------
