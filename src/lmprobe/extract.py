@@ -1040,8 +1040,10 @@ def push_extraction(
         Only used when ``stream=True``.
     staging_dir : str | Path | None
         Directory for staging shard files when ``stream=True``.
-        If None, a temporary directory is created.  Reuse the same
-        directory to resume a partial upload.
+        If None, a temporary directory is created.  Pass a persistent
+        path to enable resumability — if the staging dir is a tmpdir
+        that gets cleaned up, progress tracking is lost even though
+        already-uploaded shards are detected via remote check.
 
     Returns
     -------
@@ -1063,11 +1065,17 @@ def push_extraction(
         _compute_shard_boundaries_variable,
         _deterministic_seed,
         _hidden_shard_filename,
-        _load_manifest as _load_stream_manifest,
-        _new_manifest as _new_stream_manifest,
-        _save_manifest as _save_stream_manifest,
         _shuffle_indices,
         _write_parquet_index,
+    )
+    from .sharing import (
+        _load_manifest as _load_stream_manifest,
+    )
+    from .sharing import (
+        _new_manifest as _new_stream_manifest,
+    )
+    from .sharing import (
+        _save_manifest as _save_stream_manifest,
     )
 
     _check_hub_deps()
