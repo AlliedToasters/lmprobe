@@ -1244,10 +1244,9 @@ def push_extraction(
         (tmpdir / "index").mkdir(parents=True, exist_ok=True)
 
         # Load or create streaming manifest for resumability
-        stream_manifest = _load_stream_manifest(tmpdir)
-        resuming = stream_manifest is not None
-        if stream_manifest is None:
-            stream_manifest = _new_stream_manifest(repo_id)
+        _loaded = _load_stream_manifest(tmpdir)
+        resuming = _loaded is not None
+        stream_manifest: dict = _loaded if _loaded is not None else _new_stream_manifest(repo_id)
 
         api = HfApi(token=token)
         api.create_repo(
