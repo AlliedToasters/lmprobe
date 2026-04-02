@@ -236,6 +236,7 @@ def _save_batch(
     batch_logits_indices: torch.Tensor | None = None,
     *,
     local_root: Path | None = None,
+    num_workers: int = 1,
 ) -> None:
     """Save a batch as one safetensors file per layer.
 
@@ -249,7 +250,12 @@ def _save_batch(
         If provided, write files to the local filesystem under this
         directory.  Otherwise, write via the cache backend using *prefix*
         as key prefix.
+    num_workers : int
+        Number of parallel threads for writing layer files.  Values > 1
+        are useful when writing to S3 or another high-latency backend.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     from safetensors.torch import save_file
 
     batch_size, seq_len = batch_acts.shape[:2]
@@ -258,7 +264,7 @@ def _save_batch(
     # Reshape: (batch, seq, dim*layers) → (batch, seq, layers, dim)
     per_layer = batch_acts.view(batch_size, seq_len, num_layers, hidden_dim)
 
-    for i, layer_idx in enumerate(layer_indices):
+    def _write_layer(i: int, layer_idx: int) -> None:
         rel_path = _layer_batch_path(layer_idx, batch_idx)
         tensors: dict[str, torch.Tensor] = {
             "activations": per_layer[:, :, i, :].contiguous(),
@@ -271,6 +277,18 @@ def _save_batch(
         else:
             key = f"{prefix}/{rel_path}"
             _save_tensors_to_backend(key, tensors)
+
+    if num_workers > 1 and num_layers > 1:
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futs = [
+                pool.submit(_write_layer, i, layer_idx)
+                for i, layer_idx in enumerate(layer_indices)
+            ]
+            for fut in futs:
+                fut.result()  # propagate exceptions
+    else:
+        for i, layer_idx in enumerate(layer_indices):
+            _write_layer(i, layer_idx)
 
     # Save logits separately (not per-layer — they're layer-independent)
     if batch_logits is not None:
@@ -651,6 +669,7 @@ def consolidate_cache(
     output_dir: str | None = None,
     output_uri: str | None = None,
     batch_size: int = 32,
+    num_workers: int = 8,
 ) -> str:
     """Convert promptwise cache entries into batch-format files.
 
@@ -682,6 +701,9 @@ def consolidate_cache(
         active cache backend.  Mutually exclusive with *output_dir*.
     batch_size : int
         Number of prompts per batch file.
+    num_workers : int
+        Number of parallel threads for reading and writing cache files.
+        Higher values improve throughput for high-latency backends (S3).
 
     Returns
     -------
@@ -763,35 +785,27 @@ def consolidate_cache(
         f"{num_batches} batch files"
     )
 
-    for batch_idx in tqdm(
-        range(num_batches), total=num_batches,
-        desc="Consolidating cache", unit="batch",
-    ):
-        start = batch_idx * batch_size
-        end = min(start + batch_size, len(prompts))
-        batch_prompts = prompts[start:end]
+    from concurrent.futures import Future, ThreadPoolExecutor
 
-        # Skip completed batches (resumability)
-        if batch_idx in completed_batches:
-            manifest.batches.append(existing_batch_infos[batch_idx])
-            batches_skipped += 1
-            continue
+    def _load_one(prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
+        return load_prompt_activations(model_name, prompt, layer_indices)
 
-        # Load each prompt's activations from cache in parallel
-        from concurrent.futures import ThreadPoolExecutor
-
-        def _load_one(prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
-            return load_prompt_activations(model_name, prompt, layer_indices)
-
-        acts_list: list[torch.Tensor] = []
-        mask_list: list[torch.Tensor] = []
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(_load_one, batch_prompts))
+    def _read_batch(
+        batch_prompts: list[str], read_pool: ThreadPoolExecutor
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Read a batch of prompts from cache in parallel."""
+        results = list(read_pool.map(_load_one, batch_prompts))
+        a_list: list[torch.Tensor] = []
+        m_list: list[torch.Tensor] = []
         for a, m in results:
-            acts_list.append(a)    # (1, seq_len, hidden_dim * num_layers)
-            mask_list.append(m)    # (1, seq_len)
+            a_list.append(a)
+            m_list.append(m)
+        return a_list, m_list
 
-        # Pad to uniform sequence length within batch
+    def _prepare_batch(
+        acts_list: list[torch.Tensor], mask_list: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        """Pad and stack a batch of activations."""
         max_seq = max(a.shape[1] for a in acts_list)
         padded_acts = []
         padded_masks = []
@@ -803,23 +817,21 @@ def consolidate_cache(
                 mask = torch.nn.functional.pad(mask, (0, pad_size))
             padded_acts.append(acts)
             padded_masks.append(mask)
-
-        batch_acts = torch.cat(padded_acts, dim=0)   # (batch, max_seq, dim*layers)
-        batch_mask = torch.cat(padded_masks, dim=0)   # (batch, max_seq)
-
-        # Compute num_tokens from original masks
+        batch_acts = torch.cat(padded_acts, dim=0)
+        batch_mask = torch.cat(padded_masks, dim=0)
         num_tokens = [int(m.sum().item()) for m in mask_list]
+        return batch_acts, batch_mask, num_tokens
 
-        # Detect dtype from first batch
-        if batch_idx == 0:
-            _dtype_map_rev = {
-                torch.float32: "float32",
-                torch.float16: "float16",
-                torch.bfloat16: "bfloat16",
-            }
-            manifest.dtype = _dtype_map_rev.get(batch_acts.dtype, "float32")
+    # Use a single write pool across all batches for pipelining
+    write_pool = ThreadPoolExecutor(max_workers=num_workers)
+    read_pool = ThreadPoolExecutor(max_workers=num_workers)
+    pending_write: Future | None = None
 
-        # Save per-layer batch files (local or backend depending on mode)
+    def _do_write(
+        batch_acts: torch.Tensor,
+        batch_mask: torch.Tensor,
+        batch_idx: int,
+    ) -> None:
         _save_batch(
             batch_acts=batch_acts,
             batch_mask=batch_mask,
@@ -828,22 +840,71 @@ def consolidate_cache(
             prefix=prefix,
             batch_idx=batch_idx,
             local_root=local_root,
+            num_workers=num_workers,
         )
 
-        manifest.batches.append(BatchInfo(
-            file=_batch_filename(batch_idx),
-            prompt_start=start,
-            prompt_end=end,
-            num_tokens=num_tokens,
-            status="complete",
-        ))
+    try:
+        for batch_idx in tqdm(
+            range(num_batches), total=num_batches,
+            desc="Consolidating cache", unit="batch",
+        ):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, len(prompts))
+            batch_prompts = prompts[start:end]
 
-        # Write manifest after each batch for resumability
-        _write_manifest(manifest, prefix, local_root=local_root)
+            # Skip completed batches (resumability)
+            if batch_idx in completed_batches:
+                manifest.batches.append(existing_batch_infos[batch_idx])
+                batches_skipped += 1
+                continue
 
-        # Free memory
-        del acts_list, mask_list, padded_acts, padded_masks, batch_acts, batch_mask
-        gc.collect()
+            # Wait for previous write to finish before we overwrite tensors
+            if pending_write is not None:
+                pending_write.result()
+                pending_write = None
+
+            # Read batch
+            acts_list, mask_list = _read_batch(batch_prompts, read_pool)
+            batch_acts, batch_mask, num_tokens = _prepare_batch(
+                acts_list, mask_list
+            )
+
+            # Detect dtype from first batch
+            if batch_idx == 0:
+                _dtype_map_rev = {
+                    torch.float32: "float32",
+                    torch.float16: "float16",
+                    torch.bfloat16: "bfloat16",
+                }
+                manifest.dtype = _dtype_map_rev.get(batch_acts.dtype, "float32")
+
+            # Submit write to thread pool (pipelined with next read)
+            pending_write = write_pool.submit(
+                _do_write, batch_acts, batch_mask, batch_idx
+            )
+
+            manifest.batches.append(BatchInfo(
+                file=_batch_filename(batch_idx),
+                prompt_start=start,
+                prompt_end=end,
+                num_tokens=num_tokens,
+                status="complete",
+            ))
+
+            # Write manifest after each batch for resumability
+            _write_manifest(manifest, prefix, local_root=local_root)
+
+            # Free read-side memory (write holds refs to batch_acts/mask)
+            del acts_list, mask_list
+            gc.collect()
+
+        # Wait for final write
+        if pending_write is not None:
+            pending_write.result()
+
+    finally:
+        write_pool.shutdown(wait=True)
+        read_pool.shutdown(wait=False)
 
     elapsed = time.time() - start_time
     logger.info(
