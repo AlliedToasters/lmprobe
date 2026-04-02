@@ -76,6 +76,7 @@ class ExtractionManifest:
     batches: list[BatchInfo] = field(default_factory=list)
     created_at: str = ""
     dtype: str = "float32"
+    completed_layers: list[int] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -103,6 +104,8 @@ class ExtractionManifest:
             d["labels"] = self.labels
         if self.metadata is not None:
             d["metadata"] = self.metadata
+        if self.completed_layers is not None:
+            d["completed_layers"] = self.completed_layers
         return d
 
     @classmethod
@@ -130,6 +133,7 @@ class ExtractionManifest:
             batches=batches,
             created_at=d.get("created_at", ""),
             dtype=d.get("dtype", "float32"),
+            completed_layers=d.get("completed_layers"),
         )
 
 
@@ -750,6 +754,7 @@ def consolidate_cache(
     # Load existing manifest for resumability
     completed_batches: set[int] = set()
     existing_batch_infos: dict[int, BatchInfo] = {}
+    previously_completed_layers: set[int] = set()
     try:
         existing = load_manifest(prefix)
         for b in existing.batches:
@@ -757,10 +762,19 @@ def consolidate_cache(
                 bi = b.prompt_start // batch_size
                 completed_batches.add(bi)
                 existing_batch_infos[bi] = b
+        if existing.completed_layers:
+            previously_completed_layers = set(existing.completed_layers)
+        resume_parts = []
         if completed_batches:
+            resume_parts.append(f"{len(completed_batches)} batches")
+        if previously_completed_layers:
+            resume_parts.append(
+                f"{len(previously_completed_layers)} layers"
+            )
+        if resume_parts:
             logger.info(
-                f"[CONSOLIDATE] Resuming: {len(completed_batches)} "
-                f"batches already complete"
+                f"[CONSOLIDATE] Resuming: {', '.join(resume_parts)} "
+                f"already complete"
             )
     except FileNotFoundError:
         pass
@@ -864,14 +878,21 @@ def consolidate_cache(
 
     # Collect num_tokens per batch (from masks during first layer pass)
     batch_num_tokens: dict[int, list[int]] = {}
+    # Track which layers have been fully written (for manifest-based resume)
+    completed_layers: set[int] = set(previously_completed_layers)
 
     read_pool = ThreadPoolExecutor(max_workers=num_workers)
-    write_pool = ThreadPoolExecutor(max_workers=num_workers)
 
     try:
         for layer_idx in tqdm(
             layer_indices, desc="Consolidating layers", unit="layer",
         ):
+            # Skip entire layer if already completed in a previous run
+            if layer_idx in previously_completed_layers:
+                continue
+
+            layer_had_work = False
+
             for batch_idx, start, end in batch_ranges:
                 # Skip fully completed batches
                 if batch_idx in completed_batches:
@@ -881,6 +902,7 @@ def consolidate_cache(
                 if _layer_batch_exists(layer_idx, batch_idx):
                     continue
 
+                layer_had_work = True
                 batch_prompts = prompts[start:end]
                 batch_acts, batch_mask = _load_layer_batch(
                     layer_idx, batch_prompts, read_pool
@@ -904,21 +926,37 @@ def consolidate_cache(
                         batch_acts.dtype, "float32"
                     )
 
-                # Write (parallel writes across layers handled by pool)
-                write_pool.submit(
-                    _write_layer_batch, layer_idx, batch_idx,
-                    batch_acts, batch_mask,
-                ).result()
-
+                _write_layer_batch(layer_idx, batch_idx, batch_acts, batch_mask)
                 del batch_acts, batch_mask
+
+            completed_layers.add(layer_idx)
+
+            # Write manifest after each layer for crash recovery.
+            # On resume, completed layers let us skip N_batches existence
+            # checks per layer.
+            if layer_had_work:
+                # Build partial manifest with batch info collected so far
+                partial_manifest = ExtractionManifest(
+                    model_name=model_name,
+                    layers=layer_indices,
+                    hidden_dim=hidden_dim,
+                    total_prompts=len(prompts),
+                    batch_size=batch_size,
+                    prompts=list(prompts),
+                    labels=list(labels) if labels is not None else None,
+                    metadata=list(metadata) if metadata is not None else None,
+                    created_at=manifest.created_at,
+                    dtype=manifest.dtype,
+                    completed_layers=sorted(completed_layers),
+                )
+                _write_manifest(partial_manifest, prefix, local_root=local_root)
 
             gc.collect()
 
     finally:
         read_pool.shutdown(wait=False)
-        write_pool.shutdown(wait=True)
 
-    # Build manifest entries for newly completed batches
+    # Build final manifest with all batch entries
     for batch_idx, start, end in batch_ranges:
         if batch_idx in completed_batches:
             manifest.batches.append(existing_batch_infos[batch_idx])
