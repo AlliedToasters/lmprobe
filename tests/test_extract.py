@@ -578,3 +578,157 @@ class TestPreloadFromBatches:
         # data_rev[0] should match data[3] (reversed)
         assert torch.allclose(data_rev[0], data[3])
         assert torch.allclose(data_rev[3], data[0])
+
+
+# ---------------------------------------------------------------------------
+# push_extraction streaming tests
+# ---------------------------------------------------------------------------
+
+
+class TestPushExtractionStreaming:
+    """Tests for push_extraction(stream=True).
+
+    These mock the HuggingFace API to avoid real uploads.
+    """
+
+    def _make_extraction(self, tiny_model, tmp_path, monkeypatch):
+        """Helper: create a small extraction directory."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
+
+        prompts = POSITIVE_PROMPTS[:4]
+        prefix = extract(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=-1,
+            output_dir=str(tmp_path / "extracted"),
+            batch_size=2,
+            remote=False,
+            device="cpu",
+            backend="local",
+        )
+        return prefix
+
+    def test_stream_calls_create_commit(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """Streaming mode uses create_commit, not upload_large_folder."""
+        prefix = self._make_extraction(tiny_model, tmp_path, monkeypatch)
+
+        from unittest.mock import MagicMock, patch
+
+        mock_api = MagicMock()
+        mock_api.repo_info.side_effect = Exception("no repo yet")
+
+        from lmprobe.extract import push_extraction
+
+        with patch("huggingface_hub.HfApi", return_value=mock_api):
+            with patch(
+                "huggingface_hub.CommitOperationAdd"
+            ) as mock_op:
+                mock_op.side_effect = lambda **kw: kw
+                push_extraction(
+                    source=prefix,
+                    repo_id="test-user/test-dataset",
+                    stream=True,
+                    stream_batch_size=5,
+                    staging_dir=str(tmp_path / "staging"),
+                )
+
+        mock_api.create_repo.assert_called_once()
+        assert mock_api.create_commit.call_count >= 2  # shards + metadata
+        mock_api.upload_large_folder.assert_not_called()
+
+    def test_stream_deletes_shard_files(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """Streaming mode deletes shard files after upload."""
+        prefix = self._make_extraction(tiny_model, tmp_path, monkeypatch)
+
+        from unittest.mock import MagicMock, patch
+
+        mock_api = MagicMock()
+        mock_api.repo_info.side_effect = Exception("no repo yet")
+
+        staging = tmp_path / "staging"
+
+        from lmprobe.extract import push_extraction
+
+        with patch("huggingface_hub.HfApi", return_value=mock_api):
+            with patch("huggingface_hub.CommitOperationAdd", side_effect=lambda **kw: kw):
+                push_extraction(
+                    source=prefix,
+                    repo_id="test-user/test-dataset",
+                    stream=True,
+                    stream_batch_size=2,
+                    staging_dir=str(staging),
+                )
+
+        remaining = list(staging.rglob("*.safetensors"))
+        assert remaining == [], f"Shard files not cleaned up: {remaining}"
+
+    def test_stream_skip_existing_shards(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """Streaming mode skips shards already on remote."""
+        prefix = self._make_extraction(tiny_model, tmp_path, monkeypatch)
+
+        from unittest.mock import MagicMock, patch
+
+        manifest = load_manifest(prefix)
+        layer = manifest.layers[0]
+
+        from lmprobe.sharing import _hidden_shard_filename
+
+        existing_shard = _hidden_shard_filename(layer, 0)
+
+        mock_api = MagicMock()
+        mock_repo_info = MagicMock()
+        mock_repo_info.siblings = [MagicMock(rfilename=existing_shard)]
+        mock_api.repo_info.return_value = mock_repo_info
+
+        from lmprobe.extract import push_extraction
+
+        uploaded_shards: list[str] = []
+
+        def tracking_commit(**kwargs):
+            ops = kwargs.get("operations", [])
+            for op in ops:
+                if isinstance(op, dict):
+                    uploaded_shards.append(op.get("path_in_repo", ""))
+
+        mock_api.create_commit.side_effect = tracking_commit
+
+        with patch("huggingface_hub.HfApi", return_value=mock_api):
+            with patch("huggingface_hub.CommitOperationAdd", side_effect=lambda **kw: kw):
+                push_extraction(
+                    source=prefix,
+                    repo_id="test-user/test-dataset",
+                    stream=True,
+                    staging_dir=str(tmp_path / "staging"),
+                )
+
+        assert existing_shard not in uploaded_shards, (
+            f"Shard {existing_shard} was uploaded despite being on remote"
+        )
+
+    def test_nonstream_unchanged(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """Non-streaming mode still uses upload_large_folder."""
+        prefix = self._make_extraction(tiny_model, tmp_path, monkeypatch)
+
+        from unittest.mock import MagicMock, patch
+
+        mock_api = MagicMock()
+
+        from lmprobe.extract import push_extraction
+
+        with patch("huggingface_hub.HfApi", return_value=mock_api):
+            push_extraction(
+                source=prefix,
+                repo_id="test-user/test-dataset",
+                exist_ok=True,
+            )
+
+        mock_api.upload_large_folder.assert_called_once()
+        mock_api.create_commit.assert_not_called()

@@ -1001,6 +1001,9 @@ def push_extraction(
     license: str = "cc-by-4.0",
     token: str | None = None,
     shuffle: bool = True,
+    stream: bool = False,
+    stream_batch_size: int = 10,
+    staging_dir: str | Path | None = None,
 ) -> str:
     """Publish an extraction directory as a HuggingFace dataset.
 
@@ -1028,6 +1031,17 @@ def push_extraction(
         HuggingFace API token.
     shuffle : bool
         Deterministically shuffle prompts across shards.
+    stream : bool
+        If True, upload shards incrementally via ``create_commit``
+        after each layer, deleting local copies to bound peak disk
+        usage.  Supports resumability via a streaming manifest.
+    stream_batch_size : int
+        Number of shard files to buffer before uploading a batch.
+        Only used when ``stream=True``.
+    staging_dir : str | Path | None
+        Directory for staging shard files when ``stream=True``.
+        If None, a temporary directory is created.  Reuse the same
+        directory to resume a partial upload.
 
     Returns
     -------
@@ -1044,10 +1058,14 @@ def push_extraction(
         _build_readme,
         _check_hub_deps,
         _check_pyarrow,
+        _check_shards_on_remote,
         _compute_shard_boundaries,
         _compute_shard_boundaries_variable,
         _deterministic_seed,
         _hidden_shard_filename,
+        _load_manifest as _load_stream_manifest,
+        _new_manifest as _new_stream_manifest,
+        _save_manifest as _save_stream_manifest,
         _shuffle_indices,
         _write_parquet_index,
     )
@@ -1204,10 +1222,122 @@ def push_extraction(
         },
     }
 
-    # Create temporary directory for shard files
-    tmpdir = Path(tempfile.mkdtemp(prefix="lmprobe_push_extraction_"))
-    (tmpdir / "tensors").mkdir(parents=True, exist_ok=True)
-    (tmpdir / "index").mkdir(parents=True, exist_ok=True)
+    # -- Set up directory and upload infrastructure --
+    from huggingface_hub import HfApi
+
+    if stream:
+        from huggingface_hub import CommitOperationAdd
+
+        if staging_dir is not None:
+            tmpdir = Path(staging_dir)
+        else:
+            tmpdir = Path(tempfile.mkdtemp(prefix="lmprobe_push_extraction_"))
+        (tmpdir / "tensors").mkdir(parents=True, exist_ok=True)
+        (tmpdir / "index").mkdir(parents=True, exist_ok=True)
+
+        # Load or create streaming manifest for resumability
+        stream_manifest = _load_stream_manifest(tmpdir)
+        resuming = stream_manifest is not None
+        if stream_manifest is None:
+            stream_manifest = _new_stream_manifest(repo_id)
+
+        api = HfApi(token=token)
+        api.create_repo(
+            repo_id,
+            exist_ok=True if resuming else exist_ok,
+            private=private,
+            repo_type="dataset",
+        )
+
+        # Compute expected shard files and check which exist on remote
+        expected_files: list[str] = []
+        for layer in hidden_layers:
+            for si in range(len(hidden_boundaries)):
+                expected_files.append(_hidden_shard_filename(layer, si))
+
+        already_completed = set(stream_manifest.get("completed_shards", []))
+        remote_existing = _check_shards_on_remote(api, repo_id, expected_files)
+        skip_shards = already_completed | remote_existing
+
+        if skip_shards:
+            logger.info(
+                "[PUSH_EXTRACTION] %d/%d shards already uploaded, skipping",
+                len(skip_shards), len(expected_files),
+            )
+
+        # Build streaming callback
+        pending_shards: list[tuple[Path, str]] = []
+
+        def _flush_batch() -> None:
+            if not pending_shards:
+                return
+            logger.info(
+                "[PUSH_EXTRACTION] Uploading batch of %d shards",
+                len(pending_shards),
+            )
+            stream_manifest["pending_batch"] = [
+                [str(lp), rp] for lp, rp in pending_shards
+            ]
+            _save_stream_manifest(tmpdir, stream_manifest)
+
+            operations = [
+                CommitOperationAdd(
+                    path_in_repo=rp, path_or_fileobj=str(lp),
+                )
+                for lp, rp in pending_shards
+            ]
+            api.create_commit(
+                repo_id=repo_id,
+                operations=operations,
+                commit_message=f"Add {len(pending_shards)} shards",
+                repo_type="dataset",
+            )
+            for lp, rp in pending_shards:
+                lp.unlink(missing_ok=True)
+                stream_manifest["completed_shards"].append(rp)
+            stream_manifest.pop("pending_batch", None)
+            _save_stream_manifest(tmpdir, stream_manifest)
+            pending_shards.clear()
+
+        def _on_shard_written(local_path: Path, repo_path: str) -> None:
+            pending_shards.append((local_path, repo_path))
+            if len(pending_shards) >= stream_batch_size:
+                _flush_batch()
+
+        # Retry any pending batch from a prior failed commit
+        prior_batch = stream_manifest.get("pending_batch", [])
+        if prior_batch:
+            local_files_exist = all(
+                Path(lp).exists() for lp, _ in prior_batch
+            )
+            if local_files_exist:
+                logger.info(
+                    "[PUSH_EXTRACTION] Retrying pending batch of %d shards",
+                    len(prior_batch),
+                )
+                operations = [
+                    CommitOperationAdd(path_in_repo=rp, path_or_fileobj=lp)
+                    for lp, rp in prior_batch
+                ]
+                api.create_commit(
+                    repo_id=repo_id,
+                    operations=operations,
+                    commit_message=f"Add {len(prior_batch)} shards (retry)",
+                    repo_type="dataset",
+                )
+                for lp, rp in prior_batch:
+                    Path(lp).unlink(missing_ok=True)
+                    stream_manifest["completed_shards"].append(rp)
+                stream_manifest.pop("pending_batch", None)
+                _save_stream_manifest(tmpdir, stream_manifest)
+            else:
+                stream_manifest.pop("pending_batch", None)
+                _save_stream_manifest(tmpdir, stream_manifest)
+    else:
+        tmpdir = Path(tempfile.mkdtemp(prefix="lmprobe_push_extraction_"))
+        (tmpdir / "tensors").mkdir(parents=True, exist_ok=True)
+        (tmpdir / "index").mkdir(parents=True, exist_ok=True)
+        skip_shards = set()
 
     # Write shards per layer
     logger.info(
@@ -1227,6 +1357,9 @@ def push_extraction(
         for local_idx, shard_size in enumerate(lt_boundaries):
             shard_idx = local_idx
             fname = _hidden_shard_filename(layer, shard_idx)
+            if fname in skip_shards:
+                offset += shard_size
+                continue
             rows: list[torch.Tensor] = []
             for j in range(shard_size):
                 if offset + j < n:
@@ -1235,6 +1368,8 @@ def push_extraction(
                         rows.append(lt_act[-1:])  # last token: (1, dim)
             if rows:
                 save_file({key: torch.cat(rows, dim=0)}, str(tmpdir / fname))
+                if stream:
+                    _on_shard_written(tmpdir / fname, fname)
             offset += shard_size
 
         # Write rest-token shards
@@ -1242,6 +1377,9 @@ def push_extraction(
         for local_idx, shard_size in enumerate(rest_boundaries):
             shard_idx = lt_shard_count + local_idx
             fname = _hidden_shard_filename(layer, shard_idx)
+            if fname in skip_shards:
+                offset += shard_size
+                continue
             rows = []
             for j in range(shard_size):
                 if offset + j < n:
@@ -1250,7 +1388,13 @@ def push_extraction(
                         rows.append(rest_act[:-1])  # all but last
             if rows:
                 save_file({key: torch.cat(rows, dim=0)}, str(tmpdir / fname))
+                if stream:
+                    _on_shard_written(tmpdir / fname, fname)
             offset += shard_size
+
+        # In streaming mode, flush after each layer to free disk
+        if stream:
+            _flush_batch()
 
         del data
         gc.collect()
@@ -1270,26 +1414,51 @@ def push_extraction(
     (tmpdir / "README.md").write_text(readme)
 
     # Upload
-    from huggingface_hub import HfApi
+    if stream:
+        # Upload metadata in a final commit
+        metadata_files = list((tmpdir / "index").rglob("*")) + [
+            tmpdir / "README.md",
+        ]
+        operations = [
+            CommitOperationAdd(
+                path_in_repo=str(f.relative_to(tmpdir)),
+                path_or_fileobj=str(f),
+            )
+            for f in metadata_files
+            if f.is_file()
+        ]
+        api.create_commit(
+            repo_id=repo_id,
+            operations=operations,
+            commit_message="Add dataset metadata",
+            repo_type="dataset",
+        )
+        stream_manifest["metadata_uploaded"] = True
+        _save_stream_manifest(tmpdir, stream_manifest)
 
-    api = HfApi(token=token)
-    api.create_repo(
-        repo_id,
-        exist_ok=exist_ok,
-        private=private,
-        repo_type="dataset",
-    )
+        # Clean up metadata files
+        for f in metadata_files:
+            if f.is_file():
+                f.unlink(missing_ok=True)
+    else:
+        api = HfApi(token=token)
+        api.create_repo(
+            repo_id,
+            exist_ok=exist_ok,
+            private=private,
+            repo_type="dataset",
+        )
 
-    total_size = sum(f.stat().st_size for f in tmpdir.rglob("*") if f.is_file())
-    logger.info(
-        f"[PUSH_EXTRACTION] Uploading dataset ({total_size / 1e9:.2f} GB)"
-    )
+        total_size = sum(f.stat().st_size for f in tmpdir.rglob("*") if f.is_file())
+        logger.info(
+            f"[PUSH_EXTRACTION] Uploading dataset ({total_size / 1e9:.2f} GB)"
+        )
 
-    api.upload_large_folder(
-        repo_id=repo_id,
-        repo_type="dataset",
-        folder_path=str(tmpdir),
-    )
+        api.upload_large_folder(
+            repo_id=repo_id,
+            repo_type="dataset",
+            folder_path=str(tmpdir),
+        )
 
     url = f"https://huggingface.co/datasets/{repo_id}"
     logger.info(f"[PUSH_EXTRACTION] Published: {url}")
