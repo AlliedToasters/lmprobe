@@ -608,6 +608,17 @@ class TestPushExtractionStreaming:
         )
         return prefix
 
+    def _hub_patches(self):
+        """Context manager stack for mocking HF hub + pyarrow deps."""
+        from contextlib import ExitStack
+        from unittest.mock import patch
+
+        stack = ExitStack()
+        stack.enter_context(patch("lmprobe.sharing._check_pyarrow"))
+        stack.enter_context(patch("lmprobe.sharing._check_hub_deps"))
+        stack.enter_context(patch("lmprobe.sharing._write_parquet_index"))
+        return stack
+
     def test_stream_calls_create_commit(
         self, tiny_model, tmp_path, monkeypatch
     ):
@@ -621,18 +632,19 @@ class TestPushExtractionStreaming:
 
         from lmprobe.extract import push_extraction
 
-        with patch("huggingface_hub.HfApi", return_value=mock_api):
-            with patch(
-                "huggingface_hub.CommitOperationAdd"
-            ) as mock_op:
-                mock_op.side_effect = lambda **kw: kw
-                push_extraction(
-                    source=prefix,
-                    repo_id="test-user/test-dataset",
-                    stream=True,
-                    stream_batch_size=5,
-                    staging_dir=str(tmp_path / "staging"),
-                )
+        with self._hub_patches():
+            with patch("huggingface_hub.HfApi", return_value=mock_api):
+                with patch(
+                    "huggingface_hub.CommitOperationAdd"
+                ) as mock_op:
+                    mock_op.side_effect = lambda **kw: kw
+                    push_extraction(
+                        source=prefix,
+                        repo_id="test-user/test-dataset",
+                        stream=True,
+                        stream_batch_size=5,
+                        staging_dir=str(tmp_path / "staging"),
+                    )
 
         mock_api.create_repo.assert_called_once()
         assert mock_api.create_commit.call_count >= 2  # shards + metadata
@@ -653,15 +665,16 @@ class TestPushExtractionStreaming:
 
         from lmprobe.extract import push_extraction
 
-        with patch("huggingface_hub.HfApi", return_value=mock_api):
-            with patch("huggingface_hub.CommitOperationAdd", side_effect=lambda **kw: kw):
-                push_extraction(
-                    source=prefix,
-                    repo_id="test-user/test-dataset",
-                    stream=True,
-                    stream_batch_size=2,
-                    staging_dir=str(staging),
-                )
+        with self._hub_patches():
+            with patch("huggingface_hub.HfApi", return_value=mock_api):
+                with patch("huggingface_hub.CommitOperationAdd", side_effect=lambda **kw: kw):
+                    push_extraction(
+                        source=prefix,
+                        repo_id="test-user/test-dataset",
+                        stream=True,
+                        stream_batch_size=2,
+                        staging_dir=str(staging),
+                    )
 
         remaining = list(staging.rglob("*.safetensors"))
         assert remaining == [], f"Shard files not cleaned up: {remaining}"
@@ -698,14 +711,15 @@ class TestPushExtractionStreaming:
 
         mock_api.create_commit.side_effect = tracking_commit
 
-        with patch("huggingface_hub.HfApi", return_value=mock_api):
-            with patch("huggingface_hub.CommitOperationAdd", side_effect=lambda **kw: kw):
-                push_extraction(
-                    source=prefix,
-                    repo_id="test-user/test-dataset",
-                    stream=True,
-                    staging_dir=str(tmp_path / "staging"),
-                )
+        with self._hub_patches():
+            with patch("huggingface_hub.HfApi", return_value=mock_api):
+                with patch("huggingface_hub.CommitOperationAdd", side_effect=lambda **kw: kw):
+                    push_extraction(
+                        source=prefix,
+                        repo_id="test-user/test-dataset",
+                        stream=True,
+                        staging_dir=str(tmp_path / "staging"),
+                    )
 
         assert existing_shard not in uploaded_shards, (
             f"Shard {existing_shard} was uploaded despite being on remote"
@@ -723,12 +737,13 @@ class TestPushExtractionStreaming:
 
         from lmprobe.extract import push_extraction
 
-        with patch("huggingface_hub.HfApi", return_value=mock_api):
-            push_extraction(
-                source=prefix,
-                repo_id="test-user/test-dataset",
-                exist_ok=True,
-            )
+        with self._hub_patches():
+            with patch("huggingface_hub.HfApi", return_value=mock_api):
+                push_extraction(
+                    source=prefix,
+                    repo_id="test-user/test-dataset",
+                    exist_ok=True,
+                )
 
         mock_api.upload_large_folder.assert_called_once()
         mock_api.create_commit.assert_not_called()
