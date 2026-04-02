@@ -29,7 +29,7 @@ from .cache import (
     _load_tensors_from_backend,
     _save_tensors_to_backend,
     get_backend,
-    load_prompt_activations,
+    load_layer_across_prompts,
 )
 from .extraction import get_num_layers_from_config, resolve_layers
 
@@ -76,6 +76,7 @@ class ExtractionManifest:
     batches: list[BatchInfo] = field(default_factory=list)
     created_at: str = ""
     dtype: str = "float32"
+    completed_layers: list[int] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -103,6 +104,8 @@ class ExtractionManifest:
             d["labels"] = self.labels
         if self.metadata is not None:
             d["metadata"] = self.metadata
+        if self.completed_layers is not None:
+            d["completed_layers"] = self.completed_layers
         return d
 
     @classmethod
@@ -130,6 +133,7 @@ class ExtractionManifest:
             batches=batches,
             created_at=d.get("created_at", ""),
             dtype=d.get("dtype", "float32"),
+            completed_layers=d.get("completed_layers"),
         )
 
 
@@ -677,8 +681,8 @@ def consolidate_cache(
     writes batch-format safetensors to either the local filesystem
     (*output_dir*) or the cache backend (*output_uri*).
 
-    Each prompt file is read **once** (not once per layer), so this
-    performs N S3 GETs instead of N × L.
+    Iterates layer-at-a-time so memory is bounded to one layer per
+    batch, enabling large batch sizes on memory-constrained instances.
 
     Parameters
     ----------
@@ -750,6 +754,7 @@ def consolidate_cache(
     # Load existing manifest for resumability
     completed_batches: set[int] = set()
     existing_batch_infos: dict[int, BatchInfo] = {}
+    previously_completed_layers: set[int] = set()
     try:
         existing = load_manifest(prefix)
         for b in existing.batches:
@@ -757,10 +762,19 @@ def consolidate_cache(
                 bi = b.prompt_start // batch_size
                 completed_batches.add(bi)
                 existing_batch_infos[bi] = b
+        if existing.completed_layers:
+            previously_completed_layers = set(existing.completed_layers)
+        resume_parts = []
         if completed_batches:
+            resume_parts.append(f"{len(completed_batches)} batches")
+        if previously_completed_layers:
+            resume_parts.append(
+                f"{len(previously_completed_layers)} layers"
+            )
+        if resume_parts:
             logger.info(
-                f"[CONSOLIDATE] Resuming: {len(completed_batches)} "
-                f"batches already complete"
+                f"[CONSOLIDATE] Resuming: {', '.join(resume_parts)} "
+                f"already complete"
             )
     except FileNotFoundError:
         pass
@@ -782,30 +796,63 @@ def consolidate_cache(
 
     logger.info(
         f"[CONSOLIDATE] Converting {len(prompts)} cached prompts into "
-        f"{num_batches} batch files"
+        f"{num_batches} batch files ({len(layer_indices)} layers, "
+        f"layer-at-a-time)"
     )
 
-    from concurrent.futures import Future, ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor
 
-    def _load_one(prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
-        return load_prompt_activations(model_name, prompt, layer_indices)
+    from safetensors.torch import save_file
 
-    def _read_batch(
-        batch_prompts: list[str], read_pool: ThreadPoolExecutor
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Read a batch of prompts from cache in parallel."""
-        results = list(read_pool.map(_load_one, batch_prompts))
-        a_list: list[torch.Tensor] = []
-        m_list: list[torch.Tensor] = []
-        for a, m in results:
-            a_list.append(a)
-            m_list.append(m)
-        return a_list, m_list
+    def _write_layer_batch(
+        layer_idx: int,
+        batch_idx: int,
+        batch_acts: torch.Tensor,
+        batch_mask: torch.Tensor,
+    ) -> None:
+        """Write a single layer/batch file."""
+        rel_path = _layer_batch_path(layer_idx, batch_idx)
+        tensors: dict[str, torch.Tensor] = {
+            "activations": batch_acts,
+            "mask": batch_mask,
+        }
+        if local_root is not None:
+            out = local_root / rel_path
+            out.parent.mkdir(parents=True, exist_ok=True)
+            save_file(tensors, str(out))
+        else:
+            key = f"{prefix}/{rel_path}"
+            _save_tensors_to_backend(key, tensors)
 
-    def _prepare_batch(
-        acts_list: list[torch.Tensor], mask_list: list[torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-        """Pad and stack a batch of activations."""
+    def _layer_batch_exists(layer_idx: int, batch_idx: int) -> bool:
+        """Check if a layer/batch file already exists (for resumability)."""
+        rel_path = _layer_batch_path(layer_idx, batch_idx)
+        if local_root is not None:
+            return (local_root / rel_path).exists()
+        key = f"{prefix}/{rel_path}"
+        backend = get_backend()
+        return backend.exists(key)
+
+    def _load_layer_batch(
+        layer_idx: int,
+        batch_prompts: list[str],
+        pool: ThreadPoolExecutor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Load a single layer for a batch of prompts, pad, and stack."""
+
+        def _load_one(
+            prompt: str,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            acts_list, mask_list = load_layer_across_prompts(
+                model_name, [prompt], layer_idx
+            )
+            return acts_list[0], mask_list[0]
+
+        results = list(pool.map(_load_one, batch_prompts))
+        acts_list = [r[0] for r in results]
+        mask_list = [r[1] for r in results]
+
+        # Pad to uniform sequence length
         max_seq = max(a.shape[1] for a in acts_list)
         padded_acts = []
         padded_masks = []
@@ -817,94 +864,113 @@ def consolidate_cache(
                 mask = torch.nn.functional.pad(mask, (0, pad_size))
             padded_acts.append(acts)
             padded_masks.append(mask)
+
         batch_acts = torch.cat(padded_acts, dim=0)
         batch_mask = torch.cat(padded_masks, dim=0)
-        num_tokens = [int(m.sum().item()) for m in mask_list]
-        return batch_acts, batch_mask, num_tokens
+        return batch_acts, batch_mask
 
-    # Use a single write pool across all batches for pipelining
-    write_pool = ThreadPoolExecutor(max_workers=num_workers)
+    # Pre-compute batch boundaries
+    batch_ranges: list[tuple[int, int, int]] = []  # (batch_idx, start, end)
+    for batch_idx in range(num_batches):
+        start = batch_idx * batch_size
+        end = min(start + batch_size, len(prompts))
+        batch_ranges.append((batch_idx, start, end))
+
+    # Collect num_tokens per batch (from masks during first layer pass)
+    batch_num_tokens: dict[int, list[int]] = {}
+    # Track which layers have been fully written (for manifest-based resume)
+    completed_layers: set[int] = set(previously_completed_layers)
+
     read_pool = ThreadPoolExecutor(max_workers=num_workers)
-    pending_write: Future | None = None
-
-    def _do_write(
-        batch_acts: torch.Tensor,
-        batch_mask: torch.Tensor,
-        batch_idx: int,
-    ) -> None:
-        _save_batch(
-            batch_acts=batch_acts,
-            batch_mask=batch_mask,
-            layer_indices=layer_indices,
-            hidden_dim=hidden_dim,
-            prefix=prefix,
-            batch_idx=batch_idx,
-            local_root=local_root,
-            num_workers=num_workers,
-        )
 
     try:
-        for batch_idx in tqdm(
-            range(num_batches), total=num_batches,
-            desc="Consolidating cache", unit="batch",
+        for layer_idx in tqdm(
+            layer_indices, desc="Consolidating layers", unit="layer",
         ):
-            start = batch_idx * batch_size
-            end = min(start + batch_size, len(prompts))
-            batch_prompts = prompts[start:end]
-
-            # Skip completed batches (resumability)
-            if batch_idx in completed_batches:
-                manifest.batches.append(existing_batch_infos[batch_idx])
-                batches_skipped += 1
+            # Skip entire layer if already completed in a previous run
+            if layer_idx in previously_completed_layers:
                 continue
 
-            # Wait for previous write to finish before we overwrite tensors
-            if pending_write is not None:
-                pending_write.result()
-                pending_write = None
+            layer_had_work = False
 
-            # Read batch
-            acts_list, mask_list = _read_batch(batch_prompts, read_pool)
-            batch_acts, batch_mask, num_tokens = _prepare_batch(
-                acts_list, mask_list
-            )
+            for batch_idx, start, end in batch_ranges:
+                # Skip fully completed batches
+                if batch_idx in completed_batches:
+                    continue
 
-            # Detect dtype from first batch
-            if batch_idx == 0:
-                _dtype_map_rev = {
-                    torch.float32: "float32",
-                    torch.float16: "float16",
-                    torch.bfloat16: "bfloat16",
-                }
-                manifest.dtype = _dtype_map_rev.get(batch_acts.dtype, "float32")
+                # Skip individual layer/batch files that already exist
+                if _layer_batch_exists(layer_idx, batch_idx):
+                    continue
 
-            # Submit write to thread pool (pipelined with next read)
-            pending_write = write_pool.submit(
-                _do_write, batch_acts, batch_mask, batch_idx
-            )
+                layer_had_work = True
+                batch_prompts = prompts[start:end]
+                batch_acts, batch_mask = _load_layer_batch(
+                    layer_idx, batch_prompts, read_pool
+                )
 
+                # Capture num_tokens and dtype from the first layer pass
+                if batch_idx not in batch_num_tokens:
+                    num_tokens = [
+                        int(batch_mask[j].sum().item())
+                        for j in range(batch_mask.shape[0])
+                    ]
+                    batch_num_tokens[batch_idx] = num_tokens
+
+                if manifest.dtype is None:
+                    _dtype_map_rev = {
+                        torch.float32: "float32",
+                        torch.float16: "float16",
+                        torch.bfloat16: "bfloat16",
+                    }
+                    manifest.dtype = _dtype_map_rev.get(
+                        batch_acts.dtype, "float32"
+                    )
+
+                _write_layer_batch(layer_idx, batch_idx, batch_acts, batch_mask)
+                del batch_acts, batch_mask
+
+            completed_layers.add(layer_idx)
+
+            # Write manifest after each layer for crash recovery.
+            # On resume, completed layers let us skip N_batches existence
+            # checks per layer.
+            if layer_had_work:
+                # Build partial manifest with batch info collected so far
+                partial_manifest = ExtractionManifest(
+                    model_name=model_name,
+                    layers=layer_indices,
+                    hidden_dim=hidden_dim,
+                    total_prompts=len(prompts),
+                    batch_size=batch_size,
+                    prompts=list(prompts),
+                    labels=list(labels) if labels is not None else None,
+                    metadata=list(metadata) if metadata is not None else None,
+                    created_at=manifest.created_at,
+                    dtype=manifest.dtype,
+                    completed_layers=sorted(completed_layers),
+                )
+                _write_manifest(partial_manifest, prefix, local_root=local_root)
+
+            gc.collect()
+
+    finally:
+        read_pool.shutdown(wait=False)
+
+    # Build final manifest with all batch entries
+    for batch_idx, start, end in batch_ranges:
+        if batch_idx in completed_batches:
+            manifest.batches.append(existing_batch_infos[batch_idx])
+            batches_skipped += 1
+        else:
             manifest.batches.append(BatchInfo(
                 file=_batch_filename(batch_idx),
                 prompt_start=start,
                 prompt_end=end,
-                num_tokens=num_tokens,
+                num_tokens=batch_num_tokens[batch_idx],
                 status="complete",
             ))
 
-            # Write manifest after each batch for resumability
-            _write_manifest(manifest, prefix, local_root=local_root)
-
-            # Free read-side memory (write holds refs to batch_acts/mask)
-            del acts_list, mask_list
-            gc.collect()
-
-        # Wait for final write
-        if pending_write is not None:
-            pending_write.result()
-
-    finally:
-        write_pool.shutdown(wait=True)
-        read_pool.shutdown(wait=False)
+    _write_manifest(manifest, prefix, local_root=local_root)
 
     elapsed = time.time() - start_time
     logger.info(
