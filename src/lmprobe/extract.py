@@ -986,74 +986,235 @@ def consolidate_cache(
 # ---------------------------------------------------------------------------
 
 
-def _preload_layer_from_batches(
+@dataclass
+class _ShardBatchInfo:
+    """Pre-computed mapping from a shard to its source batch files."""
+
+    shard_idx: int
+    shuffled_start: int
+    shuffled_end: int
+    is_last_token: bool
+    # batch_idx -> list of (position_in_batch, shuffled_pos)
+    batch_to_prompts: dict[int, list[tuple[int, int]]]
+
+
+def _build_shard_batch_map(
+    manifest: ExtractionManifest,
+    perm: list[int],
+    lt_boundaries: list[int],
+    rest_boundaries: list[int],
+    lt_shard_count: int,
+) -> list[_ShardBatchInfo]:
+    """Pre-compute which batch files each shard needs.
+
+    For every shard (last-token, then rest-token), determines the shuffled
+    position range, maps each position back to its original prompt index
+    via *perm*, then derives the batch index and position within that batch.
+
+    Parameters
+    ----------
+    manifest : ExtractionManifest
+        Extraction manifest with batch info.
+    perm : list[int]
+        Permutation where ``perm[shuffled_pos] = original_idx``.
+    lt_boundaries : list[int]
+        Number of prompts per last-token shard.
+    rest_boundaries : list[int]
+        Number of prompts per rest-token shard.
+    lt_shard_count : int
+        Count of last-token shards (``len(lt_boundaries)``).
+
+    Returns
+    -------
+    list[_ShardBatchInfo]
+        One entry per shard (last-token first, then rest-token).
+    """
+    n = manifest.total_prompts
+
+    # Build lookup: original_idx -> (batch_idx, position_in_batch)
+    orig_to_batch: dict[int, tuple[int, int]] = {}
+    for batch_info in manifest.batches:
+        if batch_info.status != "complete":
+            continue
+        batch_idx = batch_info.prompt_start // manifest.batch_size
+        for j in range(batch_info.prompt_end - batch_info.prompt_start):
+            orig_idx = batch_info.prompt_start + j
+            orig_to_batch[orig_idx] = (batch_idx, j)
+
+    result: list[_ShardBatchInfo] = []
+
+    # Last-token shards
+    offset = 0
+    for local_idx, shard_size in enumerate(lt_boundaries):
+        batch_to_prompts: dict[int, list[tuple[int, int]]] = {}
+        for k in range(shard_size):
+            shuffled_pos = offset + k
+            if shuffled_pos >= n:
+                break
+            orig_idx = perm[shuffled_pos]
+            if orig_idx in orig_to_batch:
+                bid, pos = orig_to_batch[orig_idx]
+                batch_to_prompts.setdefault(bid, []).append((pos, shuffled_pos))
+        result.append(
+            _ShardBatchInfo(
+                shard_idx=local_idx,
+                shuffled_start=offset,
+                shuffled_end=offset + shard_size,
+                is_last_token=True,
+                batch_to_prompts=batch_to_prompts,
+            )
+        )
+        offset += shard_size
+
+    # Rest-token shards
+    offset = 0
+    for local_idx, shard_size in enumerate(rest_boundaries):
+        batch_to_prompts = {}
+        for k in range(shard_size):
+            shuffled_pos = offset + k
+            if shuffled_pos >= n:
+                break
+            orig_idx = perm[shuffled_pos]
+            if orig_idx in orig_to_batch:
+                bid, pos = orig_to_batch[orig_idx]
+                batch_to_prompts.setdefault(bid, []).append((pos, shuffled_pos))
+        result.append(
+            _ShardBatchInfo(
+                shard_idx=lt_shard_count + local_idx,
+                shuffled_start=offset,
+                shuffled_end=offset + shard_size,
+                is_last_token=False,
+                batch_to_prompts=batch_to_prompts,
+            )
+        )
+        offset += shard_size
+
+    return result
+
+
+def _build_shard_for_layer(
+    shard_info: _ShardBatchInfo,
+    source_prefix: str,
+    layer: int,
+) -> torch.Tensor | None:
+    """Build one shard's tensor for one layer, loading batches piecemeal.
+
+    Instead of loading the entire layer into memory, loads only the batch
+    files that contain prompts for this shard, extracts the needed rows,
+    and frees each batch immediately.
+
+    Parameters
+    ----------
+    shard_info : _ShardBatchInfo
+        Pre-computed mapping of which batch rows this shard needs.
+    source_prefix : str
+        Local directory path or extraction prefix.
+    layer : int
+        Layer index to load.
+
+    Returns
+    -------
+    torch.Tensor | None
+        Concatenated shard tensor, or None if no data.
+    """
+    collected: list[tuple[int, torch.Tensor]] = []
+
+    for batch_idx in sorted(shard_info.batch_to_prompts.keys()):
+        prompts_in_batch = shard_info.batch_to_prompts[batch_idx]
+
+        acts, mask = load_batch_layer(source_prefix, layer, batch_idx)
+
+        for pos_in_batch, shuffled_pos in prompts_in_batch:
+            prompt_mask = mask[pos_in_batch]
+            num_tokens = int(prompt_mask.sum().item())
+            prompt_acts = acts[pos_in_batch, :num_tokens, :]
+
+            if shard_info.is_last_token:
+                if prompt_acts.shape[0] > 0:
+                    collected.append((shuffled_pos, prompt_acts[-1:]))
+            else:
+                if prompt_acts.shape[0] > 1:
+                    collected.append((shuffled_pos, prompt_acts[:-1]))
+
+        del acts, mask
+
+    if not collected:
+        return None
+
+    collected.sort(key=lambda x: x[0])
+    return torch.cat([t for _, t in collected], dim=0)
+
+
+def _download_layer_batches_to_staging(
     manifest: ExtractionManifest,
     source_prefix: str,
     layer: int,
-    shuffled_prompt_indices: list[int],
-) -> list[torch.Tensor | None]:
-    """Load one layer's full-sequence activations from batch files.
+    staging_dir: Path,
+    max_workers: int = 16,
+) -> str:
+    """Download all batch files for one layer to local staging.
 
-    Returns a list indexed by *shuffled* position, where each entry is
-    a ``(num_tokens, hidden_dim)`` tensor (padding removed).
-
-    .. warning:: Memory usage
-
-       This loads an entire layer across **all** prompts into memory.
-       For large models this can be significant:
-
-       - 70B (dim=8192, 23K prompts, ~30 avg tokens): ~5 GB per layer
-       - 405B (dim=16384, 23K prompts, ~30 avg tokens): ~18 GB per layer
-
-       Ensure the machine has sufficient RAM, or reduce the number of
-       prompts processed at once.
+    For S3/remote sources, downloads batch files in parallel to local
+    disk so that :func:`load_batch_layer` can read them locally.
+    For local sources, returns *source_prefix* unchanged.
 
     Parameters
     ----------
     manifest : ExtractionManifest
         Extraction manifest.
     source_prefix : str
-        Key prefix within the cache backend.
+        Original source prefix (local or remote).
     layer : int
-        Layer index to load.
-    shuffled_prompt_indices : list[int]
-        Permutation mapping shuffled position → original prompt index.
-        i.e. ``shuffled_prompt_indices[shuffled_pos] = original_idx``
+        Layer index.
+    staging_dir : Path
+        Local directory for staged files.
+    max_workers : int
+        Parallel download threads.
+
+    Returns
+    -------
+    str
+        Local path to use as source prefix for ``load_batch_layer``.
     """
-    n = manifest.total_prompts
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # Build reverse mapping: original_idx → shuffled_pos
-    orig_to_shuffled: dict[int, int] = {}
-    for shuffled_pos, orig_idx in enumerate(shuffled_prompt_indices):
-        orig_to_shuffled[orig_idx] = shuffled_pos
+    from safetensors.torch import save_file
 
-    result: list[torch.Tensor | None] = [None] * n
+    local_staging = staging_dir / "staged_batches"
+    layer_dir = local_staging / f"layer_{layer:03d}"
+    layer_dir.mkdir(parents=True, exist_ok=True)
 
+    def _download_one(batch_idx: int) -> None:
+        rel_path = _layer_batch_path(layer, batch_idx)
+        local_file = local_staging / rel_path
+        if local_file.exists():
+            return  # already staged (resumability)
+        local_file.parent.mkdir(parents=True, exist_ok=True)
+        acts, mask = load_batch_layer(source_prefix, layer, batch_idx)
+        save_file({"activations": acts, "mask": mask}, str(local_file))
+        del acts, mask
+
+    batch_indices = []
     for batch_info in manifest.batches:
         if batch_info.status != "complete":
             continue
+        batch_indices.append(batch_info.prompt_start // manifest.batch_size)
 
-        # Load this layer's batch file (one file per layer per batch)
-        batch_idx = batch_info.prompt_start // manifest.batch_size
-        acts, mask = load_batch_layer(source_prefix, layer, batch_idx)
-        # acts: (batch_size, padded_seq_len, hidden_dim)
-        # mask: (batch_size, padded_seq_len)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_download_one, bid) for bid in batch_indices]
+        for fut in as_completed(futures):
+            fut.result()  # raise any exceptions
 
-        for j in range(batch_info.prompt_end - batch_info.prompt_start):
-            orig_idx = batch_info.prompt_start + j
-            if orig_idx not in orig_to_shuffled:
-                continue
-            shuffled_pos = orig_to_shuffled[orig_idx]
+    return str(local_staging)
 
-            # Extract this prompt's real tokens (remove padding)
-            prompt_mask = mask[j]  # (padded_seq_len,)
-            num_tokens = int(prompt_mask.sum().item())
-            prompt_acts = acts[j, :num_tokens, :]  # (num_tokens, hidden_dim)
-            result[shuffled_pos] = prompt_acts
 
-        del acts, mask
+def _cleanup_staged_layer(staging_dir: Path, layer: int) -> None:
+    """Remove staged batch files for a completed layer."""
+    import shutil
 
-    return result
+    layer_dir = staging_dir / "staged_batches" / f"layer_{layer:03d}"
+    if layer_dir.exists():
+        shutil.rmtree(layer_dir)
 
 
 def push_extraction(
@@ -1412,65 +1573,68 @@ def push_extraction(
         (tmpdir / "index").mkdir(parents=True, exist_ok=True)
         skip_shards = set()
 
-    # Write shards per layer
+    # Pre-compute shard-to-batch mappings (no activation data loaded)
+    shard_map = _build_shard_batch_map(
+        manifest, perm, lt_boundaries, rest_boundaries, lt_shard_count,
+    )
+
+    # For remote sources, stage batch files locally to avoid repeated
+    # S3 reads.  Local sources are used directly.
+    is_local_source = Path(source_prefix).is_dir()
+    batch_staging_dir: Path | None = None
+    if not is_local_source:
+        batch_staging_dir = Path(
+            tempfile.mkdtemp(prefix="lmprobe_batch_staging_")
+        )
+
+    # Write shards per layer (piecemeal — one shard at a time)
     logger.info(
         f"[PUSH_EXTRACTION] Writing shards for {len(hidden_layers)} layers, "
         f"{len(hidden_boundaries)} shards per layer"
     )
 
-    for layer in tqdm(hidden_layers, desc="Layers", unit="layer"):
-        # Load this layer from all batch files
-        data = _preload_layer_from_batches(manifest, source_prefix, layer, perm)
-        # data[shuffled_pos] = (num_tokens, hidden_dim) or None
+    try:
+        for layer in tqdm(hidden_layers, desc="Layers", unit="layer"):
+            # Stage batch files locally for remote sources
+            if batch_staging_dir is not None:
+                effective_source = _download_layer_batches_to_staging(
+                    manifest, source_prefix, layer, batch_staging_dir,
+                )
+            else:
+                effective_source = source_prefix
 
-        key = f"hidden.layer_{layer}"
+            key = f"hidden.layer_{layer}"
 
-        # Write last-token shards
-        offset = 0
-        for local_idx, shard_size in enumerate(lt_boundaries):
-            shard_idx = local_idx
-            fname = _hidden_shard_filename(layer, shard_idx)
-            if fname in skip_shards:
-                offset += shard_size
-                continue
-            rows: list[torch.Tensor] = []
-            for j in range(shard_size):
-                if offset + j < n:
-                    lt_act: torch.Tensor | None = data[offset + j]
-                    if lt_act is not None and lt_act.shape[0] > 0:
-                        rows.append(lt_act[-1:])  # last token: (1, dim)
-            if rows:
-                save_file({key: torch.cat(rows, dim=0)}, str(tmpdir / fname))
-                if stream:
-                    _on_shard_written(tmpdir / fname, fname)
-            offset += shard_size
+            for shard_info in shard_map:
+                fname = _hidden_shard_filename(layer, shard_info.shard_idx)
+                if fname in skip_shards:
+                    continue
+                shard_tensor = _build_shard_for_layer(
+                    shard_info, effective_source, layer,
+                )
+                if shard_tensor is not None:
+                    save_file(
+                        {key: shard_tensor}, str(tmpdir / fname),
+                    )
+                    if stream:
+                        _on_shard_written(tmpdir / fname, fname)
+                del shard_tensor
 
-        # Write rest-token shards
-        offset = 0
-        for local_idx, shard_size in enumerate(rest_boundaries):
-            shard_idx = lt_shard_count + local_idx
-            fname = _hidden_shard_filename(layer, shard_idx)
-            if fname in skip_shards:
-                offset += shard_size
-                continue
-            rows = []
-            for j in range(shard_size):
-                if offset + j < n:
-                    rest_act: torch.Tensor | None = data[offset + j]
-                    if rest_act is not None and rest_act.shape[0] > 1:
-                        rows.append(rest_act[:-1])  # all but last
-            if rows:
-                save_file({key: torch.cat(rows, dim=0)}, str(tmpdir / fname))
-                if stream:
-                    _on_shard_written(tmpdir / fname, fname)
-            offset += shard_size
+            # In streaming mode, flush after each layer to free disk
+            if stream:
+                _flush_batch()
 
-        # In streaming mode, flush after each layer to free disk
-        if stream:
-            _flush_batch()
+            # Clean up staged batch files for this layer
+            if batch_staging_dir is not None:
+                _cleanup_staged_layer(batch_staging_dir, layer)
 
-        del data
-        gc.collect()
+            gc.collect()
+    finally:
+        # Clean up staging directory
+        if batch_staging_dir is not None:
+            import shutil
+
+            shutil.rmtree(batch_staging_dir, ignore_errors=True)
 
     # Write metadata
     lmprobe_info = _build_lmprobe_info(model_name, n, tensor_descriptors)

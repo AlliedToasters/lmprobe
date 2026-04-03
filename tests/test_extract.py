@@ -536,13 +536,13 @@ class TestConsolidateCache:
 # ---------------------------------------------------------------------------
 
 
-class TestPreloadFromBatches:
-    def test_preload_layer(self, tiny_model, tmp_path, monkeypatch):
-        """_preload_layer_from_batches loads and unshuffles correctly."""
+class TestPiecemealShardAssembly:
+    def test_build_shard_for_layer(self, tiny_model, tmp_path, monkeypatch):
+        """_build_shard_batch_map + _build_shard_for_layer produce correct shards."""
         monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
 
         prompts = POSITIVE_PROMPTS[:4]
-        prefix = "test_preload"
+        prefix = "test_piecemeal"
 
         extract(
             model_name=tiny_model,
@@ -558,26 +558,78 @@ class TestPreloadFromBatches:
         manifest = load_manifest(prefix)
         layer = manifest.layers[0]
 
-        # Identity permutation (no shuffle)
+        from lmprobe.extract import _build_shard_batch_map, _build_shard_for_layer
+
+        # Identity permutation — one shard covering all prompts (last-token)
         perm = list(range(len(prompts)))
+        lt_boundaries = [len(prompts)]
+        rest_boundaries = [len(prompts)]
+        lt_shard_count = 1
 
-        from lmprobe.extract import _preload_layer_from_batches
+        shard_map = _build_shard_batch_map(
+            manifest, perm, lt_boundaries, rest_boundaries, lt_shard_count,
+        )
 
-        data = _preload_layer_from_batches(manifest, prefix, layer, perm)
+        assert len(shard_map) == 2  # 1 last-token + 1 rest-token
 
-        assert len(data) == 4
-        for i, t in enumerate(data):
-            assert t is not None, f"prompt {i} returned None"
-            assert t.ndim == 2  # (num_tokens, hidden_dim)
-            assert t.shape[1] == manifest.hidden_dim
+        # Last-token shard
+        lt_shard = shard_map[0]
+        assert lt_shard.is_last_token
+        lt_tensor = _build_shard_for_layer(lt_shard, prefix, layer)
+        assert lt_tensor is not None
+        assert lt_tensor.ndim == 2
+        assert lt_tensor.shape == (4, manifest.hidden_dim)
 
-        # With a different permutation, data should be reordered
-        perm_reversed = list(reversed(range(len(prompts))))
-        data_rev = _preload_layer_from_batches(manifest, prefix, layer, perm_reversed)
+        # Rest-token shard
+        rest_shard = shard_map[1]
+        assert not rest_shard.is_last_token
+        rest_tensor = _build_shard_for_layer(rest_shard, prefix, layer)
+        # rest tokens exist if prompts have >1 token
+        if rest_tensor is not None:
+            assert rest_tensor.ndim == 2
+            assert rest_tensor.shape[1] == manifest.hidden_dim
 
-        # data_rev[0] should match data[3] (reversed)
-        assert torch.allclose(data_rev[0], data[3])
-        assert torch.allclose(data_rev[3], data[0])
+    def test_shuffled_order_preserved(self, tiny_model, tmp_path, monkeypatch):
+        """Shards reflect shuffled order, not original order."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
+
+        prompts = POSITIVE_PROMPTS[:4]
+        prefix = "test_piecemeal_shuffle"
+
+        extract(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=-1,
+            output_dir=prefix,
+            batch_size=2,
+            remote=False,
+            device="cpu",
+            backend="local",
+        )
+
+        manifest = load_manifest(prefix)
+        layer = manifest.layers[0]
+
+        from lmprobe.extract import _build_shard_batch_map, _build_shard_for_layer
+
+        # Identity permutation
+        perm_identity = list(range(4))
+        shard_map_id = _build_shard_batch_map(
+            manifest, perm_identity, [4], [], 1,
+        )
+        lt_id = _build_shard_for_layer(shard_map_id[0], prefix, layer)
+
+        # Reversed permutation
+        perm_rev = list(reversed(range(4)))
+        shard_map_rev = _build_shard_batch_map(
+            manifest, perm_rev, [4], [], 1,
+        )
+        lt_rev = _build_shard_for_layer(shard_map_rev[0], prefix, layer)
+
+        assert lt_id is not None and lt_rev is not None
+        # Row 0 with reversed perm should equal row 3 with identity
+        assert torch.allclose(lt_rev[0], lt_id[3])
+        assert torch.allclose(lt_rev[3], lt_id[0])
 
 
 # ---------------------------------------------------------------------------
