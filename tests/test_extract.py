@@ -853,9 +853,9 @@ class TestPushExtractionStreaming:
             backend="local",
         )
 
+        import threading
         from pathlib import Path
         from unittest.mock import MagicMock, patch
-        import threading
 
         from lmprobe.extract import push_extraction
 
@@ -904,7 +904,7 @@ class TestPushExtractionStreaming:
                             )
 
         # Both layers should have been downloaded
-        downloaded_layers = [l for l, _ in download_calls]
+        downloaded_layers = [layer for layer, _ in download_calls]
         assert 0 in downloaded_layers, "Layer 0 should be downloaded"
         assert 1 in downloaded_layers, "Layer 1 should be downloaded"
 
