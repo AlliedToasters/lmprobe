@@ -1594,26 +1594,62 @@ def push_extraction(
     )
 
     try:
-        for layer in tqdm(hidden_layers, desc="Layers", unit="layer"):
-            # Skip entire layer if all its shards already exist on remote
-            layer_shard_names = [
-                _hidden_shard_filename(layer, si)
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Pipeline: download next layer's batches while building shards
+        # for the current layer.  Only matters for remote sources.
+        download_executor = (
+            ThreadPoolExecutor(max_workers=1)
+            if batch_staging_dir is not None
+            else None
+        )
+        next_layer_future = None
+
+        def _needs_work(layer: int) -> bool:
+            """Return True if at least one shard is missing for *layer*."""
+            return not all(
+                _hidden_shard_filename(layer, si) in skip_shards
                 for si in range(len(hidden_boundaries))
-            ]
-            if all(s in skip_shards for s in layer_shard_names):
+            )
+
+        for layer_idx, layer in enumerate(
+            tqdm(hidden_layers, desc="Layers", unit="layer")
+        ):
+            # Skip entire layer if all its shards already exist on remote
+            if not _needs_work(layer):
                 logger.info(
                     "[PUSH_EXTRACTION] Layer %d: all shards exist, skipping",
                     layer,
                 )
                 continue
 
-            # Stage batch files locally for remote sources
+            # Obtain staged batches — either from the prefetched future
+            # or by downloading synchronously (first layer / local source).
             if batch_staging_dir is not None:
-                effective_source = _download_layer_batches_to_staging(
-                    manifest, source_prefix, layer, batch_staging_dir,
-                )
+                if next_layer_future is not None:
+                    effective_source = next_layer_future.result()
+                    next_layer_future = None
+                else:
+                    effective_source = _download_layer_batches_to_staging(
+                        manifest, source_prefix, layer, batch_staging_dir,
+                    )
             else:
                 effective_source = source_prefix
+
+            # Kick off download for the next layer that needs work while
+            # we build shards for the current layer.
+            if download_executor is not None and batch_staging_dir is not None:
+                for future_idx in range(layer_idx + 1, len(hidden_layers)):
+                    future_layer = hidden_layers[future_idx]
+                    if _needs_work(future_layer):
+                        next_layer_future = download_executor.submit(
+                            _download_layer_batches_to_staging,
+                            manifest,
+                            source_prefix,
+                            future_layer,
+                            batch_staging_dir,
+                        )
+                        break
 
             key = f"hidden.layer_{layer}"
 
@@ -1641,6 +1677,12 @@ def push_extraction(
                 _cleanup_staged_layer(batch_staging_dir, layer)
 
             gc.collect()
+
+        # Shut down the prefetch executor (cancel any outstanding future)
+        if download_executor is not None:
+            if next_layer_future is not None:
+                next_layer_future.cancel()
+            download_executor.shutdown(wait=False)
     finally:
         # Clean up staging directory
         if batch_staging_dir is not None:
