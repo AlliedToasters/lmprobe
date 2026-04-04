@@ -833,3 +833,86 @@ class TestPushExtractionStreaming:
 
         mock_api.upload_large_folder.assert_called_once()
         mock_api.create_commit.assert_not_called()
+
+    def test_pipelined_staging_prefetches_next_layer(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """When staging is needed, download for the next layer starts before
+        shard building finishes for the current layer."""
+        # Extract with 2 layers so there's a "next layer" to prefetch
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path / "cache"))
+        prompts = POSITIVE_PROMPTS[:4]
+        prefix = extract(
+            model_name=tiny_model,
+            prompts=prompts,
+            layers=[0, 1],
+            output_dir=str(tmp_path / "extracted"),
+            batch_size=2,
+            remote=False,
+            device="cpu",
+            backend="local",
+        )
+
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+        import threading
+
+        from lmprobe.extract import push_extraction
+
+        mock_api = MagicMock()
+        mock_api.create_commit = MagicMock()
+
+        # Track call order and which thread calls _download_layer_batches_to_staging
+        download_calls = []
+        real_download = None
+
+        # Import the real function to wrap it
+        from lmprobe import extract as extract_mod
+
+        real_download = extract_mod._download_layer_batches_to_staging
+
+        def tracked_download(*args, **kwargs):
+            layer = args[2]  # 3rd positional arg is layer
+            download_calls.append(
+                (layer, threading.current_thread().name)
+            )
+            return real_download(*args, **kwargs)
+
+        with self._hub_patches():
+            with patch("huggingface_hub.HfApi", return_value=mock_api):
+                with patch("huggingface_hub.CommitOperationAdd", side_effect=lambda **kw: kw):
+                    # Force non-local source detection by patching Path.is_dir
+                    # to return False for the source_prefix
+                    orig_is_dir = Path.is_dir
+
+                    def fake_is_dir(self):
+                        if str(self) == prefix:
+                            return False
+                        return orig_is_dir(self)
+
+                    with patch.object(Path, "is_dir", fake_is_dir):
+                        with patch.object(
+                            extract_mod,
+                            "_download_layer_batches_to_staging",
+                            side_effect=tracked_download,
+                        ):
+                            push_extraction(
+                                source=prefix,
+                                repo_id="test-user/test-dataset",
+                                stream=True,
+                                staging_dir=str(tmp_path / "staging"),
+                            )
+
+        # Both layers should have been downloaded
+        downloaded_layers = [l for l, _ in download_calls]
+        assert 0 in downloaded_layers, "Layer 0 should be downloaded"
+        assert 1 in downloaded_layers, "Layer 1 should be downloaded"
+
+        # The second download (layer 1) should have been submitted to
+        # the background thread pool, i.e. on a different thread than
+        # the first download (layer 0).
+        threads = [t for _, t in download_calls]
+        assert threads[0] != threads[1], (
+            "Prefetched layer should run on a different thread "
+            f"(got {threads})"
+        )
