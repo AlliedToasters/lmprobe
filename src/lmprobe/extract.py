@@ -1638,7 +1638,7 @@ def push_extraction(
 
             # Kick off download for the next layer that needs work while
             # we build shards for the current layer.
-            if download_executor is not None:
+            if download_executor is not None and batch_staging_dir is not None:
                 for future_idx in range(layer_idx + 1, len(hidden_layers)):
                     future_layer = hidden_layers[future_idx]
                     if _needs_work(future_layer):
