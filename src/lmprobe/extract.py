@@ -1595,6 +1595,18 @@ def push_extraction(
 
     try:
         for layer in tqdm(hidden_layers, desc="Layers", unit="layer"):
+            # Skip entire layer if all its shards already exist on remote
+            layer_shard_names = [
+                _hidden_shard_filename(layer, si)
+                for si in range(len(hidden_boundaries))
+            ]
+            if all(s in skip_shards for s in layer_shard_names):
+                logger.info(
+                    "[PUSH_EXTRACTION] Layer %d: all shards exist, skipping",
+                    layer,
+                )
+                continue
+
             # Stage batch files locally for remote sources
             if batch_staging_dir is not None:
                 effective_source = _download_layer_batches_to_staging(

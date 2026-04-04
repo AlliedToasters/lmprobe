@@ -777,6 +777,40 @@ class TestPushExtractionStreaming:
             f"Shard {existing_shard} was uploaded despite being on remote"
         )
 
+    def test_skip_layer_load_when_all_shards_exist(
+        self, tiny_model, tmp_path, monkeypatch
+    ):
+        """Layer data is not loaded when all its shards already exist on remote."""
+        prefix = self._make_extraction(tiny_model, tmp_path, monkeypatch)
+
+        from unittest.mock import MagicMock, patch
+
+        mock_api = MagicMock()
+        # _check_shards_on_remote returns ALL expected files → every layer skipped
+        mock_api.repo_info.side_effect = Exception("should not be called directly")
+
+        from lmprobe.extract import push_extraction
+
+        with self._hub_patches():
+            with patch("huggingface_hub.HfApi", return_value=mock_api):
+                with patch("huggingface_hub.CommitOperationAdd", side_effect=lambda **kw: kw):
+                    with patch(
+                        "lmprobe.sharing._check_shards_on_remote",
+                        side_effect=lambda api, repo_id, expected: set(expected),
+                    ):
+                        with patch(
+                            "lmprobe.extract._build_shard_for_layer"
+                        ) as mock_build:
+                            push_extraction(
+                                source=prefix,
+                                repo_id="test-user/test-dataset",
+                                stream=True,
+                                staging_dir=str(tmp_path / "staging"),
+                            )
+
+        # _build_shard_for_layer should never be called — all layers skipped
+        mock_build.assert_not_called()
+
     def test_nonstream_unchanged(
         self, tiny_model, tmp_path, monkeypatch
     ):
