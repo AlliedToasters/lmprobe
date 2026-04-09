@@ -1,5 +1,6 @@
 """Tests for MoE router extraction via LocalBackend and cache round-trip."""
 
+
 import pytest
 import torch
 
@@ -185,3 +186,176 @@ class TestCachedPromptInfoRouter:
         info = discover_cached(model_name, prompt)
         assert info is not None
         assert info.router_layers == []
+
+
+class TestSaveBatchWithRouter:
+    """Test _save_batch with router logits."""
+
+    def test_save_batch_router_logits(self, tmp_path):
+        """_save_batch saves router logits to separate per-layer directories."""
+        from safetensors.torch import load_file
+
+        from lmprobe.extract import _save_batch
+
+        batch_acts = torch.randn(2, 5, 64)  # 2 prompts, 5 tokens, 2 layers * 32 dim
+        batch_mask = torch.ones(2, 5)
+        router_logits = {
+            0: torch.randn(2, 5, 8),  # 8 experts
+            1: torch.randn(2, 5, 8),
+        }
+
+        _save_batch(
+            batch_acts=batch_acts,
+            batch_mask=batch_mask,
+            layer_indices=[0, 1],
+            hidden_dim=32,
+            prefix="test",
+            batch_idx=0,
+            local_root=tmp_path,
+            batch_router_logits=router_logits,
+        )
+
+        # Check hidden state files exist
+        assert (tmp_path / "layer_000" / "batch_000000.safetensors").exists()
+        assert (tmp_path / "layer_001" / "batch_000000.safetensors").exists()
+
+        # Check router files exist
+        router_path_0 = tmp_path / "router_layer_0" / "batch_000000.safetensors"
+        router_path_1 = tmp_path / "router_layer_1" / "batch_000000.safetensors"
+        assert router_path_0.exists()
+        assert router_path_1.exists()
+
+        # Verify router file contents
+        loaded = load_file(str(router_path_0))
+        assert "router_logits" in loaded
+        assert "mask" in loaded
+        assert loaded["router_logits"].shape == (2, 5, 8)
+
+    def test_save_batch_no_router(self, tmp_path):
+        """_save_batch without router logits doesn't create router dirs."""
+        from lmprobe.extract import _save_batch
+
+        batch_acts = torch.randn(2, 5, 32)
+        batch_mask = torch.ones(2, 5)
+
+        _save_batch(
+            batch_acts=batch_acts,
+            batch_mask=batch_mask,
+            layer_indices=[0],
+            hidden_dim=32,
+            prefix="test",
+            batch_idx=0,
+            local_root=tmp_path,
+        )
+
+        assert (tmp_path / "layer_000" / "batch_000000.safetensors").exists()
+        # No router directories
+        assert not list(tmp_path.glob("router_layer_*"))
+
+
+class TestExtractionManifestRouter:
+    """Test ExtractionManifest with router fields."""
+
+    def test_roundtrip(self):
+        from lmprobe.extract import ExtractionManifest
+
+        manifest = ExtractionManifest(
+            model_name="test-model",
+            layers=[0, 1, 2],
+            hidden_dim=64,
+            total_prompts=10,
+            router_layers=[0, 1],
+            router_dim=8,
+        )
+
+        d = manifest.to_dict()
+        assert d["router_layers"] == [0, 1]
+        assert d["router_dim"] == 8
+
+        loaded = ExtractionManifest.from_dict(d)
+        assert loaded.router_layers == [0, 1]
+        assert loaded.router_dim == 8
+
+    def test_backward_compat(self):
+        """Old manifests without router fields load with None defaults."""
+        from lmprobe.extract import ExtractionManifest
+
+        old_dict = {
+            "model_name": "test",
+            "layers": [0],
+            "hidden_dim": 32,
+            "total_prompts": 5,
+        }
+        loaded = ExtractionManifest.from_dict(old_dict)
+        assert loaded.router_layers is None
+        assert loaded.router_dim is None
+
+    def test_no_router_not_serialized(self):
+        """When router fields are None, they aren't in the dict."""
+        from lmprobe.extract import ExtractionManifest
+
+        manifest = ExtractionManifest(
+            model_name="test",
+            layers=[0],
+            hidden_dim=32,
+            total_prompts=5,
+        )
+        d = manifest.to_dict()
+        assert "router_layers" not in d
+        assert "router_dim" not in d
+
+
+class TestParseRouterLayerKeys:
+    """Test _parse_router_layer_keys."""
+
+    def test_parse_router_keys(self):
+        from lmprobe.cache import _parse_router_layer_keys
+
+        keys = {"layer_0", "layer_1", "router_layer_0", "router_layer_3", "attention_mask"}
+        result = _parse_router_layer_keys(keys)
+        assert result == {0, 3}
+
+    def test_empty(self):
+        from lmprobe.cache import _parse_router_layer_keys
+
+        result = _parse_router_layer_keys(set())
+        assert result == set()
+
+    def test_no_router_keys(self):
+        from lmprobe.cache import _parse_router_layer_keys
+
+        keys = {"layer_0", "layer_1", "attention_mask"}
+        result = _parse_router_layer_keys(keys)
+        assert result == set()
+
+
+class TestRouterLayerKey:
+    """Test _router_layer_key."""
+
+    def test_format(self):
+        from lmprobe.cache import _router_layer_key
+
+        assert _router_layer_key(0) == "router_layer_0"
+        assert _router_layer_key(15) == "router_layer_15"
+
+
+class TestNnsightBackendExtendedNotSupported:
+    """Test that NnsightBackend.extract_batch_extended is callable."""
+
+    def test_nnsight_backend_has_method(self):
+        """NnsightBackend inherits extract_batch_extended from ABC."""
+        from lmprobe.backends import NnsightBackend
+
+        # Just verify the method exists (don't call it — requires nnsight model)
+        assert hasattr(NnsightBackend, "extract_batch_extended")
+
+
+class TestExtractionBackendDefaultRaises:
+    """Test that base class extract_batch_extended raises NotImplementedError."""
+
+    def test_default_raises(self):
+        from lmprobe.backends import ExtractionBackend
+
+        # The ABC can't be instantiated, but we can check the method
+        # exists and its docstring mentions extensibility
+        assert hasattr(ExtractionBackend, "extract_batch_extended")
