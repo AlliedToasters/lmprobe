@@ -20,6 +20,13 @@ Example
 from typing import Any
 
 from .activation_baseline import ActivationBaseline
+from .activation_types import (
+    ActivationType,
+    ExtractedBatch,
+    ExtractionSpec,
+    MoEInfo,
+    detect_moe_info,
+)
 from .baseline import BaselineProbe
 from .battery import BaselineBattery, BaselineResult, BaselineResults
 from .ensemble import ProbeEnsemble
@@ -33,6 +40,7 @@ except Exception:
     __version__ = "unknown"
 __all__ = [
     "ActivationBaseline",
+    "ActivationType",
     "ActivationStore",
     "BaselineBattery",
     "BaselineProbe",
@@ -42,9 +50,13 @@ __all__ = [
     "CachedLogits",
     "CachedPromptInfo",
     "DatasetMetadata",
+    "detect_moe_info",
+    "ExtractedBatch",
+    "ExtractionSpec",
     "LayerSweepResult",
     "LinearProbe",
     "ManifestEntry",
+    "MoEInfo",
     "Probe",
     "ProbeEnsemble",
     "load_layer_across_prompts",

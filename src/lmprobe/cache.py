@@ -309,6 +309,12 @@ _TOKEN_IDS_KEY = "token_ids"
 _LOGITS_KEY = "logits"
 _LOGITS_TOP_K_VALUES_KEY = "logits_top_k_values"
 _LOGITS_TOP_K_INDICES_KEY = "logits_top_k_indices"
+_ROUTER_LAYER_KEY_PREFIX = "router_layer_"
+
+
+def _router_layer_key(layer: int) -> str:
+    """Cache key for MoE router logits at a given layer."""
+    return f"router_layer_{layer}"
 
 
 def _parse_raw_layer_keys(keys: set[str] | list[str]) -> set[int]:
@@ -318,6 +324,18 @@ def _parse_raw_layer_keys(keys: set[str] | list[str]) -> set[int]:
         if k.startswith("layer_"):
             try:
                 result.add(int(k[6:]))
+            except ValueError:
+                continue
+    return result
+
+
+def _parse_router_layer_keys(keys: set[str] | list[str]) -> set[int]:
+    """Extract router layer indices from safetensors keys."""
+    result = set()
+    for k in keys:
+        if k.startswith(_ROUTER_LAYER_KEY_PREFIX):
+            try:
+                result.add(int(k[len(_ROUTER_LAYER_KEY_PREFIX):]))
             except ValueError:
                 continue
     return result
@@ -375,6 +393,7 @@ class CachedPromptInfo:
     has_perplexity: bool
     has_token_perplexity: bool
     num_tokens: int | None
+    router_layers: list[int] = field(default_factory=list)
 
 
 def _has_logits_in_keys(
@@ -553,6 +572,9 @@ def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
         except Exception:
             pass
 
+    # Parse router layer keys
+    router_layers = sorted(_parse_router_layer_keys(tensor_keys))
+
     return CachedPromptInfo(
         raw_layers=raw_layers,
         pooled=pooled,
@@ -561,6 +583,7 @@ def discover_cached(model_name: str, prompt: str) -> CachedPromptInfo | None:
         has_perplexity=has_perplexity,
         has_token_perplexity=has_token_perplexity,
         num_tokens=num_tokens,
+        router_layers=router_layers,
     )
 
 
@@ -2179,6 +2202,75 @@ def save_prompt_activations(
         old_dir = get_prompt_cache_dir(model_name, prompt)
         if old_dir.is_dir():
             shutil.rmtree(old_dir)
+
+
+def save_prompt_router_logits(
+    model_name: str,
+    prompt: str,
+    router_logits: dict[int, torch.Tensor],
+) -> None:
+    """Save MoE router logits for a prompt.
+
+    Router logits are stored in the same per-prompt safetensors file
+    alongside hidden states, using ``router_layer_{i}`` keys.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    prompt : str
+        The prompt text.
+    router_logits : dict[int, torch.Tensor]
+        Mapping from layer index to router logits tensor.
+        Each tensor has shape ``(seq_len, num_experts)``.
+    """
+    key = _prompt_cache_key(model_name, prompt)
+    new_tensors: dict[str, torch.Tensor] = {}
+    for layer_idx, tensor in router_logits.items():
+        new_tensors[_router_layer_key(layer_idx)] = _prepare_tensor(tensor)
+    _merge_save_backend(key, new_tensors)
+
+
+def load_prompt_router_logits(
+    model_name: str,
+    prompt: str,
+    layers: list[int],
+) -> dict[int, torch.Tensor]:
+    """Load MoE router logits from cache.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model ID.
+    prompt : str
+        The prompt text.
+    layers : list[int]
+        Layer indices to load router logits for.
+
+    Returns
+    -------
+    dict[int, torch.Tensor]
+        Mapping from layer index to router logits tensor.
+
+    Raises
+    ------
+    KeyError
+        If router logits for a requested layer are not cached.
+    """
+    key = _prompt_cache_key(model_name, prompt)
+    keys_to_load = [_router_layer_key(layer) for layer in layers]
+    tensors = _load_tensors_from_backend(key, keys_to_load)
+    result: dict[int, torch.Tensor] = {}
+    for layer in layers:
+        rkey = _router_layer_key(layer)
+        if rkey in tensors:
+            result[layer] = tensors[rkey]
+        else:
+            raise KeyError(
+                f"Router logits for layer {layer} not found in cache "
+                f"for model={model_name!r}, prompt={prompt[:50]!r}..."
+            )
+    return result
 
 
 def is_prompt_perplexity_cached(model_name: str, prompt: str) -> bool:
