@@ -15,6 +15,8 @@ from tqdm import tqdm
 if TYPE_CHECKING:
     from nnsight import LanguageModel
 
+    from .activation_types import ExtractedBatch
+
 
 def _require_nnsight() -> Any:
     """Import and return the nnsight module, raising a clear error if not installed."""
@@ -710,7 +712,7 @@ def _extract_batch_extended(
     prompts: list[str],
     spec: Any,
     remote: bool = False,
-) -> Any:
+) -> ExtractedBatch:
     """Extract multiple activation types in a single forward pass (nnsight).
 
     Parameters
