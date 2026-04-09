@@ -1102,7 +1102,7 @@ def _compute_shard_plan(
             n, max(router_row_bytes, 1), shard_max_bytes,
         )
     else:
-        router_boundaries: list[int] = []
+        router_boundaries = []
 
     # --- Phase 4a: Assign shard metadata (no data loading) ---
     if has_hidden and hidden_boundaries and use_raw and lt_boundaries:
