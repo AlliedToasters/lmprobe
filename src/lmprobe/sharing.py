@@ -399,6 +399,7 @@ def _compute_tensor_intersection(
             "logits_top_k": None,
             "has_perplexity": False,
             "has_token_perplexity": False,
+            "router_layers": [],
         }
 
     raw_sets = [set(i.raw_layers) for i in infos]
@@ -444,6 +445,12 @@ def _compute_tensor_intersection(
     has_perplexity = all(i.has_perplexity for i in infos)
     has_token_perplexity = all(i.has_token_perplexity for i in infos)
 
+    # Router layers: intersection of router_layers across all infos
+    router_sets = [set(i.router_layers) for i in infos]
+    router_intersection = sorted(
+        router_sets[0].intersection(*router_sets[1:])
+    ) if all(rs for rs in router_sets) else []
+
     return {
         "raw_layers": raw_intersection,
         "pooled": pooled,
@@ -451,6 +458,7 @@ def _compute_tensor_intersection(
         "logits_top_k": logits_top_k,
         "has_perplexity": has_perplexity,
         "has_token_perplexity": has_token_perplexity,
+        "router_layers": router_intersection,
     }
 
 
@@ -472,6 +480,7 @@ def _filter_tensor_types(
         "logits_top_k": available.get("logits_top_k"),
         "has_perplexity": False,
         "has_token_perplexity": False,
+        "router_layers": [],
     }
 
     for key in tensors_filter:
@@ -488,6 +497,10 @@ def _filter_tensor_types(
         if key == "perplexity" and available["has_perplexity"]:
             result["has_perplexity"] = True
             result["has_token_perplexity"] = available.get("has_token_perplexity", False)
+            continue
+
+        if key == "router_logits" and available.get("router_layers"):
+            result["router_layers"] = list(available["router_layers"])
             continue
 
         logger.warning(
@@ -564,6 +577,31 @@ def _load_logits_for_prompt(
         "logits_topk.values": values.reshape(1, -1),
         "logits_topk.indices": indices.reshape(1, -1),
     }
+
+
+def _load_router_for_prompt(
+    model_name: str,
+    prompt: str,
+    layers: list[int],
+) -> dict[str, torch.Tensor]:
+    """Load router logits for a prompt, keyed for shard storage.
+
+    Returns dict like ``{"router.layer_0": (1, num_experts), ...}``.
+    Each value is reshaped to ``(1, num_experts)`` for row-based sharding.
+    """
+    from .cache import load_prompt_router_logits
+
+    router_dict = load_prompt_router_logits(model_name, prompt, layers)
+    result: dict[str, torch.Tensor] = {}
+    for layer, tensor in router_dict.items():
+        # Router logits per prompt: (seq_len, num_experts) or (num_experts,)
+        # For pooled (last_token) storage, take last token and reshape to (1, num_experts)
+        if tensor.dim() >= 2:
+            # Take last token position
+            result[f"router.layer_{layer}"] = tensor[-1:].reshape(1, -1)
+        else:
+            result[f"router.layer_{layer}"] = tensor.reshape(1, -1)
+    return result
 
 
 def _load_hidden_raw_for_prompt(
@@ -838,6 +876,7 @@ def _compute_shard_plan(
     logits_top_k = tensor_types["logits_top_k"]
     has_perplexity = tensor_types.get("has_perplexity", False)
     has_token_perplexity = tensor_types.get("has_token_perplexity", False)
+    router_layers = tensor_types.get("router_layers", [])
 
     raw_layers = tensor_types.get("raw_layers", [])
     use_raw = bool(raw_layers)
@@ -998,6 +1037,23 @@ def _compute_shard_plan(
     if has_logits and logits_top_k is not None:
         logits_row_bytes = logits_top_k * 4 + logits_top_k * 8
 
+    # Router: estimate row bytes from a sample prompt
+    router_dim = 0
+    want_router = bool(router_layers)
+    if want_router and valid_prompts:
+        try:
+            sample_router = _load_router_for_prompt(
+                model_name, valid_prompts[0], router_layers[:1],
+            )
+            sample_key = f"router.layer_{router_layers[0]}"
+            if sample_key in sample_router:
+                router_dim = sample_router[sample_key].shape[-1]
+            del sample_router
+        except (FileNotFoundError, KeyError):
+            want_router = False
+            router_layers = []
+    router_row_bytes = router_dim * 4 * len(router_layers) if want_router else 0
+
     has_hidden = bool(hidden_layers and (hidden_strategy or use_raw))
     want_logits = bool(has_logits and logits_top_k is not None)
 
@@ -1040,6 +1096,13 @@ def _compute_shard_plan(
         )
     else:
         logits_boundaries = []
+
+    if want_router:
+        router_boundaries = _compute_shard_boundaries(
+            n, max(router_row_bytes, 1), shard_max_bytes,
+        )
+    else:
+        router_boundaries: list[int] = []
 
     # --- Phase 4a: Assign shard metadata (no data loading) ---
     if has_hidden and hidden_boundaries and use_raw and lt_boundaries:
@@ -1209,6 +1272,28 @@ def _compute_shard_plan(
             "shards": logits_shards,
         }
 
+    if want_router and router_boundaries:
+        router_shards = []
+        off = 0
+        for si, sz in enumerate(router_boundaries):
+            actual = min(sz, n - off)
+            router_shards.append({
+                "file": f"tensors/router_logits_{si:03d}.safetensors",
+                "num_prompts": actual,
+            })
+            off += actual
+
+        tensor_descriptors["router_logits"] = {
+            "type": "router",
+            "layers": router_layers,
+            "num_experts": router_dim,
+            "dtype": "float32",
+            "pooling": "last_token",
+            "file_pattern": "tensors/router_logits_{shard:03d}.safetensors",
+            "row_bytes": router_row_bytes,
+            "shards": router_shards,
+        }
+
     return {
         "prompt_metadata": prompt_metadata,
         "valid_prompts": valid_prompts,
@@ -1228,6 +1313,9 @@ def _compute_shard_plan(
         "lt_shard_count": lt_shard_count,
         "lt_boundaries": lt_boundaries,
         "rest_boundaries": rest_boundaries,
+        "want_router": want_router,
+        "router_layers": router_layers,
+        "router_boundaries": router_boundaries,
     }
 
 
@@ -1254,6 +1342,12 @@ def _reconstruct_plan_from_cached(cached_meta: dict) -> dict[str, Any]:
         s["num_prompts"] for s in logits_info.get("shards", [])
     ]
 
+    router_info = td.get("router_logits", {})
+    want_router = bool(router_info)
+    router_boundaries = [
+        s["num_prompts"] for s in router_info.get("shards", [])
+    ]
+
     return {
         "has_hidden": has_hidden,
         "hidden_layers": hidden_layers,
@@ -1261,6 +1355,8 @@ def _reconstruct_plan_from_cached(cached_meta: dict) -> dict[str, Any]:
         "want_logits": want_logits,
         "logits_boundaries": logits_boundaries,
         "lt_shard_count": lt_shard_count,
+        "want_router": want_router,
+        "router_boundaries": router_boundaries,
     }
 
 
@@ -1276,6 +1372,9 @@ def _enumerate_shard_files(plan: dict[str, Any]) -> list[str]:
     if plan["want_logits"] and plan["logits_boundaries"]:
         for shard_idx in range(len(plan["logits_boundaries"])):
             files.append(f"tensors/logits_topk_{shard_idx:03d}.safetensors")
+    if plan.get("want_router") and plan.get("router_boundaries"):
+        for shard_idx in range(len(plan["router_boundaries"])):
+            files.append(f"tensors/router_logits_{shard_idx:03d}.safetensors")
     return files
 
 
@@ -1384,6 +1483,9 @@ def _consolidate_and_shard(
     lt_shard_count = plan.get("lt_shard_count", 0)
     lt_boundaries = plan.get("lt_boundaries", [])
     rest_boundaries = plan.get("rest_boundaries", [])
+    want_router = plan.get("want_router", False)
+    router_layers_plan = plan.get("router_layers", [])
+    router_boundaries = plan.get("router_boundaries", [])
 
     from tqdm import tqdm
 
@@ -1644,6 +1746,53 @@ def _consolidate_and_shard(
                 del logits_tensors_out
 
             del shard_data_logits
+            offset += shard_size
+
+    # --- Router pass ---
+    if want_router and router_boundaries and router_layers_plan:
+        offset = 0
+        for shard_idx, shard_size in enumerate(tqdm(
+            router_boundaries, desc="Writing router shards", unit="shard",
+        )):
+            fname = f"tensors/router_logits_{shard_idx:03d}.safetensors"
+            if fname in skip_shards:
+                offset += shard_size
+                continue
+
+            shard_prompts_text = valid_prompts[offset : offset + shard_size]
+
+            # Load and concatenate router tensors for this shard
+            shard_data_router: list[dict[str, torch.Tensor]] = []
+            for prompt in shard_prompts_text:
+                try:
+                    loaded_r = _load_router_for_prompt(
+                        model_name, prompt, router_layers_plan,
+                    )
+                    shard_data_router.append(loaded_r)
+                except (FileNotFoundError, KeyError, OSError) as e:
+                    raise OSError(
+                        f"Prompt passed metadata scan but failed to load "
+                        f"router logits during shard write (cache may have "
+                        f"been modified concurrently): {e}"
+                    ) from e
+
+            # Concatenate per-layer router tensors
+            router_tensors_out: dict[str, torch.Tensor] = {}
+            for layer in router_layers_plan:
+                key = f"router.layer_{layer}"
+                layer_tensors = [
+                    p[key] for p in shard_data_router if key in p
+                ]
+                if layer_tensors:
+                    router_tensors_out[key] = torch.cat(layer_tensors, dim=0)
+
+            if router_tensors_out:
+                save_file(router_tensors_out, str(tmpdir / fname))
+                if on_shard_written is not None:
+                    on_shard_written(tmpdir / fname, fname)
+                del router_tensors_out
+
+            del shard_data_router
             offset += shard_size
 
     return tmpdir, tensor_descriptors, prompt_metadata

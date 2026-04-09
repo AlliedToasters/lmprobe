@@ -359,3 +359,154 @@ class TestExtractionBackendDefaultRaises:
         # The ABC can't be instantiated, but we can check the method
         # exists and its docstring mentions extensibility
         assert hasattr(ExtractionBackend, "extract_batch_extended")
+
+
+class TestSharingRouterDescriptor:
+    """Test router logits in tensor descriptors and sharing functions."""
+
+    def test_compute_tensor_intersection_with_router(self):
+        """Router layers are intersected across infos."""
+        from lmprobe.cache import CachedPromptInfo
+        from lmprobe.sharing import _compute_tensor_intersection
+
+        infos = [
+            CachedPromptInfo(
+                raw_layers=[0, 1], pooled={}, has_logits=False,
+                logits_top_k=None, has_perplexity=False,
+                has_token_perplexity=False, num_tokens=10,
+                router_layers=[0, 1, 2],
+            ),
+            CachedPromptInfo(
+                raw_layers=[0, 1], pooled={}, has_logits=False,
+                logits_top_k=None, has_perplexity=False,
+                has_token_perplexity=False, num_tokens=8,
+                router_layers=[1, 2, 3],
+            ),
+        ]
+        result = _compute_tensor_intersection(infos)
+        assert result["router_layers"] == [1, 2]
+
+    def test_compute_tensor_intersection_no_router(self):
+        """Empty router_layers when not all infos have router data."""
+        from lmprobe.cache import CachedPromptInfo
+        from lmprobe.sharing import _compute_tensor_intersection
+
+        infos = [
+            CachedPromptInfo(
+                raw_layers=[0], pooled={}, has_logits=False,
+                logits_top_k=None, has_perplexity=False,
+                has_token_perplexity=False, num_tokens=10,
+                router_layers=[0, 1],
+            ),
+            CachedPromptInfo(
+                raw_layers=[0], pooled={}, has_logits=False,
+                logits_top_k=None, has_perplexity=False,
+                has_token_perplexity=False, num_tokens=8,
+                router_layers=[],  # no router data
+            ),
+        ]
+        result = _compute_tensor_intersection(infos)
+        assert result["router_layers"] == []
+
+    def test_compute_tensor_intersection_empty(self):
+        """Empty infos returns empty router_layers."""
+        from lmprobe.sharing import _compute_tensor_intersection
+
+        result = _compute_tensor_intersection([])
+        assert result["router_layers"] == []
+
+    def test_filter_tensor_types_router(self):
+        """Filter includes router_layers when requested."""
+        from lmprobe.sharing import _filter_tensor_types
+
+        available = {
+            "raw_layers": [0, 1],
+            "pooled": {},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+            "has_token_perplexity": False,
+            "router_layers": [0, 1, 2],
+        }
+        result = _filter_tensor_types(available, ["router_logits"])
+        assert result["router_layers"] == [0, 1, 2]
+        # Hidden not included
+        assert result["raw_layers"] == []
+
+    def test_filter_tensor_types_no_router(self):
+        """Filter without router_logits key returns empty router_layers."""
+        from lmprobe.sharing import _filter_tensor_types
+
+        available = {
+            "raw_layers": [0],
+            "pooled": {},
+            "has_logits": False,
+            "logits_top_k": None,
+            "has_perplexity": False,
+            "has_token_perplexity": False,
+            "router_layers": [0, 1],
+        }
+        result = _filter_tensor_types(available, ["hidden_layers"])
+        assert result["router_layers"] == []
+
+    def test_enumerate_shard_files_with_router(self):
+        """_enumerate_shard_files includes router shard files."""
+        from lmprobe.sharing import _enumerate_shard_files
+
+        plan = {
+            "has_hidden": False,
+            "hidden_layers": [],
+            "hidden_boundaries": [],
+            "want_logits": False,
+            "logits_boundaries": [],
+            "lt_shard_count": 0,
+            "want_router": True,
+            "router_boundaries": [5, 5],
+        }
+        files = _enumerate_shard_files(plan)
+        assert files == [
+            "tensors/router_logits_000.safetensors",
+            "tensors/router_logits_001.safetensors",
+        ]
+
+    def test_reconstruct_plan_with_router(self):
+        """_reconstruct_plan_from_cached includes router fields."""
+        from lmprobe.sharing import _reconstruct_plan_from_cached
+
+        cached_meta = {
+            "tensor_descriptors": {
+                "router_logits": {
+                    "type": "router",
+                    "layers": [0, 1],
+                    "num_experts": 8,
+                    "shards": [
+                        {"file": "f1.safetensors", "num_prompts": 10},
+                        {"file": "f2.safetensors", "num_prompts": 5},
+                    ],
+                }
+            }
+        }
+        plan = _reconstruct_plan_from_cached(cached_meta)
+        assert plan["want_router"] is True
+        assert plan["router_boundaries"] == [10, 5]
+
+    def test_load_router_for_prompt(self, tmp_path, monkeypatch):
+        """_load_router_for_prompt loads and reshapes router logits."""
+        monkeypatch.setenv("LMPROBE_CACHE_DIR", str(tmp_path))
+
+        from lmprobe.cache import save_prompt_router_logits
+        from lmprobe.sharing import _load_router_for_prompt
+
+        model_name = "test-model"
+        prompt = "Hello world"
+        # Save router with seq_len=5, num_experts=8
+        save_prompt_router_logits(
+            model_name, prompt, {0: torch.randn(5, 8), 1: torch.randn(5, 8)}
+        )
+
+        result = _load_router_for_prompt(model_name, prompt, [0, 1])
+        assert "router.layer_0" in result
+        assert "router.layer_1" in result
+        # Should be reshaped to (1, num_experts) — last token
+        assert result["router.layer_0"].shape == (1, 8)
+        assert result["router.layer_1"].shape == (1, 8)
