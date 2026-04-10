@@ -444,6 +444,7 @@ def extract(
     logit_top_k: int | None = None,
     max_retries: int = 3,
     extract_router: bool = False,
+    chunk_size: int | str | None = None,
 ) -> str:
     """Extract activations and save raw batch responses to disk.
 
@@ -573,7 +574,8 @@ def extract(
 
     # Create extraction backend
     extraction_backend = resolve_backend(
-        backend, model_name, device, remote=remote, dtype=torch_dtype
+        backend, model_name, device, remote=remote, dtype=torch_dtype,
+        chunk_size=chunk_size,
     )
 
     # Determine if we can use server-side top-k
