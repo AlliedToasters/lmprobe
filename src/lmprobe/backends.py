@@ -803,21 +803,20 @@ def _make_causal_mask(
     """
     batch_size, seq_len = attention_mask_2d.shape
     device = attention_mask_2d.device
+    min_val = torch.finfo(dtype).min
 
-    # Causal mask: lower triangular
-    causal = torch.triu(
-        torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=device, dtype=dtype),
-        diagonal=1,
+    # Causal mask: lower triangular (1 = attend, 0 = mask)
+    causal_bool = torch.tril(
+        torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
     )
-    # Expand to (1, 1, seq, seq)
-    causal = causal.unsqueeze(0).unsqueeze(0)
 
-    # Padding mask: (batch, 1, 1, seq) — mask out padding key positions
-    padding = attention_mask_2d[:, None, None, :].to(dtype)
-    padding = (1.0 - padding) * torch.finfo(dtype).min
+    # Padding mask: (batch, seq) → (batch, 1, 1, seq)
+    padding_bool = attention_mask_2d[:, None, None, :].bool()
 
-    # Combine: broadcast (1,1,seq,seq) + (batch,1,1,seq) → (batch,1,seq,seq)
-    return causal + padding
+    # Combine: attend only if both causal AND not padding
+    combined_bool = causal_bool.unsqueeze(0).unsqueeze(0) & padding_bool
+    mask = torch.where(combined_bool, torch.tensor(0.0, dtype=dtype, device=device), min_val)
+    return mask
 
 
 def _estimate_chunk_size(
@@ -1006,9 +1005,11 @@ class ChunkedLocalBackend(ExtractionBackend):
             hidden_states = embed(input_ids.to(device)).cpu()
         embed.to("cpu")
 
-        # Build position_ids and causal mask
+        # Build position_ids, cache_position, and causal mask
+        seq_len = input_ids.shape[1]
         position_ids = attention_mask_2d.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask_2d == 0, 1)
+        cache_position = torch.arange(seq_len)
         causal_mask = _make_causal_mask(attention_mask_2d, self.dtype)
 
         # Compute rotary position embeddings
@@ -1077,6 +1078,7 @@ class ChunkedLocalBackend(ExtractionBackend):
                         "attention_mask": mask_dev,
                         "position_ids": pos_dev,
                         "use_cache": False,
+                        "cache_position": cache_position.to(device),
                     }
                     if pe_dev is not None:
                         layer_kwargs["position_embeddings"] = pe_dev
