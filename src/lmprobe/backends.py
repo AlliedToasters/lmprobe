@@ -1157,11 +1157,11 @@ class ChunkedLocalBackend(ExtractionBackend):
         prompts: list[str],
         layer_indices: list[int],
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         activations, attention_mask, logits, _ = self._chunked_forward(
             prompts, layer_indices, include_logits=True,
         )
-        assert activations is not None
+        assert logits is not None
         return activations, attention_mask, logits, None
 
     def extract_batch_extended(
