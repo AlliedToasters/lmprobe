@@ -15,6 +15,8 @@ from tqdm import tqdm
 if TYPE_CHECKING:
     from nnsight import LanguageModel
 
+    from .activation_types import ExtractedBatch
+
 
 def _require_nnsight() -> Any:
     """Import and return the nnsight module, raising a clear error if not installed."""
@@ -381,6 +383,8 @@ def _build_remote_extract_fn(
     layer_indices: list[int],
     with_logits: bool = False,
     logit_top_k: int | None = None,
+    router_layer_indices: list[int] | None = None,
+    router_module_template: str | None = None,
 ) -> Any:
     """Build a trace function for remote nnsight execution.
 
@@ -397,37 +401,44 @@ def _build_remote_extract_fn(
 
     To work around both issues we dynamically generate a real ``.py``
     file containing one ``output.save()`` statement per layer (and
-    optionally a logits save). The file is importable so that
+    optionally logits/router saves). The file is importable so that
     ``inspect.getsourcelines`` succeeds during nnsight's code capture.
 
     Parameters
     ----------
     layer_indices : list[int]
-        Positive layer indices to extract.
+        Positive layer indices to extract hidden states from.
     with_logits : bool
         If True, also save the lm_head logits output.
     logit_top_k : int | None
         If set and with_logits is True, perform server-side top-k on
         logits so only compressed tensors are transferred. The trace
         will return ``(values, indices)`` instead of full logits.
+    router_layer_indices : list[int] or None
+        Layer indices to extract MoE router logits from.
+    router_module_template : str or None
+        Dot-path template for the router module, e.g.
+        ``"model.model.layers.{layer}.block_sparse_moe.gate"``.
+        Required when router_layer_indices is not None.
 
     Returns
     -------
     callable
-        A function ``(model, tokenized) -> tuple[list[Tensor], ...]``
-        that runs the trace and returns layer outputs plus logits info.
-        When logit_top_k is set: ``(layers, (topk_values, topk_indices))``
-        Otherwise: ``(layers, logits_or_none)``
+        A function ``(model, tokenized) -> tuple[list[Tensor], logits_info, list[Tensor]]``
+        that runs the trace and returns layer outputs, logits info, and
+        router outputs.
     """
     import importlib.util
     import tempfile
 
+    # --- Hidden state save lines ---
     var_names = [f"_l{i}" for i in layer_indices]
     save_lines = "\n".join(
         f"        {v} = model.model.layers[{i}].output.save()"
         for v, i in zip(var_names, layer_indices)
     )
 
+    # --- Logits save lines ---
     if with_logits and logit_top_k is not None:
         # Server-side top-k: compute topk inside the trace
         logits_line = (
@@ -444,15 +455,37 @@ def _build_remote_extract_fn(
         logits_line = ""
         return_logits = "None"
 
-    return_layers = f"[{', '.join(var_names)}]"
+    # --- Router logit save lines ---
+    router_var_names: list[str] = []
+    router_save_lines = ""
+    if router_layer_indices and router_module_template:
+        router_var_names = [f"_r{i}" for i in router_layer_indices]
+        # Convert dot-path template to nnsight attribute access
+        # e.g., "model.model.layers.{layer}.block_sparse_moe.gate"
+        # becomes "model.model.layers[{i}].block_sparse_moe.gate"
+        # We need to handle the layers[i] indexing specially
+        router_save_lines = "\n".join(
+            f"        {v} = {router_module_template.format(layer=i)}.output.save()"
+            for v, i in zip(router_var_names, router_layer_indices)
+        )
 
-    code = (
-        "def extract(model, tokenized):\n"
-        "    with model.trace(tokenized, remote=True, scan=False) as tracer:\n"
-        f"{save_lines}\n"
-        f"{logits_line}\n"
-        f"    return ({return_layers}, {return_logits})\n"
+    return_layers = f"[{', '.join(var_names)}]"
+    return_routers = f"[{', '.join(router_var_names)}]" if router_var_names else "[]"
+
+    code_parts = [
+        "def extract(model, tokenized):\n",
+        "    with model.trace(tokenized, remote=True, scan=False) as tracer:\n",
+    ]
+    if save_lines:
+        code_parts.append(f"{save_lines}\n")
+    if logits_line:
+        code_parts.append(f"{logits_line}\n")
+    if router_save_lines:
+        code_parts.append(f"{router_save_lines}\n")
+    code_parts.append(
+        f"    return ({return_layers}, {return_logits}, {return_routers})\n"
     )
+    code = "".join(code_parts)
 
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", prefix="_lmprobe_remote_", delete=False
@@ -540,7 +573,7 @@ def _extract_batch(
         # pickling issue (nnsight #501). See _build_remote_extract_fn
         # docstring for details.
         fn = _build_remote_extract_fn(layer_indices, with_logits=False)
-        layer_outputs, _ = fn(model, tokenized)
+        layer_outputs, _, _routers = fn(model, tokenized)
         activation_tensors = _unwrap_layer_outputs(layer_outputs)
     else:
         # Local: tracer.cache() works fine without serialization.
@@ -625,7 +658,7 @@ def _extract_batch_with_logits(
         fn = _build_remote_extract_fn(
             layer_indices, with_logits=True, logit_top_k=logit_top_k
         )
-        layer_outputs, logits_proxy = fn(model, tokenized)
+        layer_outputs, logits_proxy, _routers = fn(model, tokenized)
         activation_tensors = _unwrap_layer_outputs(layer_outputs)
 
         if logit_top_k is not None:
@@ -672,6 +705,144 @@ def _extract_batch_with_logits(
     attention_mask = tokenized["attention_mask"]
 
     return combined, attention_mask, logits_val, logits_indices
+
+
+def _extract_batch_extended(
+    model: LanguageModel,
+    prompts: list[str],
+    spec: Any,
+    remote: bool = False,
+) -> ExtractedBatch:
+    """Extract multiple activation types in a single forward pass (nnsight).
+
+    Parameters
+    ----------
+    model : LanguageModel
+        The nnsight model.
+    prompts : list[str]
+        List of text prompts.
+    spec : ExtractionSpec
+        What to extract.
+    remote : bool
+        Whether to use remote execution.
+
+    Returns
+    -------
+    ExtractedBatch
+        Structured extraction result.
+    """
+    from .activation_types import ExtractedBatch
+
+    tokenized = model.tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+    )
+
+    router_layer_indices = spec.router_layers or []
+    router_template = spec.router_module_template
+
+    if remote:
+        fn = _build_remote_extract_fn(
+            spec.hidden_layers,
+            with_logits=spec.include_logits,
+            logit_top_k=spec.logit_top_k,
+            router_layer_indices=router_layer_indices,
+            router_module_template=router_template,
+        )
+        layer_outputs, logits_proxy, router_outputs = fn(model, tokenized)
+        activation_tensors = _unwrap_layer_outputs(layer_outputs)
+
+        # Process logits
+        logits_val = None
+        logits_indices = None
+        if spec.include_logits and logits_proxy is not None:
+            if spec.logit_top_k is not None:
+                vals_proxy, idxs_proxy = logits_proxy
+                logits_val = _unwrap_proxy(vals_proxy)
+                logits_indices = _unwrap_proxy(idxs_proxy)
+            else:
+                logits_val = _unwrap_proxy(logits_proxy)
+
+        # Process router outputs
+        router_logits: dict[int, torch.Tensor] | None = None
+        if router_outputs:
+            router_tensors = _unwrap_layer_outputs(router_outputs)
+            router_logits = {
+                idx: t for idx, t in zip(router_layer_indices, router_tensors)
+            }
+    else:
+        # Local nnsight extraction
+        modules_to_cache = [model.model.layers[i] for i in spec.hidden_layers]
+
+        # For router modules, we use output.save() directly
+        # since tracer.cache() may not work for deeply nested submodules
+        with model.trace(tokenized, remote=False) as tracer:
+            if modules_to_cache:
+                cache = tracer.cache(modules=modules_to_cache).save()
+
+            # Logits
+            logits_save = None
+            if spec.include_logits:
+                logits_save = model.lm_head.output.save()
+
+            # Router logits via output.save() on each router module
+            router_saves: dict[int, Any] = {}
+            if router_layer_indices and router_template:
+                for layer_idx in router_layer_indices:
+                    # Navigate nnsight model's attribute tree
+                    parts = router_template.format(layer=layer_idx).split(".")
+                    obj: Any = model
+                    for part in parts:
+                        if part.isdigit():
+                            obj = obj[int(part)]
+                        else:
+                            obj = getattr(obj, part)
+                    router_saves[layer_idx] = obj.output.save()
+
+        # Collect hidden states
+        activation_tensors = []
+        if modules_to_cache:
+            for layer_idx in spec.hidden_layers:
+                key = f"model.model.layers.{layer_idx}"
+                entry = cache[key]  # noqa: F821
+                if hasattr(entry, "output"):
+                    output = entry.output
+                else:
+                    output = entry["output"]
+                tensor = _unwrap_proxy(output)
+                if isinstance(tensor, tuple):
+                    tensor = tensor[0]
+                activation_tensors.append(tensor)
+
+        # Collect logits
+        logits_val = None
+        logits_indices = None
+        if logits_save is not None:
+            logits_val = _unwrap_proxy(logits_save)
+
+        # Collect router logits
+        router_logits = None
+        if router_saves:
+            router_logits = {}
+            for layer_idx, saved in router_saves.items():
+                val = _unwrap_proxy(saved)
+                if isinstance(val, tuple):
+                    val = val[0]
+                router_logits[layer_idx] = val
+
+    # Build result
+    combined = None
+    if activation_tensors:
+        combined = torch.cat(activation_tensors, dim=-1)
+
+    return ExtractedBatch(
+        activations=combined,
+        attention_mask=tokenized["attention_mask"],
+        logits=logits_val,
+        logits_indices=logits_indices,
+        router_logits=router_logits,
+    )
 
 
 def compute_perplexity_from_logits(

@@ -17,6 +17,8 @@ import torch
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
+    from .activation_types import ExtractedBatch, ExtractionSpec
+
 
 class ExtractionBackend(ABC):
     """Abstract base class for activation extraction backends.
@@ -109,6 +111,43 @@ class ExtractionBackend(ABC):
         - LocalBackend: transformers.PreTrainedModel
         """
 
+    def extract_batch_extended(
+        self,
+        prompts: list[str],
+        spec: ExtractionSpec,
+        **kwargs: Any,
+    ) -> ExtractedBatch:
+        """Extract multiple activation types in a single forward pass.
+
+        This is the extensible extraction method. New activation types
+        (router logits, attention patterns, etc.) are added by extending
+        :class:`~lmprobe.activation_types.ExtractionSpec` and
+        :class:`~lmprobe.activation_types.ExtractedBatch`.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            List of text prompts.
+        spec : ExtractionSpec
+            Specification of what to extract.
+        **kwargs
+            Backend-specific parameters.
+
+        Returns
+        -------
+        ExtractedBatch
+            Structured result containing all requested activations.
+
+        Raises
+        ------
+        NotImplementedError
+            If the backend does not support extended extraction.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support extract_batch_extended. "
+            f"Use extract_batch() or extract_batch_with_logits() instead."
+        )
+
 
 class NnsightBackend(ExtractionBackend):
     """Backend using nnsight for activation extraction.
@@ -200,6 +239,18 @@ class NnsightBackend(ExtractionBackend):
             logit_top_k=logit_top_k,
         )
 
+    def extract_batch_extended(
+        self,
+        prompts: list[str],
+        spec: ExtractionSpec,
+        **kwargs: Any,
+    ) -> ExtractedBatch:
+        from .extraction import _extract_batch_extended
+
+        remote = kwargs.get("remote", self.remote)
+        model = self._get_model_for_remote() if remote else self.model
+        return _extract_batch_extended(model, prompts, spec, remote=remote)
+
 
 # Global cache for locally-loaded HuggingFace models
 # Key: (model_name, device, dtype), Value: (model, tokenizer)
@@ -256,6 +307,58 @@ def _get_decoder_layers(model: Any) -> list[Any]:
         f"Llama, Mistral, Phi, GPT-2, GPT-NeoX, Falcon, MPT, OPT, "
         f"and other models using standard layer attribute paths."
     )
+
+
+def _get_router_modules(
+    model: Any,
+    layer_indices: list[int],
+    router_module_template: str,
+) -> dict[int, Any]:
+    """Get MoE router gate modules for specified layers.
+
+    Uses the ``router_module_template`` from :class:`MoEInfo` to resolve
+    the router gate submodule for each layer. The template is a dot-path
+    like ``"model.model.layers.{layer}.block_sparse_moe.gate"`` where the
+    leading ``"model."`` prefix corresponds to the top-level HF model
+    object itself.
+
+    Parameters
+    ----------
+    model : PreTrainedModel
+        A HuggingFace transformers model.
+    layer_indices : list[int]
+        Layer indices to get router modules for.
+    router_module_template : str
+        Dot-path template with ``{layer}`` placeholder.
+
+    Returns
+    -------
+    dict[int, Any]
+        Mapping from layer index to router gate module.
+        Layers without a router module (e.g., dense layers in a mixed
+        architecture) are silently skipped.
+    """
+    result: dict[int, Any] = {}
+    for layer_idx in layer_indices:
+        path = router_module_template.format(layer=layer_idx)
+        # Strip leading "model." — the template is written for nnsight's
+        # LanguageModel where the HF model is at .model, but here we
+        # already have the HF model directly.
+        if path.startswith("model."):
+            path = path[len("model."):]
+        parts = path.split(".")
+        try:
+            obj: Any = model
+            for part in parts:
+                if part.isdigit():
+                    obj = obj[int(part)]
+                else:
+                    obj = getattr(obj, part)
+            result[layer_idx] = obj
+        except (AttributeError, IndexError, TypeError):
+            # Layer doesn't have this router module (e.g., dense layer)
+            pass
+    return result
 
 
 def _get_local_model(
@@ -475,6 +578,102 @@ class LocalBackend(ExtractionBackend):
         logits = outputs.logits.detach().cpu()
 
         return combined, tokenized["attention_mask"], logits, None
+
+    def extract_batch_extended(
+        self,
+        prompts: list[str],
+        spec: ExtractionSpec,
+        **kwargs: Any,
+    ) -> ExtractedBatch:
+        from .activation_types import ExtractedBatch
+
+        model = self.model
+        tokenizer = self.tokenizer
+
+        tokenized = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+        )
+
+        device = next(model.parameters()).device
+        input_ids = tokenized["input_ids"].to(device)
+        attention_mask = tokenized["attention_mask"].to(device)
+
+        # --- Set up hooks ---
+        captured_hidden: dict[int, torch.Tensor] = {}
+        captured_router: dict[int, torch.Tensor] = {}
+        hooks: list[Any] = []
+
+        # Hidden state hooks
+        if spec.hidden_layers:
+            decoder_layers = _get_decoder_layers(model)
+            for layer_idx in spec.hidden_layers:
+                layer_module = decoder_layers[layer_idx]
+
+                def make_hidden_hook(idx: int) -> Any:
+                    def hook_fn(_module: Any, _input: Any, output: Any) -> None:
+                        if isinstance(output, tuple):
+                            captured_hidden[idx] = output[0].detach()
+                        else:
+                            captured_hidden[idx] = output.detach()
+                    return hook_fn
+
+                hooks.append(
+                    layer_module.register_forward_hook(make_hidden_hook(layer_idx))
+                )
+
+        # Router logit hooks
+        if spec.router_layers and spec.router_module_template:
+            router_modules = _get_router_modules(
+                model, spec.router_layers, spec.router_module_template
+            )
+            for layer_idx, router_module in router_modules.items():
+                def make_router_hook(idx: int) -> Any:
+                    def hook_fn(_module: Any, _input: Any, output: Any) -> None:
+                        if isinstance(output, tuple):
+                            captured_router[idx] = output[0].detach()
+                        else:
+                            captured_router[idx] = output.detach()
+                    return hook_fn
+
+                hooks.append(
+                    router_module.register_forward_hook(make_router_hook(layer_idx))
+                )
+
+        # --- Forward pass ---
+        try:
+            with torch.no_grad():
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        finally:
+            for h in hooks:
+                h.remove()
+
+        # --- Collect results ---
+        activations: torch.Tensor | None = None
+        if spec.hidden_layers and captured_hidden:
+            activation_tensors = [
+                captured_hidden[idx].cpu() for idx in spec.hidden_layers
+            ]
+            activations = torch.cat(activation_tensors, dim=-1)
+
+        logits: torch.Tensor | None = None
+        if spec.include_logits:
+            logits = outputs.logits.detach().cpu()
+
+        router_logits: dict[int, torch.Tensor] | None = None
+        if captured_router:
+            router_logits = {
+                idx: t.cpu() for idx, t in captured_router.items()
+            }
+
+        return ExtractedBatch(
+            activations=activations,
+            attention_mask=tokenized["attention_mask"],
+            logits=logits,
+            logits_indices=None,
+            router_logits=router_logits,
+        )
 
 
 def resolve_backend(

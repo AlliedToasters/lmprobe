@@ -77,6 +77,8 @@ class ExtractionManifest:
     created_at: str = ""
     dtype: str = "float32"
     completed_layers: list[int] | None = None
+    router_layers: list[int] | None = None
+    router_dim: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -106,6 +108,10 @@ class ExtractionManifest:
             d["metadata"] = self.metadata
         if self.completed_layers is not None:
             d["completed_layers"] = self.completed_layers
+        if self.router_layers is not None:
+            d["router_layers"] = self.router_layers
+        if self.router_dim is not None:
+            d["router_dim"] = self.router_dim
         return d
 
     @classmethod
@@ -134,6 +140,8 @@ class ExtractionManifest:
             created_at=d.get("created_at", ""),
             dtype=d.get("dtype", "float32"),
             completed_layers=d.get("completed_layers"),
+            router_layers=d.get("router_layers"),
+            router_dim=d.get("router_dim"),
         )
 
 
@@ -241,6 +249,7 @@ def _save_batch(
     *,
     local_root: Path | None = None,
     num_workers: int = 1,
+    batch_router_logits: dict[int, torch.Tensor] | None = None,
 ) -> None:
     """Save a batch as one safetensors file per layer.
 
@@ -307,6 +316,22 @@ def _save_batch(
         else:
             logits_key = f"{prefix}/logits/{_batch_filename(batch_idx)}"
             _save_tensors_to_backend(logits_key, logits_tensors)
+
+    # Save router logits per-layer (same pattern as hidden states)
+    if batch_router_logits:
+        for router_layer_idx, router_tensor in batch_router_logits.items():
+            router_rel = f"router_layer_{router_layer_idx}/{_batch_filename(batch_idx)}"
+            router_tensors: dict[str, torch.Tensor] = {
+                "router_logits": router_tensor,
+                "mask": batch_mask,
+            }
+            if local_root is not None:
+                out = local_root / router_rel
+                out.parent.mkdir(parents=True, exist_ok=True)
+                save_file(router_tensors, str(out))
+            else:
+                router_key = f"{prefix}/{router_rel}"
+                _save_tensors_to_backend(router_key, router_tensors)
 
 
 def load_batch_layer(
@@ -418,6 +443,7 @@ def extract(
     cache_logits: bool = False,
     logit_top_k: int | None = None,
     max_retries: int = 3,
+    extract_router: bool = False,
 ) -> str:
     """Extract activations and save raw batch responses to disk.
 
@@ -495,6 +521,26 @@ def extract(
             f"[EXTRACT] Resuming: {len(completed_batches)} batches already complete"
         )
 
+    # Detect MoE architecture if router extraction requested
+    moe_info = None
+    router_layer_indices: list[int] | None = None
+    if extract_router:
+        from .activation_types import detect_moe_info, validate_router_layers
+
+        moe_info = detect_moe_info(model_name)
+        if moe_info is None:
+            raise ValueError(
+                f"extract_router=True but model {model_name!r} is not a "
+                f"recognized MoE architecture. Only MoE models have router "
+                f"logits to extract."
+            )
+        # Default: extract routers for the same layers as hidden states
+        router_layer_indices = validate_router_layers(moe_info, layer_indices)
+        logger.info(
+            f"[EXTRACT] MoE detected: {moe_info.num_experts} experts, "
+            f"router layers: {router_layer_indices}"
+        )
+
     # Build manifest
     manifest = ExtractionManifest(
         model_name=model_name,
@@ -506,6 +552,8 @@ def extract(
         labels=list(labels) if labels is not None else None,
         metadata=list(metadata) if metadata is not None else None,
         created_at=datetime.now(timezone.utc).isoformat(),
+        router_layers=router_layer_indices,
+        router_dim=moe_info.num_experts if moe_info is not None else None,
     )
 
     # Configure remote
@@ -566,27 +614,62 @@ def extract(
                 continue
 
             # Extract
+            batch_router_logits: dict[int, torch.Tensor] | None = None
             try:
-                if retry_fn is not None:
-                    batch_acts, batch_mask, batch_logits, batch_logits_indices = (
-                        retry_fn(
-                            lambda bp=batch_prompts: extraction_backend.extract_batch_with_logits(  # type: ignore[misc]
-                                bp, layer_indices,
-                                remote=remote,
-                                logit_top_k=effective_top_k,
+                if extract_router and moe_info is not None and router_layer_indices:
+                    # Use extended extraction for router + hidden + logits
+                    from .activation_types import ExtractionSpec
+
+                    spec = ExtractionSpec(
+                        hidden_layers=layer_indices,
+                        include_logits=compute_perplexity or cache_logits,
+                        logit_top_k=effective_top_k,
+                        router_layers=router_layer_indices,
+                        router_module_template=moe_info.router_module_template,
+                    )
+                    if retry_fn is not None:
+                        result = retry_fn(
+                            lambda bp=batch_prompts, s=spec: (  # type: ignore[misc]
+                                extraction_backend.extract_batch_extended(
+                                    bp, s, remote=remote,
+                                )
                             ),
                             max_retries=effective_retries,
                             context=f"batch {batch_idx + 1}/{num_batches}",
                         )
-                    )
-                else:
-                    batch_acts, batch_mask, batch_logits, batch_logits_indices = (
-                        extraction_backend.extract_batch_with_logits(
-                            batch_prompts, layer_indices,
-                            remote=remote,
-                            logit_top_k=effective_top_k,
+                    else:
+                        result = extraction_backend.extract_batch_extended(
+                            batch_prompts, spec, remote=remote,
                         )
-                    )
+                    batch_acts = result.activations
+                    batch_mask = result.attention_mask
+                    batch_logits = result.logits
+                    batch_logits_indices = result.logits_indices
+                    batch_router_logits = result.router_logits
+                else:
+                    # Standard extraction path (no router)
+                    if retry_fn is not None:
+                        batch_acts, batch_mask, batch_logits, batch_logits_indices = (
+                            retry_fn(
+                                lambda bp=batch_prompts: (  # type: ignore[misc]
+                                    extraction_backend.extract_batch_with_logits(
+                                        bp, layer_indices,
+                                        remote=remote,
+                                        logit_top_k=effective_top_k,
+                                    )
+                                ),
+                                max_retries=effective_retries,
+                                context=f"batch {batch_idx + 1}/{num_batches}",
+                            )
+                        )
+                    else:
+                        batch_acts, batch_mask, batch_logits, batch_logits_indices = (
+                            extraction_backend.extract_batch_with_logits(
+                                batch_prompts, layer_indices,
+                                remote=remote,
+                                logit_top_k=effective_top_k,
+                            )
+                        )
             except Exception:
                 if remote and effective_retries > 0:
                     logger.error(
@@ -603,6 +686,10 @@ def extract(
                 batch_logits = batch_logits.cpu()
             if batch_logits_indices is not None:
                 batch_logits_indices = batch_logits_indices.cpu()
+            if batch_router_logits is not None:
+                batch_router_logits = {
+                    k: v.cpu() for k, v in batch_router_logits.items()
+                }
 
             # Compute num_tokens from attention_mask
             num_tokens = batch_mask.sum(dim=-1).int().tolist()
@@ -627,6 +714,7 @@ def extract(
                 batch_idx=batch_idx,
                 batch_logits=batch_logits if cache_logits else None,
                 batch_logits_indices=batch_logits_indices if cache_logits else None,
+                batch_router_logits=batch_router_logits,
             )
 
             # Update manifest
@@ -644,7 +732,7 @@ def extract(
             batches_extracted += 1
 
             # Free memory
-            del batch_acts, batch_mask, batch_logits, batch_logits_indices
+            del batch_acts, batch_mask, batch_logits, batch_logits_indices, batch_router_logits
             gc.collect()
             _release_memory()
 
