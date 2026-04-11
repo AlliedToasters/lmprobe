@@ -134,15 +134,15 @@ def _build_cuml_classifier(
     if name == "logistic_regression":
         defaults: dict[str, Any] = dict(max_iter=1000)
         defaults.update(extra)
-        return cuml.linear_model.LogisticRegression(**defaults)  # type: ignore[return-value]
+        return cuml.linear_model.LogisticRegression(**defaults)
     elif name == "ridge" or name == "ridge_regression":
         defaults = dict(alpha=1.0)
         defaults.update(extra)
-        return cuml.linear_model.Ridge(**defaults)  # type: ignore[return-value]
+        return cuml.linear_model.Ridge(**defaults)
     elif name == "svm":
         defaults = dict(probability=True)
         defaults.update(extra)
-        return cuml.svm.SVC(**defaults)  # type: ignore[return-value]
+        return cuml.svm.SVC(**defaults)
     else:
         # No cuML equivalent — return None so caller falls back to sklearn
         return None
