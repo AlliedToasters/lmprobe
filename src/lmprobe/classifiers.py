@@ -116,10 +116,13 @@ def _stable_sigmoid_proba(scores: np.ndarray) -> np.ndarray:
 
 def _build_cuml_classifier(
     name: str,
-    random_state: int | None = None,
     classifier_kwargs: dict | None = None,
 ) -> BaseEstimator | None:
     """Try to build a cuML classifier for *name*.
+
+    Note: ``random_state`` is intentionally absent — cuML's LogisticRegression,
+    Ridge, and SVC do not accept it.  The caller (``build_classifier``) handles
+    ``random_state`` only on the sklearn fallback path.
 
     Returns
     -------
@@ -140,6 +143,8 @@ def _build_cuml_classifier(
         defaults.update(extra)
         return cuml.linear_model.Ridge(**defaults)
     elif name == "svm":
+        # cuML's SVC supports probability calibration via Platt scaling,
+        # matching sklearn's SVC(probability=True) interface.
         defaults = dict(probability=True)
         defaults.update(extra)
         return cuml.svm.SVC(**defaults)
@@ -202,7 +207,7 @@ def build_classifier(
 
     # --- cuML fast path ---
     if compute_backend == "cuml" and name in _CUML_SUPPORTED_CLASSIFIERS:
-        clf = _build_cuml_classifier(name, random_state, classifier_kwargs)
+        clf = _build_cuml_classifier(name, classifier_kwargs)
         if clf is not None:
             return clf
 

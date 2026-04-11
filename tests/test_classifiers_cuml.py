@@ -17,6 +17,7 @@ import pytest
 
 from lmprobe.classifiers import (
     _CUML_SUPPORTED_CLASSIFIERS,
+    _build_cuml_classifier,
     _resolve_compute_backend,
     build_classifier,
     cuml_available,
@@ -132,6 +133,13 @@ class TestBuildClassifierComputeBackend:
         # sgd has no cuML equivalent — should still return sklearn SGDClassifier
         clf = build_classifier("sgd", random_state=42, compute_backend="cuml")
         assert type(clf).__module__.startswith("sklearn")
+
+    def test_build_cuml_classifier_returns_none_for_unknown(self):
+        """_build_cuml_classifier returns None for names without cuML equivalents."""
+        mock_cuml = MagicMock()
+        with patch.dict("sys.modules", {"cuml": mock_cuml}):
+            result = _build_cuml_classifier("lda")
+            assert result is None
 
     def test_cuml_supported_classifiers_set(self):
         """Verify the set of cuML-supported classifiers."""

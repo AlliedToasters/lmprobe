@@ -523,7 +523,7 @@ class Probe:
         """
         from sklearn.pipeline import Pipeline
 
-        use_cuml = getattr(self, "_compute_backend", "sklearn") == "cuml"
+        use_cuml = self._compute_backend == "cuml"
 
         if use_cuml:
             from cuml.decomposition import PCA
