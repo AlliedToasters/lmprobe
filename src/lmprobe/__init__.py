@@ -89,6 +89,7 @@ __all__ = [
     "set_max_threads",
     "set_profiling",
     "is_profiling",
+    "cuml_available",
 ]
 
 
@@ -115,6 +116,10 @@ def set_max_threads(n: int) -> None:
 
 def __getattr__(name: str) -> Any:
     """Lazy import for optional modules."""
+    if name == "cuml_available":
+        from .classifiers import cuml_available
+
+        return cuml_available
     if name == "ActivationStore":
         from .activation_store import ActivationStore
 

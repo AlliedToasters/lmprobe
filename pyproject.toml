@@ -67,6 +67,9 @@ embeddings = [
 hub = [
     "huggingface_hub>=0.20",
 ]
+gpu-probes = [
+    "cuml-cu12>=24.0",
+]
 docs = [
     "mkdocs-material>=9.0",
     "mkdocstrings[python]>=0.24",

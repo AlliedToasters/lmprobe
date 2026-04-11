@@ -6,6 +6,7 @@ classifiers with proper random_state propagation.
 
 from __future__ import annotations
 
+import functools
 import warnings
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,65 @@ from sklearn.svm import SVC
 
 if TYPE_CHECKING:
     from sklearn.base import BaseEstimator
+
+
+# ---------------------------------------------------------------------------
+# cuML availability check
+# ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=1)
+def cuml_available() -> bool:
+    """Check whether cuML is installed and importable.
+
+    Returns
+    -------
+    bool
+        True if ``import cuml`` succeeds.
+    """
+    try:
+        import cuml  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+_VALID_COMPUTE_BACKENDS = frozenset({"sklearn", "cuml", "auto"})
+
+
+def _resolve_compute_backend(compute_backend: str) -> str:
+    """Resolve ``"auto"`` to a concrete backend name.
+
+    Parameters
+    ----------
+    compute_backend : str
+        One of ``"sklearn"``, ``"cuml"``, or ``"auto"``.
+
+    Returns
+    -------
+    str
+        ``"sklearn"`` or ``"cuml"``.
+
+    Raises
+    ------
+    ValueError
+        If *compute_backend* is not recognised.
+    ImportError
+        If ``"cuml"`` is requested but not installed.
+    """
+    if compute_backend not in _VALID_COMPUTE_BACKENDS:
+        raise ValueError(
+            f"Unknown compute_backend: {compute_backend!r}. "
+            f"Expected one of {sorted(_VALID_COMPUTE_BACKENDS)}."
+        )
+    if compute_backend == "auto":
+        return "cuml" if cuml_available() else "sklearn"
+    if compute_backend == "cuml" and not cuml_available():
+        raise ImportError(
+            "compute_backend='cuml' requires cuML. "
+            "Install it with: pip install lmprobe[gpu-probes]"
+        )
+    return compute_backend
 
 
 # Registry of built-in classifier names
@@ -54,10 +114,54 @@ def _stable_sigmoid_proba(scores: np.ndarray) -> np.ndarray:
     return np.column_stack([1 - prob_positive, prob_positive])
 
 
+def _build_cuml_classifier(
+    name: str,
+    random_state: int | None = None,
+    classifier_kwargs: dict | None = None,
+) -> BaseEstimator | None:
+    """Try to build a cuML classifier for *name*.
+
+    Returns
+    -------
+    BaseEstimator | None
+        A cuML classifier instance, or ``None`` if no cuML equivalent exists
+        for *name* (caller should fall back to sklearn).
+    """
+    import cuml  # guaranteed importable by caller
+
+    extra = classifier_kwargs or {}
+
+    if name == "logistic_regression":
+        defaults: dict[str, Any] = dict(max_iter=1000)
+        defaults.update(extra)
+        return cuml.linear_model.LogisticRegression(**defaults)  # type: ignore[return-value]
+    elif name == "ridge" or name == "ridge_regression":
+        defaults = dict(alpha=1.0)
+        defaults.update(extra)
+        return cuml.linear_model.Ridge(**defaults)  # type: ignore[return-value]
+    elif name == "svm":
+        defaults = dict(probability=True)
+        defaults.update(extra)
+        return cuml.svm.SVC(**defaults)  # type: ignore[return-value]
+    else:
+        # No cuML equivalent — return None so caller falls back to sklearn
+        return None
+
+
+# Classifiers that have cuML equivalents
+_CUML_SUPPORTED_CLASSIFIERS = frozenset({
+    "logistic_regression",
+    "ridge",
+    "ridge_regression",
+    "svm",
+})
+
+
 def build_classifier(
     name: str,
     random_state: int | None = None,
     classifier_kwargs: dict | None = None,
+    compute_backend: str = "sklearn",
 ) -> BaseEstimator:
     """Build a classifier by name with the given random_state.
 
@@ -79,6 +183,10 @@ def build_classifier(
         Additional keyword arguments passed to the sklearn classifier constructor.
         These override the defaults (e.g., ``{"C": 0.01, "solver": "liblinear"}``
         for logistic regression).
+    compute_backend : str
+        ``"sklearn"`` (default) or ``"cuml"``. When ``"cuml"``, uses
+        GPU-accelerated cuML implementations where available. Classifiers
+        without a cuML equivalent fall back to sklearn automatically.
 
     Returns
     -------
@@ -92,8 +200,17 @@ def build_classifier(
     """
     extra = classifier_kwargs or {}
 
+    # --- cuML fast path ---
+    if compute_backend == "cuml" and name in _CUML_SUPPORTED_CLASSIFIERS:
+        clf = _build_cuml_classifier(name, random_state, classifier_kwargs)
+        if clf is not None:
+            return clf
+
+    # --- sklearn path (default) ---
     if name == "logistic_regression":
-        defaults = dict(max_iter=1000, solver="lbfgs", random_state=random_state)
+        defaults: dict[str, Any] = dict(
+            max_iter=1000, solver="lbfgs", random_state=random_state,
+        )
         defaults.update(extra)
         return LogisticRegression(**defaults)
     elif name == "logistic_regression_cv":
@@ -177,6 +294,7 @@ def resolve_classifier(
     classifier: str | BaseEstimator,
     random_state: int | None = None,
     classifier_kwargs: dict | None = None,
+    compute_backend: str = "sklearn",
 ) -> BaseEstimator:
     """Resolve a classifier specification to an estimator instance.
 
@@ -191,6 +309,9 @@ def resolve_classifier(
     classifier_kwargs : dict | None
         Additional keyword arguments for built-in classifiers.
         Ignored when a custom estimator instance is provided.
+    compute_backend : str
+        ``"sklearn"`` (default) or ``"cuml"``. Passed through to
+        :func:`build_classifier` for built-in classifiers.
 
     Returns
     -------
@@ -201,6 +322,7 @@ def resolve_classifier(
         clf = build_classifier(
             classifier, random_state=random_state,
             classifier_kwargs=classifier_kwargs,
+            compute_backend=compute_backend,
         )
     else:
         clf = classifier
