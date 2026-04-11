@@ -1086,7 +1086,7 @@ class ChunkedLocalBackend(ExtractionBackend):
             hs = hidden_states.to(device)
             mask_dev = causal_mask.to(device)
             pos_dev = position_ids.to(device)
-            pe_dev = None
+            pe_dev: tuple[torch.Tensor, ...] | torch.Tensor | None = None
             if position_embeddings is not None:
                 if isinstance(position_embeddings, tuple):
                     pe_dev = tuple(t.to(device) for t in position_embeddings)
@@ -1119,7 +1119,7 @@ class ChunkedLocalBackend(ExtractionBackend):
                             # Hook the MoE module and compute gate logits
                             # from its input + gate.weight. Needed for
                             # DeepSeek which calls F.linear() directly.
-                            def _router_hook(
+                            def _input_gate_hook(
                                 mod: Any, args: Any, out: Any,
                                 _buf: list = router_hook_output,
                             ) -> None:
@@ -1129,8 +1129,10 @@ class ChunkedLocalBackend(ExtractionBackend):
                                     hs_in.to(gate_w.dtype), gate_w,
                                 )
                                 _buf.append(logits.detach().cpu())
+
+                            rh = router_mod.register_forward_hook(_input_gate_hook)
                         else:
-                            def _router_hook(
+                            def _output_hook(
                                 _mod: Any, _inp: Any, out: Any,
                                 _buf: list = router_hook_output,
                             ) -> None:
@@ -1139,7 +1141,7 @@ class ChunkedLocalBackend(ExtractionBackend):
                                 else:
                                     _buf.append(out.detach().cpu())
 
-                        rh = router_mod.register_forward_hook(_router_hook)
+                            rh = router_mod.register_forward_hook(_output_hook)
 
                     layer_kwargs: dict[str, Any] = {
                         "attention_mask": mask_dev,
