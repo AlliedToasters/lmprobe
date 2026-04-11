@@ -58,6 +58,13 @@ class ExtractionSpec:
         ``"model.model.layers.{layer}.block_sparse_moe.gate"``.
         Required when router_layers is not None. Obtained from
         :func:`detect_moe_info`.
+    router_hook_strategy : str
+        How to capture router logits. ``"output"`` hooks the module's forward
+        output (default, works when the gate module is called directly).
+        ``"input_gate"`` hooks the parent MoE module and computes
+        ``F.linear(input, module.gate.weight)`` — needed for architectures
+        like DeepSeek that call ``F.linear`` directly instead of the gate
+        module's ``__call__``.
     """
 
     hidden_layers: list[int] = field(default_factory=list)
@@ -65,6 +72,7 @@ class ExtractionSpec:
     logit_top_k: int | None = None
     router_layers: list[int] | None = None
     router_module_template: str | None = None
+    router_hook_strategy: str = "output"
 
     def __post_init__(self) -> None:
         if self.router_layers and not self.router_module_template:
@@ -94,6 +102,10 @@ class ExtractedBatch:
         Router gate outputs keyed by layer index.
         Each tensor has shape ``(batch, seq_len, num_experts)``.
         Dict (not concatenated) because num_experts != hidden_dim.
+    hidden_per_layer : dict[int, torch.Tensor] or None
+        Per-layer hidden states keyed by layer index.
+        Each tensor has shape ``(batch, seq_len, hidden_dim)``.
+        Populated alongside ``activations`` when hidden layers are requested.
     """
 
     activations: torch.Tensor | None
@@ -101,6 +113,7 @@ class ExtractedBatch:
     logits: torch.Tensor | None = None
     logits_indices: torch.Tensor | None = None
     router_logits: dict[int, torch.Tensor] | None = None
+    hidden_per_layer: dict[int, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -121,11 +134,18 @@ class MoEInfo:
         If not all layers are MoE (e.g., DeepSeek-V2 interleaves dense and
         MoE layers), this lists which layer indices have routers.
         None means all layers have routers.
+    router_hook_strategy : str
+        How to capture router logits. ``"output"`` (default) hooks the gate
+        module's forward output. ``"input_gate"`` hooks the parent MoE
+        module's forward, computing ``F.linear(input, gate.weight)`` to get
+        router logits — needed when the gate is called via ``F.linear``
+        instead of the module's ``__call__`` (e.g., DeepSeek-V2/V3).
     """
 
     num_experts: int
     router_module_template: str
     moe_layer_indices: list[int] | None = None
+    router_hook_strategy: str = "output"
 
 
 def detect_moe_info(model_name: str) -> MoEInfo | None:
@@ -171,6 +191,9 @@ def detect_moe_info(model_name: str) -> MoEInfo | None:
             )
 
     # DeepSeek-V2 / DeepSeek-V3
+    # NOTE: DeepSeek MoE forward uses F.linear(x, gate.weight) instead of
+    # gate(x), bypassing forward hooks on the gate module. We hook the
+    # parent MoE module and compute logits from its input + gate weight.
     if model_type in ("deepseek_v2", "deepseek_v3"):
         num_experts = getattr(config, "n_routed_experts", None)
         if num_experts is not None:
@@ -186,8 +209,9 @@ def detect_moe_info(model_name: str) -> MoEInfo | None:
             ]
             return MoEInfo(
                 num_experts=num_experts,
-                router_module_template="model.model.layers.{layer}.mlp.gate",
+                router_module_template="model.model.layers.{layer}.mlp",
                 moe_layer_indices=moe_indices if moe_indices else None,
+                router_hook_strategy="input_gate",
             )
 
     # DBRX

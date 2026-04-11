@@ -629,17 +629,44 @@ class LocalBackend(ExtractionBackend):
                 model, spec.router_layers, spec.router_module_template
             )
             for layer_idx, router_module in router_modules.items():
-                def make_router_hook(idx: int) -> Any:
-                    def hook_fn(_module: Any, _input: Any, output: Any) -> None:
-                        if isinstance(output, tuple):
-                            captured_router[idx] = output[0].detach()
-                        else:
-                            captured_router[idx] = output.detach()
-                    return hook_fn
+                if spec.router_hook_strategy == "input_gate":
+                    # Hook the MoE module's forward and compute gate logits
+                    # from input. Needed for DeepSeek which calls F.linear()
+                    # on gate.weight directly, bypassing the gate module's
+                    # __call__.
+                    def make_input_gate_hook(idx: int) -> Any:
+                        def hook_fn(module: Any, args: Any, output: Any) -> None:
+                            hs = args[0] if isinstance(args, tuple) else args
+                            gate_weight = module.gate.weight
+                            logits = torch.nn.functional.linear(
+                                hs.to(gate_weight.dtype), gate_weight,
+                            )
+                            captured_router[idx] = logits.detach()
+                        return hook_fn
 
-                hooks.append(
-                    router_module.register_forward_hook(make_router_hook(layer_idx))
-                )
+                    hooks.append(
+                        router_module.register_forward_hook(
+                            make_input_gate_hook(layer_idx)
+                        )
+                    )
+                else:
+                    # Default: hook the gate module's forward output directly
+                    def make_router_hook(idx: int) -> Any:
+                        def hook_fn(_module: Any, _input: Any, output: Any) -> None:
+                            if isinstance(output, tuple):
+                                captured_router[idx] = output[0].detach()
+                            else:
+                                captured_router[idx] = output.detach()
+                        return hook_fn
+
+                    hooks.append(
+                        router_module.register_forward_hook(
+                            make_router_hook(layer_idx)
+                        )
+                    )
+
+        batch_size = input_ids.shape[0]
+        seq_len = input_ids.shape[1]
 
         # --- Forward pass ---
         try:
@@ -663,8 +690,20 @@ class LocalBackend(ExtractionBackend):
 
         router_logits: dict[int, torch.Tensor] | None = None
         if captured_router:
-            router_logits = {
-                idx: t.cpu() for idx, t in captured_router.items()
+            router_logits = {}
+            for idx, t in captured_router.items():
+                t_cpu = t.cpu()
+                # Router modules (e.g. OLMoE) may flatten batch and seq dims
+                # to (batch*seq_len, n_experts). Reshape to (batch, seq_len, n_experts).
+                if t_cpu.dim() == 2 and t_cpu.shape[0] == batch_size * seq_len:
+                    t_cpu = t_cpu.view(batch_size, seq_len, -1)
+                router_logits[idx] = t_cpu
+
+        # Also provide per-layer hidden states for callers that need them
+        hidden_per_layer: dict[int, torch.Tensor] | None = None
+        if spec.hidden_layers and captured_hidden:
+            hidden_per_layer = {
+                idx: captured_hidden[idx].cpu() for idx in spec.hidden_layers
             }
 
         return ExtractedBatch(
@@ -673,6 +712,7 @@ class LocalBackend(ExtractionBackend):
             logits=logits,
             logits_indices=None,
             router_logits=router_logits,
+            hidden_per_layer=hidden_per_layer,
         )
 
 
@@ -962,6 +1002,7 @@ class ChunkedLocalBackend(ExtractionBackend):
         include_logits: bool = False,
         router_layer_indices: list[int] | None = None,
         router_module_template: str | None = None,
+        router_hook_strategy: str = "output",
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor,
@@ -1013,7 +1054,9 @@ class ChunkedLocalBackend(ExtractionBackend):
         causal_mask = _make_causal_mask(attention_mask_2d, self.dtype)
 
         # Compute rotary position embeddings
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Some architectures (Llama, Mistral) return (cos, sin) tuples;
+        # DeepSeek-V2 returns a single complex freqs_cis tensor.
+        position_embeddings: tuple[torch.Tensor, ...] | torch.Tensor | None = None
         rotary_name = self._find_rotary_embedding_name(model)
         if rotary_name is not None:
             rotary_mod = model
@@ -1022,7 +1065,10 @@ class ChunkedLocalBackend(ExtractionBackend):
             rotary_mod.to(device)
             with torch.no_grad():
                 pe = rotary_mod(hidden_states.to(device), position_ids.to(device))
-                position_embeddings = (pe[0].cpu(), pe[1].cpu())
+                if isinstance(pe, tuple):
+                    position_embeddings = tuple(t.cpu() for t in pe)
+                else:
+                    position_embeddings = pe.cpu()
             rotary_mod.to("cpu")
 
         # --- Phase 2: Layer chunks ---
@@ -1042,10 +1088,10 @@ class ChunkedLocalBackend(ExtractionBackend):
             pos_dev = position_ids.to(device)
             pe_dev = None
             if position_embeddings is not None:
-                pe_dev = (
-                    position_embeddings[0].to(device),
-                    position_embeddings[1].to(device),
-                )
+                if isinstance(position_embeddings, tuple):
+                    pe_dev = tuple(t.to(device) for t in position_embeddings)
+                else:
+                    pe_dev = position_embeddings.to(device)
 
             with torch.no_grad():
                 for layer_idx in range(chunk_start, chunk_end):
@@ -1056,22 +1102,43 @@ class ChunkedLocalBackend(ExtractionBackend):
                     if layer_idx in router_target_set and router_module_template:
                         router_hook_output: list[torch.Tensor] = []
 
-                        def _router_hook(
-                            _mod: Any, _inp: Any, out: Any,
-                            _buf: list = router_hook_output,
-                        ) -> None:
-                            if isinstance(out, tuple):
-                                _buf.append(out[0].detach().cpu())
-                            else:
-                                _buf.append(out.detach().cpu())
-
                         router_path = router_module_template.format(layer=layer_idx)
+                        # Strip leading "model." — the template is written
+                        # for nnsight's LanguageModel where the HF model is
+                        # at .model, but here we already have the HF model.
+                        if router_path.startswith("model."):
+                            router_path = router_path[len("model."):]
                         router_mod = model
                         for part in router_path.split("."):
                             if part.isdigit():
                                 router_mod = router_mod[int(part)]
                             else:
                                 router_mod = getattr(router_mod, part)
+
+                        if router_hook_strategy == "input_gate":
+                            # Hook the MoE module and compute gate logits
+                            # from its input + gate.weight. Needed for
+                            # DeepSeek which calls F.linear() directly.
+                            def _router_hook(
+                                mod: Any, args: Any, out: Any,
+                                _buf: list = router_hook_output,
+                            ) -> None:
+                                hs_in = args[0] if isinstance(args, tuple) else args
+                                gate_w = mod.gate.weight
+                                logits = torch.nn.functional.linear(
+                                    hs_in.to(gate_w.dtype), gate_w,
+                                )
+                                _buf.append(logits.detach().cpu())
+                        else:
+                            def _router_hook(
+                                _mod: Any, _inp: Any, out: Any,
+                                _buf: list = router_hook_output,
+                            ) -> None:
+                                if isinstance(out, tuple):
+                                    _buf.append(out[0].detach().cpu())
+                                else:
+                                    _buf.append(out.detach().cpu())
+
                         rh = router_mod.register_forward_hook(_router_hook)
 
                     layer_kwargs: dict[str, Any] = {
@@ -1178,6 +1245,7 @@ class ChunkedLocalBackend(ExtractionBackend):
             include_logits=spec.include_logits,
             router_layer_indices=spec.router_layers,
             router_module_template=spec.router_module_template,
+            router_hook_strategy=spec.router_hook_strategy,
         )
         return ExtractedBatch(
             activations=activations,
