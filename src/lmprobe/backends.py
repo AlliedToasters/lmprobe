@@ -1570,10 +1570,10 @@ class DiskOffloadBackend(ExtractionBackend):
     def extract_all(
         self,
         prompts: list[str],
-        spec: "ExtractionSpec",
+        spec: ExtractionSpec,
         batch_size: int = 16,
         pool: str | None = None,
-    ) -> "ExtractedBatch":
+    ) -> ExtractedBatch:
         """Extract features from *all* prompts, loading each layer once.
 
         This is the efficient entry point for large models. All prompts
@@ -1875,7 +1875,7 @@ class DiskOffloadBackend(ExtractionBackend):
             sorted_layers = sorted(captured_hidden.keys())
             # When pooled, each tensor is (N, dim); otherwise (N, seq, dim)
             activations = torch.cat(
-                [captured_hidden[l] for l in sorted_layers], dim=-1,
+                [captured_hidden[li] for li in sorted_layers], dim=-1,
             )
 
         return ExtractedBatch(
@@ -1915,9 +1915,9 @@ class DiskOffloadBackend(ExtractionBackend):
     def extract_batch_extended(
         self,
         prompts: list[str],
-        spec: "ExtractionSpec",
+        spec: ExtractionSpec,
         **kwargs: Any,
-    ) -> "ExtractedBatch":
+    ) -> ExtractedBatch:
         return self.extract_all(prompts, spec, batch_size=len(prompts))
 
 
