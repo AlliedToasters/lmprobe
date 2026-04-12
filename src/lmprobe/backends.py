@@ -1572,6 +1572,7 @@ class DiskOffloadBackend(ExtractionBackend):
         prompts: list[str],
         spec: "ExtractionSpec",
         batch_size: int = 16,
+        pool: str | None = None,
     ) -> "ExtractedBatch":
         """Extract features from *all* prompts, loading each layer once.
 
@@ -1588,6 +1589,11 @@ class DiskOffloadBackend(ExtractionBackend):
             What to extract (hidden layers, router logits, logits).
         batch_size : int
             GPU batch size for forward passes through each layer.
+        pool : str or None
+            Pooling strategy for captured features. ``None`` keeps full
+            ``(N, seq_len, dim)`` tensors (high memory). ``"mean"``
+            mean-pools over valid tokens per statement, storing only
+            ``(N, dim)`` per layer — essential for large combined runs.
 
         Returns
         -------
@@ -1794,9 +1800,34 @@ class DiskOffloadBackend(ExtractionBackend):
 
             # Collect captured features for this layer
             if layer_hidden_out:
-                captured_hidden[layer_idx] = torch.cat(layer_hidden_out, dim=0)
+                full = torch.cat(layer_hidden_out, dim=0)  # (N, seq, dim)
+                if pool == "mean":
+                    # Mean-pool over valid tokens: (N, seq, dim) -> (N, dim)
+                    pooled = torch.zeros(
+                        full.shape[0], full.shape[2], dtype=torch.float32,
+                    )
+                    for i in range(full.shape[0]):
+                        valid = all_attention_mask[i].bool()
+                        if valid.sum().item() > 0:
+                            pooled[i] = full[i, valid].float().mean(dim=0)
+                    captured_hidden[layer_idx] = pooled
+                else:
+                    captured_hidden[layer_idx] = full
+                del full
             if layer_router_out:
-                captured_router[layer_idx] = torch.cat(layer_router_out, dim=0)
+                full_r = torch.cat(layer_router_out, dim=0)  # (N, seq, n_experts)
+                if pool == "mean":
+                    pooled_r = torch.zeros(
+                        full_r.shape[0], full_r.shape[2], dtype=torch.float32,
+                    )
+                    for i in range(full_r.shape[0]):
+                        valid = all_attention_mask[i].bool()
+                        if valid.sum().item() > 0:
+                            pooled_r[i] = full_r[i, valid].float().mean(dim=0)
+                    captured_router[layer_idx] = pooled_r
+                else:
+                    captured_router[layer_idx] = full_r
+                del full_r
 
             # Free layer
             _free_module(layer_module)
@@ -1839,10 +1870,10 @@ class DiskOffloadBackend(ExtractionBackend):
             torch.cuda.empty_cache()
 
         # --- Assemble result ---
-        # Concatenate hidden states along feature dim (standard lmprobe format)
         activations: torch.Tensor | None = None
         if captured_hidden:
             sorted_layers = sorted(captured_hidden.keys())
+            # When pooled, each tensor is (N, dim); otherwise (N, seq, dim)
             activations = torch.cat(
                 [captured_hidden[l] for l in sorted_layers], dim=-1,
             )
