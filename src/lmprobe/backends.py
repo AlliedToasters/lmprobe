@@ -1401,7 +1401,7 @@ def _materialize_module(
         if new_data is None:
             continue
         parts = name.split(".")
-        target = module
+        target: Any = module
         for part in parts[:-1]:
             target = target[int(part)] if part.isdigit() else getattr(target, part)
         target._parameters[parts[-1]] = torch.nn.Parameter(
@@ -1412,17 +1412,17 @@ def _materialize_module(
         full_name = f"{prefix}{name}"
         if full_name in weights:
             parts = name.split(".")
-            target = module
+            target2: Any = module
             for part in parts[:-1]:
-                target = target[int(part)] if part.isdigit() else getattr(target, part)
-            target._buffers[parts[-1]] = weights[full_name].to(device)
+                target2 = target2[int(part)] if part.isdigit() else getattr(target2, part)
+            target2._buffers[parts[-1]] = weights[full_name].to(device)
 
 
 def _free_module(module: torch.nn.Module) -> None:
     """Replace all parameters and buffers with empty meta tensors."""
     for name, _param in list(module.named_parameters()):
         parts = name.split(".")
-        target = module
+        target: Any = module
         for part in parts[:-1]:
             target = target[int(part)] if part.isdigit() else getattr(target, part)
         target._parameters[parts[-1]] = torch.nn.Parameter(
@@ -1430,10 +1430,10 @@ def _free_module(module: torch.nn.Module) -> None:
         )
     for name, _buf in list(module.named_buffers()):
         parts = name.split(".")
-        target = module
+        target2: Any = module
         for part in parts[:-1]:
-            target = target[int(part)] if part.isdigit() else getattr(target, part)
-        target._buffers[parts[-1]] = torch.empty(0, device="meta")
+            target2 = target2[int(part)] if part.isdigit() else getattr(target2, part)
+        target2._buffers[parts[-1]] = torch.empty(0, device="meta")
 
 
 class DiskOffloadBackend(ExtractionBackend):
@@ -1509,6 +1509,7 @@ class DiskOffloadBackend(ExtractionBackend):
 
             self._layer_to_tensors = dict(layers)
             self._non_layer_tensors = non_layer
+        assert self._non_layer_tensors is not None
         return self._layer_to_tensors, self._non_layer_tensors
 
     def _load_tensors(
@@ -1910,6 +1911,7 @@ class DiskOffloadBackend(ExtractionBackend):
         from .activation_types import ExtractionSpec
         spec = ExtractionSpec(hidden_layers=layer_indices, include_logits=True)
         result = self.extract_all(prompts, spec, batch_size=len(prompts))
+        assert result.logits is not None
         return result.activations, result.attention_mask, result.logits, None
 
     def extract_batch_extended(
