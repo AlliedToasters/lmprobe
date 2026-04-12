@@ -362,6 +362,7 @@ class Probe:
         preprocessing: str | list[str] | None = None,
         pca_components: int | None = None,
         mass_mean_augment: bool = False,
+        compute_backend: str = "sklearn",
     ):
         self.model = model
         self.layers = layers
@@ -385,6 +386,12 @@ class Probe:
         self.preprocessing = preprocessing
         self.pca_components = pca_components
         self.mass_mean_augment = mass_mean_augment
+        self.compute_backend = compute_backend
+
+        # Resolve compute backend ("auto" → concrete)
+        from .classifiers import _resolve_compute_backend
+
+        self._compute_backend = _resolve_compute_backend(compute_backend)
 
         # Detect sweep mode before other validations
         self._sweep_mode, self._sweep_layers_spec = _parse_sweep_spec(layers)
@@ -419,11 +426,13 @@ class Probe:
             self._classifier_template = resolve_classifier(
                 "ridge_regression", random_state,
                 classifier_kwargs=classifier_kwargs,
+                compute_backend=self._compute_backend,
             )
         else:
             self._classifier_template = resolve_classifier(
                 classifier, random_state,
                 classifier_kwargs=classifier_kwargs,
+                compute_backend=self._compute_backend,
             )
 
         # Create extractor (lazy loads model) only if model is provided
@@ -512,9 +521,16 @@ class Probe:
         sklearn.pipeline.Pipeline | None
             A fitted preprocessing pipeline, or None if no preprocessing.
         """
-        from sklearn.decomposition import PCA
         from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import StandardScaler
+
+        use_cuml = self._compute_backend == "cuml"
+
+        if use_cuml:
+            from cuml.decomposition import PCA
+            from cuml.preprocessing import StandardScaler
+        else:
+            from sklearn.decomposition import PCA
+            from sklearn.preprocessing import StandardScaler
 
         steps_spec = self._parse_preprocessing_spec(self.preprocessing)
         if steps_spec is None:
@@ -555,6 +571,7 @@ class Probe:
         scaling_strategy: str | None,
         *,
         single_layer_standard: bool = False,
+        compute_backend: str = "sklearn",
     ) -> tuple[Any, np.ndarray]:
         """Create and fit a layer scaler.
 
@@ -569,6 +586,9 @@ class Probe:
         single_layer_standard : bool
             If True and n_layers == 1 and scaling_strategy is None,
             use StandardScaler (prevents convergence issues, #40).
+        compute_backend : str
+            ``"sklearn"`` or ``"cuml"``. Controls which StandardScaler
+            implementation is used.
 
         Returns
         -------
@@ -578,7 +598,10 @@ class Probe:
         if single_layer_standard and n_layers == 1:
             # Single-layer probes always use StandardScaler to prevent
             # convergence issues with unscaled activations (#40)
-            from sklearn.preprocessing import StandardScaler
+            if compute_backend == "cuml":
+                from cuml.preprocessing import StandardScaler
+            else:
+                from sklearn.preprocessing import StandardScaler
 
             scaler = StandardScaler()
             return scaler, scaler.fit_transform(X)
@@ -972,6 +995,7 @@ class Probe:
             with profile_section(_prof, "scale"):
                 self.scaler_, X = self._fit_layer_scaler(
                     X, n_layers, scaling_strategy, single_layer_standard=True,
+                    compute_backend=self._compute_backend,
                 )
 
             # Save pre-preprocessing activations for mass-mean augmentation
@@ -1087,6 +1111,7 @@ class Probe:
         n_selected = len(self.selected_layers_)
         self.scaler_, X_selected = self._fit_layer_scaler(
             X_selected, n_selected, scaling_strategy,
+            compute_backend=self._compute_backend,
         )
 
         self._extractor, self._cached_extractor = self._create_selected_extractor(
@@ -1133,6 +1158,7 @@ class Probe:
         scaling_strategy = self._get_scaling_strategy()
         _candidate_scaler, X_candidates_scaled = self._fit_layer_scaler(
             X_candidates, n_candidate_layers, scaling_strategy,
+            compute_backend=self._compute_backend,
         )
 
         group_lasso_clf = build_group_lasso_classifier(
@@ -1194,6 +1220,7 @@ class Probe:
         scaling_strategy = self._get_scaling_strategy()
         _scaler, X_candidates_scaled = self._fit_layer_scaler(
             X_candidates, n_candidate_layers, scaling_strategy,
+            compute_backend=self._compute_backend,
         )
 
         # Train on all candidates to compute importance
@@ -1772,6 +1799,7 @@ class Probe:
             with profile_section(_prof, "scale"):
                 self.scaler_, X = self._fit_layer_scaler(
                     X, n_layers, scaling_strategy, single_layer_standard=True,
+                    compute_backend=self._compute_backend,
                 )
 
             # Save pre-preprocessing activations for mass-mean augmentation
