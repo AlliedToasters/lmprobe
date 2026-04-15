@@ -1,10 +1,13 @@
 """Pluggable extraction backends for lmprobe.
 
-This module defines the ExtractionBackend ABC and provides two implementations:
+This module defines the ExtractionBackend ABC and provides implementations:
 - NnsightBackend: Uses nnsight for model loading and activation extraction
   (supports both local and remote/NDIF execution)
 - LocalBackend: Uses HuggingFace transformers directly with register_forward_hook
   (local-only, no nnsight dependency for extraction)
+- ChunkedLocalBackend: Loads full model on CPU, chunks layers through GPU
+- DiskOffloadBackend: Loads layer weights from safetensors one layer at a time
+  for models exceeding CPU RAM (e.g. DeepSeek-V3 671B FP8)
 """
 
 from __future__ import annotations
@@ -1258,6 +1261,668 @@ class ChunkedLocalBackend(ExtractionBackend):
         )
 
 
+# ---------------------------------------------------------------------------
+# DiskOffloadBackend — for models exceeding CPU RAM (e.g. DeepSeek-V3 671B)
+# ---------------------------------------------------------------------------
+
+
+def _dequantize_fp8_block(
+    weight_fp8: torch.Tensor,
+    scale_inv: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Dequantize FP8 e4m3 block-quantized weight to bf16.
+
+    Parameters
+    ----------
+    weight_fp8 : torch.Tensor
+        Weight in float8_e4m3fn, shape ``(out_features, in_features)``.
+    scale_inv : torch.Tensor
+        Per-block inverse scale, shape
+        ``(ceil(out_features/block_size), ceil(in_features/block_size))``.
+    block_size : int
+        Block size used for quantization (default 128).
+    """
+    out_f, in_f = weight_fp8.shape
+    ob = (out_f + block_size - 1) // block_size
+    ib = (in_f + block_size - 1) // block_size
+
+    pad_out = ob * block_size - out_f
+    pad_in = ib * block_size - in_f
+    if pad_out > 0 or pad_in > 0:
+        w = torch.nn.functional.pad(weight_fp8.float(), (0, pad_in, 0, pad_out))
+    else:
+        w = weight_fp8.float()
+
+    w = w.reshape(ob, block_size, ib, block_size)
+    w = w * scale_inv[:, None, :, None]
+    w = w.reshape(ob * block_size, ib * block_size)
+
+    if pad_out > 0 or pad_in > 0:
+        w = w[:out_f, :in_f]
+
+    return w.to(torch.bfloat16)
+
+
+def _pack_expert_weights(
+    weights: dict[str, torch.Tensor],
+    layer_prefix: str,
+    n_experts: int,
+    device: str,
+) -> dict[str, torch.Tensor]:
+    """Pack individual per-expert FP8 weights into 3D packed format.
+
+    Safetensors stores per-expert weights as separate 2D tensors.
+    Transformers' native DeepSeek-V3 implementation expects packed 3D
+    tensors: ``gate_up_proj [n_experts, 2*intermediate, hidden]`` and
+    ``down_proj [n_experts, hidden, intermediate]``.
+    """
+    test_key = f"{layer_prefix}mlp.experts.0.gate_proj.weight"
+    if test_key not in weights:
+        return {}
+
+    gate_up_list = []
+    down_list = []
+
+    for i in range(n_experts):
+        gk = f"{layer_prefix}mlp.experts.{i}.gate_proj.weight"
+        gs = gk + "_scale_inv"
+        uk = f"{layer_prefix}mlp.experts.{i}.up_proj.weight"
+        us = uk + "_scale_inv"
+        dk = f"{layer_prefix}mlp.experts.{i}.down_proj.weight"
+        ds = dk + "_scale_inv"
+
+        gate = (
+            _dequantize_fp8_block(weights[gk], weights[gs])
+            if gs in weights
+            else weights[gk].to(torch.bfloat16)
+        )
+        up = (
+            _dequantize_fp8_block(weights[uk], weights[us])
+            if us in weights
+            else weights[uk].to(torch.bfloat16)
+        )
+        gate_up_list.append(torch.cat([gate, up], dim=0))
+
+        down = (
+            _dequantize_fp8_block(weights[dk], weights[ds])
+            if ds in weights
+            else weights[dk].to(torch.bfloat16)
+        )
+        down_list.append(down)
+
+        for k in [gk, gs, uk, us, dk, ds]:
+            weights.pop(k, None)
+
+    packed = {}
+    ep = f"{layer_prefix}mlp.experts."
+    packed[ep + "gate_up_proj"] = torch.stack(gate_up_list).to(device)
+    packed[ep + "down_proj"] = torch.stack(down_list).to(device)
+    del gate_up_list, down_list
+    return packed
+
+
+def _materialize_module(
+    module: torch.nn.Module,
+    weights: dict[str, torch.Tensor],
+    prefix: str,
+    device: str,
+) -> None:
+    """Replace meta-device parameters with real tensors from *weights*.
+
+    FP8 weights are dequantized to bf16 via their companion
+    ``_scale_inv`` tensors. Weights are loaded on CPU (in *weights*)
+    and moved to *device* during assignment to avoid doubling GPU memory.
+    """
+    fp8_keys = {
+        n
+        for n in weights
+        if n.endswith(".weight")
+        and weights[n].dtype == torch.float8_e4m3fn
+        and n + "_scale_inv" in weights
+    }
+
+    def _get(full_name: str) -> torch.Tensor | None:
+        if full_name in fp8_keys:
+            w = _dequantize_fp8_block(
+                weights[full_name], weights[full_name + "_scale_inv"],
+            )
+            weights.pop(full_name, None)
+            weights.pop(full_name + "_scale_inv", None)
+            return w
+        if full_name in weights:
+            w = weights[full_name]
+            return w.to(torch.bfloat16) if w.dtype == torch.float8_e4m3fn else w
+        return None
+
+    for name, _param in module.named_parameters():
+        full_name = f"{prefix}{name}"
+        new_data = _get(full_name)
+        if new_data is None:
+            continue
+        parts = name.split(".")
+        target: Any = module
+        for part in parts[:-1]:
+            target = target[int(part)] if part.isdigit() else getattr(target, part)
+        target._parameters[parts[-1]] = torch.nn.Parameter(
+            new_data.to(device), requires_grad=False,
+        )
+
+    for name, _buf in module.named_buffers():
+        full_name = f"{prefix}{name}"
+        if full_name in weights:
+            parts = name.split(".")
+            target2: Any = module
+            for part in parts[:-1]:
+                target2 = target2[int(part)] if part.isdigit() else getattr(target2, part)
+            target2._buffers[parts[-1]] = weights[full_name].to(device)
+
+
+def _free_module(module: torch.nn.Module) -> None:
+    """Replace all parameters and buffers with empty meta tensors."""
+    for name, _param in list(module.named_parameters()):
+        parts = name.split(".")
+        target: Any = module
+        for part in parts[:-1]:
+            target = target[int(part)] if part.isdigit() else getattr(target, part)
+        target._parameters[parts[-1]] = torch.nn.Parameter(
+            torch.empty(0, device="meta"), requires_grad=False,
+        )
+    for name, _buf in list(module.named_buffers()):
+        parts = name.split(".")
+        target2: Any = module
+        for part in parts[:-1]:
+            target2 = target2[int(part)] if part.isdigit() else getattr(target2, part)
+        target2._buffers[parts[-1]] = torch.empty(0, device="meta")
+
+
+class DiskOffloadBackend(ExtractionBackend):
+    """Backend for models that exceed CPU RAM (e.g. DeepSeek-V3 671B FP8).
+
+    Loads layer weights directly from safetensors files to GPU one layer
+    at a time. Supports FP8 block-quantized weights with automatic
+    dequantization and expert weight packing for MoE architectures.
+
+    The key method is :meth:`extract_all`, which processes an entire
+    dataset layer-by-layer so each layer is loaded from disk exactly
+    once, regardless of dataset size.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        device: str = "cuda:0",
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        super().__init__(model_name, device)
+        self.dtype = dtype
+        self._tokenizer_obj: Any | None = None
+        self._config: Any | None = None
+        self._model_skeleton: Any | None = None
+        self._snapshot_dir: Any | None = None
+        self._layer_to_tensors: dict | None = None
+        self._non_layer_tensors: list | None = None
+
+    # --- Lazy initialization ---
+
+    def _get_config(self) -> Any:
+        if self._config is None:
+            from transformers import AutoConfig
+            self._config = AutoConfig.from_pretrained(self.model_name)
+        return self._config
+
+    def _get_snapshot_dir(self) -> Any:
+        if self._snapshot_dir is None:
+            from pathlib import Path
+
+            from huggingface_hub import snapshot_download
+            self._snapshot_dir = Path(snapshot_download(
+                self.model_name,
+                allow_patterns=["*.safetensors", "*.json"],
+            ))
+        return self._snapshot_dir
+
+    def _get_shard_map(self) -> tuple[dict, list]:
+        if self._layer_to_tensors is None:
+            import json
+            from collections import defaultdict
+
+            snap = self._get_snapshot_dir()
+            index_path = snap / "model.safetensors.index.json"
+            with open(index_path) as f:
+                index = json.load(f)
+
+            layers: dict[int, list[tuple[str, str]]] = defaultdict(list)
+            non_layer: list[tuple[str, str]] = []
+
+            for tensor_name, shard_file in index["weight_map"].items():
+                parts = tensor_name.split(".")
+                if (
+                    len(parts) >= 3
+                    and parts[0] == "model"
+                    and parts[1] == "layers"
+                    and parts[2].isdigit()
+                ):
+                    layers[int(parts[2])].append((tensor_name, shard_file))
+                else:
+                    non_layer.append((tensor_name, shard_file))
+
+            self._layer_to_tensors = dict(layers)
+            self._non_layer_tensors = non_layer
+        assert self._non_layer_tensors is not None
+        return self._layer_to_tensors, self._non_layer_tensors
+
+    def _load_tensors(
+        self, tensor_list: list[tuple[str, str]], device: str,
+    ) -> dict[str, torch.Tensor]:
+        """Load tensors from safetensors shards to *device*."""
+        from collections import defaultdict
+
+        from safetensors.torch import load_file as st_load_file
+
+        shard_to_keys: dict[str, list[str]] = defaultdict(list)
+        for tensor_name, shard_file in tensor_list:
+            shard_to_keys[shard_file].append(tensor_name)
+
+        snap = self._get_snapshot_dir()
+        result: dict[str, torch.Tensor] = {}
+        for shard_file, keys in shard_to_keys.items():
+            shard_data = st_load_file(str(snap / shard_file), device=device)
+            for k in keys:
+                if k in shard_data:
+                    result[k] = shard_data[k]
+            del shard_data
+        return result
+
+    def _get_model_skeleton(self) -> Any:
+        """Create an empty model (meta device) for the forward graph."""
+        if self._model_skeleton is None:
+            from accelerate import init_empty_weights
+            from transformers import AutoModelForCausalLM
+
+            config = self._get_config()
+            # Disable quantizer so we get standard nn.Linear modules
+            config.quantization_config = None
+            with init_empty_weights():
+                self._model_skeleton = AutoModelForCausalLM.from_config(config)
+            self._model_skeleton.eval()
+        return self._model_skeleton
+
+    # --- Properties ---
+
+    @property
+    def tokenizer(self) -> PreTrainedTokenizerBase:
+        if self._tokenizer_obj is None:
+            from transformers import AutoTokenizer
+            self._tokenizer_obj = AutoTokenizer.from_pretrained(self.model_name)
+            if self._tokenizer_obj.pad_token is None:
+                self._tokenizer_obj.pad_token = self._tokenizer_obj.eos_token
+        return self._tokenizer_obj
+
+    @property
+    def model(self) -> Any:
+        raise RuntimeError(
+            "DiskOffloadBackend does not keep the full model in memory. "
+            "Use extract_all() for efficient feature extraction."
+        )
+
+    # --- Core: full-dataset layer-by-layer extraction ---
+
+    def extract_all(
+        self,
+        prompts: list[str],
+        spec: ExtractionSpec,
+        batch_size: int = 16,
+        pool: str | None = None,
+    ) -> ExtractedBatch:
+        """Extract features from *all* prompts, loading each layer once.
+
+        This is the efficient entry point for large models. All prompts
+        are tokenized upfront, then the entire dataset is streamed
+        through each layer before moving to the next. Each layer's
+        weights are loaded from safetensors exactly once.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            All prompts to process.
+        spec : ExtractionSpec
+            What to extract (hidden layers, router logits, logits).
+        batch_size : int
+            GPU batch size for forward passes through each layer.
+        pool : str or None
+            Pooling strategy for captured features. ``None`` keeps full
+            ``(N, seq_len, dim)`` tensors (high memory). ``"mean"``
+            mean-pools over valid tokens per statement, storing only
+            ``(N, dim)`` per layer — essential for large combined runs.
+
+        Returns
+        -------
+        ExtractedBatch
+            Extracted features for all prompts.
+        """
+        import gc
+        import math
+
+        from .activation_types import ExtractedBatch
+
+        config = self._get_config()
+        model = self._get_model_skeleton()
+        layer_map, non_layer = self._get_shard_map()
+        device = self.device
+
+        num_layers = config.num_hidden_layers
+        hidden_target = set(spec.hidden_layers)
+        router_target = set(spec.router_layers or [])
+        n_experts = getattr(config, "n_routed_experts", None)
+        first_moe = getattr(config, "first_k_dense_replace", 0)
+
+        # --- Tokenize all prompts ---
+        tokenized = self.tokenizer(
+            prompts, return_tensors="pt", padding=True, truncation=True,
+        )
+        all_input_ids = tokenized["input_ids"]
+        all_attention_mask = tokenized["attention_mask"]
+        n_prompts = all_input_ids.shape[0]
+        seq_len = all_input_ids.shape[1]
+        n_batches = math.ceil(n_prompts / batch_size)
+
+        # --- Phase 1: Embedding ---
+        embed_tensors = [(n, f) for n, f in non_layer if "embed_tokens" in n]
+        embed_weights = self._load_tensors(embed_tensors, device)
+        embed = _get_embedding_module(model)
+        _materialize_module(embed, embed_weights, "model.embed_tokens.", device)
+        del embed_weights
+
+        # Process all batches through embedding
+        all_hidden = torch.zeros(
+            n_prompts, seq_len, config.hidden_size, dtype=self.dtype,
+        )
+        with torch.no_grad():
+            for b in range(n_batches):
+                s, e = b * batch_size, min((b + 1) * batch_size, n_prompts)
+                all_hidden[s:e] = embed(all_input_ids[s:e].to(device)).cpu()
+
+        _free_module(embed)
+        torch.cuda.empty_cache()
+
+        # --- Position setup ---
+        position_ids = all_attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(all_attention_mask == 0, 1)
+        cache_position = torch.arange(seq_len)
+
+        min_val = torch.finfo(self.dtype).min
+        causal_mask = torch.full(
+            (1, 1, seq_len, seq_len), min_val, dtype=self.dtype,
+        )
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+
+        # --- Rotary embeddings ---
+        rotary_name = ChunkedLocalBackend._find_rotary_embedding_name(model)
+        position_embeddings: tuple[torch.Tensor, ...] | torch.Tensor | None = None
+        if rotary_name is not None:
+            rotary_mod = model
+            for part in rotary_name.split("."):
+                rotary_mod = getattr(rotary_mod, part)
+
+            # Re-initialize rotary from config (meta tensors have no data)
+            dim = getattr(config, "qk_rope_head_dim", None)
+            if dim is None:
+                head_dim = config.hidden_size // config.num_attention_heads
+                dim = head_dim
+            base = getattr(config, "rope_theta", 10000.0)
+            inv_freq = 1.0 / (
+                base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+            )
+            rotary_mod.to_empty(device=device)
+            rotary_mod.inv_freq = inv_freq
+
+            with torch.no_grad():
+                pe = rotary_mod(
+                    all_hidden[:1].to(device), position_ids[:1].to(device),
+                )
+                if isinstance(pe, tuple):
+                    position_embeddings = tuple(t.cpu() for t in pe)
+                else:
+                    position_embeddings = pe.cpu()
+
+            _free_module(rotary_mod)
+            torch.cuda.empty_cache()
+
+        # --- Phase 2: Layer-by-layer ---
+        captured_hidden: dict[int, torch.Tensor] = {}
+        captured_router: dict[int, torch.Tensor] = {}
+        decoder_layers = _get_decoder_layers(model)
+
+        for layer_idx in range(num_layers):
+            # Load layer weights: CPU first, then materialize on GPU
+            layer_weights = self._load_tensors(
+                layer_map[layer_idx], "cpu",
+            )
+            prefix = f"model.layers.{layer_idx}."
+
+            # Pack expert weights for MoE layers
+            if n_experts and layer_idx >= first_moe:
+                packed = _pack_expert_weights(
+                    layer_weights, prefix, n_experts, device,
+                )
+                layer_weights.update(packed)
+                del packed
+
+            layer_module = decoder_layers[layer_idx]
+            _materialize_module(layer_module, layer_weights, prefix, device)
+            del layer_weights
+
+            # Prepare per-batch args on GPU
+            mask_dev = causal_mask.to(device)
+            pos_cache_dev = cache_position.to(device)
+            if position_embeddings is not None:
+                if isinstance(position_embeddings, tuple):
+                    pe_dev: Any = tuple(t.to(device) for t in position_embeddings)
+                else:
+                    pe_dev = position_embeddings.to(device)
+            else:
+                pe_dev = None
+
+            layer_hidden_out = []
+            layer_router_out = []
+
+            with torch.no_grad():
+                for b in range(n_batches):
+                    s = b * batch_size
+                    e = min(s + batch_size, n_prompts)
+                    hs = all_hidden[s:e].to(device)
+                    pos_dev = position_ids[s:e].to(device)
+
+                    # Expand causal mask for batch
+                    batch_mask = mask_dev.expand(e - s, -1, -1, -1)
+                    # Apply padding mask
+                    pad_mask = all_attention_mask[s:e, None, None, :].to(self.dtype).to(device)
+                    batch_mask = batch_mask.clone()
+                    batch_mask.masked_fill_(pad_mask == 0, min_val)
+
+                    # Router hook
+                    rh = None
+                    router_buf: list[torch.Tensor] = []
+                    if layer_idx in router_target and spec.router_module_template:
+                        router_path = spec.router_module_template.format(layer=layer_idx)
+                        if router_path.startswith("model."):
+                            router_path = router_path[len("model."):]
+                        rmod = model
+                        for part in router_path.split("."):
+                            rmod = rmod[int(part)] if part.isdigit() else getattr(rmod, part)
+
+                        if spec.router_hook_strategy == "input_gate":
+                            def _ig_hook(
+                                mod: Any, args: Any, out: Any,
+                                _buf: list = router_buf,
+                            ) -> None:
+                                hs_in = args[0] if isinstance(args, tuple) else args
+                                gw = mod.gate.weight
+                                _buf.append(
+                                    torch.nn.functional.linear(
+                                        hs_in.to(gw.dtype), gw,
+                                    ).detach().cpu()
+                                )
+                            rh = rmod.register_forward_hook(_ig_hook)
+                        else:
+                            def _out_hook(
+                                _mod: Any, _inp: Any, out: Any,
+                                _buf: list = router_buf,
+                            ) -> None:
+                                t = out[0] if isinstance(out, tuple) else out
+                                _buf.append(t.detach().cpu())
+                            rh = rmod.register_forward_hook(_out_hook)
+
+                    # Layer forward
+                    layer_kwargs: dict[str, Any] = {
+                        "attention_mask": batch_mask,
+                        "position_ids": pos_dev,
+                        "use_cache": False,
+                        "cache_position": pos_cache_dev,
+                    }
+                    if pe_dev is not None:
+                        layer_kwargs["position_embeddings"] = pe_dev
+
+                    output = layer_module(hs, **layer_kwargs)
+                    hs_out = output[0] if isinstance(output, tuple) else output
+
+                    # Store hidden states back to CPU buffer
+                    all_hidden[s:e] = hs_out.to(self.dtype).cpu()
+
+                    # Capture probe features (last token only is done by caller)
+                    if layer_idx in hidden_target:
+                        layer_hidden_out.append(hs_out.detach().cpu())
+
+                    if rh is not None:
+                        rh.remove()
+                        if router_buf:
+                            layer_router_out.append(router_buf[0])
+
+            # Collect captured features for this layer
+            if layer_hidden_out:
+                full = torch.cat(layer_hidden_out, dim=0)  # (N, seq, dim)
+                if pool == "mean":
+                    # Mean-pool over valid tokens: (N, seq, dim) -> (N, dim)
+                    pooled = torch.zeros(
+                        full.shape[0], full.shape[2], dtype=torch.float32,
+                    )
+                    for i in range(full.shape[0]):
+                        valid = all_attention_mask[i].bool()
+                        if valid.sum().item() > 0:
+                            pooled[i] = full[i, valid].float().mean(dim=0)
+                    captured_hidden[layer_idx] = pooled
+                else:
+                    captured_hidden[layer_idx] = full
+                del full
+            if layer_router_out:
+                full_r = torch.cat(layer_router_out, dim=0)  # (N, seq, n_experts)
+                if pool == "mean":
+                    pooled_r = torch.zeros(
+                        full_r.shape[0], full_r.shape[2], dtype=torch.float32,
+                    )
+                    for i in range(full_r.shape[0]):
+                        valid = all_attention_mask[i].bool()
+                        if valid.sum().item() > 0:
+                            pooled_r[i] = full_r[i, valid].float().mean(dim=0)
+                    captured_router[layer_idx] = pooled_r
+                else:
+                    captured_router[layer_idx] = full_r
+                del full_r
+
+            # Free layer
+            _free_module(layer_module)
+            del mask_dev, pos_cache_dev, pe_dev
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # --- Phase 3: Logits (optional) ---
+        logits_out: torch.Tensor | None = None
+        if spec.include_logits:
+            norm_tensors = [
+                (n, f) for n, f in non_layer
+                if "norm" in n and "layer" not in n
+            ]
+            head_tensors = [(n, f) for n, f in non_layer if "lm_head" in n]
+
+            norm_w = self._load_tensors(norm_tensors, device)
+            final_norm = _get_final_norm(model)
+            _materialize_module(final_norm, norm_w, "model.norm.", device)
+            del norm_w
+
+            head_w = self._load_tensors(head_tensors, device)
+            lm_head = _get_lm_head(model)
+            _materialize_module(lm_head, head_w, "lm_head.", device)
+            del head_w
+
+            logit_batches = []
+            with torch.no_grad():
+                for b in range(n_batches):
+                    s = b * batch_size
+                    e = min(s + batch_size, n_prompts)
+                    hs_dev = all_hidden[s:e].to(device)
+                    logit_batches.append(
+                        lm_head(final_norm(hs_dev)).cpu()
+                    )
+            logits_out = torch.cat(logit_batches, dim=0)
+
+            _free_module(final_norm)
+            _free_module(lm_head)
+            torch.cuda.empty_cache()
+
+        # --- Assemble result ---
+        activations: torch.Tensor | None = None
+        if captured_hidden:
+            sorted_layers = sorted(captured_hidden.keys())
+            # When pooled, each tensor is (N, dim); otherwise (N, seq, dim)
+            activations = torch.cat(
+                [captured_hidden[li] for li in sorted_layers], dim=-1,
+            )
+
+        return ExtractedBatch(
+            activations=activations,
+            attention_mask=all_attention_mask,
+            logits=logits_out,
+            logits_indices=None,
+            router_logits=captured_router if captured_router else None,
+            hidden_per_layer=captured_hidden if captured_hidden else None,
+        )
+
+    # --- Standard ExtractionBackend interface ---
+
+    def extract_batch(
+        self,
+        prompts: list[str],
+        layer_indices: list[int],
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from .activation_types import ExtractionSpec
+        spec = ExtractionSpec(hidden_layers=layer_indices)
+        result = self.extract_all(prompts, spec, batch_size=len(prompts))
+        assert result.activations is not None
+        return result.activations, result.attention_mask
+
+    def extract_batch_with_logits(
+        self,
+        prompts: list[str],
+        layer_indices: list[int],
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        from .activation_types import ExtractionSpec
+        spec = ExtractionSpec(hidden_layers=layer_indices, include_logits=True)
+        result = self.extract_all(prompts, spec, batch_size=len(prompts))
+        assert result.logits is not None
+        return result.activations, result.attention_mask, result.logits, None
+
+    def extract_batch_extended(
+        self,
+        prompts: list[str],
+        spec: ExtractionSpec,
+        **kwargs: Any,
+    ) -> ExtractedBatch:
+        return self.extract_all(prompts, spec, batch_size=len(prompts))
+
+
 def resolve_backend(
     backend: str,
     model_name: str,
@@ -1271,7 +1936,8 @@ def resolve_backend(
     Parameters
     ----------
     backend : str
-        Backend identifier: ``"nnsight"``, ``"local"``, or ``"chunked"``.
+        Backend identifier: ``"nnsight"``, ``"local"``, ``"chunked"``,
+        or ``"disk_offload"``.
     model_name : str
         HuggingFace model ID or local path.
     device : str
@@ -1323,8 +1989,15 @@ def resolve_backend(
         chunked_dtype = dtype if dtype is not None else torch.bfloat16
         cs = chunk_size if chunk_size is not None else "auto"
         return ChunkedLocalBackend(model_name, device, dtype=chunked_dtype, chunk_size=cs)
+    elif backend == "disk_offload":
+        if remote:
+            raise ValueError(
+                "backend='disk_offload' does not support remote=True."
+            )
+        offload_dtype = dtype if dtype is not None else torch.bfloat16
+        return DiskOffloadBackend(model_name, device, dtype=offload_dtype)
     else:
         raise ValueError(
             f"Unknown backend: {backend!r}. "
-            f"Available backends: 'nnsight', 'local', 'chunked'."
+            f"Available backends: 'nnsight', 'local', 'chunked', 'disk_offload'."
         )
