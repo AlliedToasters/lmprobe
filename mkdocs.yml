@@ -54,6 +54,7 @@ nav:
     - HuggingFace Datasets: guides/datasets.md
     - 'Tutorial: Geometry of Truth': guides/got-tutorial.md
     - Baselines: guides/baselines.md
+    - Large Model Inference: guides/large-models.md
     - Remote Execution: guides/remote.md
     - Caching: guides/caching.md
   - API Reference:

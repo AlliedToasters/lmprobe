@@ -91,6 +91,8 @@ The `backend` parameter controls the extraction engine:
 | Value | Description |
 |-------|-------------|
 | `"local"` | HuggingFace Transformers (default) |
+| `"chunked"` | CPU-resident model, layers chunked through GPU |
+| `"disk_offload"` | Weights loaded from disk per layer (for 100B+ models) |
 | `"nnsight"` | nnsight / NDIF remote execution |
 
-`remote=True` requires `backend="nnsight"`. Setting `remote=True` with `backend="local"` will raise an error.
+`remote=True` requires `backend="nnsight"`. Setting `remote=True` with other backends will raise an error. See [Large Model Inference](large-models.md) for details on `"chunked"` and `"disk_offload"`.
