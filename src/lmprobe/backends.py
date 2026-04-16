@@ -1097,19 +1097,40 @@ class ChunkedLocalBackend(ExtractionBackend):
         # Compute rotary position embeddings
         # Some architectures (Llama, Mistral) return (cos, sin) tuples;
         # DeepSeek-V2 returns a single complex freqs_cis tensor.
-        position_embeddings: tuple[torch.Tensor, ...] | torch.Tensor | None = None
+        # Gemma3 computes per-layer-type embeddings via a layer_type arg.
+        position_embeddings: tuple[torch.Tensor, ...] | torch.Tensor | dict | None = None
+        layer_types: list[str] | None = None
         rotary_name = self._find_rotary_embedding_name(model)
         if rotary_name is not None:
             rotary_mod = model
             for part in rotary_name.split("."):
                 rotary_mod = getattr(rotary_mod, part)
             rotary_mod.to(device)
-            with torch.no_grad():
-                pe = rotary_mod(hidden_states.to(device), position_ids.to(device))
-                if isinstance(pe, tuple):
-                    position_embeddings = tuple(t.cpu() for t in pe)
-                else:
-                    position_embeddings = pe.cpu()
+
+            # Detect Gemma3-style per-layer-type rotary embeddings
+            text_cfg = getattr(
+                getattr(model, "config", None), "text_config",
+                getattr(model, "config", None),
+            )
+            layer_types_cfg = getattr(text_cfg, "layer_types", None)
+            if layer_types_cfg is not None:
+                layer_types = list(layer_types_cfg)
+                position_embeddings = {}
+                with torch.no_grad():
+                    for lt in set(layer_types):
+                        pe = rotary_mod(
+                            hidden_states.to(device),
+                            position_ids.to(device),
+                            layer_type=lt,
+                        )
+                        position_embeddings[lt] = tuple(t.cpu() for t in pe)
+            else:
+                with torch.no_grad():
+                    pe = rotary_mod(hidden_states.to(device), position_ids.to(device))
+                    if isinstance(pe, tuple):
+                        position_embeddings = tuple(t.cpu() for t in pe)
+                    else:
+                        position_embeddings = pe.cpu()
             rotary_mod.to("cpu")
 
         # --- Phase 2: Layer chunks ---
@@ -1127,12 +1148,20 @@ class ChunkedLocalBackend(ExtractionBackend):
             hs = hidden_states.to(device)
             mask_dev = causal_mask.to(device)
             pos_dev = position_ids.to(device)
-            pe_dev: tuple[torch.Tensor, ...] | torch.Tensor | None = None
+
+            # Pre-compute position embeddings on device
+            pe_dev_map: dict | tuple | torch.Tensor | None = None
             if position_embeddings is not None:
-                if isinstance(position_embeddings, tuple):
-                    pe_dev = tuple(t.to(device) for t in position_embeddings)
+                if isinstance(position_embeddings, dict):
+                    # Gemma3-style: dict of {layer_type: (cos, sin)}
+                    pe_dev_map = {
+                        lt: tuple(t.to(device) for t in pe)
+                        for lt, pe in position_embeddings.items()
+                    }
+                elif isinstance(position_embeddings, tuple):
+                    pe_dev_map = tuple(t.to(device) for t in position_embeddings)
                 else:
-                    pe_dev = position_embeddings.to(device)
+                    pe_dev_map = position_embeddings.to(device)
 
             with torch.no_grad():
                 for layer_idx in range(chunk_start, chunk_end):
@@ -1190,8 +1219,13 @@ class ChunkedLocalBackend(ExtractionBackend):
                         "use_cache": False,
                         "cache_position": cache_position.to(device),
                     }
-                    if pe_dev is not None:
-                        layer_kwargs["position_embeddings"] = pe_dev
+                    if pe_dev_map is not None:
+                        if isinstance(pe_dev_map, dict) and layer_types is not None:
+                            # Gemma3-style: select by layer type
+                            lt = layer_types[layer_idx]
+                            layer_kwargs["position_embeddings"] = pe_dev_map[lt]
+                        else:
+                            layer_kwargs["position_embeddings"] = pe_dev_map
 
                     output = layer_module(hs, **layer_kwargs)
                     hs = output[0] if isinstance(output, tuple) else output
@@ -1205,7 +1239,7 @@ class ChunkedLocalBackend(ExtractionBackend):
                             captured_router[layer_idx] = router_hook_output[0]
 
             hidden_states = hs.cpu()
-            del hs, mask_dev, pos_dev, pe_dev
+            del hs, mask_dev, pos_dev, pe_dev_map
 
             # Move chunk back to CPU
             for i in range(chunk_start, chunk_end):
