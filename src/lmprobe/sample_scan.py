@@ -80,6 +80,7 @@ class SampleScan:
         dtype: Any = None,
         batch_size: int = 4,
         chunk_size: int | str = "auto",
+        generative_masks: list[np.ndarray] | None = None,
     ) -> SampleScan:
         """Fit a scan on a corpus and write results to disk.
 
@@ -106,6 +107,10 @@ class SampleScan:
             Number of prompts per forward-pass batch.
         chunk_size : int or str
             Layers per GPU chunk ("auto" or explicit int).
+        generative_masks : list of np.ndarray or None
+            Per-sample boolean masks, shape [seq_len_i]. True = generative
+            (assistant) token. PCA is fit only on generative tokens to
+            avoid prompt leakage. All tokens are still projected.
 
         Returns
         -------
@@ -149,6 +154,7 @@ class SampleScan:
             signals=signals,
             n_components=n_components,
             batch_size=batch_size,
+            generative_masks=generative_masks,
         )
 
         actual_signals = metadata_dict["signals"]
@@ -314,11 +320,12 @@ class SampleScan:
         self,
         labels: np.ndarray | list[int] | None = None,
         signal: str | None = None,
+        token_positions: np.ndarray | list[int] | None = None,
     ) -> np.ndarray:
         """Compute per-(layer, signal) separability scores.
 
-        Uses last-token projections for each sample and computes
-        max-over-PCs AUROC for binary separation.
+        Uses one token position per sample and computes max-over-PCs
+        AUROC for binary separation.
 
         Parameters
         ----------
@@ -326,6 +333,12 @@ class SampleScan:
             Binary labels per sample. If None, uses stored labels.
         signal : str or None
             If given, only compute for this signal.
+        token_positions : array-like or None
+            Per-sample token position to use for the separability
+            computation. Shape [n_samples]. If None, uses the last
+            token of each sample (seq_length - 1). Use this to
+            restrict analysis to specific regions (e.g. last token
+            of the assistant turn) and avoid prompt leakage.
 
         Returns
         -------
@@ -350,6 +363,11 @@ class SampleScan:
 
         seq_lengths = self._samples_table.column("seq_length").to_numpy()
 
+        if token_positions is not None:
+            tok_pos_per_sample = np.asarray(token_positions, dtype=np.int64)
+        else:
+            tok_pos_per_sample = seq_lengths - 1
+
         coords = self._coords_table
         sample_ids_col = coords.column("sample_id").to_numpy()
         layers_col = coords.column("layer").to_numpy()
@@ -363,11 +381,11 @@ class SampleScan:
                 sample_vecs = np.zeros((n_samples, k), dtype=np.float32)
 
                 for sid in range(n_samples):
-                    last_tok = seq_lengths[sid] - 1
+                    target_tok = int(tok_pos_per_sample[sid])
                     mask = (
                         (sample_ids_col == sid)
                         & (layers_col == layer_idx)
-                        & (token_pos_col == last_tok)
+                        & (token_pos_col == target_tok)
                         & (signal_col == sig_idx)
                     )
                     rows = self._projections[mask]
@@ -467,6 +485,7 @@ class SampleScan:
         show_stats: bool = True,
         figsize: tuple[float, float] | None = None,
         title: str = "",
+        generative_mask: np.ndarray | None = None,
     ) -> matplotlib.figure.Figure:
         """Render the hero figure for a prompt under this scan's lens.
 
@@ -484,6 +503,9 @@ class SampleScan:
             Figure size (width, height) in inches.
         title : str
             Optional figure title.
+        generative_mask : np.ndarray or None
+            Boolean mask shape [seq_len]. True = assistant/generative
+            token, False = prompt token. Prompt tokens are grayed out.
 
         Returns
         -------
@@ -509,4 +531,5 @@ class SampleScan:
             layer_stats=layer_stats if show_stats else None,
             figsize=figsize,
             title=title,
+            generative_mask=generative_mask,
         )

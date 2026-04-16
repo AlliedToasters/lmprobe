@@ -14,7 +14,6 @@ import pytest
 
 from tests.conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_MODEL
 
-
 # ---------------------------------------------------------------------------
 # Storage tests (no model needed)
 # ---------------------------------------------------------------------------

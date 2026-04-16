@@ -37,6 +37,7 @@ def render_scan_figure(
     *,
     figsize: tuple[float, float] | None = None,
     title: str = "",
+    generative_mask: np.ndarray | None = None,
 ) -> matplotlib.figure.Figure:
     """Render the hero scan figure.
 
@@ -56,6 +57,9 @@ def render_scan_figure(
         (width, height) in inches.
     title : str
         Optional figure title.
+    generative_mask : np.ndarray or None
+        Boolean mask shape [seq_len]. True = generative (assistant) token,
+        False = prompt token. Prompt tokens are grayed out in the figure.
 
     Returns
     -------
@@ -72,6 +76,13 @@ def render_scan_figure(
     for sig_idx in range(n_signals):
         rgb = _normalize_rgb(projections[:, :, sig_idx, :3])  # [seq_len, n_layers, 3]
         rgb = rgb.transpose(1, 0, 2)  # [n_layers, seq_len, 3]
+        # Gray out non-generative (prompt) tokens
+        if generative_mask is not None:
+            prompt_cols = ~generative_mask  # [seq_len]
+            gray = rgb[..., :1].mean(axis=-1, keepdims=True)  # luminance
+            gray = np.broadcast_to(gray, rgb.shape).copy()
+            # Desaturate + dim prompt tokens
+            rgb[:, prompt_cols, :] = gray[:, prompt_cols, :] * 0.4 + 0.3
         signal_rgbs.append(rgb)
 
     show_surprise = log_probs is not None
@@ -177,7 +188,10 @@ def render_scan_figure(
         # Layer stats on the right
         if show_stats_col and layer_stats is not None:
             ax_stats = fig.add_subplot(gs[row, 1])
-            stats = layer_stats[:, grid_idx] if grid_idx < layer_stats.shape[1] else np.zeros(n_layers)
+            if grid_idx < layer_stats.shape[1]:
+                stats = layer_stats[:, grid_idx]
+            else:
+                stats = np.zeros(n_layers)
             ax_stats.barh(
                 range(n_layers), stats,
                 color="steelblue", alpha=0.7, height=0.8,
