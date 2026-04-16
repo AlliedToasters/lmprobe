@@ -49,6 +49,9 @@ remote = [
 s3 = [
     "boto3>=1.26",
 ]
+scan = [
+    "pyarrow>=14.0",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
@@ -57,6 +60,7 @@ dev = [
     "black>=23.0",
     "moto[s3]>=5.0",
     "mypy>=1.10",
+    "pyarrow>=14.0",
 ]
 auto = [
     "skglm>=0.3",

@@ -87,6 +87,7 @@ __all__ = [
     "set_cache_dtype",
     "set_cache_limit",
     "set_max_threads",
+    "SampleScan",
     "set_profiling",
     "is_profiling",
     "cuml_available",
@@ -116,6 +117,10 @@ def set_max_threads(n: int) -> None:
 
 def __getattr__(name: str) -> Any:
     """Lazy import for optional modules."""
+    if name == "SampleScan":
+        from .sample_scan import SampleScan
+
+        return SampleScan
     if name == "cuml_available":
         from .classifiers import cuml_available
 
