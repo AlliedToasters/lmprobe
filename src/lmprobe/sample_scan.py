@@ -435,31 +435,27 @@ class SampleScan:
             - projections_values: np.ndarray [N_total, 1, k]
             - token_ids_per_sample: list of token ID lists
             - seq_lengths: list of int
-        Also writes projections to a temporary scan dir, but the
-        returned coords can be used to reconstruct per-sample arrays.
+        The returned coords can be used to reconstruct per-sample arrays.
         """
-        import tempfile
-
         backend = self._get_backend()
         proj_signals = [signal] if signal else self.signals
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            (
-                _metadata,
-                _bases,
-                projections,
-                coords,
-                token_ids_per_sample,
-                seq_lengths,
-                _attention_mask,
-                _signal_dims,
-            ) = backend.scan_forward(
-                prompts,
-                signals=proj_signals,
-                n_components=self._metadata.n_components,
-                batch_size=batch_size,
-                external_bases=self._bases,
-            )
+        (
+            _metadata,
+            _bases,
+            projections,
+            coords,
+            token_ids_per_sample,
+            seq_lengths,
+            _attention_mask,
+            _signal_dims,
+        ) = backend.scan_forward(
+            prompts,
+            signals=proj_signals,
+            n_components=self._metadata.n_components,
+            batch_size=batch_size,
+            external_bases=self._bases,
+        )
 
         return projections, coords, token_ids_per_sample, seq_lengths
 
