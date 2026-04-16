@@ -99,10 +99,10 @@ def render_scan_figure(
             gray = rgb[..., :1].mean(axis=-1, keepdims=True)
             gray = np.broadcast_to(gray, rgb.shape).copy()
             rgb[:, prompt_cols, :] = gray[:, prompt_cols, :] * 0.4 + 0.3
-        # Prepend surprise row
+        # Append surprise row at bottom (after final layer)
         if show_surprise and log_probs is not None:
             surprise_rgb = _logprob_to_rgb(log_probs)[np.newaxis, :, :]  # [1, seq_len, 3]
-            rgb = np.concatenate([surprise_rgb, rgb], axis=0)  # [n_layers+1, seq_len, 3]
+            rgb = np.concatenate([rgb, surprise_rgb], axis=0)  # [n_layers+1, seq_len, 3]
         signal_rgbs.append(rgb)
 
     total_rows = n_layers + (1 if show_surprise else 0)
@@ -132,10 +132,10 @@ def render_scan_figure(
         wspace=0.05,
     )
 
-    # Y-tick labels: "surprise" row + layer numbers
+    # Y-tick labels: layer numbers + "S" at bottom
     if show_surprise:
         ytick_positions = list(range(total_rows))
-        ytick_labels = ["S"] + [str(i) if i % 4 == 0 else "" for i in range(n_layers)]
+        ytick_labels = [str(i) if i % 4 == 0 else "" for i in range(n_layers)] + ["S"]
     else:
         ytick_positions = list(range(0, n_layers, max(1, n_layers // 16)))
         ytick_labels = [str(i) for i in ytick_positions]
@@ -151,19 +151,9 @@ def render_scan_figure(
         ax.set_yticks(ytick_positions)
         ax.set_yticklabels(ytick_labels, fontsize=6)
 
-        # Token text on x-axis (top for first grid, bottom for last)
+        # Token text on x-axis (always bottom)
         ax.set_xticks(range(seq_len))
-        if grid_idx == 0:
-            ax.set_xticklabels(
-                tokens,
-                rotation=60,
-                ha="right",
-                fontsize=token_fontsize,
-                fontfamily="monospace",
-            )
-            ax.xaxis.set_ticks_position("top")
-            ax.xaxis.set_label_position("top")
-        elif grid_idx == len(signal_rgbs) - 1:
+        if grid_idx == len(signal_rgbs) - 1 or n_grids == 1:
             ax.set_xticklabels(
                 tokens,
                 rotation=60,
@@ -181,10 +171,9 @@ def render_scan_figure(
                 stats = layer_stats[:, grid_idx]
             else:
                 stats = np.zeros(n_layers)
-            # Offset by 1 if surprise row is present
-            y_offset = 1 if show_surprise else 0
+            # No offset needed — surprise is at the bottom now
             ax_stats.barh(
-                np.arange(n_layers) + y_offset, stats,
+                np.arange(n_layers), stats,
                 color="steelblue", alpha=0.7, height=0.8,
             )
             ax_stats.set_ylim(-0.5, total_rows - 0.5)
