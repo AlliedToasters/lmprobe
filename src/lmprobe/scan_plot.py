@@ -38,7 +38,8 @@ def _logprob_to_rgb(log_probs: np.ndarray) -> np.ndarray:
     normed = np.clip(log_probs, -10, 0) / -10  # 0 = high prob, 1 = low prob
     normed = 1 - normed  # flip so green = high prob
     rgba = cmap(normed)
-    return rgba[:, :3].astype(np.float32)  # drop alpha
+    result: np.ndarray = rgba[:, :3].astype(np.float32)  # drop alpha
+    return result
 
 
 def render_scan_figure(
