@@ -418,11 +418,18 @@ class TestGetProjections:
         assert proj.shape[2] == 1
 
 
+_has_matplotlib = True
+try:
+    import matplotlib  # noqa: F401
+except ImportError:
+    _has_matplotlib = False
+
 # ---------------------------------------------------------------------------
 # Plot tests
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not _has_matplotlib, reason="matplotlib not installed")
 class TestPlot:
     """Verify the hero figure renders without error."""
 
