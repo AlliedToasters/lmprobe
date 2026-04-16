@@ -284,6 +284,14 @@ def _get_decoder_layers(model: Any) -> list[Any]:
     # (Llama, Mistral, Phi, Qwen, BitNet, Gemma)
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return list(model.model.layers)
+    # Multimodal models (e.g. Mistral3ForConditionalGeneration) nest the
+    # text decoder inside model.language_model
+    if (
+        hasattr(model, "model")
+        and hasattr(model.model, "language_model")
+        and hasattr(model.model.language_model, "layers")
+    ):
+        return list(model.model.language_model.layers)
     # GPT-2, GPT-J
     if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
         return list(model.transformer.h)
@@ -740,6 +748,13 @@ def _get_embedding_module(model: Any) -> Any:
     # Llama, Mistral, Phi, Qwen, Gemma
     if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
         return model.model.embed_tokens
+    # Multimodal models (e.g. Mistral3ForConditionalGeneration)
+    if (
+        hasattr(model, "model")
+        and hasattr(model.model, "language_model")
+        and hasattr(model.model.language_model, "embed_tokens")
+    ):
+        return model.model.language_model.embed_tokens
     # GPT-2, GPT-J
     if hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
         return model.transformer.wte
@@ -776,6 +791,13 @@ def _get_final_norm(model: Any) -> Any:
     # Llama, Mistral, Phi, Qwen, Gemma
     if hasattr(model, "model") and hasattr(model.model, "norm"):
         return model.model.norm
+    # Multimodal models (e.g. Mistral3ForConditionalGeneration)
+    if (
+        hasattr(model, "model")
+        and hasattr(model.model, "language_model")
+        and hasattr(model.model.language_model, "norm")
+    ):
+        return model.model.language_model.norm
     # GPT-2
     if hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
         return model.transformer.ln_f
@@ -893,8 +915,10 @@ def _estimate_chunk_size(
     from transformers import AutoConfig
 
     config = AutoConfig.from_pretrained(model_name)
-    hidden_size = config.hidden_size
-    intermediate_size = getattr(config, "intermediate_size", hidden_size * 4)
+    # Multimodal models nest text params under text_config
+    text_cfg = getattr(config, "text_config", config)
+    hidden_size = text_cfg.hidden_size
+    intermediate_size = getattr(text_cfg, "intermediate_size", hidden_size * 4)
 
     bytes_per_param = 2 if dtype in (torch.float16, torch.bfloat16) else 4
     # Approximate params per layer: 4 attention matrices + 3 FFN matrices
@@ -988,13 +1012,27 @@ class ChunkedLocalBackend(ExtractionBackend):
         hold the full weights while GPU VRAM is not.
         """
         if not hasattr(self, "_full_model"):
-            from transformers import AutoModelForCausalLM
+            from transformers import AutoConfig, AutoModelForCausalLM
 
-            self._full_model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                torch_dtype=self.dtype,
-                attn_implementation="eager",
-            )
+            config = AutoConfig.from_pretrained(self.model_name)
+
+            # Multimodal / conditional-generation models (e.g. Mistral3)
+            # are not registered under AutoModelForCausalLM. Detect them
+            # via the presence of text_config and load with the right class.
+            if hasattr(config, "text_config"):
+                from transformers import AutoModelForImageTextToText
+
+                self._full_model = AutoModelForImageTextToText.from_pretrained(
+                    self.model_name,
+                    torch_dtype=self.dtype,
+                    attn_implementation="eager",
+                )
+            else:
+                self._full_model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    torch_dtype=self.dtype,
+                    attn_implementation="eager",
+                )
             self._full_model.eval()
         return self._full_model
 
@@ -1208,6 +1246,13 @@ class ChunkedLocalBackend(ExtractionBackend):
         # Llama, Mistral, Qwen, Gemma
         if hasattr(model, "model") and hasattr(model.model, "rotary_emb"):
             return "model.rotary_emb"
+        # Multimodal models (e.g. Mistral3ForConditionalGeneration)
+        if (
+            hasattr(model, "model")
+            and hasattr(model.model, "language_model")
+            and hasattr(model.model.language_model, "rotary_emb")
+        ):
+            return "model.language_model.rotary_emb"
         return None
 
     # --- ExtractionBackend interface ---

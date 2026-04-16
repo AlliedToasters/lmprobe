@@ -130,9 +130,18 @@ def get_num_layers_from_config(model_name: str) -> int:
 
     # Different model architectures use different config field names
     # Try common ones in order of prevalence
-    for attr in ("num_hidden_layers", "n_layer", "num_layers", "n_layers"):
+    layer_attrs = ("num_hidden_layers", "n_layer", "num_layers", "n_layers")
+    for attr in layer_attrs:
         if hasattr(config, attr):
             return int(getattr(config, attr))
+
+    # Multimodal models (e.g. Mistral-Small-3.1) nest the text transformer
+    # config under text_config
+    if hasattr(config, "text_config"):
+        text_config = config.text_config
+        for attr in layer_attrs:
+            if hasattr(text_config, attr):
+                return int(getattr(text_config, attr))
 
     raise ValueError(
         f"Could not determine layer count from config for {model_name}. "
