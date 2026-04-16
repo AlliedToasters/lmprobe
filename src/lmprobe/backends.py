@@ -1427,7 +1427,9 @@ class ChunkedLocalBackend(ExtractionBackend):
         final_norm.to(device)
         lm_head.to(device)
         with torch.no_grad():
-            logits = lm_head(final_norm(hidden_states.to(device))).cpu()
+            logits: torch.Tensor = lm_head(
+                final_norm(hidden_states.to(device)),
+            ).cpu()
         final_norm.to("cpu")
         lm_head.to("cpu")
         return logits

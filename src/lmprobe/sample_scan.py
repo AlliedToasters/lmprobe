@@ -54,8 +54,9 @@ class SampleScan:
 
         self._scan_dir = Path(scan_dir)
         self._metadata = scan_storage.read_metadata(self._scan_dir)
-        self._bases = scan_storage.read_basis(self._scan_dir, "0_global")
-        assert isinstance(self._bases, dict)
+        bases_loaded = scan_storage.read_basis(self._scan_dir, "0_global")
+        assert isinstance(bases_loaded, dict)
+        self._bases: dict[str, np.ndarray] = bases_loaded
         self._channel_config = scan_storage.read_channel_config(
             self._scan_dir, "0_global",
         )
@@ -415,7 +416,7 @@ class SampleScan:
         prompts: list[str],
         signal: str | None = None,
         batch_size: int = 4,
-    ) -> tuple[np.ndarray, list[list[int]], list[int]]:
+    ) -> tuple[np.ndarray, dict[str, list[Any]], list[list[int]], list[int]]:
         """Project multiple prompts through the scan basis in a single
         batched forward pass. Much faster than looping project_prompt().
 
@@ -431,11 +432,11 @@ class SampleScan:
         Returns
         -------
         tuple
-            (projections_values, token_ids_per_sample, seq_lengths)
-            - projections_values: np.ndarray [N_total, 1, k]
+            (projections, coords, token_ids_per_sample, seq_lengths)
+            - projections: np.ndarray [N_total, 1, k]
+            - coords: dict with keys sample_id, layer, token_pos, signal
             - token_ids_per_sample: list of token ID lists
             - seq_lengths: list of int
-        The returned coords can be used to reconstruct per-sample arrays.
         """
         backend = self._get_backend()
         proj_signals = [signal] if signal else self.signals

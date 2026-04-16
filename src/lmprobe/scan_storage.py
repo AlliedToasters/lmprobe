@@ -151,10 +151,11 @@ def read_basis(
     channel_dir = scan_dir / "channels" / channel
 
     if signal is not None:
-        return np.load(channel_dir / f"basis_{signal}.npy")
+        result: np.ndarray = np.load(channel_dir / f"basis_{signal}.npy")
+        return result
 
     # Load all signal bases
-    bases = {}
+    bases: dict[str, np.ndarray] = {}
     for path in sorted(channel_dir.glob("basis_*.npy")):
         # Extract signal name from "basis_attn_delta.npy" -> "attn_delta"
         sig_name = path.stem[len("basis_"):]
@@ -165,7 +166,8 @@ def read_basis(
 def read_channel_config(scan_dir: Path, channel: str = "0_global") -> dict[str, Any]:
     """Read channel config."""
     with open(scan_dir / "channels" / channel / "config.json") as f:
-        return json.load(f)
+        data: dict[str, Any] = json.load(f)
+        return data
 
 
 def write_projections(
@@ -210,9 +212,10 @@ def open_projections(scan_dir: Path) -> np.memmap:
 
     Returns memmap of shape [N_total, n_channels, k].
     """
-    return np.load(
+    result: np.memmap = np.load(
         scan_dir / "projections" / "values.npy", mmap_mode="r"
     )
+    return result
 
 
 def read_coords(scan_dir: Path) -> Any:
