@@ -11,8 +11,9 @@ import json
 
 import numpy as np
 import pytest
+from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 
-from tests.conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS, TEST_MODEL
+TEST_MODEL = "stas/tiny-random-llama-2"
 
 # ---------------------------------------------------------------------------
 # Storage tests (no model needed)
