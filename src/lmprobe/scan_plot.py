@@ -2,7 +2,8 @@
 
 Renders a 2D RGB image of a model forward pass on a single prompt:
 tokens on x-axis, layers on y-axis, RGB channels from top-3 PCA
-components of each signal at that coordinate.
+components of each signal at that coordinate. Surprise (log-prob)
+is appended as a top row in the heatmap.
 """
 
 from __future__ import annotations
@@ -26,6 +27,18 @@ def _normalize_rgb(arr: np.ndarray) -> np.ndarray:
         else:
             result[..., c] = 0.5
     return result
+
+
+def _logprob_to_rgb(log_probs: np.ndarray) -> np.ndarray:
+    """Convert log-prob values to RGB using RdYlGn colormap."""
+    import matplotlib.pyplot as plt
+
+    cmap = plt.get_cmap("RdYlGn")
+    # Normalize: clip to [-10, 0] range, map to [0, 1]
+    normed = np.clip(log_probs, -10, 0) / -10  # 0 = high prob, 1 = low prob
+    normed = 1 - normed  # flip so green = high prob
+    rgba = cmap(normed)
+    return rgba[:, :3].astype(np.float32)  # drop alpha
 
 
 def render_scan_figure(
@@ -70,28 +83,33 @@ def render_scan_figure(
 
     seq_len, n_layers, n_signals, k = projections.shape
     n_grids = n_signals
+    show_surprise = log_probs is not None
+    show_stats_col = layer_stats is not None
 
     # Build RGB image per signal: [n_layers, seq_len, 3]
+    # If surprise is shown, prepend a surprise row: [n_layers+1, seq_len, 3]
     signal_rgbs = []
     for sig_idx in range(n_signals):
         rgb = _normalize_rgb(projections[:, :, sig_idx, :3])  # [seq_len, n_layers, 3]
         rgb = rgb.transpose(1, 0, 2)  # [n_layers, seq_len, 3]
         # Gray out non-generative (prompt) tokens
         if generative_mask is not None:
-            prompt_cols = ~generative_mask  # [seq_len]
-            gray = rgb[..., :1].mean(axis=-1, keepdims=True)  # luminance
+            prompt_cols = ~generative_mask
+            gray = rgb[..., :1].mean(axis=-1, keepdims=True)
             gray = np.broadcast_to(gray, rgb.shape).copy()
-            # Desaturate + dim prompt tokens
             rgb[:, prompt_cols, :] = gray[:, prompt_cols, :] * 0.4 + 0.3
+        # Prepend surprise row
+        if show_surprise and log_probs is not None:
+            surprise_rgb = _logprob_to_rgb(log_probs)[np.newaxis, :, :]  # [1, seq_len, 3]
+            rgb = np.concatenate([surprise_rgb, rgb], axis=0)  # [n_layers+1, seq_len, 3]
         signal_rgbs.append(rgb)
 
-    show_surprise = log_probs is not None
-    show_stats_col = layer_stats is not None
+    total_rows = n_layers + (1 if show_surprise else 0)
 
     # Figure sizing
     if figsize is None:
         width = max(8, seq_len * 0.35 + (2 if show_stats_col else 0))
-        height_per_grid = max(3, n_layers * 0.15)
+        height_per_grid = max(3, total_rows * 0.15)
         height = (
             1.5
             + height_per_grid * n_grids
@@ -102,107 +120,77 @@ def render_scan_figure(
 
     fig = plt.figure(figsize=figsize)
 
-    n_rows = n_grids + (1 if show_surprise else 0)
-    height_ratios = []
-    if show_surprise:
-        height_ratios.append(1)
-    for _ in range(n_grids):
-        height_ratios.append(n_layers)
-
     n_cols = 2 if show_stats_col else 1
     width_ratios = [seq_len, max(2, seq_len // 10)] if show_stats_col else [1]
 
     gs = GridSpec(
-        n_rows, n_cols,
+        n_grids, n_cols,
         figure=fig,
-        height_ratios=height_ratios,
         width_ratios=width_ratios,
         hspace=0.3,
         wspace=0.05,
     )
 
-    row = 0
+    # Y-tick labels: "surprise" row + layer numbers
+    if show_surprise:
+        ytick_positions = list(range(total_rows))
+        ytick_labels = ["S"] + [str(i) if i % 4 == 0 else "" for i in range(n_layers)]
+    else:
+        ytick_positions = list(range(0, n_layers, max(1, n_layers // 16)))
+        ytick_labels = [str(i) for i in ytick_positions]
 
-    # --- Surprise strip ---
-    if show_surprise and log_probs is not None:
-        ax_surprise = fig.add_subplot(gs[row, 0])
-        lp_display = log_probs[np.newaxis, :]
-        ax_surprise.imshow(
-            lp_display,
-            aspect="auto",
-            cmap="RdYlGn",
-            interpolation="nearest",
-        )
-        ax_surprise.set_yticks([])
-        ax_surprise.set_ylabel("surprise", fontsize=8, rotation=0, labelpad=40)
+    # Token text for x-axis
+    token_fontsize = max(4, min(8, 200 // max(seq_len, 1)))
 
-        ax_surprise.set_xticks(range(seq_len))
-        ax_surprise.set_xticklabels(
-            tokens,
-            rotation=60,
-            ha="right",
-            fontsize=max(5, min(8, 200 // max(seq_len, 1))),
-            fontfamily="monospace",
-        )
-        ax_surprise.xaxis.set_ticks_position("top")
-        ax_surprise.xaxis.set_label_position("top")
-
-        if show_stats_col:
-            ax_empty = fig.add_subplot(gs[row, 1])
-            ax_empty.axis("off")
-
-        row += 1
-
-    # --- Signal grids ---
     for grid_idx, (rgb, sig_name) in enumerate(zip(signal_rgbs, signal_names)):
-        ax = fig.add_subplot(gs[row, 0])
+        ax = fig.add_subplot(gs[grid_idx, 0])
         ax.imshow(rgb, aspect="auto", interpolation="nearest")
         ax.set_ylabel(sig_name, fontsize=9, rotation=0, labelpad=60)
 
-        if n_layers <= 64:
-            ax.set_yticks(range(0, n_layers, max(1, n_layers // 16)))
-        else:
-            ax.set_yticks(range(0, n_layers, n_layers // 8))
+        ax.set_yticks(ytick_positions)
+        ax.set_yticklabels(ytick_labels, fontsize=6)
 
-        # Token labels on first grid if no surprise strip
-        if not show_surprise and grid_idx == 0:
-            ax.set_xticks(range(seq_len))
+        # Token text on x-axis (top for first grid, bottom for last)
+        ax.set_xticks(range(seq_len))
+        if grid_idx == 0:
             ax.set_xticklabels(
                 tokens,
                 rotation=60,
                 ha="right",
-                fontsize=max(5, min(8, 200 // max(seq_len, 1))),
+                fontsize=token_fontsize,
                 fontfamily="monospace",
             )
             ax.xaxis.set_ticks_position("top")
             ax.xaxis.set_label_position("top")
         elif grid_idx == len(signal_rgbs) - 1:
-            ax.set_xticks(range(seq_len))
             ax.set_xticklabels(
-                [str(i) for i in range(seq_len)],
-                fontsize=6,
+                tokens,
+                rotation=60,
+                ha="right",
+                fontsize=token_fontsize,
+                fontfamily="monospace",
             )
         else:
-            ax.set_xticks([])
+            ax.set_xticklabels([])
 
         # Layer stats on the right
         if show_stats_col and layer_stats is not None:
-            ax_stats = fig.add_subplot(gs[row, 1])
+            ax_stats = fig.add_subplot(gs[grid_idx, 1])
             if grid_idx < layer_stats.shape[1]:
                 stats = layer_stats[:, grid_idx]
             else:
                 stats = np.zeros(n_layers)
+            # Offset by 1 if surprise row is present
+            y_offset = 1 if show_surprise else 0
             ax_stats.barh(
-                range(n_layers), stats,
+                np.arange(n_layers) + y_offset, stats,
                 color="steelblue", alpha=0.7, height=0.8,
             )
-            ax_stats.set_ylim(-0.5, n_layers - 0.5)
+            ax_stats.set_ylim(-0.5, total_rows - 0.5)
             ax_stats.invert_yaxis()
             ax_stats.set_yticks([])
             ax_stats.set_xlabel("energy", fontsize=7)
             ax_stats.tick_params(axis="x", labelsize=6)
-
-        row += 1
 
     if title:
         fig.suptitle(title, fontsize=12, y=0.98)
