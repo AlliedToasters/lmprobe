@@ -408,7 +408,62 @@ class SampleScan:
 
         return result
 
-    # --- Projection ---
+    # --- Batch Projection ---
+
+    def batch_project(
+        self,
+        prompts: list[str],
+        signal: str | None = None,
+        batch_size: int = 4,
+    ) -> tuple[np.ndarray, list[list[int]], list[int]]:
+        """Project multiple prompts through the scan basis in a single
+        batched forward pass. Much faster than looping project_prompt().
+
+        Parameters
+        ----------
+        prompts : list[str]
+            Prompts to project.
+        signal : str or None
+            If given, only project this signal.
+        batch_size : int
+            Prompts per forward-pass batch.
+
+        Returns
+        -------
+        tuple
+            (projections_values, token_ids_per_sample, seq_lengths)
+            - projections_values: np.ndarray [N_total, 1, k]
+            - token_ids_per_sample: list of token ID lists
+            - seq_lengths: list of int
+        Also writes projections to a temporary scan dir, but the
+        returned coords can be used to reconstruct per-sample arrays.
+        """
+        import tempfile
+
+        backend = self._get_backend()
+        proj_signals = [signal] if signal else self.signals
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (
+                _metadata,
+                _bases,
+                projections,
+                coords,
+                token_ids_per_sample,
+                seq_lengths,
+                _attention_mask,
+                _signal_dims,
+            ) = backend.scan_forward(
+                prompts,
+                signals=proj_signals,
+                n_components=self._metadata.n_components,
+                batch_size=batch_size,
+                external_bases=self._bases,
+            )
+
+        return projections, coords, token_ids_per_sample, seq_lengths
+
+    # --- Single Projection ---
 
     def _get_backend(self) -> Any:
         """Lazy-load the ChunkedLocalBackend for projection."""

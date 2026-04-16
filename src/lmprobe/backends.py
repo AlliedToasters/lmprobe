@@ -1547,6 +1547,7 @@ class ChunkedLocalBackend(ExtractionBackend):
         n_components: int = 64,
         batch_size: int = 4,
         generative_masks: list[np.ndarray] | None = None,
+        external_bases: dict[str, np.ndarray] | None = None,
     ) -> tuple[
         dict[str, Any],                # metadata
         dict[str, np.ndarray],          # bases: {signal_name: [n_layers, dim, k_eff]}
@@ -1575,6 +1576,11 @@ class ChunkedLocalBackend(ExtractionBackend):
             generative (assistant) token. If provided, PCA is fit only
             on generative tokens to avoid prompt leakage. All tokens
             are still projected through the basis.
+        external_bases : dict of {signal_name: np.ndarray} or None
+            Pre-trained PCA bases to project through instead of fitting
+            new ones. Shape [n_layers, dim, k] per signal. When provided,
+            PCA fitting is skipped entirely — enables fast batched
+            projection through an existing scan's basis.
 
         Returns all data needed to write a SampleScan to disk.
         """
@@ -1802,34 +1808,38 @@ class ChunkedLocalBackend(ExtractionBackend):
                 if sig_name not in signal_dims:
                     signal_dims[sig_name] = dim
 
-                # Build PCA fit data — filter to generative tokens if mask provided
-                if generative_masks is not None:
-                    # Build a flat boolean mask matching the [B_total * S] rows
-                    fit_mask_parts = []
-                    for sid in range(B_total):
-                        if sid < len(generative_masks) and generative_masks[sid] is not None:
-                            gmask = generative_masks[sid]
-                            # Pad or truncate to S (padded sequence length)
-                            padded_mask = np.zeros(S, dtype=bool)
-                            padded_mask[:min(len(gmask), S)] = gmask[:S]
-                            fit_mask_parts.append(padded_mask)
-                        else:
-                            fit_mask_parts.append(np.ones(S, dtype=bool))
-                    fit_mask = np.concatenate(fit_mask_parts)
-                    flat_fit = flat[fit_mask]
+                if external_bases is not None and sig_name in external_bases:
+                    # Use pre-trained basis — skip PCA fitting
+                    basis = external_bases[sig_name][layer_idx]  # [dim, k]
+                    signal_bases[sig_name][layer_idx] = basis
+                    k = basis.shape[1]
+                    projected = (flat @ basis.astype(np.float32)).astype(np.float16)
                 else:
-                    flat_fit = flat
+                    # Build PCA fit data — filter to generative tokens if mask provided
+                    if generative_masks is not None:
+                        fit_mask_parts = []
+                        for sid in range(B_total):
+                            if sid < len(generative_masks) and generative_masks[sid] is not None:
+                                gmask = generative_masks[sid]
+                                padded_mask = np.zeros(S, dtype=bool)
+                                padded_mask[:min(len(gmask), S)] = gmask[:S]
+                                fit_mask_parts.append(padded_mask)
+                            else:
+                                fit_mask_parts.append(np.ones(S, dtype=bool))
+                        fit_mask = np.concatenate(fit_mask_parts)
+                        flat_fit = flat[fit_mask]
+                    else:
+                        flat_fit = flat
 
-                k = min(n_components, flat_fit.shape[0] - 1, dim)
-                pca = PCA(n_components=k)
-                pca.fit(flat_fit)
+                    k = min(n_components, flat_fit.shape[0] - 1, dim)
+                    pca = PCA(n_components=k)
+                    pca.fit(flat_fit)
 
-                # Store basis: components_ is [k, dim], we store [dim, k]
-                basis = pca.components_.T.astype(np.float16)
-                signal_bases[sig_name][layer_idx] = basis
+                    basis = pca.components_.T.astype(np.float16)
+                    signal_bases[sig_name][layer_idx] = basis
 
-                # Project ALL tokens (not just generative) through the basis
-                projected = pca.transform(flat).astype(np.float16)
+                    # Project ALL tokens through the basis
+                    projected = pca.transform(flat).astype(np.float16)
                 if k < n_components:
                     padded = np.zeros(
                         (projected.shape[0], n_components), dtype=np.float16,
