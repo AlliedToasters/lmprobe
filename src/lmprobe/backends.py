@@ -996,6 +996,8 @@ class ChunkedLocalBackend(ExtractionBackend):
         self._chunk_size = chunk_size
         self._tokenizer: PreTrainedTokenizerBase | None = None
         self._config: Any = None
+        self._num_layers: int | None = None
+        self._resolved_chunk_size: int | None = None
 
     @property
     def model(self) -> Any:
@@ -1022,9 +1024,22 @@ class ChunkedLocalBackend(ExtractionBackend):
         return self._config
 
     def _resolve_chunk_size(self) -> int:
+        if self._resolved_chunk_size is not None:
+            return self._resolved_chunk_size
         if isinstance(self._chunk_size, int):
-            return self._chunk_size
-        return _estimate_chunk_size(self.model_name, self.device, self.dtype)
+            self._resolved_chunk_size = self._chunk_size
+        else:
+            self._resolved_chunk_size = _estimate_chunk_size(
+                self.model_name, self.device, self.dtype,
+            )
+        return self._resolved_chunk_size
+
+    def _get_num_layers(self) -> int:
+        if self._num_layers is None:
+            from .extraction import get_num_layers_from_config
+
+            self._num_layers = get_num_layers_from_config(self.model_name)
+        return self._num_layers
 
     def _load_full_model_cpu(self) -> Any:
         """Load the full model on CPU with eager attention.
@@ -1324,15 +1339,13 @@ class ChunkedLocalBackend(ExtractionBackend):
         cache_position, position_embeddings, layer_types, decoder_layers,
         num_layers, chunk_size, model, device.
         """
-        from .extraction import get_num_layers_from_config
-
         tokenized = self.tokenizer(
             prompts, return_tensors="pt", padding=True,
         )
         input_ids = tokenized["input_ids"]
         attention_mask_2d = tokenized["attention_mask"]
 
-        num_layers = get_num_layers_from_config(self.model_name)
+        num_layers = self._get_num_layers()
         chunk_size = self._resolve_chunk_size()
 
         model = self._load_full_model_cpu()
@@ -1572,12 +1585,11 @@ class ChunkedLocalBackend(ExtractionBackend):
         from tqdm import tqdm
 
         from .activation_types import detect_moe_info
-        from .extraction import get_num_layers_from_config
 
         if signals is None:
             signals = ["attn_delta", "mlp_delta"]
 
-        num_layers = get_num_layers_from_config(self.model_name)
+        num_layers = self._get_num_layers()
         model = self._load_full_model_cpu()
         device = self.device
         chunk_size = self._resolve_chunk_size()
