@@ -50,7 +50,34 @@ class SampleScan:
         Path to an existing scan directory on disk.
     """
 
-    def __init__(self, scan_dir: str | Path) -> None:
+    def __init__(
+        self,
+        scan_dir: str | Path,
+        *,
+        backend: str = "auto",
+    ) -> None:
+        """Load an existing scan from disk.
+
+        Parameters
+        ----------
+        scan_dir : str or Path
+            Path to an existing scan directory.
+        backend : str
+            Which backend to use for projection forward passes. One of:
+              - ``"auto"`` (default): heuristic based on model size vs.
+                available CPU RAM. ``disk_offload`` kicks in when the
+                estimated model weight footprint exceeds 80% of system RAM.
+              - ``"chunked"``: force ``ChunkedLocalBackend`` (full model on
+                CPU, layers streamed to GPU in chunks). Fast when the full
+                dataset's intermediate residuals + signal captures fit in
+                CPU RAM alongside the model weights.
+              - ``"disk_offload"``: force ``DiskOffloadBackend`` (layer
+                weights streamed directly from safetensors to GPU, never
+                resident on CPU). Preferred when the full model wouldn't
+                leave room for intermediate activations at the sample
+                counts being projected — e.g. fusing many long-sequence
+                prompts into one call.
+        """
         from . import scan_storage
 
         self._scan_dir = Path(scan_dir)
@@ -64,6 +91,13 @@ class SampleScan:
         self._samples_table = scan_storage.read_samples(self._scan_dir)
         self._projections: np.memmap | None = None
         self._coords_table: Any = None
+
+        if backend not in ("auto", "chunked", "disk_offload"):
+            raise ValueError(
+                f"backend must be one of 'auto', 'chunked', 'disk_offload'; "
+                f"got {backend!r}"
+            )
+        self._backend_mode = backend
 
         # Backend for projection forward passes (lazy-loaded)
         self._backend: Any = None
@@ -609,25 +643,37 @@ class SampleScan:
     def _get_backend(self) -> Any:
         """Lazy-load a backend for projection.
 
-        Uses DiskOffloadBackend for models whose weights exceed ~80% of
-        available CPU RAM; otherwise uses ChunkedLocalBackend.
+        Resolution order:
+          1. If ``self._backend_mode`` was set explicitly at construction
+             (``"chunked"`` or ``"disk_offload"``), honor that.
+          2. Otherwise (``"auto"``), use DiskOffloadBackend when the
+             estimated model weight footprint exceeds 80% of available
+             CPU RAM; else ChunkedLocalBackend.
         """
         if self._backend is None:
             import torch
 
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-            # Estimate model weight size from hidden_dim and n_layers
-            # Rough heuristic: 2 bytes/param (bf16), ~12*hidden^2 params/layer
-            est_bytes = self._metadata.n_layers * 12 * (self._metadata.hidden_dim ** 2) * 2
-            mem_avail: float
-            try:
-                import os
-                mem_avail = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-            except (ValueError, OSError):
-                mem_avail = float("inf")
+            mode = self._backend_mode
+            if mode == "auto":
+                # Estimate model weight size from hidden_dim and n_layers.
+                # Rough heuristic: 2 bytes/param (bf16), ~12*hidden^2 params/layer.
+                est_bytes = (
+                    self._metadata.n_layers
+                    * 12
+                    * (self._metadata.hidden_dim ** 2)
+                    * 2
+                )
+                mem_avail: float
+                try:
+                    import os
+                    mem_avail = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                except (ValueError, OSError):
+                    mem_avail = float("inf")
+                mode = "disk_offload" if est_bytes > 0.8 * mem_avail else "chunked"
 
-            if est_bytes > 0.8 * mem_avail:
+            if mode == "disk_offload":
                 from .backends import DiskOffloadBackend
                 self._backend = DiskOffloadBackend(
                     model_name=self._metadata.model_id,
