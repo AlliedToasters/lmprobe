@@ -2765,7 +2765,6 @@ class DiskOffloadBackend(ExtractionBackend):
         limited CPU memory.
         """
         import gc
-        import math
 
         import numpy as np
         from sklearn.decomposition import PCA
@@ -2799,7 +2798,6 @@ class DiskOffloadBackend(ExtractionBackend):
             )
 
         n_samples = len(prompts)
-        n_batches = math.ceil(n_samples / batch_size)
         batches = [
             (s, min(s + batch_size, n_samples))
             for s in range(0, n_samples, batch_size)
@@ -3090,7 +3088,6 @@ class DiskOffloadBackend(ExtractionBackend):
         layer weights from safetensors instead of keeping the model in RAM.
         """
         import gc
-        import math
 
         config = self._get_config()
         model = self._get_model_skeleton()
