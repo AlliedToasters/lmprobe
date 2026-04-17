@@ -61,6 +61,26 @@ class TestChunkedBackendInterface:
         assert backend.tokenizer is not None
         assert backend.tokenizer.pad_token is not None
 
+    def test_attn_implementation_default_is_sdpa(self, tiny_model):
+        backend = ChunkedLocalBackend(tiny_model, "cpu", chunk_size=1)
+        assert backend._attn_implementation == "sdpa"
+
+    def test_attn_implementation_override(self, tiny_model):
+        backend = ChunkedLocalBackend(
+            tiny_model, "cpu", chunk_size=1, attn_implementation="eager",
+        )
+        assert backend._attn_implementation == "eager"
+
+    def test_attn_implementation_propagates_to_loaded_model(self, tiny_model):
+        backend = ChunkedLocalBackend(
+            tiny_model, "cpu", chunk_size=1, attn_implementation="eager",
+        )
+        model = backend._load_full_model_cpu()
+        # Most transformers models expose the resolved attention impl on
+        # config._attn_implementation after load.
+        resolved = getattr(model.config, "_attn_implementation", None)
+        assert resolved == "eager", f"expected eager, got {resolved!r}"
+
 
 # ── Correctness: chunked matches local ──────────────────────────────────────
 

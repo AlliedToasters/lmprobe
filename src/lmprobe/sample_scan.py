@@ -82,6 +82,8 @@ class SampleScan:
         batch_size: int = 4,
         chunk_size: int | str = "auto",
         generative_masks: list[np.ndarray] | None = None,
+        backend: str = "chunked",
+        attn_implementation: str = "sdpa",
     ) -> SampleScan:
         """Fit a scan on a corpus and write results to disk.
 
@@ -112,6 +114,15 @@ class SampleScan:
             Per-sample boolean masks, shape [seq_len_i]. True = generative
             (assistant) token. PCA is fit only on generative tokens to
             avoid prompt leakage. All tokens are still projected.
+        backend : str
+            Backend to use: "chunked" (loads full model on CPU, streams
+            layers through GPU) or "disk_offload" (loads layer weights
+            directly from safetensors to GPU — for models exceeding CPU RAM).
+        attn_implementation : str
+            Attention kernel passed to ``from_pretrained`` for the chunked
+            backend. Default ``"sdpa"``. Use ``"eager"`` only if a custom
+            signal hook needs materialized ``[B, H, T, T]`` attention weights.
+            Ignored by the ``disk_offload`` backend.
 
         Returns
         -------
@@ -121,7 +132,6 @@ class SampleScan:
         import torch
 
         from . import scan_storage
-        from .backends import ChunkedLocalBackend
 
         if dtype is None:
             dtype = torch.bfloat16
@@ -131,14 +141,24 @@ class SampleScan:
 
         scan_dir = Path(scan_dir)
 
-        backend_kwargs: dict[str, Any] = {
-            "model_name": model_name,
-            "device": device,
-            "dtype": dtype,
-        }
-        if chunk_size != "auto":
-            backend_kwargs["chunk_size"] = chunk_size
-        backend = ChunkedLocalBackend(**backend_kwargs)
+        if backend == "disk_offload":
+            from .backends import DiskOffloadBackend
+            backend_obj = DiskOffloadBackend(
+                model_name=model_name,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            from .backends import ChunkedLocalBackend
+            backend_kwargs: dict[str, Any] = {
+                "model_name": model_name,
+                "device": device,
+                "dtype": dtype,
+                "attn_implementation": attn_implementation,
+            }
+            if chunk_size != "auto":
+                backend_kwargs["chunk_size"] = chunk_size
+            backend_obj = ChunkedLocalBackend(**backend_kwargs)
 
         # Run the scan forward pass
         (
@@ -150,7 +170,7 @@ class SampleScan:
             seq_lengths,
             _attention_mask,
             signal_dims,
-        ) = backend.scan_forward(
+        ) = backend_obj.scan_forward(
             prompts,
             signals=signals,
             n_components=n_components,
@@ -463,19 +483,39 @@ class SampleScan:
     # --- Single Projection ---
 
     def _get_backend(self) -> Any:
-        """Lazy-load the ChunkedLocalBackend for projection."""
+        """Lazy-load a backend for projection.
+
+        Uses DiskOffloadBackend for models whose weights exceed ~80% of
+        available CPU RAM; otherwise uses ChunkedLocalBackend.
+        """
         if self._backend is None:
             import torch
 
-            from .backends import ChunkedLocalBackend
-
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-            self._backend = ChunkedLocalBackend(
-                model_name=self._metadata.model_id,
-                device=device,
-                dtype=torch.bfloat16,
-            )
+            # Estimate model weight size from hidden_dim and n_layers
+            # Rough heuristic: 2 bytes/param (bf16), ~12*hidden^2 params/layer
+            est_bytes = self._metadata.n_layers * 12 * (self._metadata.hidden_dim ** 2) * 2
+            try:
+                import os
+                mem_avail = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            except (ValueError, OSError):
+                mem_avail = float("inf")
+
+            if est_bytes > 0.8 * mem_avail:
+                from .backends import DiskOffloadBackend
+                self._backend = DiskOffloadBackend(
+                    model_name=self._metadata.model_id,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+            else:
+                from .backends import ChunkedLocalBackend
+                self._backend = ChunkedLocalBackend(
+                    model_name=self._metadata.model_id,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
         return self._backend
 
     def project_prompt(
