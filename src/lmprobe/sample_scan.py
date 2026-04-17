@@ -141,6 +141,7 @@ class SampleScan:
 
         scan_dir = Path(scan_dir)
 
+        backend_obj: Any
         if backend == "disk_offload":
             from .backends import DiskOffloadBackend
             backend_obj = DiskOffloadBackend(
@@ -496,6 +497,7 @@ class SampleScan:
             # Estimate model weight size from hidden_dim and n_layers
             # Rough heuristic: 2 bytes/param (bf16), ~12*hidden^2 params/layer
             est_bytes = self._metadata.n_layers * 12 * (self._metadata.hidden_dim ** 2) * 2
+            mem_avail: float
             try:
                 import os
                 mem_avail = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")

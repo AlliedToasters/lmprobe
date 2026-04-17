@@ -1702,7 +1702,7 @@ class ChunkedLocalBackend(ExtractionBackend):
             pe_pos = batch_pos_ids[0][:1].to(device)
 
             unique_types = set(layer_types_cfg) if layer_types_cfg is not None else set()
-            if len(unique_types) > 1:
+            if layer_types_cfg is not None and len(unique_types) > 1:
                 layer_types = list(layer_types_cfg)
                 position_embeddings = {}
                 with torch.no_grad():
@@ -2865,7 +2865,7 @@ class DiskOffloadBackend(ExtractionBackend):
             pe_pos = batch_pos_ids[0][:1].to(device)
 
             unique_types = set(layer_types_cfg) if layer_types_cfg else set()
-            if len(unique_types) > 1:
+            if layer_types_cfg and len(unique_types) > 1:
                 layer_types = list(layer_types_cfg)
                 position_embeddings = {}
                 with torch.no_grad():
@@ -3147,7 +3147,7 @@ class DiskOffloadBackend(ExtractionBackend):
 
             layer_types_cfg = getattr(text_cfg, "layer_types", None)
             unique_types = set(layer_types_cfg) if layer_types_cfg else set()
-            if len(unique_types) > 1:
+            if layer_types_cfg and len(unique_types) > 1:
                 layer_types = list(layer_types_cfg)
                 position_embeddings = {}
                 with torch.no_grad():
