@@ -1887,6 +1887,7 @@ class ChunkedLocalBackend(ExtractionBackend):
                     chunks = per_layer_projected[layer_idx][sig_name]
                     if not chunks:
                         continue
+                    assert external_bases is not None
                     basis = external_bases[sig_name][layer_idx]
                     signal_bases[sig_name][layer_idx] = basis
                     k = basis.shape[1]
@@ -3122,6 +3123,7 @@ class DiskOffloadBackend(ExtractionBackend):
                     chunks = per_signal_projected[sig_name]
                     if not chunks:
                         continue
+                    assert external_bases is not None
                     basis = external_bases[sig_name][layer_idx]
                     signal_bases[sig_name][layer_idx] = basis
                     k = basis.shape[1]
