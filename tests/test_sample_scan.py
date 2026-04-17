@@ -382,6 +382,142 @@ class TestProjectPrompt:
 
 
 # ---------------------------------------------------------------------------
+# Grouped batch projection
+# ---------------------------------------------------------------------------
+
+
+class TestBatchProjectGrouped:
+    """Verify fused multi-group projection — spec 001."""
+
+    @pytest.fixture
+    def scan(self, tmp_path):
+        from lmprobe.sample_scan import SampleScan
+
+        prompts = POSITIVE_PROMPTS[:3] + NEGATIVE_PROMPTS[:3]
+        labels = [1, 1, 1, 0, 0, 0]
+
+        return SampleScan.run(
+            prompts=prompts,
+            labels=labels,
+            model_name=TEST_MODEL,
+            scan_dir=tmp_path / "grouped_scan",
+            n_components=4,
+            device="cpu",
+            batch_size=2,
+        )
+
+    def test_single_group_matches_batch_project(self, scan):
+        prompts = ["The dog ran fast", "The cat slept quietly"]
+
+        proj_ref, coords_ref, tokens_ref, lens_ref = scan.batch_project(prompts)
+        out = scan.batch_project_grouped({"only": prompts})
+
+        assert list(out.keys()) == ["only"]
+        proj, coords, tokens, lens = out["only"]
+
+        np.testing.assert_array_equal(proj, proj_ref)
+        assert tokens == tokens_ref
+        assert lens == lens_ref
+        for key in coords_ref:
+            assert list(coords[key]) == list(coords_ref[key])
+
+    def test_multi_group_matches_per_group(self, scan):
+        g_a = ["The dog ran fast"]
+        g_b = ["The cat slept", "A bird flew"]
+
+        proj_a, coords_a, tokens_a, lens_a = scan.batch_project(g_a)
+        proj_b, coords_b, tokens_b, lens_b = scan.batch_project(g_b)
+
+        out = scan.batch_project_grouped({"a": g_a, "b": g_b})
+
+        np.testing.assert_array_equal(out["a"][0], proj_a)
+        np.testing.assert_array_equal(out["b"][0], proj_b)
+        assert out["a"][2] == tokens_a
+        assert out["b"][2] == tokens_b
+        assert out["a"][3] == lens_a
+        assert out["b"][3] == lens_b
+        for key in coords_a:
+            assert list(out["a"][1][key]) == list(coords_a[key])
+        for key in coords_b:
+            assert list(out["b"][1][key]) == list(coords_b[key])
+
+    def test_sample_id_rebased(self, scan):
+        out = scan.batch_project_grouped({
+            "a": ["The dog ran"],
+            "b": ["The cat slept", "A bird flew"],
+        })
+        assert set(out["a"][1]["sample_id"]) == {0}
+        assert set(out["b"][1]["sample_id"]) == {0, 1}
+
+    def test_preserves_key_order(self, scan):
+        keys = ["z", "a", "m", "b"]
+        groups = {k: [f"prompt for {k}"] for k in keys}
+        out = scan.batch_project_grouped(groups)
+        assert list(out.keys()) == keys
+
+    def test_one_backend_call_for_n_groups(self, scan):
+        call_count = {"n": 0}
+        real_scan_forward = scan._get_backend().scan_forward
+
+        def counting_scan_forward(*args, **kwargs):
+            call_count["n"] += 1
+            return real_scan_forward(*args, **kwargs)
+
+        scan._get_backend().scan_forward = counting_scan_forward
+        try:
+            scan.batch_project_grouped({
+                "a": ["The dog ran"],
+                "b": ["The cat slept"],
+                "c": ["A bird flew"],
+            })
+        finally:
+            scan._get_backend().scan_forward = real_scan_forward
+
+        assert call_count["n"] == 1
+
+    def test_batch_project_warns_on_third_call(self, scan):
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w1:
+            warnings.simplefilter("always")
+            scan.batch_project(["p1"])
+        assert not any("batch_project_grouped" in str(x.message) for x in w1)
+
+        with warnings.catch_warnings(record=True) as w2:
+            warnings.simplefilter("always")
+            scan.batch_project(["p2"])
+        assert not any("batch_project_grouped" in str(x.message) for x in w2)
+
+        with warnings.catch_warnings(record=True) as w3:
+            warnings.simplefilter("always")
+            scan.batch_project(["p3"])
+        matching = [x for x in w3 if "batch_project_grouped" in str(x.message)]
+        assert len(matching) == 1
+        assert issubclass(matching[0].category, UserWarning)
+
+    def test_batch_project_warning_fires_once(self, scan):
+        import warnings
+
+        for _ in range(3):
+            scan.batch_project(["p"])
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            scan.batch_project(["p"])
+            scan.batch_project(["p"])
+        assert not any("batch_project_grouped" in str(x.message) for x in w)
+
+    def test_grouped_does_not_trigger_warning(self, scan):
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            for _ in range(5):
+                scan.batch_project_grouped({"k": ["p"]})
+        assert not any("batch_project_grouped" in str(x.message) for x in w)
+
+
+# ---------------------------------------------------------------------------
 # Get projections from stored corpus data
 # ---------------------------------------------------------------------------
 

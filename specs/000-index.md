@@ -23,6 +23,7 @@ affects: [module names]
 
 | File | Title | Status | Affects |
 |------|-------|--------|---------|
+| [001-grouped-projection.md](001-grouped-projection.md) | Grouped projection API (`batch_project_grouped`) | draft | sample_scan, backends |
 ---
 
 ## Design docs

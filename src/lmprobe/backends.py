@@ -1801,15 +1801,18 @@ class ChunkedLocalBackend(ExtractionBackend):
             if torch.cuda.is_available() and device != "cpu":
                 torch.cuda.empty_cache()
 
-            # --- Between-chunk PCA ---
+            # --- Between-chunk PCA fit or basis projection ---
             pca_items = [
                 (layer_idx, sig_idx, sig_name)
                 for layer_idx in range(chunk_start, chunk_end)
                 for sig_idx, sig_name in enumerate(signals)
             ]
+            _stage_label = (
+                "projecting" if external_bases is not None else "PCA fit"
+            )
             for layer_idx, sig_idx, sig_name in tqdm(
                 pca_items,
-                desc=f"  PCA fit (layers {chunk_start}-{chunk_end-1})",
+                desc=f"  {_stage_label} (layers {chunk_start}-{chunk_end-1})",
                 leave=False,
             ):
                 captures = per_layer_captures[layer_idx][sig_name]

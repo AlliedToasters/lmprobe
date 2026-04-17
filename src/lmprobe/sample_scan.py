@@ -26,6 +26,7 @@ Example
 from __future__ import annotations
 
 import datetime
+from collections.abc import Hashable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -66,6 +67,11 @@ class SampleScan:
 
         # Backend for projection forward passes (lazy-loaded)
         self._backend: Any = None
+
+        # Counter for batch_project calls to warn about the N-sweep trap.
+        # See `batch_project_grouped` for the fused alternative.
+        self._batch_project_call_count = 0
+        self._batch_project_warned = False
 
     @classmethod
     def run(
@@ -441,6 +447,12 @@ class SampleScan:
         """Project multiple prompts through the scan basis in a single
         batched forward pass. Much faster than looping project_prompt().
 
+        Each call performs a full layer-streaming sweep (chunked backend)
+        or full-dataset layer load (disk_offload backend). For multiple
+        logical groups (dataset splits, train/eval/control corpora),
+        prefer :meth:`batch_project_grouped` — one sweep for the whole
+        union instead of one sweep per group.
+
         Parameters
         ----------
         prompts : list[str]
@@ -458,7 +470,37 @@ class SampleScan:
             - coords: dict with keys sample_id, layer, token_pos, signal
             - token_ids_per_sample: list of token ID lists
             - seq_lengths: list of int
+
+        See Also
+        --------
+        batch_project_grouped : Fused variant for multiple labeled groups.
         """
+        self._batch_project_call_count += 1
+        if (
+            self._batch_project_call_count >= 3
+            and not self._batch_project_warned
+        ):
+            import warnings
+            warnings.warn(
+                "SampleScan.batch_project called 3+ times on the same "
+                "scan. Each call re-streams every model layer CPU→GPU. "
+                "For multiple prompt groups (e.g. dataset splits), use "
+                "scan.batch_project_grouped({...}) — same semantics, one "
+                "layer sweep for the whole union.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self._batch_project_warned = True
+        return self._batch_project_impl(
+            prompts, signal=signal, batch_size=batch_size,
+        )
+
+    def _batch_project_impl(
+        self,
+        prompts: list[str],
+        signal: str | None = None,
+        batch_size: int = 4,
+    ) -> tuple[np.ndarray, dict[str, list[Any]], list[list[int]], list[int]]:
         backend = self._get_backend()
         proj_signals = [signal] if signal else self.signals
 
@@ -480,6 +522,87 @@ class SampleScan:
         )
 
         return projections, coords, token_ids_per_sample, seq_lengths
+
+    def batch_project_grouped(
+        self,
+        prompt_groups: Mapping[Hashable, list[str]],
+        *,
+        signal: str | None = None,
+        batch_size: int = 4,
+    ) -> dict[
+        Hashable,
+        tuple[np.ndarray, dict[str, list[Any]], list[list[int]], list[int]],
+    ]:
+        """Project multiple labeled groups of prompts in a single
+        layer-streaming sweep.
+
+        Preferred over repeated :meth:`batch_project` calls when multiple
+        groups (e.g. dataset splits) need projecting: layer weights are
+        streamed CPU→GPU once for the whole union of prompts, rather than
+        once per call. Each per-group output is indistinguishable from
+        what :meth:`batch_project` would return if called on that group's
+        prompts alone.
+
+        Parameters
+        ----------
+        prompt_groups : mapping of hashable key → list[str]
+            Named groups of prompts. Iteration order is preserved in the
+            returned dict.
+        signal : str or None
+            If given, only project this signal.
+        batch_size : int
+            Microbatch size for the forward pass.
+
+        Returns
+        -------
+        dict
+            ``{key: (projections, coords, token_ids_per_sample, seq_lengths)}``.
+            Per-group ``coords["sample_id"]`` is rebased to 0..len(group)-1.
+        """
+        keys = list(prompt_groups.keys())
+        all_prompts: list[str] = []
+        bounds: list[tuple[Hashable, int, int]] = []
+        cursor = 0
+        for k in keys:
+            group_prompts = list(prompt_groups[k])
+            start = cursor
+            all_prompts.extend(group_prompts)
+            cursor += len(group_prompts)
+            bounds.append((k, start, cursor))
+
+        projections, coords, token_ids_per_sample, seq_lengths = (
+            self._batch_project_impl(
+                all_prompts, signal=signal, batch_size=batch_size,
+            )
+        )
+
+        sample_id_arr = np.asarray(coords["sample_id"])
+        token_pos_arr = np.asarray(coords["token_pos"])
+        coord_arrays = {c: np.asarray(v) for c, v in coords.items()}
+
+        out: dict[
+            Hashable,
+            tuple[np.ndarray, dict[str, list[Any]], list[list[int]], list[int]],
+        ] = {}
+        for key, start, end in bounds:
+            group_seq_lens = seq_lengths[start:end]
+            # Padding in standalone batch_project is max(seq_len in group);
+            # trim token positions beyond that so per-group output matches.
+            pad_len = max(group_seq_lens) if group_seq_lens else 0
+            mask = (
+                (sample_id_arr >= start)
+                & (sample_id_arr < end)
+                & (token_pos_arr < pad_len)
+            )
+            group_coords = {c: arr[mask] for c, arr in coord_arrays.items()}
+            group_coords["sample_id"] = group_coords["sample_id"] - start
+            out[key] = (
+                projections[mask],
+                {c: v.tolist() for c, v in group_coords.items()},
+                token_ids_per_sample[start:end],
+                group_seq_lens,
+            )
+        return out
 
     # --- Single Projection ---
 
