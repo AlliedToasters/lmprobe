@@ -1941,436 +1941,440 @@ class ChunkedLocalBackend(ExtractionBackend):
         batch_cache_positions: list[torch.Tensor] = []
 
         _hs_tmpdir = tempfile.TemporaryDirectory(prefix="lmprobe_scan_")
-        batch_hidden_states: np.memmap | None = None
-        _hs_N_total = int(all_input_ids.shape[0])
-        _hs_S_max = int(all_input_ids.shape[1])
+        try:
+            batch_hidden_states: np.memmap | None = None
+            _hs_N_total = int(all_input_ids.shape[0])
+            _hs_S_max = int(all_input_ids.shape[1])
 
-        for start, end in batches:
-            ids = all_input_ids[start:end]
-            mask = all_attention_mask[start:end]
+            for start, end in batches:
+                ids = all_input_ids[start:end]
+                mask = all_attention_mask[start:end]
 
-            with torch.no_grad():
-                hs = embed(ids.to(device)).cpu()
-
-            if hidden_dim is None:
-                hidden_dim = int(hs.shape[-1])
-            if batch_hidden_states is None:
-                hs_path = os.path.join(_hs_tmpdir.name, "batch_hidden_states.bin")
-                batch_hidden_states = np.memmap(
-                    hs_path,
-                    dtype=_mmap_np_dtype(self.dtype),
-                    mode="w+",
-                    shape=(_hs_N_total, _hs_S_max, hidden_dim),
-                )
-            _mmap_write_slice(batch_hidden_states, start, end, hs)
-            del hs
-
-            seq_len = ids.shape[1]
-            pos_ids = mask.long().cumsum(-1) - 1
-            pos_ids.masked_fill_(mask == 0, 1)
-            batch_pos_ids.append(pos_ids)
-            batch_cache_positions.append(torch.arange(seq_len))
-
-        embed.to("cpu")
-        assert batch_hidden_states is not None
-
-        # Rotary embeddings
-        position_embeddings: tuple[torch.Tensor, ...] | torch.Tensor | dict | None = None
-        layer_types: list[str] | None = None
-        rotary_name = self._find_rotary_embedding_name(model)
-        if rotary_name is not None:
-            rotary_mod = model
-            for part in rotary_name.split("."):
-                rotary_mod = getattr(rotary_mod, part)
-            rotary_mod.to(device)
-
-            text_cfg = getattr(
-                getattr(model, "config", None), "text_config",
-                getattr(model, "config", None),
-            )
-            layer_types_cfg = getattr(text_cfg, "layer_types", None)
-            # Use a single sample's pos_ids so cos/sin broadcast to any batch size
-            pe_hs = _mmap_read_slice(
-                batch_hidden_states, 0, 1, self.dtype,
-            ).to(device)
-            pe_pos = batch_pos_ids[0][:1].to(device)
-
-            unique_types = set(layer_types_cfg) if layer_types_cfg is not None else set()
-            if layer_types_cfg is not None and len(unique_types) > 1:
-                layer_types = list(layer_types_cfg)
-                position_embeddings = {}
                 with torch.no_grad():
-                    for lt in unique_types:
-                        pe = rotary_mod(pe_hs, pe_pos, layer_type=lt)
-                        position_embeddings[lt] = tuple(t.cpu() for t in pe)
-            else:
-                if layer_types_cfg is not None:
-                    layer_types = list(layer_types_cfg)
-                with torch.no_grad():
-                    pe = rotary_mod(pe_hs, pe_pos)
-                    if isinstance(pe, tuple):
-                        position_embeddings = tuple(t.cpu() for t in pe)
-                    else:
-                        position_embeddings = pe.cpu()
-            rotary_mod.to("cpu")
+                    hs = embed(ids.to(device)).cpu()
 
-        assert hidden_dim is not None
-        decoder_layers = _get_decoder_layers(model)
-
-        # Accumulators
-        # Per-signal basis: {signal_name: [n_layers, dim, k_eff]}
-        # We'll build these after seeing actual dims from hooks
-        signal_bases: dict[str, list[np.ndarray | None]] = {
-            sig: [None] * num_layers for sig in signals
-        }
-        signal_dims: dict[str, int] = {}  # discovered during first chunk
-        # Projections + coords are pre-allocated at full size so each chunk
-        # writes into a fixed slice rather than append-growing a list. This
-        # keeps cross-chunk memory constant: without it, all_proj_chunks
-        # (fp16) and the four coord Python-int lists grew ~1.3 GB per chunk
-        # and dominated working-set pressure on long scans. Skip allocation
-        # under the reducers path (spec 003) — nothing is written.
-        N_total = all_input_ids.shape[0]
-        S_max = all_input_ids.shape[1]
-        n_signals = len(signals)
-        if reducers is None:
-            total_rows = num_layers * n_signals * N_total * S_max
-            all_projections = np.zeros(
-                (total_rows, 1, n_components), dtype=np.float16,
-            )
-            all_coord_sample_id = np.zeros(total_rows, dtype=np.int32)
-            all_coord_layer = np.zeros(total_rows, dtype=np.int16)
-            all_coord_token_pos = np.zeros(total_rows, dtype=np.int16)
-            all_coord_signal = np.zeros(total_rows, dtype=np.int8)
-        else:
-            all_projections = np.zeros((0, 1, n_components), dtype=np.float16)
-            all_coord_sample_id = np.zeros(0, dtype=np.int32)
-            all_coord_layer = np.zeros(0, dtype=np.int16)
-            all_coord_token_pos = np.zeros(0, dtype=np.int16)
-            all_coord_signal = np.zeros(0, dtype=np.int8)
-        proj_cursor: int = 0
-
-        # Spec 002: stream-project through pre-fit basis to avoid accumulating
-        # full [N, S, H] activation tensors on CPU. Basis stays on device for
-        # the whole sweep; only [B, S, k] projections move to CPU.
-        stream_signals: set[str] = (
-            set(external_bases.keys()) if external_bases is not None else set()
-        )
-        basis_gpu: dict[str, torch.Tensor] = {}
-        if external_bases is not None:
-            for sig, arr in external_bases.items():
-                basis_gpu[sig] = torch.from_numpy(
-                    np.ascontiguousarray(arr),
-                ).to(device=device, dtype=torch.float32)
-
-        def _stream_project(
-            delta: torch.Tensor, sig_name: str, layer_idx: int,
-        ) -> np.ndarray:
-            B, S, H = delta.shape
-            basis = basis_gpu[sig_name][layer_idx]
-            flat = delta.reshape(-1, H).to(torch.float32)
-            proj = (flat @ basis).reshape(B, S, -1).to(torch.float16)
-            out = proj.cpu().numpy()
-            del flat, proj
-            return out
-
-        # Spec 003: when reducers are supplied, preload signal_bases from
-        # external_bases so the final_bases assembly loop doesn't rely on
-        # per_layer_projected being populated (it won't be — reducers own
-        # the output and the per-token path is skipped).
-        signal_to_idx = {s: i for i, s in enumerate(signals)}
-        if reducers is not None and external_bases is not None:
-            for sig in stream_signals:
-                for layer_idx_pre in range(num_layers):
-                    signal_bases[sig][layer_idx_pre] = (
-                        external_bases[sig][layer_idx_pre]
+                if hidden_dim is None:
+                    hidden_dim = int(hs.shape[-1])
+                if batch_hidden_states is None:
+                    hs_path = os.path.join(_hs_tmpdir.name, "batch_hidden_states.bin")
+                    batch_hidden_states = np.memmap(
+                        hs_path,
+                        dtype=_mmap_np_dtype(self.dtype),
+                        mode="w+",
+                        shape=(_hs_N_total, _hs_S_max, hidden_dim),
                     )
-                signal_dims.setdefault(sig, external_bases[sig].shape[1])
-
-        def _dispatch_reducers(
-            proj_cpu: np.ndarray,
-            sig_name: str,
-            layer_idx: int,
-            start: int,
-            end: int,
-        ) -> None:
-            """Spec 003: feed one microbatch's projection to every reducer."""
-            assert reducers is not None
-            sample_ids_batch = np.arange(start, end)
-            mask_batch_np = (
-                all_attention_mask[start:end].cpu().numpy().astype(bool)
-            )
-            sig_idx = signal_to_idx[sig_name]
-            for _name, (red, state) in reducers.items():
-                red.update(
-                    state, proj_cpu, sample_ids_batch,
-                    layer_idx, sig_idx, mask_batch_np,
-                )
-
-        # --- Layer chunk loop ---
-        n_chunks = (num_layers + chunk_size - 1) // chunk_size
-        chunk_pbar = tqdm(
-            range(0, num_layers, chunk_size),
-            desc="Scan: layer chunks",
-            total=n_chunks,
-        )
-        for chunk_start in chunk_pbar:
-            chunk_end = min(chunk_start + chunk_size, num_layers)
-            chunk_pbar.set_postfix(layers=f"{chunk_start}-{chunk_end-1}")
-
-            for i in range(chunk_start, chunk_end):
-                decoder_layers[i].to(device)
-
-            # {layer_idx: {signal_name: [tensor_per_batch, ...]}}
-            # Legacy path (PCA fit, or signals not in external_bases).
-            per_layer_captures: dict[int, dict[str, list[torch.Tensor]]] = {
-                L: {sig: [] for sig in signals}
-                for L in range(chunk_start, chunk_end)
-            }
-            # Stream-project path (external_bases signals).
-            per_layer_projected: dict[int, dict[str, list[np.ndarray]]] = {
-                L: {sig: [] for sig in signals}
-                for L in range(chunk_start, chunk_end)
-            }
-
-            for batch_idx, (start, end) in enumerate(batches):
-                # Push per-batch progress onto the chunk bar so the user sees
-                # forward motion inside a chunk — a chunk-level tick can take
-                # hours on large fused sweeps (N_batches × chunk_size forward
-                # passes between ticks).
-                chunk_pbar.set_postfix(
-                    layers=f"{chunk_start}-{chunk_end-1}",
-                    batch=f"{batch_idx+1}/{len(batches)}",
-                )
-                hs = _mmap_read_slice(
-                    batch_hidden_states, start, end, self.dtype,
-                ).to(device)
-                # Build the causal mask on-the-fly and push straight to GPU;
-                # drop the CPU copy at batch-end so [B, 1, S, S] tensors
-                # don't persist across 1000s of batches.
-                mask_2d = all_attention_mask[start:end]
-                mask_dev = _make_causal_mask(mask_2d, self.dtype).to(device)
-                pos_dev = batch_pos_ids[batch_idx].to(device)
-                pe_dev = self._pe_to_device(position_embeddings, device)
-
-                with torch.no_grad():
-                    for layer_idx in range(chunk_start, chunk_end):
-                        layer_module = decoder_layers[layer_idx]
-
-                        hook_list, capture_residual = self._resolve_signal_hooks(
-                            signals, layer_module, layer_idx,
-                            router_module_template, model,
-                            stream_signals=stream_signals,
-                        )
-
-                        layer_kwargs = self._build_layer_kwargs(
-                            mask_dev, pos_dev, batch_cache_positions[batch_idx],
-                            pe_dev, layer_types, layer_idx, device,
-                        )
-
-                        output = layer_module(hs, **layer_kwargs)
-                        hs = output[0] if isinstance(output, tuple) else output
-
-                        # Collect hooked signals. Stream-projected signals
-                        # get `(delta @ basis)` on GPU right here; legacy
-                        # signals go to CPU for between-chunk PCA.
-                        for sig_name, handle, buf in hook_list:
-                            handle.remove()
-                            if not buf:
-                                continue
-                            if sig_name in stream_signals:
-                                delta_gpu = buf[0]
-                                if sig_name not in signal_dims:
-                                    signal_dims[sig_name] = delta_gpu.shape[-1]
-                                proj_cpu = _stream_project(
-                                    delta_gpu, sig_name, layer_idx,
-                                )
-                                if reducers is not None:
-                                    _dispatch_reducers(
-                                        proj_cpu, sig_name, layer_idx,
-                                        start, end,
-                                    )
-                                    del proj_cpu
-                                else:
-                                    per_layer_projected[layer_idx][sig_name].append(
-                                        proj_cpu,
-                                    )
-                                del delta_gpu
-                            else:
-                                per_layer_captures[layer_idx][sig_name].append(buf[0])
-
-                        # Residual = layer output (already in hs).
-                        if capture_residual:
-                            if "residual" in stream_signals:
-                                if "residual" not in signal_dims:
-                                    signal_dims["residual"] = hs.shape[-1]
-                                proj_cpu = _stream_project(
-                                    hs.detach(), "residual", layer_idx,
-                                )
-                                if reducers is not None:
-                                    _dispatch_reducers(
-                                        proj_cpu, "residual", layer_idx,
-                                        start, end,
-                                    )
-                                    del proj_cpu
-                                else:
-                                    per_layer_projected[layer_idx]["residual"].append(
-                                        proj_cpu,
-                                    )
-                            else:
-                                per_layer_captures[layer_idx]["residual"].append(
-                                    hs.detach().cpu()
-                                )
-
                 _mmap_write_slice(batch_hidden_states, start, end, hs)
-                del hs, mask_dev, pos_dev, pe_dev
+                del hs
 
-            # Offload chunk
-            for i in range(chunk_start, chunk_end):
-                decoder_layers[i].to("cpu")
-            gc.collect()
-            if torch.cuda.is_available() and device != "cpu":
-                torch.cuda.empty_cache()
+                seq_len = ids.shape[1]
+                pos_ids = mask.long().cumsum(-1) - 1
+                pos_ids.masked_fill_(mask == 0, 1)
+                batch_pos_ids.append(pos_ids)
+                batch_cache_positions.append(torch.arange(seq_len))
 
-            # --- Between-chunk PCA fit or basis projection ---
-            pca_items = [
-                (layer_idx, sig_idx, sig_name)
-                for layer_idx in range(chunk_start, chunk_end)
-                for sig_idx, sig_name in enumerate(signals)
-            ]
-            _stage_label = (
-                "projecting" if external_bases is not None else "PCA fit"
-            )
-            for layer_idx, sig_idx, sig_name in tqdm(
-                pca_items,
-                desc=f"  {_stage_label} (layers {chunk_start}-{chunk_end-1})",
-                leave=False,
-            ):
-                if sig_name in stream_signals:
-                    # Stream-project branch: concatenate already-projected
-                    # per-batch arrays; skip PCA and float32 upcast entirely.
-                    chunks = per_layer_projected[layer_idx][sig_name]
-                    if not chunks:
-                        continue
-                    assert external_bases is not None
-                    basis = external_bases[sig_name][layer_idx]
-                    signal_bases[sig_name][layer_idx] = basis
-                    k = basis.shape[1]
-                    # np.concatenate allocates a single contiguous buffer;
-                    # `projected` is a view of it and is the only copy kept
-                    # alive via all_proj_chunks. Clearing the per-batch
-                    # chunks list here (rather than waiting for the chunk
-                    # loop's `del per_layer_projected` at the bottom)
-                    # releases the duplicate per-batch storage progressively
-                    # across the assembly loop — up to 18 GB freed on a
-                    # 1000-sample sweep.
-                    B_total = sum(c.shape[0] for c in chunks)
-                    S = chunks[0].shape[1]
-                    projected = np.concatenate(chunks, axis=0).reshape(-1, k)
-                    per_layer_projected[layer_idx][sig_name] = []
-                    del chunks
+            embed.to("cpu")
+            assert batch_hidden_states is not None
+
+            # Rotary embeddings
+            position_embeddings: tuple[torch.Tensor, ...] | torch.Tensor | dict | None = None
+            layer_types: list[str] | None = None
+            rotary_name = self._find_rotary_embedding_name(model)
+            if rotary_name is not None:
+                rotary_mod = model
+                for part in rotary_name.split("."):
+                    rotary_mod = getattr(rotary_mod, part)
+                rotary_mod.to(device)
+
+                text_cfg = getattr(
+                    getattr(model, "config", None), "text_config",
+                    getattr(model, "config", None),
+                )
+                layer_types_cfg = getattr(text_cfg, "layer_types", None)
+                # Use a single sample's pos_ids so cos/sin broadcast to any batch size
+                pe_hs = _mmap_read_slice(
+                    batch_hidden_states, 0, 1, self.dtype,
+                ).to(device)
+                pe_pos = batch_pos_ids[0][:1].to(device)
+
+                unique_types = set(layer_types_cfg) if layer_types_cfg is not None else set()
+                if layer_types_cfg is not None and len(unique_types) > 1:
+                    layer_types = list(layer_types_cfg)
+                    position_embeddings = {}
+                    with torch.no_grad():
+                        for lt in unique_types:
+                            pe = rotary_mod(pe_hs, pe_pos, layer_type=lt)
+                            position_embeddings[lt] = tuple(t.cpu() for t in pe)
                 else:
-                    # Fit + project on GPU via cuml when available (falls back
-                    # to sklearn on CPU). The helper pops from the captures
-                    # list as it streams to GPU, so the entry is drained by
-                    # the time the call returns.
-                    captures = per_layer_captures[layer_idx][sig_name]
-                    if not captures:
-                        continue
-                    if sig_name not in signal_dims:
-                        signal_dims[sig_name] = int(captures[0].shape[2])
-                    basis, projected, B_total, S, dim = _fit_project_scan_pca(
-                        captures,
-                        device=device,
-                        n_components=n_components,
-                        generative_masks=generative_masks,
-                    )
-                    k = basis.shape[1]
-                    signal_bases[sig_name][layer_idx] = basis
-                    # `captures` was drained in place by the helper; make sure
-                    # the dict entry is empty too.
-                    per_layer_captures[layer_idx][sig_name] = []
-                    del captures
-                # Write directly into the pre-allocated outputs at the
-                # current cursor. Coords are generated vectorized — no
-                # Python int-list overhead (~1.3 GB/chunk savings on a
-                # 40-layer scan of 1000 samples × 611 tokens).
-                block = B_total * S
-                row_end = proj_cursor + block
-                all_projections[proj_cursor:row_end, 0, :k] = projected
-                if k < n_components:
-                    all_projections[proj_cursor:row_end, 0, k:] = 0
-                all_coord_sample_id[proj_cursor:row_end] = np.repeat(
-                    np.arange(B_total, dtype=np.int32), S,
-                )
-                all_coord_layer[proj_cursor:row_end] = layer_idx
-                all_coord_token_pos[proj_cursor:row_end] = np.tile(
-                    np.arange(S, dtype=np.int16), B_total,
-                )
-                all_coord_signal[proj_cursor:row_end] = sig_idx
-                proj_cursor = row_end
+                    if layer_types_cfg is not None:
+                        layer_types = list(layer_types_cfg)
+                    with torch.no_grad():
+                        pe = rotary_mod(pe_hs, pe_pos)
+                        if isinstance(pe, tuple):
+                            position_embeddings = tuple(t.cpu() for t in pe)
+                        else:
+                            position_embeddings = pe.cpu()
+                rotary_mod.to("cpu")
 
-                del projected
+            assert hidden_dim is not None
+            decoder_layers = _get_decoder_layers(model)
+
+            # Accumulators
+            # Per-signal basis: {signal_name: [n_layers, dim, k_eff]}
+            # We'll build these after seeing actual dims from hooks
+            signal_bases: dict[str, list[np.ndarray | None]] = {
+                sig: [None] * num_layers for sig in signals
+            }
+            signal_dims: dict[str, int] = {}  # discovered during first chunk
+            # Projections + coords are pre-allocated at full size so each chunk
+            # writes into a fixed slice rather than append-growing a list. This
+            # keeps cross-chunk memory constant: without it, all_proj_chunks
+            # (fp16) and the four coord Python-int lists grew ~1.3 GB per chunk
+            # and dominated working-set pressure on long scans. Skip allocation
+            # under the reducers path (spec 003) — nothing is written.
+            N_total = all_input_ids.shape[0]
+            S_max = all_input_ids.shape[1]
+            n_signals = len(signals)
+            if reducers is None:
+                total_rows = num_layers * n_signals * N_total * S_max
+                all_projections = np.zeros(
+                    (total_rows, 1, n_components), dtype=np.float16,
+                )
+                all_coord_sample_id = np.zeros(total_rows, dtype=np.int32)
+                all_coord_layer = np.zeros(total_rows, dtype=np.int16)
+                all_coord_token_pos = np.zeros(total_rows, dtype=np.int16)
+                all_coord_signal = np.zeros(total_rows, dtype=np.int8)
+            else:
+                all_projections = np.zeros((0, 1, n_components), dtype=np.float16)
+                all_coord_sample_id = np.zeros(0, dtype=np.int32)
+                all_coord_layer = np.zeros(0, dtype=np.int16)
+                all_coord_token_pos = np.zeros(0, dtype=np.int16)
+                all_coord_signal = np.zeros(0, dtype=np.int8)
+            proj_cursor: int = 0
+
+            # Spec 002: stream-project through pre-fit basis to avoid accumulating
+            # full [N, S, H] activation tensors on CPU. Basis stays on device for
+            # the whole sweep; only [B, S, k] projections move to CPU.
+            stream_signals: set[str] = (
+                set(external_bases.keys()) if external_bases is not None else set()
+            )
+            basis_gpu: dict[str, torch.Tensor] = {}
+            if external_bases is not None:
+                for sig, arr in external_bases.items():
+                    basis_gpu[sig] = torch.from_numpy(
+                        np.ascontiguousarray(arr),
+                    ).to(device=device, dtype=torch.float32)
+
+            def _stream_project(
+                delta: torch.Tensor, sig_name: str, layer_idx: int,
+            ) -> np.ndarray:
+                B, S, H = delta.shape
+                basis = basis_gpu[sig_name][layer_idx]
+                flat = delta.reshape(-1, H).to(torch.float32)
+                proj = (flat @ basis).reshape(B, S, -1).to(torch.float16)
+                out = proj.cpu().numpy()
+                del flat, proj
+                return out
+
+            # Spec 003: when reducers are supplied, preload signal_bases from
+            # external_bases so the final_bases assembly loop doesn't rely on
+            # per_layer_projected being populated (it won't be — reducers own
+            # the output and the per-token path is skipped).
+            signal_to_idx = {s: i for i, s in enumerate(signals)}
+            if reducers is not None and external_bases is not None:
+                for sig in stream_signals:
+                    for layer_idx_pre in range(num_layers):
+                        signal_bases[sig][layer_idx_pre] = (
+                            external_bases[sig][layer_idx_pre]
+                        )
+                    signal_dims.setdefault(sig, external_bases[sig].shape[1])
+
+            def _dispatch_reducers(
+                proj_cpu: np.ndarray,
+                sig_name: str,
+                layer_idx: int,
+                start: int,
+                end: int,
+            ) -> None:
+                """Spec 003: feed one microbatch's projection to every reducer."""
+                assert reducers is not None
+                sample_ids_batch = np.arange(start, end)
+                mask_batch_np = (
+                    all_attention_mask[start:end].cpu().numpy().astype(bool)
+                )
+                sig_idx = signal_to_idx[sig_name]
+                for _name, (red, state) in reducers.items():
+                    red.update(
+                        state, proj_cpu, sample_ids_batch,
+                        layer_idx, sig_idx, mask_batch_np,
+                    )
+
+            # --- Layer chunk loop ---
+            n_chunks = (num_layers + chunk_size - 1) // chunk_size
+            chunk_pbar = tqdm(
+                range(0, num_layers, chunk_size),
+                desc="Scan: layer chunks",
+                total=n_chunks,
+            )
+            for chunk_start in chunk_pbar:
+                chunk_end = min(chunk_start + chunk_size, num_layers)
+                chunk_pbar.set_postfix(layers=f"{chunk_start}-{chunk_end-1}")
+
+                for i in range(chunk_start, chunk_end):
+                    decoder_layers[i].to(device)
+
+                # {layer_idx: {signal_name: [tensor_per_batch, ...]}}
+                # Legacy path (PCA fit, or signals not in external_bases).
+                per_layer_captures: dict[int, dict[str, list[torch.Tensor]]] = {
+                    L: {sig: [] for sig in signals}
+                    for L in range(chunk_start, chunk_end)
+                }
+                # Stream-project path (external_bases signals).
+                per_layer_projected: dict[int, dict[str, list[np.ndarray]]] = {
+                    L: {sig: [] for sig in signals}
+                    for L in range(chunk_start, chunk_end)
+                }
+
+                for batch_idx, (start, end) in enumerate(batches):
+                    # Push per-batch progress onto the chunk bar so the user sees
+                    # forward motion inside a chunk — a chunk-level tick can take
+                    # hours on large fused sweeps (N_batches × chunk_size forward
+                    # passes between ticks).
+                    chunk_pbar.set_postfix(
+                        layers=f"{chunk_start}-{chunk_end-1}",
+                        batch=f"{batch_idx+1}/{len(batches)}",
+                    )
+                    hs = _mmap_read_slice(
+                        batch_hidden_states, start, end, self.dtype,
+                    ).to(device)
+                    # Build the causal mask on-the-fly and push straight to GPU;
+                    # drop the CPU copy at batch-end so [B, 1, S, S] tensors
+                    # don't persist across 1000s of batches.
+                    mask_2d = all_attention_mask[start:end]
+                    mask_dev = _make_causal_mask(mask_2d, self.dtype).to(device)
+                    pos_dev = batch_pos_ids[batch_idx].to(device)
+                    pe_dev = self._pe_to_device(position_embeddings, device)
+
+                    with torch.no_grad():
+                        for layer_idx in range(chunk_start, chunk_end):
+                            layer_module = decoder_layers[layer_idx]
+
+                            hook_list, capture_residual = self._resolve_signal_hooks(
+                                signals, layer_module, layer_idx,
+                                router_module_template, model,
+                                stream_signals=stream_signals,
+                            )
+
+                            layer_kwargs = self._build_layer_kwargs(
+                                mask_dev, pos_dev, batch_cache_positions[batch_idx],
+                                pe_dev, layer_types, layer_idx, device,
+                            )
+
+                            output = layer_module(hs, **layer_kwargs)
+                            hs = output[0] if isinstance(output, tuple) else output
+
+                            # Collect hooked signals. Stream-projected signals
+                            # get `(delta @ basis)` on GPU right here; legacy
+                            # signals go to CPU for between-chunk PCA.
+                            for sig_name, handle, buf in hook_list:
+                                handle.remove()
+                                if not buf:
+                                    continue
+                                if sig_name in stream_signals:
+                                    delta_gpu = buf[0]
+                                    if sig_name not in signal_dims:
+                                        signal_dims[sig_name] = delta_gpu.shape[-1]
+                                    proj_cpu = _stream_project(
+                                        delta_gpu, sig_name, layer_idx,
+                                    )
+                                    if reducers is not None:
+                                        _dispatch_reducers(
+                                            proj_cpu, sig_name, layer_idx,
+                                            start, end,
+                                        )
+                                        del proj_cpu
+                                    else:
+                                        per_layer_projected[layer_idx][sig_name].append(
+                                            proj_cpu,
+                                        )
+                                    del delta_gpu
+                                else:
+                                    per_layer_captures[layer_idx][sig_name].append(buf[0])
+
+                            # Residual = layer output (already in hs).
+                            if capture_residual:
+                                if "residual" in stream_signals:
+                                    if "residual" not in signal_dims:
+                                        signal_dims["residual"] = hs.shape[-1]
+                                    proj_cpu = _stream_project(
+                                        hs.detach(), "residual", layer_idx,
+                                    )
+                                    if reducers is not None:
+                                        _dispatch_reducers(
+                                            proj_cpu, "residual", layer_idx,
+                                            start, end,
+                                        )
+                                        del proj_cpu
+                                    else:
+                                        per_layer_projected[layer_idx]["residual"].append(
+                                            proj_cpu,
+                                        )
+                                else:
+                                    per_layer_captures[layer_idx]["residual"].append(
+                                        hs.detach().cpu()
+                                    )
+
+                    _mmap_write_slice(batch_hidden_states, start, end, hs)
+                    del hs, mask_dev, pos_dev, pe_dev
+
+                # Offload chunk
+                for i in range(chunk_start, chunk_end):
+                    decoder_layers[i].to("cpu")
+                gc.collect()
+                if torch.cuda.is_available() and device != "cpu":
+                    torch.cuda.empty_cache()
+
+                # --- Between-chunk PCA fit or basis projection ---
+                pca_items = [
+                    (layer_idx, sig_idx, sig_name)
+                    for layer_idx in range(chunk_start, chunk_end)
+                    for sig_idx, sig_name in enumerate(signals)
+                ]
+                _stage_label = (
+                    "projecting" if external_bases is not None else "PCA fit"
+                )
+                for layer_idx, sig_idx, sig_name in tqdm(
+                    pca_items,
+                    desc=f"  {_stage_label} (layers {chunk_start}-{chunk_end-1})",
+                    leave=False,
+                ):
+                    if sig_name in stream_signals:
+                        # Stream-project branch: concatenate already-projected
+                        # per-batch arrays; skip PCA and float32 upcast entirely.
+                        chunks = per_layer_projected[layer_idx][sig_name]
+                        if not chunks:
+                            continue
+                        assert external_bases is not None
+                        basis = external_bases[sig_name][layer_idx]
+                        signal_bases[sig_name][layer_idx] = basis
+                        k = basis.shape[1]
+                        # np.concatenate allocates a single contiguous buffer;
+                        # `projected` is a view of it and is the only copy kept
+                        # alive via all_proj_chunks. Clearing the per-batch
+                        # chunks list here (rather than waiting for the chunk
+                        # loop's `del per_layer_projected` at the bottom)
+                        # releases the duplicate per-batch storage progressively
+                        # across the assembly loop — up to 18 GB freed on a
+                        # 1000-sample sweep.
+                        B_total = sum(c.shape[0] for c in chunks)
+                        S = chunks[0].shape[1]
+                        projected = np.concatenate(chunks, axis=0).reshape(-1, k)
+                        per_layer_projected[layer_idx][sig_name] = []
+                        del chunks
+                    else:
+                        # Fit + project on GPU via cuml when available (falls back
+                        # to sklearn on CPU). The helper pops from the captures
+                        # list as it streams to GPU, so the entry is drained by
+                        # the time the call returns.
+                        captures = per_layer_captures[layer_idx][sig_name]
+                        if not captures:
+                            continue
+                        if sig_name not in signal_dims:
+                            signal_dims[sig_name] = int(captures[0].shape[2])
+                        basis, projected, B_total, S, dim = _fit_project_scan_pca(
+                            captures,
+                            device=device,
+                            n_components=n_components,
+                            generative_masks=generative_masks,
+                        )
+                        k = basis.shape[1]
+                        signal_bases[sig_name][layer_idx] = basis
+                        # `captures` was drained in place by the helper; make sure
+                        # the dict entry is empty too.
+                        per_layer_captures[layer_idx][sig_name] = []
+                        del captures
+                    # Write directly into the pre-allocated outputs at the
+                    # current cursor. Coords are generated vectorized — no
+                    # Python int-list overhead (~1.3 GB/chunk savings on a
+                    # 40-layer scan of 1000 samples × 611 tokens).
+                    block = B_total * S
+                    row_end = proj_cursor + block
+                    all_projections[proj_cursor:row_end, 0, :k] = projected
+                    if k < n_components:
+                        all_projections[proj_cursor:row_end, 0, k:] = 0
+                    all_coord_sample_id[proj_cursor:row_end] = np.repeat(
+                        np.arange(B_total, dtype=np.int32), S,
+                    )
+                    all_coord_layer[proj_cursor:row_end] = layer_idx
+                    all_coord_token_pos[proj_cursor:row_end] = np.tile(
+                        np.arange(S, dtype=np.int16), B_total,
+                    )
+                    all_coord_signal[proj_cursor:row_end] = sig_idx
+                    proj_cursor = row_end
+
+                    del projected
+                    gc.collect()
+
+                del per_layer_captures, per_layer_projected
                 gc.collect()
 
-            del per_layer_captures, per_layer_projected
-            gc.collect()
+            # Assemble per-signal basis arrays: {sig: [n_layers, dim, k_eff]}
+            final_bases: dict[str, np.ndarray] = {}
+            for sig_name in signals:
+                dim = signal_dims.get(sig_name, hidden_dim)
+                k_eff = min(n_components, dim)
+                basis_arr = np.zeros((num_layers, dim, k_eff), dtype=np.float16)
+                for L in range(num_layers):
+                    layer_basis = signal_bases[sig_name][L]
+                    if layer_basis is not None:
+                        actual_k = layer_basis.shape[1]
+                        basis_arr[L, :, :actual_k] = layer_basis
+                final_bases[sig_name] = basis_arr
 
-        # Assemble per-signal basis arrays: {sig: [n_layers, dim, k_eff]}
-        final_bases: dict[str, np.ndarray] = {}
-        for sig_name in signals:
-            dim = signal_dims.get(sig_name, hidden_dim)
-            k_eff = min(n_components, dim)
-            basis_arr = np.zeros((num_layers, dim, k_eff), dtype=np.float16)
-            for L in range(num_layers):
-                layer_basis = signal_bases[sig_name][L]
-                if layer_basis is not None:
-                    actual_k = layer_basis.shape[1]
-                    basis_arr[L, :, :actual_k] = layer_basis
-            final_bases[sig_name] = basis_arr
+            # Truncate the pre-allocated outputs to `proj_cursor` — in the
+            # reducers path (spec 003) nothing is written, so cursor stays 0.
+            all_projections = all_projections[:proj_cursor]
+            all_coord_sample_id = all_coord_sample_id[:proj_cursor]
+            all_coord_layer = all_coord_layer[:proj_cursor]
+            all_coord_token_pos = all_coord_token_pos[:proj_cursor]
+            all_coord_signal = all_coord_signal[:proj_cursor]
 
-        # Truncate the pre-allocated outputs to `proj_cursor` — in the
-        # reducers path (spec 003) nothing is written, so cursor stays 0.
-        all_projections = all_projections[:proj_cursor]
-        all_coord_sample_id = all_coord_sample_id[:proj_cursor]
-        all_coord_layer = all_coord_layer[:proj_cursor]
-        all_coord_token_pos = all_coord_token_pos[:proj_cursor]
-        all_coord_signal = all_coord_signal[:proj_cursor]
+            metadata = {
+                "model_id": self.model_name,
+                "hidden_dim": hidden_dim,
+                "n_layers": num_layers,
+                "n_components": n_components,
+                "n_samples": n_samples,
+                "signals": signals,
+            }
 
-        metadata = {
-            "model_id": self.model_name,
-            "hidden_dim": hidden_dim,
-            "n_layers": num_layers,
-            "n_components": n_components,
-            "n_samples": n_samples,
-            "signals": signals,
-        }
+            coords = {
+                "sample_id": all_coord_sample_id,
+                "layer": all_coord_layer,
+                "token_pos": all_coord_token_pos,
+                "signal": all_coord_signal,
+            }
 
-        coords = {
-            "sample_id": all_coord_sample_id,
-            "layer": all_coord_layer,
-            "token_pos": all_coord_token_pos,
-            "signal": all_coord_signal,
-        }
 
-        # Release the memmap + temp directory. Drop the memmap reference
-        # first so Python releases the mmap before TemporaryDirectory
-        # unlinks the backing file (matters on Windows; harmless on
-        # Linux). On the exception path, the weakref finalizer
-        # registered by TemporaryDirectory handles cleanup on GC.
-        del batch_hidden_states
-        _hs_tmpdir.cleanup()
-
-        return (
-            metadata,
-            final_bases,
-            all_projections,
-            coords,
-            token_ids_per_sample,
-            seq_lengths,
-            all_attention_mask,
-            signal_dims,
-        )
+            return (
+                metadata,
+                final_bases,
+                all_projections,
+                coords,
+                token_ids_per_sample,
+                seq_lengths,
+                all_attention_mask,
+                signal_dims,
+            )
+        finally:
+            # Deterministic memmap + tempdir cleanup. Drop the
+            # memmap reference first so Python releases the mmap
+            # before TemporaryDirectory unlinks the backing file
+            # (matters on Windows; harmless on Linux).
+            try:
+                del batch_hidden_states
+            except NameError:
+                pass
+            _hs_tmpdir.cleanup()
 
     def project_forward(
         self,

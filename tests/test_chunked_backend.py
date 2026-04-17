@@ -299,20 +299,86 @@ class TestScanForwardMemmap:
 
     def test_bf16_path_roundtrips(self, tiny_model):
         """Spec 004 stores bf16 residuals in a uint16 memmap container.
-        Verify the reinterpret-view round-trip is stable end-to-end at
-        the default bf16 dtype."""
-        backend = ChunkedLocalBackend(
-            tiny_model, "cpu", dtype=torch.bfloat16, chunk_size=1,
-        )
-        _, bases, proj, _, _, _, _, _ = backend.scan_forward(
-            prompts=["One short", "Two short", "Three short"],
-            signals=["attn_delta"],
-            n_components=2,
-            batch_size=2,
-        )
-        # Shape + finiteness checks. A broken bf16 reinterpret would
-        # typically produce NaN or catastrophically large values.
+        Compare chunked (cross-chunk memmap roundtrip) to single-chunk
+        (no roundtrip) at bf16. Bit-identical isn't achievable at bf16
+        because sklearn's PCA rounds fp32 intermediates differently
+        across call orderings, but the two paths should agree within
+        bf16-ish tolerance. A broken `.view(torch.bfloat16)` typically
+        blows up well past this."""
         import numpy as np
-        assert proj.shape[-1] == 2
-        assert np.isfinite(proj).all()
-        assert np.isfinite(bases["attn_delta"]).all()
+
+        from lmprobe.extraction import get_num_layers_from_config
+
+        num_layers = get_num_layers_from_config(tiny_model)
+        prompts = ["One short", "Two short", "Three short"]
+
+        def run(chunk_size):
+            backend = ChunkedLocalBackend(
+                tiny_model, "cpu", dtype=torch.bfloat16, chunk_size=chunk_size,
+            )
+            return backend.scan_forward(
+                prompts=prompts,
+                signals=["attn_delta"],
+                n_components=2,
+                batch_size=2,
+            )
+
+        _, bases_single, proj_single, _, _, _, _, _ = run(num_layers)
+        _, bases_chunk, proj_chunk, _, _, _, _, _ = run(1)
+
+        # bf16 stored in the memmap; compare as fp32.
+        assert np.isfinite(proj_chunk).all()
+        assert np.isfinite(bases_chunk["attn_delta"]).all()
+        np.testing.assert_allclose(
+            proj_chunk.astype(np.float32),
+            proj_single.astype(np.float32),
+            atol=5e-2, rtol=5e-2,
+        )
+        np.testing.assert_allclose(
+            bases_chunk["attn_delta"].astype(np.float32),
+            bases_single["attn_delta"].astype(np.float32),
+            atol=5e-2, rtol=5e-2,
+        )
+
+    def test_tempdir_cleaned_up_on_exception(self, tiny_model, monkeypatch):
+        """If scan_forward raises mid-scan, the TemporaryDirectory must
+        still be cleaned up — the try/finally around the body guarantees
+        this independent of GC timing. Inject the failure at
+        `_make_causal_mask`, which is called inside the chunk loop
+        after the tmpdir has been created and populated."""
+        import os
+        import tempfile
+
+        created_dirs: list[str] = []
+        real_tempdir = tempfile.TemporaryDirectory
+
+        class _TrackingTempDir(real_tempdir):  # type: ignore[misc, valid-type]
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created_dirs.append(self.name)
+
+        monkeypatch.setattr(tempfile, "TemporaryDirectory", _TrackingTempDir)
+
+        import lmprobe.backends as bmod
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("forced test failure")
+
+        monkeypatch.setattr(bmod, "_make_causal_mask", boom)
+
+        backend = ChunkedLocalBackend(
+            tiny_model, "cpu", dtype=torch.float32, chunk_size=1,
+        )
+        with pytest.raises(RuntimeError, match="forced test failure"):
+            backend.scan_forward(
+                prompts=["One", "Two"],
+                signals=["attn_delta"],
+                n_components=2,
+                batch_size=2,
+            )
+
+        assert created_dirs, "scan_forward did not open a TemporaryDirectory"
+        for d in created_dirs:
+            assert not os.path.exists(d), (
+                f"temp dir leaked on exception path: {d}"
+            )
