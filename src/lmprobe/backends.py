@@ -2514,6 +2514,199 @@ class ChunkedLocalBackend(ExtractionBackend):
 
         return projections, token_ids, logits
 
+    # --- Sweep-based equivalents (for migration parity testing) ---
+    #
+    # These methods call the new sweep primitive with the appropriate
+    # accumulators and unpack back to the legacy tuple shape. Used by
+    # tests/test_sweep_parity.py to gate the refactor. In task #6 the
+    # legacy method bodies are swapped to call these.
+
+    def scan_via_sweep(
+        self,
+        prompts: list[str],
+        *,
+        signals: list[str] | None = None,
+        n_components: int = 64,
+        batch_size: int = 4,
+        generative_masks: list[np.ndarray] | None = None,
+        external_bases: dict[str, np.ndarray] | None = None,
+    ) -> dict[str, Any]:
+        """Run a sweep with ``PCAFit`` (and ``PerTokenProjection`` if
+        ``external_bases`` is supplied) and return the raw accumulator outputs.
+
+        Convenience wrapper that matches the call patterns of ``scan_forward``
+        but returns the sweep-native ``{accumulator_name: output}`` dict.
+        """
+        from .accumulators import PCAFit, PerTokenProjection
+        from .sweep import sweep
+
+        signals_list = signals or ["attn_delta", "mlp_delta"]
+        loader = ChunkedLayerLoader(self)
+        accumulators: dict[str, Any] = {}
+        if external_bases is None:
+            accumulators["fit"] = PCAFit(
+                signals=signals_list,
+                n_components=n_components,
+                generative_masks=generative_masks,
+            )
+        else:
+            accumulators["proj"] = PerTokenProjection(external_bases)
+        return sweep(
+            prompts,
+            accumulators=accumulators,
+            loader=loader,
+            external_bases=external_bases,
+            batch_size=batch_size,
+        )
+
+    def project_forward_via_sweep(
+        self,
+        prompt: str,
+        bases: dict[str, np.ndarray],
+        signals: list[str],
+        include_logits: bool = True,
+    ) -> tuple[np.ndarray, list[int], torch.Tensor | None]:
+        """Sweep-based drop-in for :meth:`project_forward`. Returns the
+        same ``(projections, token_ids, logits)`` tuple."""
+        from .accumulators import LogitCapture, PerTokenProjection
+        from .sweep import sweep
+
+        proj_bases = {s: bases[s] for s in signals if s in bases}
+        if not proj_bases:
+            raise ValueError(
+                f"project_forward_via_sweep: no bases supplied for any of "
+                f"the requested signals {signals} (bases keys: "
+                f"{list(bases.keys())})."
+            )
+
+        loader = ChunkedLayerLoader(self)
+        accumulators: dict[str, Any] = {
+            "proj": PerTokenProjection(proj_bases),
+        }
+        if include_logits:
+            accumulators["logits"] = LogitCapture()
+
+        out = sweep(
+            [prompt],
+            accumulators=accumulators,
+            loader=loader,
+            external_bases=proj_bases,
+            batch_size=1,
+        )
+
+        proj_result = out["proj"]
+        values = proj_result["values"]                 # [total_rows, k_max]
+        offset_table = proj_result["offset_table"]     # [1, n_layers, n_sig, 2]
+        sweep_signal_names = proj_result["signal_names"]
+        seq_lengths = proj_result["seq_lengths"]
+
+        # Rebuild legacy dense shape [seq_len, n_layers, n_signals, max_k]
+        # using the user-supplied `signals` ordering (which may differ from
+        # PerTokenProjection's sorted signal order).
+        seq_len = int(seq_lengths[0])
+        num_layers = loader.num_layers
+        max_k = int(values.shape[-1])
+        sig_to_new_idx = {s: i for i, s in enumerate(sweep_signal_names)}
+        dense = np.zeros(
+            (seq_len, num_layers, len(signals), max_k), dtype=np.float32,
+        )
+        for out_si, sig_name in enumerate(signals):
+            new_si = sig_to_new_idx.get(sig_name)
+            if new_si is None:
+                continue
+            for L in range(num_layers):
+                start, end = offset_table[0, L, new_si]
+                # end - start == seq_len (real tokens only).
+                rows = values[start:end].astype(np.float32)
+                dense[: rows.shape[0], L, out_si, :] = rows
+
+        # Token IDs: reconstruct from tokenizer (cheap).
+        tokenized = self.tokenizer([prompt], return_tensors="pt", padding=True)
+        input_ids = tokenized["input_ids"][0]
+        attention_mask = tokenized["attention_mask"][0]
+        real_len = int(attention_mask.sum().item())
+        token_ids = input_ids[:real_len].tolist()
+
+        logits_out: torch.Tensor | None = None
+        if include_logits:
+            logit_tensor = out["logits"]  # [1, S_max, V] or None
+            if logit_tensor is not None:
+                logits_out = logit_tensor[:, :real_len, :]
+
+        return dense[:real_len], token_ids, logits_out
+
+    def chunked_forward_via_sweep(
+        self,
+        prompts: list[str],
+        layer_indices: list[int],
+        include_logits: bool = False,
+        router_layer_indices: list[int] | None = None,
+        router_module_template: str | None = None,
+        router_hook_strategy: str = "output",
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor | None,
+        dict[int, torch.Tensor] | None,
+    ]:
+        """Sweep-based drop-in for :meth:`_chunked_forward`. Returns the
+        same ``(activations, attention_mask, logits, router_logits)`` tuple.
+
+        ``batch_size=len(prompts)`` matches the caller expectation
+        (``extract_batch`` et al. pass the entire corpus as one batch)."""
+        from .accumulators import (
+            HiddenStateCapture,
+            LogitCapture,
+            RouterLogitCapture,
+        )
+        from .sweep import sweep
+
+        loader = ChunkedLayerLoader(self)
+        # Pin the router template for this call (detect_moe_info runs inside
+        # prepare() but the caller can override — e.g. extract_batch_extended
+        # passes a custom template).
+        if router_module_template is not None:
+            loader.router_module_template = router_module_template
+
+        accumulators: dict[str, Any] = {}
+        if layer_indices:
+            accumulators["hs"] = HiddenStateCapture(
+                layer_indices, dtype=self.dtype,
+            )
+        if include_logits:
+            accumulators["logits"] = LogitCapture()
+        if router_layer_indices:
+            accumulators["router"] = RouterLogitCapture(
+                router_layer_indices, strategy=router_hook_strategy,
+            )
+
+        # Shortcut: if no accumulators, we still need the attention mask.
+        # Run a minimal sweep with HiddenStateCapture on layer 0 just to
+        # drive the tokenizer? Simpler — tokenize here and return.
+        if not accumulators:
+            tokenized = self.tokenizer(
+                prompts, return_tensors="pt", padding=True,
+            )
+            return None, tokenized["attention_mask"], None, None
+
+        out = sweep(
+            prompts,
+            accumulators=accumulators,
+            loader=loader,
+            batch_size=len(prompts),
+        )
+
+        activations = out["hs"] if "hs" in accumulators else None
+
+        # attention_mask — re-tokenize (cheap) to match legacy shape
+        tokenized = self.tokenizer(prompts, return_tensors="pt", padding=True)
+        attention_mask_2d = tokenized["attention_mask"]
+
+        logits_out = out.get("logits") if include_logits else None
+        router_out = out.get("router") if router_layer_indices else None
+
+        return activations, attention_mask_2d, logits_out, router_out
+
     # --- ExtractionBackend interface ---
 
     def extract_batch(
@@ -2563,6 +2756,531 @@ class ChunkedLocalBackend(ExtractionBackend):
             logits_indices=None,
             router_logits=router_logits,
         )
+
+
+# ---------------------------------------------------------------------------
+# ChunkedLayerLoader — LayerLoader implementation for ChunkedLocalBackend
+# ---------------------------------------------------------------------------
+#
+# Backs the new sweep primitive (src/lmprobe/sweep.py). Reuses all of
+# ChunkedLocalBackend's existing model-loading + rotary + memmap infrastructure;
+# only adds protocol methods (prepare, iter_layer_groups, layer_group, read_hs,
+# write_hs, build_layer_kwargs, apply_lm_head) and the `_drive_sweep` forward
+# loop that sweep.py dispatches into.
+
+
+class _ResidualBuffer:
+    """Memmap-backed residual buffer, lifecycle-owned by ChunkedLayerLoader.prepare."""
+
+    def __init__(self, mmap: np.memmap, tmpdir: Any) -> None:
+        self.mmap = mmap
+        self._tmpdir = tmpdir
+
+    def cleanup(self) -> None:
+        # Drop memmap ref first so Python releases the mmap before the
+        # backing file is unlinked (matters on Windows; harmless on Linux).
+        del self.mmap
+        self._tmpdir.cleanup()
+
+
+class ChunkedLayerLoader:
+    """LayerLoader wrapping :class:`ChunkedLocalBackend`.
+
+    Implements the sweep primitive's :class:`~lmprobe.sweep.LayerLoader`
+    protocol: embedding + rotary in :meth:`prepare`, chunk-sized layer
+    groups via :meth:`iter_layer_groups`, memmap-backed residual buffer
+    (spec 004), and the concrete forward-loop in :meth:`_drive_sweep`.
+
+    During the migration both this class and the legacy
+    ``ChunkedLocalBackend.scan_forward`` coexist; the sweep-based path is
+    reachable via ``backend.scan_via_sweep(...)``. Parity is enforced by
+    ``tests/test_sweep_parity.py``.
+    """
+
+    def __init__(self, backend: ChunkedLocalBackend) -> None:
+        self._backend = backend
+        # LayerLoader protocol attributes:
+        self.tokenizer = backend.tokenizer
+        self.num_layers: int = backend._get_num_layers()
+        self.hidden_dim: int = 0  # populated in prepare()
+        self.dtype: torch.dtype = backend.dtype
+        self.device: str = backend.device
+        self.layer_types: list[str] | None = None
+        self.router_module_template: str | None = None
+        # Lazily-resolved chunk size (same source of truth as scan_forward).
+        self._chunk_size = backend._resolve_chunk_size()
+
+    # --- LayerLoader protocol ------------------------------------------------
+
+    def prepare(
+        self, prompts: list[str], batch_size: int,
+    ) -> Any:
+        """Context manager: tokenize → embed → rotary → allocate memmap.
+
+        Yields an :class:`~lmprobe.sweep.EmbedState`. The residual buffer's
+        backing tempdir is deterministically cleaned up on exit.
+        """
+        from contextlib import contextmanager
+
+        from .activation_types import detect_moe_info
+        from .sweep import EmbedState
+
+        @contextmanager
+        def _prepare_ctx() -> Any:
+            import os
+            import tempfile
+
+            # Detect MoE routing template (surfaces for RouterLogitCapture
+            # accumulators to read off `loader.router_module_template`).
+            try:
+                moe_info = detect_moe_info(self._backend.model_name)
+                if moe_info is not None:
+                    self.router_module_template = moe_info.router_module_template
+            except Exception:
+                pass
+
+            # Tokenize with corpus-wide padding (matches scan_forward).
+            tokenized = self.tokenizer(
+                prompts, return_tensors="pt", padding=True,
+            )
+            all_input_ids = tokenized["input_ids"]
+            all_attention_mask = tokenized["attention_mask"]
+
+            token_ids_per_sample: list[list[int]] = []
+            seq_lengths: list[int] = []
+            for i in range(len(prompts)):
+                real_len = int(all_attention_mask[i].sum().item())
+                seq_lengths.append(real_len)
+                token_ids_per_sample.append(
+                    all_input_ids[i, :real_len].tolist(),
+                )
+
+            n_samples = len(prompts)
+            batches: list[tuple[int, int]] = [
+                (s, min(s + batch_size, n_samples))
+                for s in range(0, n_samples, batch_size)
+            ]
+
+            model = self._backend._load_full_model_cpu()
+            device = self.device
+            embed = _get_embedding_module(model)
+            embed.to(device)
+
+            pos_ids_per_batch: list[torch.Tensor] = []
+            cache_positions_per_batch: list[torch.Tensor] = []
+
+            tmpdir = tempfile.TemporaryDirectory(prefix="lmprobe_sweep_")
+            try:
+                hs_path = os.path.join(tmpdir.name, "residuals.bin")
+                S_max = int(all_input_ids.shape[1])
+                mmap: np.memmap | None = None
+                hidden_dim: int | None = None
+
+                for start, end in batches:
+                    ids = all_input_ids[start:end]
+                    mask = all_attention_mask[start:end]
+                    with torch.no_grad():
+                        hs = embed(ids.to(device)).cpu()
+                    if hidden_dim is None:
+                        hidden_dim = int(hs.shape[-1])
+                    if mmap is None:
+                        mmap = np.memmap(
+                            hs_path,
+                            dtype=_mmap_np_dtype(self.dtype),
+                            mode="w+",
+                            shape=(n_samples, S_max, hidden_dim),
+                        )
+                    _mmap_write_slice(mmap, start, end, hs)
+                    del hs
+                    pos_ids = mask.long().cumsum(-1) - 1
+                    pos_ids.masked_fill_(mask == 0, 1)
+                    pos_ids_per_batch.append(pos_ids)
+                    cache_positions_per_batch.append(
+                        torch.arange(ids.shape[1]),
+                    )
+                embed.to("cpu")
+                assert mmap is not None and hidden_dim is not None
+                self.hidden_dim = hidden_dim
+
+                # Rotary phase — same logic as scan_forward. Broadcast via
+                # a single-sample slice of the just-embedded residuals.
+                position_embeddings, layer_types = self._compute_rotary(
+                    model, mmap, pos_ids_per_batch, device,
+                )
+                self.layer_types = layer_types
+
+                state = EmbedState(
+                    input_ids=all_input_ids,
+                    attention_mask=all_attention_mask,
+                    batches=batches,
+                    pos_ids_per_batch=pos_ids_per_batch,
+                    cache_positions_per_batch=cache_positions_per_batch,
+                    position_embeddings=position_embeddings,
+                    layer_types=layer_types,
+                    seq_lengths=seq_lengths,
+                    token_ids_per_sample=token_ids_per_sample,
+                    hidden_dim=hidden_dim,
+                    residual_buffer=_ResidualBuffer(mmap, tmpdir),
+                )
+            except Exception:
+                tmpdir.cleanup()
+                raise
+
+            try:
+                yield state
+            finally:
+                state.residual_buffer.cleanup()
+
+        return _prepare_ctx()
+
+    def _compute_rotary(
+        self,
+        model: Any,
+        mmap: np.memmap,
+        pos_ids_per_batch: list[torch.Tensor],
+        device: str,
+    ) -> tuple[Any, list[str] | None]:
+        """Port of the rotary block in scan_forward (lines ~1978–2016)."""
+        rotary_name = ChunkedLocalBackend._find_rotary_embedding_name(model)
+        if rotary_name is None:
+            return None, None
+        rotary_mod = model
+        for part in rotary_name.split("."):
+            rotary_mod = getattr(rotary_mod, part)
+        rotary_mod.to(device)
+
+        text_cfg = getattr(
+            getattr(model, "config", None), "text_config",
+            getattr(model, "config", None),
+        )
+        layer_types_cfg = getattr(text_cfg, "layer_types", None)
+        pe_hs = _mmap_read_slice(mmap, 0, 1, self.dtype).to(device)
+        pe_pos = pos_ids_per_batch[0][:1].to(device)
+
+        unique_types = set(layer_types_cfg) if layer_types_cfg is not None else set()
+        position_embeddings: Any
+        layer_types: list[str] | None
+        if layer_types_cfg is not None and len(unique_types) > 1:
+            layer_types = list(layer_types_cfg)
+            position_embeddings = {}
+            with torch.no_grad():
+                for lt in unique_types:
+                    pe = rotary_mod(pe_hs, pe_pos, layer_type=lt)
+                    position_embeddings[lt] = tuple(t.cpu() for t in pe)
+        else:
+            if layer_types_cfg is not None:
+                layer_types = list(layer_types_cfg)
+            else:
+                layer_types = None
+            with torch.no_grad():
+                pe = rotary_mod(pe_hs, pe_pos)
+                if isinstance(pe, tuple):
+                    position_embeddings = tuple(t.cpu() for t in pe)
+                else:
+                    position_embeddings = pe.cpu()
+        rotary_mod.to("cpu")
+        return position_embeddings, layer_types
+
+    def iter_layer_groups(self) -> Any:
+        for start in range(0, self.num_layers, self._chunk_size):
+            yield list(range(start, min(start + self._chunk_size, self.num_layers)))
+
+    def layer_group(self, indices: list[int]) -> Any:
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx() -> Any:
+            import gc
+
+            model = self._backend._load_full_model_cpu()
+            decoder_layers = _get_decoder_layers(model)
+            for i in indices:
+                decoder_layers[i].to(self.device)
+            try:
+                yield [decoder_layers[i] for i in indices]
+            finally:
+                for i in indices:
+                    decoder_layers[i].to("cpu")
+                gc.collect()
+                if torch.cuda.is_available() and self.device != "cpu":
+                    torch.cuda.empty_cache()
+        return _ctx()
+
+    def read_hs(
+        self,
+        state: Any,
+        start: int,
+        end: int,
+        device: str,
+    ) -> torch.Tensor:
+        return _mmap_read_slice(
+            state.residual_buffer.mmap, start, end, self.dtype,
+        ).to(device)
+
+    def write_hs(
+        self,
+        state: Any,
+        start: int,
+        end: int,
+        hs: torch.Tensor,
+    ) -> None:
+        _mmap_write_slice(state.residual_buffer.mmap, start, end, hs)
+
+    def build_layer_kwargs(
+        self,
+        state: Any,
+        batch_idx: int,
+        layer_idx: int,
+        causal_mask_dev: torch.Tensor,
+        device: str,
+    ) -> dict[str, Any]:
+        pos_dev = state.pos_ids_per_batch[batch_idx].to(device)
+        cache_position = state.cache_positions_per_batch[batch_idx]
+        pe_dev = ChunkedLocalBackend._pe_to_device(
+            state.position_embeddings, device,
+        )
+        return ChunkedLocalBackend._build_layer_kwargs(
+            causal_mask_dev, pos_dev, cache_position,
+            pe_dev, state.layer_types, layer_idx, device,
+        )
+
+    def apply_lm_head(
+        self,
+        final_hs: torch.Tensor,
+        device: str,
+    ) -> torch.Tensor:
+        """Apply final_norm + lm_head to a batch of residuals."""
+        model = self._backend._load_full_model_cpu()
+        final_norm = _get_final_norm(model)
+        lm_head = _get_lm_head(model)
+        final_norm.to(device)
+        lm_head.to(device)
+        try:
+            with torch.no_grad():
+                logits = lm_head(final_norm(final_hs))
+        finally:
+            final_norm.to("cpu")
+            lm_head.to("cpu")
+        assert isinstance(logits, torch.Tensor)
+        return logits
+
+    # --- Sweep driver --------------------------------------------------------
+
+    def _drive_sweep(
+        self,
+        *,
+        state: Any,
+        accumulators: Any,
+        plans: dict[tuple[int, str], Any],
+        basis_gpu: dict[str, torch.Tensor],
+        batch_size: int,
+        ctx: Any,
+    ) -> None:
+        """Layer-chunk + batch forward loop. Hooks emit signals;
+        :func:`sweep._dispatch_plan` routes each capture to subscribers."""
+        from tqdm import tqdm
+
+        from .sweep import (
+            SIGNAL_ATTN_DELTA,
+            SIGNAL_LOGITS,
+            SIGNAL_MLP_DELTA,
+            SIGNAL_RESIDUAL,
+            SIGNAL_ROUTER_LOGITS,
+            _dispatch_plan,
+            _notify_group_complete,
+        )
+
+        # Router strategy: read off the first RouterLogitCapture-like
+        # accumulator if one subscribes to router_logits. (Convention: the
+        # accumulator exposes a `strategy` attribute. Conflict between
+        # subscribers is a caller bug; we use the first declared.)
+        router_strategy = "output"
+        for acc in accumulators.values():
+            if SIGNAL_ROUTER_LOGITS in acc.signals and hasattr(acc, "strategy"):
+                router_strategy = acc.strategy
+                break
+
+        device = self.device
+        model = self._backend._load_full_model_cpu()
+
+        group_iter = list(self.iter_layer_groups())
+        for chunk_idx, chunk_indices in enumerate(tqdm(
+            group_iter,
+            desc="Sweep: layer groups",
+        )):
+            with self.layer_group(chunk_indices) as layer_modules_in_group:
+                # Map layer_idx -> module for O(1) lookup in the batch loop.
+                layer_modules = {
+                    layer_idx: layer_modules_in_group[i]
+                    for i, layer_idx in enumerate(chunk_indices)
+                }
+
+                for batch_idx, (start, end) in enumerate(state.batches):
+                    hs = self.read_hs(state, start, end, device)
+                    mask_dev = _make_causal_mask(
+                        state.attention_mask[start:end], self.dtype,
+                    ).to(device)
+                    sample_ids = np.arange(start, end, dtype=np.int32)
+                    attn_mask_np = (
+                        state.attention_mask[start:end].cpu().numpy().astype(bool)
+                    )
+
+                    with torch.no_grad():
+                        for layer_idx in chunk_indices:
+                            layer_module = layer_modules[layer_idx]
+
+                            # Register hooks only for signals that have
+                            # subscribers at this layer.
+                            hook_handles: list[Any] = []
+                            hook_bufs: dict[str, list[torch.Tensor]] = {}
+
+                            for sig in (
+                                SIGNAL_ATTN_DELTA,
+                                SIGNAL_MLP_DELTA,
+                                SIGNAL_ROUTER_LOGITS,
+                            ):
+                                if (layer_idx, sig) not in plans:
+                                    continue
+                                buf: list[torch.Tensor] = []
+                                hook_bufs[sig] = buf
+                                handle = _install_sweep_hook(
+                                    sig, layer_module, layer_idx, model,
+                                    self.router_module_template,
+                                    router_strategy, buf,
+                                )
+                                if handle is not None:
+                                    hook_handles.append((sig, handle))
+
+                            layer_kwargs = self.build_layer_kwargs(
+                                state, batch_idx, layer_idx, mask_dev, device,
+                            )
+                            output = layer_module(hs, **layer_kwargs)
+                            hs = output[0] if isinstance(output, tuple) else output
+
+                            # Dispatch hooked signals. Slice basis per
+                            # layer — basis_gpu[sig] is [n_layers, H, k].
+                            for sig, handle in hook_handles:
+                                handle.remove()
+                                buf = hook_bufs[sig]
+                                if not buf:
+                                    continue
+                                plan = plans.get((layer_idx, sig))
+                                if plan is None:
+                                    continue
+                                sig_basis = basis_gpu.get(sig)
+                                per_layer_basis = (
+                                    sig_basis[layer_idx] if sig_basis is not None
+                                    else None
+                                )
+                                _dispatch_plan(
+                                    plan, buf[0], sig, layer_idx,
+                                    sample_ids, attn_mask_np,
+                                    per_layer_basis,
+                                )
+                                buf.clear()
+
+                            # Residual = layer output (no hook needed).
+                            res_plan = plans.get((layer_idx, SIGNAL_RESIDUAL))
+                            if res_plan is not None:
+                                res_basis = basis_gpu.get(SIGNAL_RESIDUAL)
+                                res_per_layer = (
+                                    res_basis[layer_idx] if res_basis is not None
+                                    else None
+                                )
+                                _dispatch_plan(
+                                    res_plan, hs.detach(), SIGNAL_RESIDUAL,
+                                    layer_idx, sample_ids, attn_mask_np,
+                                    res_per_layer,
+                                )
+
+                    self.write_hs(state, start, end, hs)
+                    del hs, mask_dev
+
+            # Layer group is unloaded; fire completion hook so PCAFit can
+            # fit-and-free incrementally.
+            _notify_group_complete(accumulators, chunk_indices)
+
+        # End-of-sweep: logits. Any accumulator subscribing to SIGNAL_LOGITS
+        # receives one dispatch per microbatch with the lm_head output.
+        wants_logits = any(
+            SIGNAL_LOGITS in a.signals for a in accumulators.values()
+        )
+        if wants_logits:
+            for batch_idx, (start, end) in enumerate(state.batches):
+                hs = self.read_hs(state, start, end, device)
+                logits = self.apply_lm_head(hs, device)
+                sample_ids = np.arange(start, end, dtype=np.int32)
+                attn_mask_np = (
+                    state.attention_mask[start:end].cpu().numpy().astype(bool)
+                )
+                logits_cpu = logits.detach().cpu()
+                for acc in accumulators.values():
+                    if SIGNAL_LOGITS in acc.signals:
+                        acc.update(
+                            logits_cpu, SIGNAL_LOGITS, -1,
+                            sample_ids, attn_mask_np,
+                        )
+                del hs, logits, logits_cpu
+
+
+def _install_sweep_hook(
+    sig: str,
+    layer_module: Any,
+    layer_idx: int,
+    model: Any,
+    router_module_template: str | None,
+    router_strategy: str,
+    buf: list[torch.Tensor],
+) -> Any:
+    """Register a forward hook for a sweep signal on the appropriate
+    submodule. Returns the hook handle, or ``None`` if the signal is
+    unavailable for this layer (e.g. router_logits on a dense layer)."""
+    if sig == "attn_delta":
+        def _hook(_mod: Any, _inp: Any, out: Any) -> None:
+            delta = out[0] if isinstance(out, tuple) else out
+            buf.append(delta.detach())
+        mod = _get_attn_submodule(layer_module)
+        return mod.register_forward_hook(_hook)
+    if sig == "mlp_delta":
+        def _hook(_mod: Any, _inp: Any, out: Any) -> None:
+            delta = out[0] if isinstance(out, tuple) else out
+            buf.append(delta.detach())
+        mod = _get_mlp_submodule(layer_module)
+        return mod.register_forward_hook(_hook)
+    if sig == "router_logits":
+        if router_module_template is None:
+            return None
+        router_path = router_module_template.format(layer=layer_idx)
+        if router_path.startswith("model."):
+            router_path = router_path[len("model."):]
+        try:
+            router_mod = model
+            for part in router_path.split("."):
+                if part.isdigit():
+                    router_mod = router_mod[int(part)]
+                else:
+                    router_mod = getattr(router_mod, part)
+        except (AttributeError, IndexError):
+            return None
+
+        if router_strategy == "input_gate":
+            # DeepSeek-style: compute logits from module input × gate weight.
+            def _hook_ig(mod: Any, args: Any, out: Any) -> None:
+                hs_in = args[0] if isinstance(args, tuple) else args
+                gate_w = mod.gate.weight
+                logits = torch.nn.functional.linear(
+                    hs_in.to(gate_w.dtype), gate_w,
+                )
+                buf.append(logits.detach())
+            return router_mod.register_forward_hook(_hook_ig)
+        else:
+            def _hook_out(_mod: Any, _inp: Any, out: Any) -> None:
+                if isinstance(out, tuple):
+                    buf.append(out[0].detach())
+                else:
+                    buf.append(out.detach())
+            return router_mod.register_forward_hook(_hook_out)
+    return None
 
 
 # ---------------------------------------------------------------------------

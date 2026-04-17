@@ -476,26 +476,37 @@ class TestBatchProjectGrouped:
         assert call_count["n"] == 1
 
     def test_batch_project_warns_on_third_call(self, scan):
+        # The legacy "loop trap" UserWarning fires on the 3rd batch_project
+        # call. Filter out the new DeprecationWarning (orthogonal — emitted
+        # every call now that batch_project is being sunset).
         import warnings
+
+        def _loop_warnings(ws):
+            return [
+                x for x in ws
+                if issubclass(x.category, UserWarning)
+                and not issubclass(x.category, DeprecationWarning)
+                and "batch_project_grouped" in str(x.message)
+            ]
 
         with warnings.catch_warnings(record=True) as w1:
             warnings.simplefilter("always")
             scan.batch_project(["p1"])
-        assert not any("batch_project_grouped" in str(x.message) for x in w1)
+        assert _loop_warnings(w1) == []
 
         with warnings.catch_warnings(record=True) as w2:
             warnings.simplefilter("always")
             scan.batch_project(["p2"])
-        assert not any("batch_project_grouped" in str(x.message) for x in w2)
+        assert _loop_warnings(w2) == []
 
         with warnings.catch_warnings(record=True) as w3:
             warnings.simplefilter("always")
             scan.batch_project(["p3"])
-        matching = [x for x in w3 if "batch_project_grouped" in str(x.message)]
+        matching = _loop_warnings(w3)
         assert len(matching) == 1
-        assert issubclass(matching[0].category, UserWarning)
 
     def test_batch_project_warning_fires_once(self, scan):
+        # Loop-trap UserWarning fires once per instance even after many calls.
         import warnings
 
         for _ in range(3):
@@ -505,16 +516,30 @@ class TestBatchProjectGrouped:
             warnings.simplefilter("always")
             scan.batch_project(["p"])
             scan.batch_project(["p"])
-        assert not any("batch_project_grouped" in str(x.message) for x in w)
+        loop_warnings = [
+            x for x in w
+            if issubclass(x.category, UserWarning)
+            and not issubclass(x.category, DeprecationWarning)
+            and "batch_project_grouped" in str(x.message)
+        ]
+        assert loop_warnings == []
 
-    def test_grouped_does_not_trigger_warning(self, scan):
+    def test_grouped_does_not_trigger_loop_warning(self, scan):
+        # The loop-trap UserWarning should not fire from batch_project_grouped,
+        # regardless of the new DeprecationWarning emitted on every call.
         import warnings
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             for _ in range(5):
                 scan.batch_project_grouped({"k": ["p"]})
-        assert not any("batch_project_grouped" in str(x.message) for x in w)
+        loop_warnings = [
+            x for x in w
+            if issubclass(x.category, UserWarning)
+            and not issubclass(x.category, DeprecationWarning)
+            and "batch_project_grouped" in str(x.message)
+        ]
+        assert loop_warnings == []
 
 
 # ---------------------------------------------------------------------------

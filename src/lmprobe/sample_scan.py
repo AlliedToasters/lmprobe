@@ -93,6 +93,12 @@ class SampleScan:
         self._samples_table = scan_storage.read_samples(self._scan_dir)
         self._projections: np.memmap | None = None
         self._coords_table: Any = None
+        # Offset table: [n_samples, n_layers, n_signals, 2] int32.
+        # Lazy-loaded on first per_token() / per_token_layer() call.
+        # May be None for scans written before the offset table was added
+        # — in that case per_token falls back to coord-scanning.
+        self._offset_table: np.memmap | None = None
+        self._offset_table_checked: bool = False
 
         if backend not in ("auto", "chunked", "disk_offload"):
             raise ValueError(
@@ -278,6 +284,34 @@ class SampleScan:
             coords_signal=np.array(coords["signal"], dtype=np.int8),
         )
 
+        # Offset table — derived from the known row layout. Enables O(1)
+        # per-token slicing via `scan.per_token(...)` instead of
+        # O(N) coord-scanning. Legacy scan_forward writes rows in
+        # ``(chunk_layer_major, signal_minor, sample, token_pos)`` order
+        # with ``S == S_max`` for every batch (tokenizer pads corpus-wide);
+        # mirror that layout here.
+        n_signals_actual = len(actual_signals)
+        s_max_val = int(max(seq_lengths)) if seq_lengths else 0
+        block_size = metadata_dict["n_samples"] * s_max_val
+        offset_table = np.zeros(
+            (
+                metadata_dict["n_samples"],
+                metadata_dict["n_layers"],
+                n_signals_actual,
+                2,
+            ),
+            dtype=np.int32,
+        )
+        for L in range(metadata_dict["n_layers"]):
+            for si in range(n_signals_actual):
+                block_offset = (L * n_signals_actual + si) * block_size
+                for sid in range(metadata_dict["n_samples"]):
+                    start = block_offset + sid * s_max_val
+                    end = start + int(seq_lengths[sid])
+                    offset_table[sid, L, si, 0] = start
+                    offset_table[sid, L, si, 1] = end
+        scan_storage.write_offset_table(scan_dir, offset_table)
+
         return cls(scan_dir)
 
     # --- Properties ---
@@ -324,6 +358,190 @@ class SampleScan:
 
             self._projections = scan_storage.open_projections(self._scan_dir)
             self._coords_table = scan_storage.read_coords(self._scan_dir)
+
+    def _load_offset_table(self) -> np.memmap | None:
+        """Lazy-load the offset table. ``None`` for pre-offset-table scans."""
+        if not self._offset_table_checked:
+            from . import scan_storage
+            self._offset_table = scan_storage.open_offset_table(self._scan_dir)
+            self._offset_table_checked = True
+        return self._offset_table
+
+    # --- New sweep-based public API (per-token as first-class product) ---
+
+    def sweep(
+        self,
+        prompts: list[str],
+        *,
+        accumulators: Mapping[str, Any],
+        external_bases: dict[str, np.ndarray] | None = None,
+        batch_size: int = 4,
+    ) -> dict[str, Any]:
+        """Run a single sweep over ``prompts`` with ``accumulators``.
+
+        The primary programmatic entry point post-deprecation of
+        ``batch_project`` / ``batch_project_grouped`` / ``batch_project_reduced``.
+        Pass any combination of accumulators from :mod:`lmprobe.accumulators`
+        (e.g. ``PerTokenProjection``, ``LastTokenReducer``, ``MeanReducer``,
+        ``HiddenStateCapture``, ``LogitCapture``) or your own.
+
+        Parameters
+        ----------
+        prompts : list[str]
+            Prompts to forward.
+        accumulators : mapping of {name: Accumulator}
+            Accumulators to drive off the sweep. Output is keyed by name.
+        external_bases : dict or None
+            External bases for stream-projection. Defaults to
+            ``self.bases`` (this scan's fit bases) — suitable for any
+            projection-wanting accumulator in ``accumulators``.
+        batch_size : int
+            Microbatch size.
+
+        Returns
+        -------
+        dict
+            ``{name: accumulator.finalize()}``.
+        """
+        from .backends import ChunkedLayerLoader, ChunkedLocalBackend
+        from .sweep import sweep as _sweep
+
+        if external_bases is None:
+            external_bases = self._bases
+
+        backend = self._get_backend()
+        if isinstance(backend, ChunkedLocalBackend):
+            loader = ChunkedLayerLoader(backend)
+        else:
+            raise NotImplementedError(
+                "SampleScan.sweep() currently supports ChunkedLocalBackend "
+                "only; DiskOffloadBackend sweep integration is pending. "
+                "For DiskOffload, continue to use batch_project* (DeprecationWarning)."
+            )
+
+        return _sweep(
+            prompts,
+            accumulators=accumulators,
+            loader=loader,
+            external_bases=external_bases,
+            batch_size=batch_size,
+        )
+
+    def per_token(
+        self,
+        sample_id: int,
+        layer: int,
+        signal: str | None = None,
+    ) -> np.ndarray:
+        """O(1) slice of per-token projections for one (sample, layer).
+
+        Backed by the offset table written at scan time. Falls back to
+        the coord-scanning path for scans created before the offset table
+        existed — same result, O(N_rows) cost.
+
+        Parameters
+        ----------
+        sample_id : int
+            Index into the corpus.
+        layer : int
+            Layer index.
+        signal : str or None
+            If given, return projections for this signal only: shape
+            ``[seq_len, k]``. Else stack all signals: ``[seq_len, n_sig, k]``.
+
+        Returns
+        -------
+        np.ndarray
+            Real tokens only (padding excluded via the offset table's
+            end-row bound = ``start + seq_length[sample_id]``).
+        """
+        offset_table = self._load_offset_table()
+        if offset_table is None:
+            # Legacy fallback — for scans written pre-offset-table.
+            dense = self.get_projections(sample_id, signal)
+            # dense is [seq_len, n_layers, n_sig, k] or [seq_len, n_layers, 1, k]
+            out = dense[:, layer, :, :]
+            if signal is not None:
+                return out[:, 0, :]
+            return out
+
+        self._load_projections()
+        assert self._projections is not None
+        signal_names = self.signals
+
+        if signal is not None:
+            si = signal_names.index(signal)
+            start, end = offset_table[sample_id, layer, si]
+            rows: np.ndarray = np.asarray(
+                self._projections[int(start) : int(end), 0, :]
+            )
+            return rows
+
+        slices: list[np.ndarray] = []
+        for si in range(len(signal_names)):
+            start, end = offset_table[sample_id, layer, si]
+            slices.append(
+                np.asarray(self._projections[int(start) : int(end), 0, :])
+            )
+        return np.stack(slices, axis=1)  # [seq_len, n_sig, k]
+
+    def per_token_layer(
+        self,
+        layer: int,
+        signal: str,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """All real-token projections at ``(layer, signal)`` across the corpus.
+
+        Returns
+        -------
+        values : np.ndarray
+            ``[total_real_tokens, k]`` fp16.
+        sample_ids : np.ndarray
+            ``[total_real_tokens]`` int32 — which sample each row belongs to.
+        token_positions : np.ndarray
+            ``[total_real_tokens]`` int16 — position within the sample.
+        """
+        offset_table = self._load_offset_table()
+        if offset_table is None:
+            raise RuntimeError(
+                "per_token_layer() requires an offset table. This scan was "
+                "written before the offset table was introduced; re-run "
+                "SampleScan.run() to regenerate, or use the slower "
+                "get_projections() path per sample."
+            )
+
+        self._load_projections()
+        assert self._projections is not None
+        signal_names = self.signals
+        si = signal_names.index(signal)
+
+        n_samples = self._metadata.n_samples
+        all_rows: list[np.ndarray] = []
+        all_sids: list[np.ndarray] = []
+        all_toks: list[np.ndarray] = []
+        for sid in range(n_samples):
+            start, end = offset_table[sid, layer, si]
+            length = int(end) - int(start)
+            if length <= 0:
+                continue
+            rows = np.asarray(
+                self._projections[int(start) : int(end), 0, :]
+            )
+            all_rows.append(rows)
+            all_sids.append(np.full(length, sid, dtype=np.int32))
+            all_toks.append(np.arange(length, dtype=np.int16))
+        if not all_rows:
+            k = self._metadata.n_components
+            return (
+                np.zeros((0, k), dtype=np.float16),
+                np.zeros(0, dtype=np.int32),
+                np.zeros(0, dtype=np.int16),
+            )
+        return (
+            np.concatenate(all_rows, axis=0),
+            np.concatenate(all_sids, axis=0),
+            np.concatenate(all_toks, axis=0),
+        )
 
     # --- Query API ---
 
@@ -511,12 +729,20 @@ class SampleScan:
         --------
         batch_project_grouped : Fused variant for multiple labeled groups.
         """
+        import warnings
+        warnings.warn(
+            "SampleScan.batch_project is deprecated. Use scan.sweep(..., "
+            "accumulators={'proj': PerTokenProjection(scan.bases)}) and "
+            "index via scan.per_token(sample_id, layer). batch_project will "
+            "be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._batch_project_call_count += 1
         if (
             self._batch_project_call_count >= 3
             and not self._batch_project_warned
         ):
-            import warnings
             warnings.warn(
                 "SampleScan.batch_project called 3+ times on the same "
                 "scan. Each call re-streams every model layer CPU→GPU. "
@@ -595,6 +821,15 @@ class SampleScan:
             ``{key: (projections, coords, token_ids_per_sample, seq_lengths)}``.
             Per-group ``coords["sample_id"]`` is rebased to 0..len(group)-1.
         """
+        import warnings
+        warnings.warn(
+            "SampleScan.batch_project_grouped is deprecated. Use scan.sweep("
+            "flatten(groups), accumulators={'proj': PerTokenProjection(scan.bases)}"
+            ") and index via scan.per_token(sample_id, layer). "
+            "Will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         keys = list(prompt_groups.keys())
         all_prompts: list[str] = []
         bounds: list[tuple[Hashable, int, int]] = []
@@ -684,6 +919,15 @@ class SampleScan:
         dict
             ``{group_key: {reducer_name: [N_group, n_layers, n_signals, k]}}``.
         """
+        import warnings
+        warnings.warn(
+            "SampleScan.batch_project_reduced is deprecated. Use scan.sweep("
+            "flatten(groups), accumulators={name: LastTokenReducer(masks, "
+            "bases=scan.bases), ...}) with new-protocol reducers from "
+            "lmprobe.accumulators. Will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         keys = list(prompt_groups.keys())
         all_prompts: list[str] = []
         bounds: list[tuple[Hashable, int, int]] = []
