@@ -1816,7 +1816,7 @@ class ChunkedLocalBackend(ExtractionBackend):
         dict[str, Any],                # metadata
         dict[str, np.ndarray],          # bases: {signal_name: [n_layers, dim, k_eff]}
         np.ndarray,                     # projections [N_total, 1, k]
-        dict[str, list],                # coords {sample_id, layer, token_pos, signal}
+        dict[str, np.ndarray],          # coords {sample_id, layer, token_pos, signal}
         list[list[int]],                # token_ids per sample
         list[int],                      # seq_lengths per sample
         torch.Tensor,                   # attention_mask [n_samples, max_seq_len]
@@ -3207,7 +3207,7 @@ class DiskOffloadBackend(ExtractionBackend):
         dict[str, Any],                # metadata
         dict[str, np.ndarray],          # bases
         np.ndarray,                     # projections [N_total, 1, k]
-        dict[str, list],                # coords
+        dict[str, np.ndarray],          # coords
         list[list[int]],                # token_ids per sample
         list[int],                      # seq_lengths per sample
         torch.Tensor,                   # attention_mask
