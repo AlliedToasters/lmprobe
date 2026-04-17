@@ -175,7 +175,7 @@ def _fit_project_scan_pca(
 
     if use_cuml:
         import cupy as cp
-        from cuml.decomposition import PCA as CuPCA
+        from cuml.decomposition import PCA as CuPCA  # noqa: N811
         from torch.utils.dlpack import to_dlpack
 
         # Move each capture to GPU (fp32 for numerical stability in PCA)
