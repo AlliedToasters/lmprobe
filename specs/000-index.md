@@ -24,6 +24,7 @@ affects: [module names]
 | File | Title | Status | Affects |
 |------|-------|--------|---------|
 | [001-grouped-projection.md](001-grouped-projection.md) | Grouped projection API (`batch_project_grouped`) | draft | sample_scan, backends |
+| [003-per-sample-reduced-projection.md](003-per-sample-reduced-projection.md) | Per-sample reduced projection (`batch_project_reduced`) | draft | sample_scan, backends |
 ---
 
 ## Design docs

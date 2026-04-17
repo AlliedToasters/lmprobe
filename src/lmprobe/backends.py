@@ -13,6 +13,7 @@ This module defines the ExtractionBackend ABC and provides implementations:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from .activation_types import ExtractedBatch, ExtractionSpec
+    from .reducers import Reducer
 
 
 class ExtractionBackend(ABC):
@@ -1582,6 +1584,7 @@ class ChunkedLocalBackend(ExtractionBackend):
         batch_size: int = 4,
         generative_masks: list[np.ndarray] | None = None,
         external_bases: dict[str, np.ndarray] | None = None,
+        reducers: Mapping[str, tuple[Reducer, Any]] | None = None,
     ) -> tuple[
         dict[str, Any],                # metadata
         dict[str, np.ndarray],          # bases: {signal_name: [n_layers, dim, k_eff]}
@@ -1615,6 +1618,13 @@ class ChunkedLocalBackend(ExtractionBackend):
             new ones. Shape [n_layers, dim, k] per signal. When provided,
             PCA fitting is skipped entirely — enables fast batched
             projection through an existing scan's basis.
+        reducers : mapping of {name: (Reducer, state)} or None
+            Spec 003. When provided, per-microbatch projections are
+            dispatched to each reducer's ``update`` immediately after
+            ``_stream_project`` and then freed. Per-token projections
+            never accumulate across chunks, and the returned projection
+            array is empty — reducers own the output. Requires
+            ``external_bases`` to cover every signal in ``signals``.
 
         Returns all data needed to write a SampleScan to disk.
         """
@@ -1628,6 +1638,19 @@ class ChunkedLocalBackend(ExtractionBackend):
 
         if signals is None:
             signals = ["attn_delta", "mlp_delta"]
+
+        if reducers is not None:
+            if external_bases is None:
+                raise ValueError(
+                    "scan_forward: reducers=... requires external_bases=... "
+                    "(reducers only operate on stream-projected signals)."
+                )
+            missing = [s for s in signals if s not in external_bases]
+            if missing:
+                raise ValueError(
+                    "scan_forward: reducers=... requires external_bases to "
+                    f"cover every signal; missing {missing}."
+                )
 
         num_layers = self._get_num_layers()
         model = self._load_full_model_cpu()
@@ -1781,6 +1804,39 @@ class ChunkedLocalBackend(ExtractionBackend):
             del flat, proj
             return out
 
+        # Spec 003: when reducers are supplied, preload signal_bases from
+        # external_bases so the final_bases assembly loop doesn't rely on
+        # per_layer_projected being populated (it won't be — reducers own
+        # the output and the per-token path is skipped).
+        signal_to_idx = {s: i for i, s in enumerate(signals)}
+        if reducers is not None and external_bases is not None:
+            for sig in stream_signals:
+                for layer_idx_pre in range(num_layers):
+                    signal_bases[sig][layer_idx_pre] = (
+                        external_bases[sig][layer_idx_pre]
+                    )
+                signal_dims.setdefault(sig, external_bases[sig].shape[1])
+
+        def _dispatch_reducers(
+            proj_cpu: np.ndarray,
+            sig_name: str,
+            layer_idx: int,
+            start: int,
+            end: int,
+        ) -> None:
+            """Spec 003: feed one microbatch's projection to every reducer."""
+            assert reducers is not None
+            sample_ids_batch = np.arange(start, end)
+            mask_batch_np = (
+                all_attention_mask[start:end].cpu().numpy().astype(bool)
+            )
+            sig_idx = signal_to_idx[sig_name]
+            for _name, (red, state) in reducers.items():
+                red.update(
+                    state, proj_cpu, sample_ids_batch,
+                    layer_idx, sig_idx, mask_batch_np,
+                )
+
         # --- Layer chunk loop ---
         n_chunks = (num_layers + chunk_size - 1) // chunk_size
         chunk_pbar = tqdm(
@@ -1854,9 +1910,19 @@ class ChunkedLocalBackend(ExtractionBackend):
                                 delta_gpu = buf[0]
                                 if sig_name not in signal_dims:
                                     signal_dims[sig_name] = delta_gpu.shape[-1]
-                                per_layer_projected[layer_idx][sig_name].append(
-                                    _stream_project(delta_gpu, sig_name, layer_idx),
+                                proj_cpu = _stream_project(
+                                    delta_gpu, sig_name, layer_idx,
                                 )
+                                if reducers is not None:
+                                    _dispatch_reducers(
+                                        proj_cpu, sig_name, layer_idx,
+                                        start, end,
+                                    )
+                                    del proj_cpu
+                                else:
+                                    per_layer_projected[layer_idx][sig_name].append(
+                                        proj_cpu,
+                                    )
                                 del delta_gpu
                             else:
                                 per_layer_captures[layer_idx][sig_name].append(buf[0])
@@ -1866,9 +1932,19 @@ class ChunkedLocalBackend(ExtractionBackend):
                             if "residual" in stream_signals:
                                 if "residual" not in signal_dims:
                                     signal_dims["residual"] = hs.shape[-1]
-                                per_layer_projected[layer_idx]["residual"].append(
-                                    _stream_project(hs.detach(), "residual", layer_idx),
+                                proj_cpu = _stream_project(
+                                    hs.detach(), "residual", layer_idx,
                                 )
+                                if reducers is not None:
+                                    _dispatch_reducers(
+                                        proj_cpu, "residual", layer_idx,
+                                        start, end,
+                                    )
+                                    del proj_cpu
+                                else:
+                                    per_layer_projected[layer_idx]["residual"].append(
+                                        proj_cpu,
+                                    )
                             else:
                                 per_layer_captures[layer_idx]["residual"].append(
                                     hs.detach().cpu()
@@ -1994,9 +2070,16 @@ class ChunkedLocalBackend(ExtractionBackend):
                     basis_arr[L, :, :actual_k] = layer_basis
             final_bases[sig_name] = basis_arr
 
-        # Stack projections
-        all_projections = np.concatenate(all_proj_chunks, axis=0)
-        all_projections = all_projections[:, np.newaxis, :]  # [N_total, 1, k]
+        # Stack projections. Empty under the reducers path (spec 003) —
+        # reducers own the output; the returned projection array is
+        # intentionally shape (0, 1, n_components).
+        if all_proj_chunks:
+            all_projections = np.concatenate(all_proj_chunks, axis=0)
+            all_projections = all_projections[:, np.newaxis, :]  # [N_total, 1, k]
+        else:
+            all_projections = np.zeros(
+                (0, 1, n_components), dtype=np.float16,
+            )
 
         metadata = {
             "model_id": self.model_name,
@@ -2851,6 +2934,7 @@ class DiskOffloadBackend(ExtractionBackend):
         batch_size: int = 4,
         generative_masks: list[np.ndarray] | None = None,
         external_bases: dict[str, np.ndarray] | None = None,
+        reducers: Mapping[str, tuple[Reducer, Any]] | None = None,
     ) -> tuple[
         dict[str, Any],                # metadata
         dict[str, np.ndarray],          # bases
@@ -2867,6 +2951,11 @@ class DiskOffloadBackend(ExtractionBackend):
         layer's weights from safetensors files instead of keeping the full
         model in CPU RAM. Enables scanning 70B+ models on machines with
         limited CPU memory.
+
+        The ``reducers`` parameter (spec 003) has the same semantics as in
+        :meth:`ChunkedLocalBackend.scan_forward`: when provided, per-token
+        projections never accumulate across layers and the returned
+        projection array is empty.
         """
         import gc
 
@@ -2876,6 +2965,19 @@ class DiskOffloadBackend(ExtractionBackend):
 
         if signals is None:
             signals = ["attn_delta", "mlp_delta"]
+
+        if reducers is not None:
+            if external_bases is None:
+                raise ValueError(
+                    "scan_forward: reducers=... requires external_bases=... "
+                    "(reducers only operate on stream-projected signals)."
+                )
+            missing = [s for s in signals if s not in external_bases]
+            if missing:
+                raise ValueError(
+                    "scan_forward: reducers=... requires external_bases to "
+                    f"cover every signal; missing {missing}."
+                )
 
         config = self._get_config()
         model = self._get_model_skeleton()
@@ -3027,6 +3129,37 @@ class DiskOffloadBackend(ExtractionBackend):
             del flat, proj
             return out
 
+        # Spec 003: preload signal_bases / signal_dims from external_bases
+        # for the reducers path, since the per-layer assembly loop (which
+        # normally populates these for the stream path) is skipped for
+        # signals whose chunks list is empty.
+        signal_to_idx = {s: i for i, s in enumerate(signals)}
+        if reducers is not None and external_bases is not None:
+            for sig, arr in external_bases.items():
+                for L in range(num_layers):
+                    signal_bases[sig][L] = arr[L]
+                signal_dims.setdefault(sig, arr.shape[1])
+
+        def _dispatch_reducers(
+            proj_cpu: np.ndarray,
+            sig_name: str,
+            layer_idx: int,
+            start: int,
+            end: int,
+        ) -> None:
+            """Spec 003: feed one microbatch's projection to every reducer."""
+            assert reducers is not None
+            sample_ids_batch = np.arange(start, end)
+            mask_batch_np = (
+                all_attention_mask[start:end].cpu().numpy().astype(bool)
+            )
+            sig_idx = signal_to_idx[sig_name]
+            for _name, (red, state) in reducers.items():
+                red.update(
+                    state, proj_cpu, sample_ids_batch,
+                    layer_idx, sig_idx, mask_batch_np,
+                )
+
         # --- Phase 2: Layer-by-layer ---
         layer_pbar = tqdm(range(num_layers), desc="Scan: layers")
         for layer_idx in layer_pbar:
@@ -3111,9 +3244,17 @@ class DiskOffloadBackend(ExtractionBackend):
                             delta_gpu = hook_buf[0]
                             if sig_name not in signal_dims:
                                 signal_dims[sig_name] = delta_gpu.shape[-1]
-                            per_signal_projected[sig_name].append(
-                                _stream_project(delta_gpu, sig_name, layer_idx),
+                            proj_cpu = _stream_project(
+                                delta_gpu, sig_name, layer_idx,
                             )
+                            if reducers is not None:
+                                _dispatch_reducers(
+                                    proj_cpu, sig_name, layer_idx,
+                                    start, end,
+                                )
+                                del proj_cpu
+                            else:
+                                per_signal_projected[sig_name].append(proj_cpu)
                             del delta_gpu
                         else:
                             per_signal_captures[sig_name].append(hook_buf[0])
@@ -3125,11 +3266,17 @@ class DiskOffloadBackend(ExtractionBackend):
                         ):
                             if "residual" not in signal_dims:
                                 signal_dims["residual"] = hs.shape[-1]
-                            per_signal_projected["residual"].append(
-                                _stream_project(
-                                    hs.detach(), "residual", layer_idx,
-                                ),
+                            proj_cpu = _stream_project(
+                                hs.detach(), "residual", layer_idx,
                             )
+                            if reducers is not None:
+                                _dispatch_reducers(
+                                    proj_cpu, "residual", layer_idx,
+                                    start, end,
+                                )
+                                del proj_cpu
+                            else:
+                                per_signal_projected["residual"].append(proj_cpu)
                         else:
                             per_signal_captures["residual"].append(
                                 hs.detach().cpu(),
@@ -3231,8 +3378,14 @@ class DiskOffloadBackend(ExtractionBackend):
                     basis_arr[L, :, :actual_k] = layer_basis
             final_bases[sig_name] = basis_arr
 
-        all_projections = np.concatenate(all_proj_chunks, axis=0)
-        all_projections = all_projections[:, np.newaxis, :]
+        # Empty under the reducers path (spec 003) — reducers own the output.
+        if all_proj_chunks:
+            all_projections = np.concatenate(all_proj_chunks, axis=0)
+            all_projections = all_projections[:, np.newaxis, :]
+        else:
+            all_projections = np.zeros(
+                (0, 1, n_components), dtype=np.float16,
+            )
 
         metadata = {
             "model_id": self.model_name,

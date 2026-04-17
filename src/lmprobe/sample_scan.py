@@ -35,6 +35,8 @@ import numpy as np
 if TYPE_CHECKING:
     import matplotlib.figure
 
+    from .reducers import Reducer
+
 
 class SampleScan:
     """A compressed activation scan — a reusable PCA basis fit on a corpus.
@@ -636,6 +638,104 @@ class SampleScan:
                 token_ids_per_sample[start:end],
                 group_seq_lens,
             )
+        return out
+
+    def batch_project_reduced(
+        self,
+        prompt_groups: Mapping[Hashable, list[str]],
+        *,
+        reducers: Mapping[str, Reducer],
+        signal: str | None = None,
+        batch_size: int = 4,
+    ) -> dict[Hashable, dict[str, np.ndarray]]:
+        """Project groups through the scan basis and reduce per-sample in-chunk.
+
+        Spec 003. Fused single-sweep projection over the union of all
+        prompts (same pattern as :meth:`batch_project_grouped`) that applies
+        each supplied reducer to every microbatch's projection as soon as it
+        is produced, then frees it. Per-token projections never accumulate
+        across chunks — cross-chunk memory is bounded by residuals plus the
+        tiny per-sample reducer outputs, independent of sequence length and
+        chunk count.
+
+        The caller-supplied :class:`~lmprobe.reducers.Reducer` instances own
+        their masks. Mask list length must equal the total number of prompts
+        in the union (``sum(len(v) for v in prompt_groups.values())``), with
+        per-sample ordering matching the flattened union order (groups
+        concatenated in ``prompt_groups`` iteration order). Built-in
+        reducers live in :mod:`lmprobe.reducers`.
+
+        Parameters
+        ----------
+        prompt_groups : mapping of hashable key → list[str]
+            Named groups of prompts. Iteration order defines the flat
+            union ordering that reducer masks must match.
+        reducers : mapping of {name: Reducer}
+            Reducers keyed by name. Each is initialized internally via
+            ``init_state(N_total, n_layers, n_signals, k)``.
+        signal : str or None
+            If given, restrict to this signal only; ``n_signals == 1`` and
+            ``sig_idx == 0`` inside reducer state.
+        batch_size : int
+            Microbatch size for the forward pass.
+
+        Returns
+        -------
+        dict
+            ``{group_key: {reducer_name: [N_group, n_layers, n_signals, k]}}``.
+        """
+        keys = list(prompt_groups.keys())
+        all_prompts: list[str] = []
+        bounds: list[tuple[Hashable, int, int]] = []
+        cursor = 0
+        for k in keys:
+            group_prompts = list(prompt_groups[k])
+            start = cursor
+            all_prompts.extend(group_prompts)
+            cursor += len(group_prompts)
+            bounds.append((k, start, cursor))
+
+        n_total = cursor
+        proj_signals = [signal] if signal else self.signals
+        n_layers = self._metadata.n_layers
+        n_signals = len(proj_signals)
+        k_dim = self._metadata.n_components
+
+        bases_subset = {
+            s: self._bases[s] for s in proj_signals if s in self._bases
+        }
+        if not bases_subset:
+            raise ValueError(
+                f"batch_project_reduced: no bases available for requested "
+                f"signals {proj_signals}; scan bases: {list(self._bases)}."
+            )
+        if len(bases_subset) != len(proj_signals):
+            missing = [s for s in proj_signals if s not in bases_subset]
+            raise ValueError(
+                f"batch_project_reduced: scan missing bases for signals "
+                f"{missing}; available: {list(self._bases)}."
+            )
+
+        bound: dict[str, tuple[Reducer, Any]] = {}
+        for name, red in reducers.items():
+            state = red.init_state(n_total, n_layers, n_signals, k_dim)
+            bound[name] = (red, state)
+
+        backend = self._get_backend()
+        backend.scan_forward(
+            all_prompts,
+            signals=proj_signals,
+            n_components=k_dim,
+            batch_size=batch_size,
+            external_bases=bases_subset,
+            reducers=bound,
+        )
+
+        out: dict[Hashable, dict[str, np.ndarray]] = {k: {} for k in keys}
+        for name, (red, state) in bound.items():
+            full = red.finalize(state)
+            for key, start, end in bounds:
+                out[key][name] = full[start:end]
         return out
 
     # --- Single Projection ---

@@ -518,6 +518,300 @@ class TestBatchProjectGrouped:
 
 
 # ---------------------------------------------------------------------------
+# Spec 003: per-sample reduced projection
+# ---------------------------------------------------------------------------
+
+
+class TestBatchProjectReduced:
+    """Fused projection with in-chunk per-sample reduction — spec 003."""
+
+    @pytest.fixture
+    def scan(self, tmp_path):
+        from lmprobe.sample_scan import SampleScan
+
+        prompts = POSITIVE_PROMPTS[:3] + NEGATIVE_PROMPTS[:3]
+        labels = [1, 1, 1, 0, 0, 0]
+
+        return SampleScan.run(
+            prompts=prompts,
+            labels=labels,
+            model_name=TEST_MODEL,
+            scan_dir=tmp_path / "reduced_scan",
+            signals=["attn_delta", "mlp_delta"],
+            n_components=4,
+            device="cpu",
+            batch_size=2,
+        )
+
+    def _tokenize_seq_lens(self, scan, prompts):
+        """Mirror the scan's tokenizer to build mask templates."""
+        from lmprobe._tokenizer_utils import load_tokenizer
+
+        tok = load_tokenizer(scan._metadata.model_id)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        enc = tok(prompts, return_tensors="pt", padding=True)
+        mask = enc["attention_mask"].numpy().astype(bool)
+        return [int(m.sum()) for m in mask]
+
+    def test_last_token_parity_with_batch_project(self, scan):
+        """Per-sample last-token projection via reducer matches selecting
+        the last real token from a batch_project per-token output."""
+        from lmprobe.reducers import LastTokenReducer
+
+        prompts = ["The dog ran fast", "The cat slept", "Birds fly"]
+        seq_lens = self._tokenize_seq_lens(scan, prompts)
+        masks = [np.ones(L, dtype=bool) for L in seq_lens]
+
+        reducers = {"last_token": LastTokenReducer(masks)}
+        out = scan.batch_project_reduced(
+            {"g": prompts}, reducers=reducers, batch_size=2,
+        )
+        reduced = out["g"]["last_token"]
+
+        n_layers = scan._metadata.n_layers
+        n_signals = len(scan.signals)
+        k = scan._metadata.n_components
+        assert reduced.shape == (len(prompts), n_layers, n_signals, k)
+
+        # Reference: run batch_project per sample (so padding doesn't pollute
+        # the "last real token" index), and pull the final-real-token slice.
+        sig_to_idx = {s: i for i, s in enumerate(scan.signals)}
+        for i, p in enumerate(prompts):
+            proj, coords, _, lens = scan.batch_project([p])
+            sample_id = np.asarray(coords["sample_id"])
+            layer = np.asarray(coords["layer"])
+            tok_pos = np.asarray(coords["token_pos"])
+            sig = np.asarray(coords["signal"])
+            last_pos = lens[0] - 1
+            for sig_name in scan.signals:
+                for L in range(n_layers):
+                    mask = (
+                        (sample_id == 0)
+                        & (layer == L)
+                        & (tok_pos == last_pos)
+                        & (sig == sig_to_idx[sig_name])
+                    )
+                    if not mask.any():
+                        continue
+                    expected = proj[mask][0, 0, :]
+                    got = reduced[i, L, sig_to_idx[sig_name], :]
+                    np.testing.assert_allclose(
+                        got.astype(np.float32),
+                        expected.astype(np.float32),
+                        atol=5e-2,
+                    )
+
+    def test_mean_parity_with_batch_project(self, scan):
+        """MeanReducer with all-True masks matches the mean over real
+        tokens of a batch_project per-token output."""
+        from lmprobe.reducers import MeanReducer
+
+        prompts = ["A quick brown fox", "Another short one"]
+        seq_lens = self._tokenize_seq_lens(scan, prompts)
+        masks = [np.ones(L, dtype=bool) for L in seq_lens]
+
+        out = scan.batch_project_reduced(
+            {"g": prompts},
+            reducers={"mean_all": MeanReducer(masks)},
+            batch_size=2,
+        )
+        reduced = out["g"]["mean_all"]
+
+        sig_to_idx = {s: i for i, s in enumerate(scan.signals)}
+        n_layers = scan._metadata.n_layers
+        for i, p in enumerate(prompts):
+            proj, coords, _, lens = scan.batch_project([p])
+            sample_id = np.asarray(coords["sample_id"])
+            layer = np.asarray(coords["layer"])
+            tok_pos = np.asarray(coords["token_pos"])
+            sig = np.asarray(coords["signal"])
+            real_len = lens[0]
+            for sig_name in scan.signals:
+                for L in range(n_layers):
+                    sel = (
+                        (sample_id == 0)
+                        & (layer == L)
+                        & (sig == sig_to_idx[sig_name])
+                        & (tok_pos < real_len)
+                    )
+                    if not sel.any():
+                        continue
+                    expected = proj[sel][:, 0, :].astype(np.float32).mean(0)
+                    got = reduced[i, L, sig_to_idx[sig_name], :].astype(
+                        np.float32,
+                    )
+                    np.testing.assert_allclose(got, expected, atol=5e-2)
+
+    def test_mean_excl_last_n_parity(self, scan):
+        """MeanExclLastN(n=1) drops the final True position; matches a
+        mean over the first real_len-1 tokens of a batch_project output."""
+        from lmprobe.reducers import MeanExclLastNReducer
+
+        prompts = ["A quick brown fox", "Another short one"]
+        seq_lens = self._tokenize_seq_lens(scan, prompts)
+        masks = [np.ones(L, dtype=bool) for L in seq_lens]
+
+        out = scan.batch_project_reduced(
+            {"g": prompts},
+            reducers={"mean_excl1": MeanExclLastNReducer(masks, n=1)},
+            batch_size=2,
+        )
+        reduced = out["g"]["mean_excl1"]
+
+        sig_to_idx = {s: i for i, s in enumerate(scan.signals)}
+        n_layers = scan._metadata.n_layers
+        for i, p in enumerate(prompts):
+            proj, coords, _, lens = scan.batch_project([p])
+            sample_id = np.asarray(coords["sample_id"])
+            layer = np.asarray(coords["layer"])
+            tok_pos = np.asarray(coords["token_pos"])
+            sig = np.asarray(coords["signal"])
+            real_len = lens[0]
+            for sig_name in scan.signals:
+                for L in range(n_layers):
+                    sel = (
+                        (sample_id == 0)
+                        & (layer == L)
+                        & (sig == sig_to_idx[sig_name])
+                        & (tok_pos < real_len - 1)
+                    )
+                    if not sel.any():
+                        continue
+                    expected = proj[sel][:, 0, :].astype(np.float32).mean(0)
+                    got = reduced[i, L, sig_to_idx[sig_name], :].astype(
+                        np.float32,
+                    )
+                    np.testing.assert_allclose(got, expected, atol=5e-2)
+
+    def test_one_scan_forward_call_regardless_of_group_count(self, scan):
+        from lmprobe.reducers import LastTokenReducer
+
+        prompts_a = ["A quick brown fox"]
+        prompts_b = ["Another short one", "Even shorter"]
+        prompts_c = ["Third group prompt"]
+        seq_lens = self._tokenize_seq_lens(
+            scan, prompts_a + prompts_b + prompts_c,
+        )
+        masks = [np.ones(L, dtype=bool) for L in seq_lens]
+
+        call_count = {"n": 0}
+        real = scan._get_backend().scan_forward
+
+        def counting(*args, **kwargs):
+            call_count["n"] += 1
+            return real(*args, **kwargs)
+
+        scan._get_backend().scan_forward = counting
+        try:
+            scan.batch_project_reduced(
+                {"a": prompts_a, "b": prompts_b, "c": prompts_c},
+                reducers={"lt": LastTokenReducer(masks)},
+                batch_size=2,
+            )
+        finally:
+            scan._get_backend().scan_forward = real
+
+        assert call_count["n"] == 1
+
+    def test_returns_empty_coords_and_projections(self, scan):
+        """The reducers path must not populate per-token accumulators —
+        scan_forward returns an empty [0, 1, k] array and empty coords."""
+        from lmprobe.reducers import LastTokenReducer
+
+        prompts = ["A quick brown fox"]
+        seq_lens = self._tokenize_seq_lens(scan, prompts)
+        masks = [np.ones(L, dtype=bool) for L in seq_lens]
+        backend = scan._get_backend()
+
+        reducers = {"lt": LastTokenReducer(masks)}
+        n_layers = scan._metadata.n_layers
+        n_sig = len(scan.signals)
+        k = scan._metadata.n_components
+        bound = {
+            n: (r, r.init_state(1, n_layers, n_sig, k))
+            for n, r in reducers.items()
+        }
+        bases_subset = {s: scan._bases[s] for s in scan.signals}
+
+        (
+            _meta, _bases, projections, coords, _tok, _lens, _am, _sd,
+        ) = backend.scan_forward(
+            prompts,
+            signals=list(scan.signals),
+            n_components=scan._metadata.n_components,
+            batch_size=2,
+            external_bases=bases_subset,
+            reducers=bound,
+        )
+        assert projections.shape[0] == 0
+        assert coords["sample_id"] == []
+        assert coords["token_pos"] == []
+
+    def test_reducers_without_external_bases_raises(self, scan):
+        from lmprobe.reducers import LastTokenReducer
+
+        backend = scan._get_backend()
+        reducers = {"lt": LastTokenReducer([np.ones(3, dtype=bool)])}
+        bound = {n: (r, r.init_state(1, 1, 1, 1)) for n, r in reducers.items()}
+        with pytest.raises(ValueError, match="reducers=.* requires external_bases"):
+            backend.scan_forward(
+                ["x"],
+                signals=["attn_delta"],
+                n_components=4,
+                batch_size=1,
+                external_bases=None,
+                reducers=bound,
+            )
+
+    def test_key_order_preserved(self, scan):
+        from lmprobe.reducers import LastTokenReducer
+
+        prompts_flat = ["alpha one", "beta one", "beta two", "gamma one"]
+        seq_lens = self._tokenize_seq_lens(scan, prompts_flat)
+        masks = [np.ones(L, dtype=bool) for L in seq_lens]
+
+        out = scan.batch_project_reduced(
+            {"alpha": ["alpha one"], "beta": ["beta one", "beta two"], "gamma": ["gamma one"]},
+            reducers={"lt": LastTokenReducer(masks)},
+            batch_size=2,
+        )
+        assert list(out.keys()) == ["alpha", "beta", "gamma"]
+        assert out["alpha"]["lt"].shape[0] == 1
+        assert out["beta"]["lt"].shape[0] == 2
+        assert out["gamma"]["lt"].shape[0] == 1
+
+    def test_multiple_reducers_in_single_sweep(self, scan):
+        """All reducers fed from the same microbatch projections."""
+        from lmprobe.reducers import (
+            LastTokenReducer,
+            MeanExclLastNReducer,
+            MeanReducer,
+        )
+
+        prompts = ["A quick brown fox", "Another short one"]
+        seq_lens = self._tokenize_seq_lens(scan, prompts)
+        masks = [np.ones(L, dtype=bool) for L in seq_lens]
+
+        out = scan.batch_project_reduced(
+            {"g": prompts},
+            reducers={
+                "last": LastTokenReducer(masks),
+                "mean": MeanReducer(masks),
+                "excl1": MeanExclLastNReducer(masks, n=1),
+            },
+            batch_size=2,
+        )
+        for name in ("last", "mean", "excl1"):
+            assert out["g"][name].shape == (
+                2,
+                scan._metadata.n_layers,
+                len(scan.signals),
+                scan._metadata.n_components,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Spec 002: stream-project parity
 # ---------------------------------------------------------------------------
 
