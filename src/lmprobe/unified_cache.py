@@ -1035,8 +1035,7 @@ class UnifiedCache:
             len(uncached), len(prompts) - len(uncached),
         )
 
-        from transformers import AutoTokenizer
-
+        from ._tokenizer_utils import load_tokenizer
         from .logit_utils import (
             compute_perplexity_from_activations,
             download_lm_head_weights,
@@ -1046,7 +1045,7 @@ class UnifiedCache:
         norm_weight, lm_head_weight, norm_config = download_lm_head_weights(
             self.model_name, device=device,
         )
-        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        tokenizer = load_tokenizer(self.model_name)
 
         computed = 0
         for batch_start in range(0, len(uncached), batch_size):

@@ -898,8 +898,8 @@ def _compute_shard_plan(
 
     # Pre-load tokenizer once before threads if token_perplexity is needed
     if has_token_perplexity and _tokenizer_cache.get("instance") is None:
-        from transformers import AutoTokenizer
-        _tokenizer_cache["instance"] = AutoTokenizer.from_pretrained(model_name)
+        from ._tokenizer_utils import load_tokenizer
+        _tokenizer_cache["instance"] = load_tokenizer(model_name)
 
     def _scan_one(idx: int) -> tuple[int, dict | None]:
         """Scan metadata for a single prompt.  Returns (idx, meta_entry | None)."""

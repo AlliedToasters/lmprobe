@@ -420,9 +420,11 @@ def _get_local_model(
 
         check_cuda_compatibility(device)
 
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM
 
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        from ._tokenizer_utils import load_tokenizer
+
+        tokenizer = load_tokenizer(model_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -1017,9 +1019,9 @@ class ChunkedLocalBackend(ExtractionBackend):
     @property
     def tokenizer(self) -> PreTrainedTokenizerBase:
         if self._tokenizer is None:
-            from transformers import AutoTokenizer
+            from ._tokenizer_utils import load_tokenizer
 
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self._tokenizer = load_tokenizer(self.model_name)
             if self._tokenizer.pad_token is None:
                 self._tokenizer.pad_token = self._tokenizer.eos_token
         return self._tokenizer
@@ -2480,8 +2482,8 @@ class DiskOffloadBackend(ExtractionBackend):
     @property
     def tokenizer(self) -> PreTrainedTokenizerBase:
         if self._tokenizer_obj is None:
-            from transformers import AutoTokenizer
-            self._tokenizer_obj = AutoTokenizer.from_pretrained(self.model_name)
+            from ._tokenizer_utils import load_tokenizer
+            self._tokenizer_obj = load_tokenizer(self.model_name)
             if self._tokenizer_obj.pad_token is None:
                 self._tokenizer_obj.pad_token = self._tokenizer_obj.eos_token
         return self._tokenizer_obj
