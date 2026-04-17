@@ -518,6 +518,105 @@ class TestBatchProjectGrouped:
 
 
 # ---------------------------------------------------------------------------
+# Spec 002: stream-project parity
+# ---------------------------------------------------------------------------
+
+
+class TestStreamProjectParity:
+    """Projecting through an external basis via the stream-project path
+    (delta @ basis on device, per-microbatch) must agree with projecting
+    through the legacy captures → stack → PCA.transform path, up to
+    fp16 / GPU-vs-CPU matmul tolerance."""
+
+    @pytest.fixture
+    def scan(self, tmp_path):
+        from lmprobe.sample_scan import SampleScan
+
+        prompts = POSITIVE_PROMPTS[:3] + NEGATIVE_PROMPTS[:3]
+        labels = [1, 1, 1, 0, 0, 0]
+
+        return SampleScan.run(
+            prompts=prompts,
+            labels=labels,
+            model_name=TEST_MODEL,
+            scan_dir=tmp_path / "parity_scan",
+            signals=["attn_delta", "mlp_delta"],
+            n_components=4,
+            device="cpu",
+            batch_size=2,
+        )
+
+    def test_batch_project_matches_stored_projections(self, scan):
+        """Re-projecting the fit corpus through its own basis reproduces
+        the projections computed during the PCA-fit pass (legacy path).
+
+        The fit path does ``pca.transform(flat)`` on CPU in fp32. The
+        stream-project path does ``(delta.reshape(-1,H).float() @ basis)``
+        on the same device. The basis is identical (``pca.components_.T``),
+        so outputs should match within fp16 tolerance."""
+        prompts = POSITIVE_PROMPTS[:3] + NEGATIVE_PROMPTS[:3]
+
+        proj_stream, coords_stream, _, seq_lens = scan.batch_project(prompts)
+
+        # Assemble per-sample dense tensor from stream output:
+        # [seq_len, n_layers, n_signals, k]
+        n_layers = scan.n_layers
+        n_signals = len(scan.signals)
+        k = scan.n_components
+
+        sample_ids = np.asarray(coords_stream["sample_id"])
+        layers = np.asarray(coords_stream["layer"])
+        tokens = np.asarray(coords_stream["token_pos"])
+        sigs = np.asarray(coords_stream["signal"])
+
+        for i in range(len(prompts)):
+            ref = scan.get_projections(i)  # from stored legacy-fit projections
+            seq_len = ref.shape[0]
+
+            mask = sample_ids == i
+            stream_dense = np.zeros(
+                (seq_len, n_layers, n_signals, k), dtype=np.float32,
+            )
+            rows = np.where(mask)[0]
+            for r in rows:
+                t = int(tokens[r])
+                if t >= seq_len:
+                    continue  # padding token beyond real seq_len
+                L = int(layers[r])
+                s = int(sigs[r])
+                stream_dense[t, L, s, :] = proj_stream[r, 0, :].astype(
+                    np.float32,
+                )
+
+            np.testing.assert_allclose(
+                stream_dense, ref, atol=1e-2, rtol=1e-2,
+                err_msg=f"sample {i}: stream-project diverges from PCA-fit",
+            )
+
+    def test_stream_project_dominates_when_external_bases_given(self, scan):
+        """Instrument the backend: under stream-project, the
+        ``per_layer_captures`` / ``per_signal_captures`` bucket should
+        never accumulate cross-batch CPU tensors for signals that have a
+        basis. We verify indirectly: ``batch_project`` returns identical
+        shapes and non-zero projections."""
+        prompts = ["Hello world", "Another test prompt"]
+        proj, coords, _, seq_lens = scan.batch_project(prompts)
+
+        # Output shape: N_samples * max_seq_len (padded) * n_layers * n_signals
+        # rows of [k]-vectors. Rows for padded positions are projected but
+        # will get filtered by callers using seq_lens.
+        n_signals = len(scan.signals)
+        n_layers = scan.n_layers
+        max_seq = max(seq_lens)
+        expected_rows = len(prompts) * max_seq * n_layers * n_signals
+        assert proj.shape[0] == expected_rows
+        assert proj.shape[2] == scan.n_components
+        # At least some projections are non-zero (sanity: stream-project
+        # actually produced output rather than leaving zeros).
+        assert np.abs(proj).sum() > 0
+
+
+# ---------------------------------------------------------------------------
 # Get projections from stored corpus data
 # ---------------------------------------------------------------------------
 

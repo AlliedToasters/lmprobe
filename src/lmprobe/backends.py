@@ -1502,6 +1502,8 @@ class ChunkedLocalBackend(ExtractionBackend):
         layer_idx: int,
         router_module_template: str | None,
         model: Any,
+        *,
+        stream_signals: set[str] | None = None,
     ) -> tuple[
         list[tuple[str, Any, list[torch.Tensor]]],  # [(signal_name, hook_handle, buffer)]
         bool,  # capture_residual — no hook, just layer output
@@ -1510,7 +1512,16 @@ class ChunkedLocalBackend(ExtractionBackend):
 
         Returns list of (signal_name, hook_handle, buffer) for hookable signals,
         plus a flag indicating whether to capture the residual (layer output).
+
+        Parameters
+        ----------
+        stream_signals : set[str] or None
+            Signals whose captures should stay on device (for downstream
+            stream-projection via an external basis — spec 002). Signals
+            *not* in this set — or always, when this is None — are
+            ``.cpu()``-ed inside the hook as before.
         """
+        stream_signals = stream_signals or set()
         hooks: list[tuple[str, Any, list[torch.Tensor]]] = []
         capture_residual = False
 
@@ -1520,13 +1531,18 @@ class ChunkedLocalBackend(ExtractionBackend):
                 continue
 
             buf: list[torch.Tensor] = []
+            stream = sig in stream_signals
 
             def _hook(
                 _mod: Any, _inp: Any, out: Any,
                 _buf: list = buf,
+                _stream: bool = stream,
             ) -> None:
                 delta = out[0] if isinstance(out, tuple) else out
-                _buf.append(delta.detach().cpu())
+                if _stream:
+                    _buf.append(delta.detach())
+                else:
+                    _buf.append(delta.detach().cpu())
 
             if sig == "attn_delta":
                 mod = _get_attn_submodule(layer_module)
@@ -1736,6 +1752,30 @@ class ChunkedLocalBackend(ExtractionBackend):
         all_coord_token_pos: list[int] = []
         all_coord_signal: list[int] = []
 
+        # Spec 002: stream-project through pre-fit basis to avoid accumulating
+        # full [N, S, H] activation tensors on CPU. Basis stays on device for
+        # the whole sweep; only [B, S, k] projections move to CPU.
+        stream_signals: set[str] = (
+            set(external_bases.keys()) if external_bases is not None else set()
+        )
+        basis_gpu: dict[str, torch.Tensor] = {}
+        if external_bases is not None:
+            for sig, arr in external_bases.items():
+                basis_gpu[sig] = torch.from_numpy(
+                    np.ascontiguousarray(arr),
+                ).to(device=device, dtype=torch.float32)
+
+        def _stream_project(
+            delta: torch.Tensor, sig_name: str, layer_idx: int,
+        ) -> np.ndarray:
+            B, S, H = delta.shape
+            basis = basis_gpu[sig_name][layer_idx]
+            flat = delta.reshape(-1, H).to(torch.float32)
+            proj = (flat @ basis).reshape(B, S, -1).to(torch.float16)
+            out = proj.cpu().numpy()
+            del flat, proj
+            return out
+
         # --- Layer chunk loop ---
         n_chunks = (num_layers + chunk_size - 1) // chunk_size
         chunk_pbar = tqdm(
@@ -1751,7 +1791,13 @@ class ChunkedLocalBackend(ExtractionBackend):
                 decoder_layers[i].to(device)
 
             # {layer_idx: {signal_name: [tensor_per_batch, ...]}}
+            # Legacy path (PCA fit, or signals not in external_bases).
             per_layer_captures: dict[int, dict[str, list[torch.Tensor]]] = {
+                L: {sig: [] for sig in signals}
+                for L in range(chunk_start, chunk_end)
+            }
+            # Stream-project path (external_bases signals).
+            per_layer_projected: dict[int, dict[str, list[np.ndarray]]] = {
                 L: {sig: [] for sig in signals}
                 for L in range(chunk_start, chunk_end)
             }
@@ -1769,6 +1815,7 @@ class ChunkedLocalBackend(ExtractionBackend):
                         hook_list, capture_residual = self._resolve_signal_hooks(
                             signals, layer_module, layer_idx,
                             router_module_template, model,
+                            stream_signals=stream_signals,
                         )
 
                         layer_kwargs = self._build_layer_kwargs(
@@ -1779,17 +1826,36 @@ class ChunkedLocalBackend(ExtractionBackend):
                         output = layer_module(hs, **layer_kwargs)
                         hs = output[0] if isinstance(output, tuple) else output
 
-                        # Collect hooked signals
+                        # Collect hooked signals. Stream-projected signals
+                        # get `(delta @ basis)` on GPU right here; legacy
+                        # signals go to CPU for between-chunk PCA.
                         for sig_name, handle, buf in hook_list:
                             handle.remove()
-                            if buf:
+                            if not buf:
+                                continue
+                            if sig_name in stream_signals:
+                                delta_gpu = buf[0]
+                                if sig_name not in signal_dims:
+                                    signal_dims[sig_name] = delta_gpu.shape[-1]
+                                per_layer_projected[layer_idx][sig_name].append(
+                                    _stream_project(delta_gpu, sig_name, layer_idx),
+                                )
+                                del delta_gpu
+                            else:
                                 per_layer_captures[layer_idx][sig_name].append(buf[0])
 
-                        # Residual = layer output (already in hs)
+                        # Residual = layer output (already in hs).
                         if capture_residual:
-                            per_layer_captures[layer_idx]["residual"].append(
-                                hs.detach().cpu()
-                            )
+                            if "residual" in stream_signals:
+                                if "residual" not in signal_dims:
+                                    signal_dims["residual"] = hs.shape[-1]
+                                per_layer_projected[layer_idx]["residual"].append(
+                                    _stream_project(hs.detach(), "residual", layer_idx),
+                                )
+                            else:
+                                per_layer_captures[layer_idx]["residual"].append(
+                                    hs.detach().cpu()
+                                )
 
                 batch_hidden_states[batch_idx] = hs.cpu()
                 del hs, mask_dev, pos_dev, pe_dev
@@ -1815,25 +1881,32 @@ class ChunkedLocalBackend(ExtractionBackend):
                 desc=f"  {_stage_label} (layers {chunk_start}-{chunk_end-1})",
                 leave=False,
             ):
-                captures = per_layer_captures[layer_idx][sig_name]
-                if not captures:
-                    continue
-
-                stacked = torch.cat(captures, dim=0)  # [B_total, S, dim]
-                B_total, S, dim = stacked.shape
-                flat = stacked.reshape(-1, dim).float().numpy()
-
-                # Record signal dimension
-                if sig_name not in signal_dims:
-                    signal_dims[sig_name] = dim
-
-                if external_bases is not None and sig_name in external_bases:
-                    # Use pre-trained basis — skip PCA fitting
-                    basis = external_bases[sig_name][layer_idx]  # [dim, k]
+                if sig_name in stream_signals:
+                    # Stream-project branch: concatenate already-projected
+                    # per-batch arrays; skip PCA and float32 upcast entirely.
+                    chunks = per_layer_projected[layer_idx][sig_name]
+                    if not chunks:
+                        continue
+                    basis = external_bases[sig_name][layer_idx]
                     signal_bases[sig_name][layer_idx] = basis
                     k = basis.shape[1]
-                    projected = (flat @ basis.astype(np.float32)).astype(np.float16)
+                    stacked_proj = np.concatenate(chunks, axis=0)  # [B_total, S, k]
+                    B_total, S, _ = stacked_proj.shape
+                    projected = stacked_proj.reshape(-1, k)
+                    del stacked_proj
                 else:
+                    # Legacy path: stack → flat → PCA (or external project).
+                    captures = per_layer_captures[layer_idx][sig_name]
+                    if not captures:
+                        continue
+
+                    stacked = torch.cat(captures, dim=0)  # [B_total, S, dim]
+                    B_total, S, dim = stacked.shape
+                    flat = stacked.reshape(-1, dim).float().numpy()
+
+                    if sig_name not in signal_dims:
+                        signal_dims[sig_name] = dim
+
                     # Build PCA fit data — filter to generative tokens if mask provided
                     if generative_masks is not None:
                         fit_mask_parts = []
@@ -1859,6 +1932,7 @@ class ChunkedLocalBackend(ExtractionBackend):
 
                     # Project ALL tokens through the basis
                     projected = pca.transform(flat).astype(np.float16)
+                    del stacked, flat
                 if k < n_components:
                     padded = np.zeros(
                         (projected.shape[0], n_components), dtype=np.float16,
@@ -1875,9 +1949,9 @@ class ChunkedLocalBackend(ExtractionBackend):
                         all_coord_token_pos.append(tok)
                         all_coord_signal.append(sig_idx)
 
-                del stacked, flat, projected
+                del projected
 
-            del per_layer_captures
+            del per_layer_captures, per_layer_projected
             gc.collect()
 
         # Assemble per-signal basis arrays: {sig: [n_layers, dim, k_eff]}
@@ -2902,6 +2976,29 @@ class DiskOffloadBackend(ExtractionBackend):
         all_coord_token_pos: list[int] = []
         all_coord_signal: list[int] = []
 
+        # Spec 002: when projecting through a pre-fit basis, keep the basis
+        # on device and project each microbatch's delta on GPU rather than
+        # accumulating full [N, S, H] activations on CPU.
+        basis_gpu: dict[str, torch.Tensor] = {}
+        if external_bases is not None:
+            for sig, arr in external_bases.items():
+                basis_gpu[sig] = torch.from_numpy(
+                    np.ascontiguousarray(arr),
+                ).to(device=device, dtype=torch.float32)
+
+        def _stream_project(
+            delta: torch.Tensor, sig_name: str, layer_idx: int,
+        ) -> np.ndarray:
+            """Project [B, S, H] on GPU through basis_gpu[sig][layer], return
+            [B, S, k] fp16 numpy on CPU. Caller is responsible for coords."""
+            B, S, H = delta.shape
+            basis = basis_gpu[sig_name][layer_idx]  # [H, k] fp32
+            flat = delta.reshape(-1, H).to(torch.float32)
+            proj = (flat @ basis).reshape(B, S, -1).to(torch.float16)
+            out = proj.cpu().numpy()
+            del flat, proj
+            return out
+
         # --- Phase 2: Layer-by-layer ---
         layer_pbar = tqdm(range(num_layers), desc="Scan: layers")
         for layer_idx in layer_pbar:
@@ -2914,7 +3011,12 @@ class DiskOffloadBackend(ExtractionBackend):
             _materialize_module(layer_module, layer_weights, prefix, device)
             del layer_weights
 
+            # Legacy path accumulates CPU tensors for PCA fit.
             per_signal_captures: dict[str, list[torch.Tensor]] = {
+                sig: [] for sig in signals
+            }
+            # Stream-project path accumulates already-projected np arrays.
+            per_signal_projected: dict[str, list[np.ndarray]] = {
                 sig: [] for sig in signals
             }
 
@@ -2925,7 +3027,8 @@ class DiskOffloadBackend(ExtractionBackend):
                 pe_dev = ChunkedLocalBackend._pe_to_device(position_embeddings, device)
 
                 with torch.no_grad():
-                    # Set up signal hooks
+                    # Set up signal hooks — keep captures on GPU when we're
+                    # going to stream-project them; else move to CPU as before.
                     hooks: list[tuple[str, Any, list[torch.Tensor]]] = []
                     capture_residual = False
                     for sig in signals:
@@ -2933,12 +3036,21 @@ class DiskOffloadBackend(ExtractionBackend):
                             capture_residual = True
                             continue
                         buf: list[torch.Tensor] = []
+                        stream = (
+                            external_bases is not None
+                            and sig in external_bases
+                        )
+
                         def _hook(
                             _mod: Any, _inp: Any, out: Any,
                             _buf: list = buf,
+                            _stream: bool = stream,
                         ) -> None:
                             delta = out[0] if isinstance(out, tuple) else out
-                            _buf.append(delta.detach().cpu())
+                            if _stream:
+                                _buf.append(delta.detach())
+                            else:
+                                _buf.append(delta.detach().cpu())
                         if sig == "attn_delta":
                             mod = _get_attn_submodule(layer_module)
                             h = mod.register_forward_hook(_hook)
@@ -2958,11 +3070,38 @@ class DiskOffloadBackend(ExtractionBackend):
 
                     for sig_name, handle, hook_buf in hooks:
                         handle.remove()
-                        if hook_buf:
+                        if not hook_buf:
+                            continue
+                        if (
+                            external_bases is not None
+                            and sig_name in external_bases
+                        ):
+                            delta_gpu = hook_buf[0]
+                            if sig_name not in signal_dims:
+                                signal_dims[sig_name] = delta_gpu.shape[-1]
+                            per_signal_projected[sig_name].append(
+                                _stream_project(delta_gpu, sig_name, layer_idx),
+                            )
+                            del delta_gpu
+                        else:
                             per_signal_captures[sig_name].append(hook_buf[0])
 
                     if capture_residual:
-                        per_signal_captures["residual"].append(hs.detach().cpu())
+                        if (
+                            external_bases is not None
+                            and "residual" in external_bases
+                        ):
+                            if "residual" not in signal_dims:
+                                signal_dims["residual"] = hs.shape[-1]
+                            per_signal_projected["residual"].append(
+                                _stream_project(
+                                    hs.detach(), "residual", layer_idx,
+                                ),
+                            )
+                        else:
+                            per_signal_captures["residual"].append(
+                                hs.detach().cpu(),
+                            )
 
                 batch_hidden_states[batch_idx] = hs.cpu()
                 del hs, mask_dev, pos_dev, pe_dev
@@ -2972,25 +3111,35 @@ class DiskOffloadBackend(ExtractionBackend):
             gc.collect()
             torch.cuda.empty_cache()
 
-            # --- PCA for this layer ---
+            # --- Per-layer assembly ---
             for sig_idx, sig_name in enumerate(signals):
-                captures = per_signal_captures[sig_name]
-                if not captures:
-                    continue
+                stream = (
+                    external_bases is not None
+                    and sig_name in external_bases
+                )
 
-                stacked = torch.cat(captures, dim=0)  # [B_total, S, dim]
-                B_total, S, dim = stacked.shape
-                flat = stacked.reshape(-1, dim).float().numpy()
-
-                if sig_name not in signal_dims:
-                    signal_dims[sig_name] = dim
-
-                if external_bases is not None and sig_name in external_bases:
+                if stream:
+                    chunks = per_signal_projected[sig_name]
+                    if not chunks:
+                        continue
                     basis = external_bases[sig_name][layer_idx]
                     signal_bases[sig_name][layer_idx] = basis
                     k = basis.shape[1]
-                    projected = (flat @ basis.astype(np.float32)).astype(np.float16)
+                    stacked_proj = np.concatenate(chunks, axis=0)  # [B_total, S, k]
+                    B_total, S, _ = stacked_proj.shape
+                    projected = stacked_proj.reshape(-1, k)
+                    del stacked_proj
                 else:
+                    captures = per_signal_captures[sig_name]
+                    if not captures:
+                        continue
+                    stacked = torch.cat(captures, dim=0)  # [B_total, S, dim]
+                    B_total, S, dim = stacked.shape
+                    flat = stacked.reshape(-1, dim).float().numpy()
+
+                    if sig_name not in signal_dims:
+                        signal_dims[sig_name] = dim
+
                     if generative_masks is not None:
                         fit_mask_parts = []
                         for sid in range(B_total):
@@ -3013,6 +3162,7 @@ class DiskOffloadBackend(ExtractionBackend):
                     basis = pca.components_.T.astype(np.float16)
                     signal_bases[sig_name][layer_idx] = basis
                     projected = pca.transform(flat).astype(np.float16)
+                    del stacked, flat
 
                 if k < n_components:
                     padded = np.zeros(
@@ -3030,9 +3180,9 @@ class DiskOffloadBackend(ExtractionBackend):
                         all_coord_token_pos.append(tok)
                         all_coord_signal.append(sig_idx)
 
-                del stacked, flat, projected
+                del projected
 
-            del per_signal_captures
+            del per_signal_captures, per_signal_projected
             gc.collect()
 
         # Assemble bases
