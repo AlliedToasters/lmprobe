@@ -269,9 +269,9 @@ def compute_perplexity_from_activations(
 
     # Load tokenizer if not provided
     if tokenizer is None:
-        from transformers import AutoTokenizer
+        from ._tokenizer_utils import load_tokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = load_tokenizer(model_name)
 
     results = []
     per_token_ppl_list: list[torch.Tensor] = []

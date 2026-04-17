@@ -26,6 +26,7 @@ Example
 from __future__ import annotations
 
 import datetime
+from collections.abc import Hashable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +34,8 @@ import numpy as np
 
 if TYPE_CHECKING:
     import matplotlib.figure
+
+    from .reducers import Reducer
 
 
 class SampleScan:
@@ -49,7 +52,34 @@ class SampleScan:
         Path to an existing scan directory on disk.
     """
 
-    def __init__(self, scan_dir: str | Path) -> None:
+    def __init__(
+        self,
+        scan_dir: str | Path,
+        *,
+        backend: str = "auto",
+    ) -> None:
+        """Load an existing scan from disk.
+
+        Parameters
+        ----------
+        scan_dir : str or Path
+            Path to an existing scan directory.
+        backend : str
+            Which backend to use for projection forward passes. One of:
+              - ``"auto"`` (default): heuristic based on model size vs.
+                available CPU RAM. ``disk_offload`` kicks in when the
+                estimated model weight footprint exceeds 80% of system RAM.
+              - ``"chunked"``: force ``ChunkedLocalBackend`` (full model on
+                CPU, layers streamed to GPU in chunks). Fast when the full
+                dataset's intermediate residuals + signal captures fit in
+                CPU RAM alongside the model weights.
+              - ``"disk_offload"``: force ``DiskOffloadBackend`` (layer
+                weights streamed directly from safetensors to GPU, never
+                resident on CPU). Preferred when the full model wouldn't
+                leave room for intermediate activations at the sample
+                counts being projected — e.g. fusing many long-sequence
+                prompts into one call.
+        """
         from . import scan_storage
 
         self._scan_dir = Path(scan_dir)
@@ -64,8 +94,20 @@ class SampleScan:
         self._projections: np.memmap | None = None
         self._coords_table: Any = None
 
+        if backend not in ("auto", "chunked", "disk_offload"):
+            raise ValueError(
+                f"backend must be one of 'auto', 'chunked', 'disk_offload'; "
+                f"got {backend!r}"
+            )
+        self._backend_mode = backend
+
         # Backend for projection forward passes (lazy-loaded)
         self._backend: Any = None
+
+        # Counter for batch_project calls to warn about the N-sweep trap.
+        # See `batch_project_grouped` for the fused alternative.
+        self._batch_project_call_count = 0
+        self._batch_project_warned = False
 
     @classmethod
     def run(
@@ -441,6 +483,12 @@ class SampleScan:
         """Project multiple prompts through the scan basis in a single
         batched forward pass. Much faster than looping project_prompt().
 
+        Each call performs a full layer-streaming sweep (chunked backend)
+        or full-dataset layer load (disk_offload backend). For multiple
+        logical groups (dataset splits, train/eval/control corpora),
+        prefer :meth:`batch_project_grouped` — one sweep for the whole
+        union instead of one sweep per group.
+
         Parameters
         ----------
         prompts : list[str]
@@ -458,7 +506,37 @@ class SampleScan:
             - coords: dict with keys sample_id, layer, token_pos, signal
             - token_ids_per_sample: list of token ID lists
             - seq_lengths: list of int
+
+        See Also
+        --------
+        batch_project_grouped : Fused variant for multiple labeled groups.
         """
+        self._batch_project_call_count += 1
+        if (
+            self._batch_project_call_count >= 3
+            and not self._batch_project_warned
+        ):
+            import warnings
+            warnings.warn(
+                "SampleScan.batch_project called 3+ times on the same "
+                "scan. Each call re-streams every model layer CPU→GPU. "
+                "For multiple prompt groups (e.g. dataset splits), use "
+                "scan.batch_project_grouped({...}) — same semantics, one "
+                "layer sweep for the whole union.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self._batch_project_warned = True
+        return self._batch_project_impl(
+            prompts, signal=signal, batch_size=batch_size,
+        )
+
+    def _batch_project_impl(
+        self,
+        prompts: list[str],
+        signal: str | None = None,
+        batch_size: int = 4,
+    ) -> tuple[np.ndarray, dict[str, list[Any]], list[list[int]], list[int]]:
         backend = self._get_backend()
         proj_signals = [signal] if signal else self.signals
 
@@ -481,30 +559,221 @@ class SampleScan:
 
         return projections, coords, token_ids_per_sample, seq_lengths
 
+    def batch_project_grouped(
+        self,
+        prompt_groups: Mapping[Hashable, list[str]],
+        *,
+        signal: str | None = None,
+        batch_size: int = 4,
+    ) -> dict[
+        Hashable,
+        tuple[np.ndarray, dict[str, list[Any]], list[list[int]], list[int]],
+    ]:
+        """Project multiple labeled groups of prompts in a single
+        layer-streaming sweep.
+
+        Preferred over repeated :meth:`batch_project` calls when multiple
+        groups (e.g. dataset splits) need projecting: layer weights are
+        streamed CPU→GPU once for the whole union of prompts, rather than
+        once per call. Each per-group output is indistinguishable from
+        what :meth:`batch_project` would return if called on that group's
+        prompts alone.
+
+        Parameters
+        ----------
+        prompt_groups : mapping of hashable key → list[str]
+            Named groups of prompts. Iteration order is preserved in the
+            returned dict.
+        signal : str or None
+            If given, only project this signal.
+        batch_size : int
+            Microbatch size for the forward pass.
+
+        Returns
+        -------
+        dict
+            ``{key: (projections, coords, token_ids_per_sample, seq_lengths)}``.
+            Per-group ``coords["sample_id"]`` is rebased to 0..len(group)-1.
+        """
+        keys = list(prompt_groups.keys())
+        all_prompts: list[str] = []
+        bounds: list[tuple[Hashable, int, int]] = []
+        cursor = 0
+        for k in keys:
+            group_prompts = list(prompt_groups[k])
+            start = cursor
+            all_prompts.extend(group_prompts)
+            cursor += len(group_prompts)
+            bounds.append((k, start, cursor))
+
+        projections, coords, token_ids_per_sample, seq_lengths = (
+            self._batch_project_impl(
+                all_prompts, signal=signal, batch_size=batch_size,
+            )
+        )
+
+        sample_id_arr = np.asarray(coords["sample_id"])
+        token_pos_arr = np.asarray(coords["token_pos"])
+        coord_arrays = {c: np.asarray(v) for c, v in coords.items()}
+
+        out: dict[
+            Hashable,
+            tuple[np.ndarray, dict[str, list[Any]], list[list[int]], list[int]],
+        ] = {}
+        for key, start, end in bounds:
+            group_seq_lens = seq_lengths[start:end]
+            # Padding in standalone batch_project is max(seq_len in group);
+            # trim token positions beyond that so per-group output matches.
+            pad_len = max(group_seq_lens) if group_seq_lens else 0
+            mask = (
+                (sample_id_arr >= start)
+                & (sample_id_arr < end)
+                & (token_pos_arr < pad_len)
+            )
+            group_coords = {c: arr[mask] for c, arr in coord_arrays.items()}
+            group_coords["sample_id"] = group_coords["sample_id"] - start
+            out[key] = (
+                projections[mask],
+                {c: v.tolist() for c, v in group_coords.items()},
+                token_ids_per_sample[start:end],
+                group_seq_lens,
+            )
+        return out
+
+    def batch_project_reduced(
+        self,
+        prompt_groups: Mapping[Hashable, list[str]],
+        *,
+        reducers: Mapping[str, Reducer],
+        signal: str | None = None,
+        batch_size: int = 4,
+    ) -> dict[Hashable, dict[str, np.ndarray]]:
+        """Project groups through the scan basis and reduce per-sample in-chunk.
+
+        Spec 003. Fused single-sweep projection over the union of all
+        prompts (same pattern as :meth:`batch_project_grouped`) that applies
+        each supplied reducer to every microbatch's projection as soon as it
+        is produced, then frees it. Per-token projections never accumulate
+        across chunks — cross-chunk memory is bounded by residuals plus the
+        tiny per-sample reducer outputs, independent of sequence length and
+        chunk count.
+
+        The caller-supplied :class:`~lmprobe.reducers.Reducer` instances own
+        their masks. Mask list length must equal the total number of prompts
+        in the union (``sum(len(v) for v in prompt_groups.values())``), with
+        per-sample ordering matching the flattened union order (groups
+        concatenated in ``prompt_groups`` iteration order). Built-in
+        reducers live in :mod:`lmprobe.reducers`.
+
+        Parameters
+        ----------
+        prompt_groups : mapping of hashable key → list[str]
+            Named groups of prompts. Iteration order defines the flat
+            union ordering that reducer masks must match.
+        reducers : mapping of {name: Reducer}
+            Reducers keyed by name. Each is initialized internally via
+            ``init_state(N_total, n_layers, n_signals, k)``.
+        signal : str or None
+            If given, restrict to this signal only; ``n_signals == 1`` and
+            ``sig_idx == 0`` inside reducer state.
+        batch_size : int
+            Microbatch size for the forward pass.
+
+        Returns
+        -------
+        dict
+            ``{group_key: {reducer_name: [N_group, n_layers, n_signals, k]}}``.
+        """
+        keys = list(prompt_groups.keys())
+        all_prompts: list[str] = []
+        bounds: list[tuple[Hashable, int, int]] = []
+        cursor = 0
+        for k in keys:
+            group_prompts = list(prompt_groups[k])
+            start = cursor
+            all_prompts.extend(group_prompts)
+            cursor += len(group_prompts)
+            bounds.append((k, start, cursor))
+
+        n_total = cursor
+        proj_signals = [signal] if signal else self.signals
+        n_layers = self._metadata.n_layers
+        n_signals = len(proj_signals)
+        k_dim = self._metadata.n_components
+
+        bases_subset = {
+            s: self._bases[s] for s in proj_signals if s in self._bases
+        }
+        if not bases_subset:
+            raise ValueError(
+                f"batch_project_reduced: no bases available for requested "
+                f"signals {proj_signals}; scan bases: {list(self._bases)}."
+            )
+        if len(bases_subset) != len(proj_signals):
+            missing = [s for s in proj_signals if s not in bases_subset]
+            raise ValueError(
+                f"batch_project_reduced: scan missing bases for signals "
+                f"{missing}; available: {list(self._bases)}."
+            )
+
+        bound: dict[str, tuple[Reducer, Any]] = {}
+        for name, red in reducers.items():
+            state = red.init_state(n_total, n_layers, n_signals, k_dim)
+            bound[name] = (red, state)
+
+        backend = self._get_backend()
+        backend.scan_forward(
+            all_prompts,
+            signals=proj_signals,
+            n_components=k_dim,
+            batch_size=batch_size,
+            external_bases=bases_subset,
+            reducers=bound,
+        )
+
+        out: dict[Hashable, dict[str, np.ndarray]] = {k: {} for k in keys}
+        for name, (red, state) in bound.items():
+            full = red.finalize(state)
+            for key, start, end in bounds:
+                out[key][name] = full[start:end]
+        return out
+
     # --- Single Projection ---
 
     def _get_backend(self) -> Any:
         """Lazy-load a backend for projection.
 
-        Uses DiskOffloadBackend for models whose weights exceed ~80% of
-        available CPU RAM; otherwise uses ChunkedLocalBackend.
+        Resolution order:
+          1. If ``self._backend_mode`` was set explicitly at construction
+             (``"chunked"`` or ``"disk_offload"``), honor that.
+          2. Otherwise (``"auto"``), use DiskOffloadBackend when the
+             estimated model weight footprint exceeds 80% of available
+             CPU RAM; else ChunkedLocalBackend.
         """
         if self._backend is None:
             import torch
 
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-            # Estimate model weight size from hidden_dim and n_layers
-            # Rough heuristic: 2 bytes/param (bf16), ~12*hidden^2 params/layer
-            est_bytes = self._metadata.n_layers * 12 * (self._metadata.hidden_dim ** 2) * 2
-            mem_avail: float
-            try:
-                import os
-                mem_avail = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-            except (ValueError, OSError):
-                mem_avail = float("inf")
+            mode = self._backend_mode
+            if mode == "auto":
+                # Estimate model weight size from hidden_dim and n_layers.
+                # Rough heuristic: 2 bytes/param (bf16), ~12*hidden^2 params/layer.
+                est_bytes = (
+                    self._metadata.n_layers
+                    * 12
+                    * (self._metadata.hidden_dim ** 2)
+                    * 2
+                )
+                mem_avail: float
+                try:
+                    import os
+                    mem_avail = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                except (ValueError, OSError):
+                    mem_avail = float("inf")
+                mode = "disk_offload" if est_bytes > 0.8 * mem_avail else "chunked"
 
-            if est_bytes > 0.8 * mem_avail:
+            if mode == "disk_offload":
                 from .backends import DiskOffloadBackend
                 self._backend = DiskOffloadBackend(
                     model_name=self._metadata.model_id,
