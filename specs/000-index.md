@@ -25,6 +25,7 @@ affects: [module names]
 |------|-------|--------|---------|
 | [001-grouped-projection.md](001-grouped-projection.md) | Grouped projection API (`batch_project_grouped`) | draft | sample_scan, backends |
 | [003-per-sample-reduced-projection.md](003-per-sample-reduced-projection.md) | Per-sample reduced projection (`batch_project_reduced`) | draft | sample_scan, backends |
+| [004-memmap-batch-hidden-states.md](004-memmap-batch-hidden-states.md) | Memmap-backed `batch_hidden_states` in `ChunkedLocalBackend` | draft | backends |
 ---
 
 ## Design docs

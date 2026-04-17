@@ -12,6 +12,7 @@ This module defines the ExtractionBackend ABC and provides implementations:
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
@@ -24,6 +25,232 @@ if TYPE_CHECKING:
 
     from .activation_types import ExtractedBatch, ExtractionSpec
     from .reducers import Reducer
+
+
+_logger = logging.getLogger(__name__)
+
+
+# --- spec 004: memmap-backed batch_hidden_states ---------------------------
+#
+# `np.memmap` has no native bfloat16. For bf16 we store bytes as uint16
+# (same width) and reinterpret via `torch.Tensor.view(torch.bfloat16)` on
+# read / `.view(torch.uint16)` on write. fp16/fp32/fp64 map directly.
+
+_TORCH_TO_MMAP_NUMPY: dict[torch.dtype, Any] = {
+    torch.bfloat16: np.uint16,
+    torch.float16: np.float16,
+    torch.float32: np.float32,
+    torch.float64: np.float64,
+}
+
+
+def _mmap_np_dtype(torch_dtype: torch.dtype) -> Any:
+    try:
+        return _TORCH_TO_MMAP_NUMPY[torch_dtype]
+    except KeyError as e:
+        raise ValueError(
+            f"scan_forward: unsupported dtype for memmap residuals: {torch_dtype}"
+        ) from e
+
+
+def _mmap_read_slice(
+    mmap: np.memmap, start: int, end: int, torch_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Read `mmap[start:end]` into a detached torch tensor with the
+    correct float dtype. The copy is intentional — we don't want the
+    returned tensor (which will be moved to GPU) to pin memmap pages."""
+    np_slice = np.array(mmap[start:end], copy=True)
+    t = torch.from_numpy(np_slice)
+    if torch_dtype == torch.bfloat16:
+        t = t.view(torch.bfloat16)
+    return t
+
+
+def _mmap_write_slice(
+    mmap: np.memmap, start: int, end: int, tensor: torch.Tensor,
+) -> None:
+    """Write `tensor` (CPU, any float dtype) into `mmap[start:end]`."""
+    t = tensor.detach().cpu().contiguous()
+    if t.dtype == torch.bfloat16:
+        t = t.view(torch.uint16)
+    mmap[start:end] = t.numpy()
+
+
+_CUML_CHECKED = False
+_CUML_AVAILABLE = False
+
+
+def _cuml_available() -> bool:
+    """Return True if cuml + cupy are importable and a CUDA device is
+    present. Result is cached after first check."""
+    global _CUML_CHECKED, _CUML_AVAILABLE
+    if _CUML_CHECKED:
+        return _CUML_AVAILABLE
+    _CUML_CHECKED = True
+    if not torch.cuda.is_available():
+        _CUML_AVAILABLE = False
+        return False
+    try:
+        import cuml  # noqa: F401
+        import cupy  # noqa: F401
+        _CUML_AVAILABLE = True
+        _logger.info(
+            "lmprobe: cuml + cupy detected — scan-time PCA will run on GPU",
+        )
+    except ImportError:
+        _CUML_AVAILABLE = False
+    return _CUML_AVAILABLE
+
+
+def _fit_project_scan_pca(
+    captures: list[torch.Tensor],
+    *,
+    device: str,
+    n_components: int,
+    generative_masks: list[np.ndarray] | None,
+    sample_id_offset: int = 0,
+) -> tuple[np.ndarray, np.ndarray, int, int, int]:
+    """Fit a PCA basis on the union of capture tensors and project every
+    token through the resulting basis.
+
+    On a CUDA box with cuml/cupy installed, this runs entirely on GPU
+    (zero-copy from torch via dlpack). Captures are moved to GPU one at
+    a time; the caller is responsible for clearing the source list after
+    this function returns. The full `[B_total, S, dim]` tensor is never
+    materialized on CPU.
+
+    Without cuml, falls back to the original sklearn-on-CPU path.
+
+    Parameters
+    ----------
+    captures : list of torch.Tensor
+        Per-batch capture tensors, each ``[B_i, S, dim]``, on CPU (bf16
+        or fp16 typically).
+    device : str
+        CUDA device string (e.g. ``"cuda:0"``). Used when cuml is
+        available.
+    n_components : int
+        Target PCA rank. Effective ``k = min(n_components, n_fit_rows - 1, dim)``.
+    generative_masks : list of np.ndarray or None
+        Per-sample boolean masks (``True`` = fit on this token). When
+        provided, PCA is fit only on the True rows; all rows are still
+        projected through the resulting basis.
+    sample_id_offset : int
+        Offset to apply when indexing into ``generative_masks``
+        (used when captures correspond to a sub-range of the corpus).
+
+    Returns
+    -------
+    basis_fp16 : np.ndarray, shape [dim, k]
+        PCA basis as a column-of-components matrix (so that
+        ``data @ basis`` yields projections).
+    projected_fp16 : np.ndarray, shape [B_total * S, k]
+        Projections of every token through the basis.
+    B_total, S, dim : int
+        Shape components of the concatenated capture tensor.
+    """
+    use_cuml = _cuml_available()
+
+    # Shape discovery (cheap — no data movement).
+    B_total = sum(int(c.shape[0]) for c in captures)
+    S = int(captures[0].shape[1])
+    dim = int(captures[0].shape[2])
+
+    # Build the PCA-fit mask in CPU numpy regardless of backend — it's
+    # tiny (B_total * S bools) and shared across paths.
+    if generative_masks is not None:
+        mask_parts: list[np.ndarray] = []
+        for sid in range(B_total):
+            gid = sid + sample_id_offset
+            if gid < len(generative_masks) and generative_masks[gid] is not None:
+                gmask = generative_masks[gid]
+                padded = np.zeros(S, dtype=bool)
+                padded[:min(len(gmask), S)] = gmask[:S]
+                mask_parts.append(padded)
+            else:
+                mask_parts.append(np.ones(S, dtype=bool))
+        fit_mask_np = np.concatenate(mask_parts)
+    else:
+        fit_mask_np = None
+
+    if use_cuml:
+        import cupy as cp
+        from cuml.decomposition import PCA as CuPCA
+        from torch.utils.dlpack import to_dlpack
+
+        # Move each capture to GPU (fp32 for numerical stability in PCA)
+        # and concat on-device. Source CPU tensors are released as soon
+        # as their GPU copy exists.
+        gpu_parts: list[torch.Tensor] = []
+        while captures:
+            c = captures.pop(0)
+            gpu_parts.append(c.to(device, dtype=torch.float32, non_blocking=True))
+            del c
+        stacked_gpu = torch.cat(gpu_parts, dim=0).contiguous()
+        del gpu_parts
+        flat_gpu = stacked_gpu.reshape(B_total * S, dim)
+        # Keep stacked_gpu alive — flat_gpu is a view.
+
+        if fit_mask_np is not None:
+            fit_mask_gpu = torch.from_numpy(fit_mask_np).to(device)
+            flat_fit_gpu = flat_gpu[fit_mask_gpu].contiguous()
+        else:
+            fit_mask_gpu = None
+            flat_fit_gpu = flat_gpu
+
+        k = min(n_components, int(flat_fit_gpu.shape[0]) - 1, dim)
+        torch.cuda.empty_cache()
+
+        # Phase 1: fit on the assistant-token subset. Zero-copy view.
+        # `svd_solver="jacobi"` runs a truncated SVD for small k — GPU
+        # working set is O(n × k) instead of O(n × d).
+        fit_cp = cp.from_dlpack(to_dlpack(flat_fit_gpu))
+        pca = CuPCA(n_components=k, output_type="cupy", svd_solver="jacobi")
+        pca.fit(fit_cp)
+        basis_np = cp.asnumpy(pca.components_).T.astype(np.float16)
+        basis_gpu = torch.from_numpy(basis_np).to(device, dtype=torch.float32)
+
+        # Release fit data + fit mask before projecting — keeping the
+        # filtered subset live through transform doubles the GPU
+        # footprint for no reason (we already have the basis).
+        del fit_cp, pca, flat_fit_gpu
+        if fit_mask_gpu is not None:
+            del fit_mask_gpu
+        torch.cuda.empty_cache()
+
+        # Phase 2: project via matmul. torch @ is fp32 on GPU, output
+        # fp16. Avoids cuml's transform allocating another large buffer.
+        projected_gpu = (flat_gpu @ basis_gpu).half()
+        projected_np = projected_gpu.cpu().numpy()
+
+        del projected_gpu, basis_gpu, flat_gpu, stacked_gpu
+        torch.cuda.empty_cache()
+        return basis_np, projected_np, B_total, S, dim
+
+    # --- sklearn fallback (CPU) ---
+    from sklearn.decomposition import PCA
+
+    stacked = torch.cat(captures, dim=0)
+    while captures:
+        captures.pop(0)
+    flat = stacked.reshape(B_total * S, dim).float().numpy()
+    del stacked
+
+    if fit_mask_np is not None:
+        flat_fit = flat[fit_mask_np]
+    else:
+        flat_fit = flat
+
+    k = min(n_components, int(flat_fit.shape[0]) - 1, dim)
+    pca = PCA(n_components=k)
+    pca.fit(flat_fit)
+    basis_np = pca.components_.T.astype(np.float16)
+    projected_np = pca.transform(flat).astype(np.float16)
+    flat_is_fit = flat_fit is flat
+    del pca, flat
+    if not flat_is_fit:
+        del flat_fit
+    return basis_np, projected_np, B_total, S, dim
 
 
 class ExtractionBackend(ABC):
@@ -1629,9 +1856,10 @@ class ChunkedLocalBackend(ExtractionBackend):
         Returns all data needed to write a SampleScan to disk.
         """
         import gc
+        import os
+        import tempfile
 
         import numpy as np
-        from sklearn.decomposition import PCA
         from tqdm import tqdm
 
         from .activation_types import detect_moe_info
@@ -1695,17 +1923,27 @@ class ChunkedLocalBackend(ExtractionBackend):
             end = min(start + batch_size, n_samples)
             batches.append((start, end))
 
-        # Run embedding for each batch. We keep residuals (`hidden_states`)
-        # on CPU — they're reused across every chunk's layer loop — but
-        # *not* the per-batch causal masks: a [B, 1, S, S] bf16 mask is
-        # ~S²·B·2 bytes, which for long sequences dominates the CPU
-        # residuals. Recomputing inside the batch loop is trivially cheap
-        # (one triu + masked_fill) compared to the forward pass.
+        # Spec 004: residuals (`batch_hidden_states`) live in an
+        # np.memmap-backed buffer of shape [N_total, S_max, hidden_dim]
+        # rather than a list of CPU tensors. Linux's page cache handles
+        # residency — we only pay for what's touched in the current
+        # chunk, not the whole corpus. For a 9k-sample × 574-token ×
+        # 5120-hidden run that's the difference between 54 GB of
+        # always-resident CPU RAM and roughly `batch_size × S × H` of
+        # active pages at any moment.
+        #
+        # Per-batch causal masks are *not* persisted: a [B, 1, S, S]
+        # bf16 mask is S²-heavy and recomputing inside the batch loop
+        # is trivially cheap (one triu + masked_fill).
         embed = _get_embedding_module(model)
         embed.to(device)
-        batch_hidden_states: list[torch.Tensor] = []
         batch_pos_ids: list[torch.Tensor] = []
         batch_cache_positions: list[torch.Tensor] = []
+
+        _hs_tmpdir = tempfile.TemporaryDirectory(prefix="lmprobe_scan_")
+        batch_hidden_states: np.memmap | None = None
+        _hs_N_total = int(all_input_ids.shape[0])
+        _hs_S_max = int(all_input_ids.shape[1])
 
         for start, end in batches:
             ids = all_input_ids[start:end]
@@ -1713,7 +1951,19 @@ class ChunkedLocalBackend(ExtractionBackend):
 
             with torch.no_grad():
                 hs = embed(ids.to(device)).cpu()
-            batch_hidden_states.append(hs)
+
+            if hidden_dim is None:
+                hidden_dim = int(hs.shape[-1])
+            if batch_hidden_states is None:
+                hs_path = os.path.join(_hs_tmpdir.name, "batch_hidden_states.bin")
+                batch_hidden_states = np.memmap(
+                    hs_path,
+                    dtype=_mmap_np_dtype(self.dtype),
+                    mode="w+",
+                    shape=(_hs_N_total, _hs_S_max, hidden_dim),
+                )
+            _mmap_write_slice(batch_hidden_states, start, end, hs)
+            del hs
 
             seq_len = ids.shape[1]
             pos_ids = mask.long().cumsum(-1) - 1
@@ -1721,10 +1971,8 @@ class ChunkedLocalBackend(ExtractionBackend):
             batch_pos_ids.append(pos_ids)
             batch_cache_positions.append(torch.arange(seq_len))
 
-            if hidden_dim is None:
-                hidden_dim = hs.shape[-1]
-
         embed.to("cpu")
+        assert batch_hidden_states is not None
 
         # Rotary embeddings
         position_embeddings: tuple[torch.Tensor, ...] | torch.Tensor | dict | None = None
@@ -1742,7 +1990,9 @@ class ChunkedLocalBackend(ExtractionBackend):
             )
             layer_types_cfg = getattr(text_cfg, "layer_types", None)
             # Use a single sample's pos_ids so cos/sin broadcast to any batch size
-            pe_hs = batch_hidden_states[0][:1].to(device)
+            pe_hs = _mmap_read_slice(
+                batch_hidden_states, 0, 1, self.dtype,
+            ).to(device)
             pe_pos = batch_pos_ids[0][:1].to(device)
 
             unique_types = set(layer_types_cfg) if layer_types_cfg is not None else set()
@@ -1774,11 +2024,31 @@ class ChunkedLocalBackend(ExtractionBackend):
             sig: [None] * num_layers for sig in signals
         }
         signal_dims: dict[str, int] = {}  # discovered during first chunk
-        all_proj_chunks: list[np.ndarray] = []
-        all_coord_sample_id: list[int] = []
-        all_coord_layer: list[int] = []
-        all_coord_token_pos: list[int] = []
-        all_coord_signal: list[int] = []
+        # Projections + coords are pre-allocated at full size so each chunk
+        # writes into a fixed slice rather than append-growing a list. This
+        # keeps cross-chunk memory constant: without it, all_proj_chunks
+        # (fp16) and the four coord Python-int lists grew ~1.3 GB per chunk
+        # and dominated working-set pressure on long scans. Skip allocation
+        # under the reducers path (spec 003) — nothing is written.
+        N_total = all_input_ids.shape[0]
+        S_max = all_input_ids.shape[1]
+        n_signals = len(signals)
+        if reducers is None:
+            total_rows = num_layers * n_signals * N_total * S_max
+            all_projections = np.zeros(
+                (total_rows, 1, n_components), dtype=np.float16,
+            )
+            all_coord_sample_id = np.zeros(total_rows, dtype=np.int32)
+            all_coord_layer = np.zeros(total_rows, dtype=np.int16)
+            all_coord_token_pos = np.zeros(total_rows, dtype=np.int16)
+            all_coord_signal = np.zeros(total_rows, dtype=np.int8)
+        else:
+            all_projections = np.zeros((0, 1, n_components), dtype=np.float16)
+            all_coord_sample_id = np.zeros(0, dtype=np.int32)
+            all_coord_layer = np.zeros(0, dtype=np.int16)
+            all_coord_token_pos = np.zeros(0, dtype=np.int16)
+            all_coord_signal = np.zeros(0, dtype=np.int8)
+        proj_cursor: int = 0
 
         # Spec 002: stream-project through pre-fit basis to avoid accumulating
         # full [N, S, H] activation tensors on CPU. Basis stays on device for
@@ -1872,7 +2142,9 @@ class ChunkedLocalBackend(ExtractionBackend):
                     layers=f"{chunk_start}-{chunk_end-1}",
                     batch=f"{batch_idx+1}/{len(batches)}",
                 )
-                hs = batch_hidden_states[batch_idx].to(device)
+                hs = _mmap_read_slice(
+                    batch_hidden_states, start, end, self.dtype,
+                ).to(device)
                 # Build the causal mask on-the-fly and push straight to GPU;
                 # drop the CPU copy at batch-end so [B, 1, S, S] tensors
                 # don't persist across 1000s of batches.
@@ -1950,7 +2222,7 @@ class ChunkedLocalBackend(ExtractionBackend):
                                     hs.detach().cpu()
                                 )
 
-                batch_hidden_states[batch_idx] = hs.cpu()
+                _mmap_write_slice(batch_hidden_states, start, end, hs)
                 del hs, mask_dev, pos_dev, pe_dev
 
             # Offload chunk
@@ -1998,61 +2270,48 @@ class ChunkedLocalBackend(ExtractionBackend):
                     per_layer_projected[layer_idx][sig_name] = []
                     del chunks
                 else:
-                    # Legacy path: stack → flat → PCA (or external project).
+                    # Fit + project on GPU via cuml when available (falls back
+                    # to sklearn on CPU). The helper pops from the captures
+                    # list as it streams to GPU, so the entry is drained by
+                    # the time the call returns.
                     captures = per_layer_captures[layer_idx][sig_name]
                     if not captures:
                         continue
-
-                    stacked = torch.cat(captures, dim=0)  # [B_total, S, dim]
-                    B_total, S, dim = stacked.shape
-                    flat = stacked.reshape(-1, dim).float().numpy()
-
                     if sig_name not in signal_dims:
-                        signal_dims[sig_name] = dim
-
-                    # Build PCA fit data — filter to generative tokens if mask provided
-                    if generative_masks is not None:
-                        fit_mask_parts = []
-                        for sid in range(B_total):
-                            if sid < len(generative_masks) and generative_masks[sid] is not None:
-                                gmask = generative_masks[sid]
-                                padded_mask = np.zeros(S, dtype=bool)
-                                padded_mask[:min(len(gmask), S)] = gmask[:S]
-                                fit_mask_parts.append(padded_mask)
-                            else:
-                                fit_mask_parts.append(np.ones(S, dtype=bool))
-                        fit_mask = np.concatenate(fit_mask_parts)
-                        flat_fit = flat[fit_mask]
-                    else:
-                        flat_fit = flat
-
-                    k = min(n_components, flat_fit.shape[0] - 1, dim)
-                    pca = PCA(n_components=k)
-                    pca.fit(flat_fit)
-
-                    basis = pca.components_.T.astype(np.float16)
-                    signal_bases[sig_name][layer_idx] = basis
-
-                    # Project ALL tokens through the basis
-                    projected = pca.transform(flat).astype(np.float16)
-                    del stacked, flat
-                if k < n_components:
-                    padded = np.zeros(
-                        (projected.shape[0], n_components), dtype=np.float16,
+                        signal_dims[sig_name] = int(captures[0].shape[2])
+                    basis, projected, B_total, S, dim = _fit_project_scan_pca(
+                        captures,
+                        device=device,
+                        n_components=n_components,
+                        generative_masks=generative_masks,
                     )
-                    padded[:, :k] = projected
-                    projected = padded
-
-                all_proj_chunks.append(projected)
-
-                for sample_idx in range(B_total):
-                    for tok in range(S):
-                        all_coord_sample_id.append(sample_idx)
-                        all_coord_layer.append(layer_idx)
-                        all_coord_token_pos.append(tok)
-                        all_coord_signal.append(sig_idx)
+                    k = basis.shape[1]
+                    signal_bases[sig_name][layer_idx] = basis
+                    # `captures` was drained in place by the helper; make sure
+                    # the dict entry is empty too.
+                    per_layer_captures[layer_idx][sig_name] = []
+                    del captures
+                # Write directly into the pre-allocated outputs at the
+                # current cursor. Coords are generated vectorized — no
+                # Python int-list overhead (~1.3 GB/chunk savings on a
+                # 40-layer scan of 1000 samples × 611 tokens).
+                block = B_total * S
+                row_end = proj_cursor + block
+                all_projections[proj_cursor:row_end, 0, :k] = projected
+                if k < n_components:
+                    all_projections[proj_cursor:row_end, 0, k:] = 0
+                all_coord_sample_id[proj_cursor:row_end] = np.repeat(
+                    np.arange(B_total, dtype=np.int32), S,
+                )
+                all_coord_layer[proj_cursor:row_end] = layer_idx
+                all_coord_token_pos[proj_cursor:row_end] = np.tile(
+                    np.arange(S, dtype=np.int16), B_total,
+                )
+                all_coord_signal[proj_cursor:row_end] = sig_idx
+                proj_cursor = row_end
 
                 del projected
+                gc.collect()
 
             del per_layer_captures, per_layer_projected
             gc.collect()
@@ -2070,16 +2329,13 @@ class ChunkedLocalBackend(ExtractionBackend):
                     basis_arr[L, :, :actual_k] = layer_basis
             final_bases[sig_name] = basis_arr
 
-        # Stack projections. Empty under the reducers path (spec 003) —
-        # reducers own the output; the returned projection array is
-        # intentionally shape (0, 1, n_components).
-        if all_proj_chunks:
-            all_projections = np.concatenate(all_proj_chunks, axis=0)
-            all_projections = all_projections[:, np.newaxis, :]  # [N_total, 1, k]
-        else:
-            all_projections = np.zeros(
-                (0, 1, n_components), dtype=np.float16,
-            )
+        # Truncate the pre-allocated outputs to `proj_cursor` — in the
+        # reducers path (spec 003) nothing is written, so cursor stays 0.
+        all_projections = all_projections[:proj_cursor]
+        all_coord_sample_id = all_coord_sample_id[:proj_cursor]
+        all_coord_layer = all_coord_layer[:proj_cursor]
+        all_coord_token_pos = all_coord_token_pos[:proj_cursor]
+        all_coord_signal = all_coord_signal[:proj_cursor]
 
         metadata = {
             "model_id": self.model_name,
@@ -2096,6 +2352,14 @@ class ChunkedLocalBackend(ExtractionBackend):
             "token_pos": all_coord_token_pos,
             "signal": all_coord_signal,
         }
+
+        # Release the memmap + temp directory. Drop the memmap reference
+        # first so Python releases the mmap before TemporaryDirectory
+        # unlinks the backing file (matters on Windows; harmless on
+        # Linux). On the exception path, the weakref finalizer
+        # registered by TemporaryDirectory handles cleanup on GC.
+        del batch_hidden_states
+        _hs_tmpdir.cleanup()
 
         return (
             metadata,
@@ -2960,7 +3224,6 @@ class DiskOffloadBackend(ExtractionBackend):
         import gc
 
         import numpy as np
-        from sklearn.decomposition import PCA
         from tqdm import tqdm
 
         if signals is None:
@@ -3100,11 +3363,29 @@ class DiskOffloadBackend(ExtractionBackend):
             sig: [None] * num_layers for sig in signals
         }
         signal_dims: dict[str, int] = {}
-        all_proj_chunks: list[np.ndarray] = []
-        all_coord_sample_id: list[int] = []
-        all_coord_layer: list[int] = []
-        all_coord_token_pos: list[int] = []
-        all_coord_signal: list[int] = []
+        # Pre-allocated per-scan outputs — same rationale as the chunked
+        # backend (see the equivalent comment there). Keeps cross-layer
+        # memory constant on multi-layer scans of long-sequence corpora.
+        # Skip under the reducers path — nothing is written there.
+        N_total = all_input_ids.shape[0]
+        S_max = all_input_ids.shape[1]
+        n_signals = len(signals)
+        if reducers is None:
+            total_rows = num_layers * n_signals * N_total * S_max
+            all_projections = np.zeros(
+                (total_rows, 1, n_components), dtype=np.float16,
+            )
+            all_coord_sample_id = np.zeros(total_rows, dtype=np.int32)
+            all_coord_layer = np.zeros(total_rows, dtype=np.int16)
+            all_coord_token_pos = np.zeros(total_rows, dtype=np.int16)
+            all_coord_signal = np.zeros(total_rows, dtype=np.int8)
+        else:
+            all_projections = np.zeros((0, 1, n_components), dtype=np.float16)
+            all_coord_sample_id = np.zeros(0, dtype=np.int32)
+            all_coord_layer = np.zeros(0, dtype=np.int16)
+            all_coord_token_pos = np.zeros(0, dtype=np.int16)
+            all_coord_signal = np.zeros(0, dtype=np.int8)
+        proj_cursor: int = 0
 
         # Spec 002: when projecting through a pre-fit basis, keep the basis
         # on device and project each microbatch's delta on GPU rather than
@@ -3313,52 +3594,33 @@ class DiskOffloadBackend(ExtractionBackend):
                     captures = per_signal_captures[sig_name]
                     if not captures:
                         continue
-                    stacked = torch.cat(captures, dim=0)  # [B_total, S, dim]
-                    B_total, S, dim = stacked.shape
-                    flat = stacked.reshape(-1, dim).float().numpy()
-
                     if sig_name not in signal_dims:
-                        signal_dims[sig_name] = dim
-
-                    if generative_masks is not None:
-                        fit_mask_parts = []
-                        for sid in range(B_total):
-                            if sid < len(generative_masks) and generative_masks[sid] is not None:
-                                gmask = generative_masks[sid]
-                                padded_mask = np.zeros(S, dtype=bool)
-                                padded_mask[:min(len(gmask), S)] = gmask[:S]
-                                fit_mask_parts.append(padded_mask)
-                            else:
-                                fit_mask_parts.append(np.ones(S, dtype=bool))
-                        fit_mask = np.concatenate(fit_mask_parts)
-                        flat_fit = flat[fit_mask]
-                    else:
-                        flat_fit = flat
-
-                    k = min(n_components, flat_fit.shape[0] - 1, dim)
-                    pca = PCA(n_components=k)
-                    pca.fit(flat_fit)
-
-                    basis = pca.components_.T.astype(np.float16)
-                    signal_bases[sig_name][layer_idx] = basis
-                    projected = pca.transform(flat).astype(np.float16)
-                    del stacked, flat
-
-                if k < n_components:
-                    padded = np.zeros(
-                        (projected.shape[0], n_components), dtype=np.float16,
+                        signal_dims[sig_name] = int(captures[0].shape[2])
+                    basis, projected, B_total, S, dim = _fit_project_scan_pca(
+                        captures,
+                        device=device,
+                        n_components=n_components,
+                        generative_masks=generative_masks,
                     )
-                    padded[:, :k] = projected
-                    projected = padded
+                    k = basis.shape[1]
+                    signal_bases[sig_name][layer_idx] = basis
+                    per_signal_captures[sig_name] = []
+                    del captures
 
-                all_proj_chunks.append(projected)
-
-                for sample_idx in range(B_total):
-                    for tok in range(S):
-                        all_coord_sample_id.append(sample_idx)
-                        all_coord_layer.append(layer_idx)
-                        all_coord_token_pos.append(tok)
-                        all_coord_signal.append(sig_idx)
+                block = B_total * S
+                row_end = proj_cursor + block
+                all_projections[proj_cursor:row_end, 0, :k] = projected
+                if k < n_components:
+                    all_projections[proj_cursor:row_end, 0, k:] = 0
+                all_coord_sample_id[proj_cursor:row_end] = np.repeat(
+                    np.arange(B_total, dtype=np.int32), S,
+                )
+                all_coord_layer[proj_cursor:row_end] = layer_idx
+                all_coord_token_pos[proj_cursor:row_end] = np.tile(
+                    np.arange(S, dtype=np.int16), B_total,
+                )
+                all_coord_signal[proj_cursor:row_end] = sig_idx
+                proj_cursor = row_end
 
                 del projected
 
@@ -3378,14 +3640,13 @@ class DiskOffloadBackend(ExtractionBackend):
                     basis_arr[L, :, :actual_k] = layer_basis
             final_bases[sig_name] = basis_arr
 
-        # Empty under the reducers path (spec 003) — reducers own the output.
-        if all_proj_chunks:
-            all_projections = np.concatenate(all_proj_chunks, axis=0)
-            all_projections = all_projections[:, np.newaxis, :]
-        else:
-            all_projections = np.zeros(
-                (0, 1, n_components), dtype=np.float16,
-            )
+        # Truncate pre-allocated outputs to cursor. In the reducers path
+        # (spec 003) cursor stays 0 and these become empty views.
+        all_projections = all_projections[:proj_cursor]
+        all_coord_sample_id = all_coord_sample_id[:proj_cursor]
+        all_coord_layer = all_coord_layer[:proj_cursor]
+        all_coord_token_pos = all_coord_token_pos[:proj_cursor]
+        all_coord_signal = all_coord_signal[:proj_cursor]
 
         metadata = {
             "model_id": self.model_name,

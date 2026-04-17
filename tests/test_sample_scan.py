@@ -745,8 +745,10 @@ class TestBatchProjectReduced:
             reducers=bound,
         )
         assert projections.shape[0] == 0
-        assert coords["sample_id"] == []
-        assert coords["token_pos"] == []
+        # Coords are now numpy arrays (teammate's pre-allocation refactor);
+        # verify emptiness via size, not list-equality.
+        assert coords["sample_id"].size == 0
+        assert coords["token_pos"].size == 0
 
     def test_reducers_without_external_bases_raises(self, scan):
         from lmprobe.reducers import LastTokenReducer

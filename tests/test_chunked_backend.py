@@ -223,3 +223,96 @@ class TestChunkedExtraction:
 
         num_layers = get_num_layers_from_config(tiny_model)
         assert cs == num_layers
+
+
+# ── scan_forward: memmap-backed batch_hidden_states (spec 004) ──────────────
+
+
+class TestScanForwardMemmap:
+    """Spec 004: cross-chunk residuals live in an np.memmap, not a list of
+    CPU tensors. These tests verify the memmap path is correct under
+    actual chunking (chunk_size < num_layers) and produces results
+    indistinguishable from a single-chunk run."""
+
+    def _scan(self, tiny_model, chunk_size: int, prompts: list[str]):
+        backend = ChunkedLocalBackend(
+            tiny_model, "cpu", dtype=torch.float32, chunk_size=chunk_size,
+        )
+        return backend.scan_forward(
+            prompts=prompts,
+            signals=["attn_delta", "mlp_delta"],
+            n_components=4,
+            batch_size=2,
+        )
+
+    def test_chunked_scan_matches_single_chunk(self, tiny_model):
+        """Running with chunk_size=1 (forces memmap round-trip between
+        every layer) produces identical projections and bases to
+        chunk_size=num_layers (single chunk, no cross-chunk write-back)."""
+        from lmprobe.extraction import get_num_layers_from_config
+
+        num_layers = get_num_layers_from_config(tiny_model)
+        prompts = ["The dog ran fast", "A cat sat quietly", "Fetch the ball"]
+
+        _, bases_full, proj_full, coords_full, _, _, _, _ = self._scan(
+            tiny_model, chunk_size=num_layers, prompts=prompts,
+        )
+        _, bases_chunk, proj_chunk, coords_chunk, _, _, _, _ = self._scan(
+            tiny_model, chunk_size=1, prompts=prompts,
+        )
+
+        import numpy as np
+
+        # With dtype=fp32 the memmap round-trip is byte-identical, so
+        # PCA sees the same input and produces the same output.
+        np.testing.assert_array_equal(proj_full, proj_chunk)
+
+        for sig in bases_full:
+            np.testing.assert_array_equal(bases_full[sig], bases_chunk[sig])
+
+        for key in coords_full:
+            np.testing.assert_array_equal(coords_full[key], coords_chunk[key])
+
+    def test_memmap_file_is_cleaned_up(self, tiny_model, monkeypatch):
+        """The memmap's backing file lives under a TemporaryDirectory
+        scoped to scan_forward — no temp files should persist after
+        the call returns."""
+        import tempfile
+
+        created_dirs: list[str] = []
+        real_tempdir = tempfile.TemporaryDirectory
+
+        class _TrackingTempDir(real_tempdir):  # type: ignore[misc, valid-type]
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created_dirs.append(self.name)
+
+        monkeypatch.setattr(tempfile, "TemporaryDirectory", _TrackingTempDir)
+
+        self._scan(tiny_model, chunk_size=1, prompts=["One", "Two"])
+
+        import os
+        # At least one TemporaryDirectory was used, and all are gone.
+        assert created_dirs, "scan_forward did not open a TemporaryDirectory"
+        for d in created_dirs:
+            assert not os.path.exists(d), f"temp dir leaked: {d}"
+
+    def test_bf16_path_roundtrips(self, tiny_model):
+        """Spec 004 stores bf16 residuals in a uint16 memmap container.
+        Verify the reinterpret-view round-trip is stable end-to-end at
+        the default bf16 dtype."""
+        backend = ChunkedLocalBackend(
+            tiny_model, "cpu", dtype=torch.bfloat16, chunk_size=1,
+        )
+        _, bases, proj, _, _, _, _, _ = backend.scan_forward(
+            prompts=["One short", "Two short", "Three short"],
+            signals=["attn_delta"],
+            n_components=2,
+            batch_size=2,
+        )
+        # Shape + finiteness checks. A broken bf16 reinterpret would
+        # typically produce NaN or catastrophically large values.
+        import numpy as np
+        assert proj.shape[-1] == 2
+        assert np.isfinite(proj).all()
+        assert np.isfinite(bases["attn_delta"]).all()
