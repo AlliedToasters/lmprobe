@@ -1672,12 +1672,16 @@ class ChunkedLocalBackend(ExtractionBackend):
             end = min(start + batch_size, n_samples)
             batches.append((start, end))
 
-        # Run embedding for each batch
+        # Run embedding for each batch. We keep residuals (`hidden_states`)
+        # on CPU — they're reused across every chunk's layer loop — but
+        # *not* the per-batch causal masks: a [B, 1, S, S] bf16 mask is
+        # ~S²·B·2 bytes, which for long sequences dominates the CPU
+        # residuals. Recomputing inside the batch loop is trivially cheap
+        # (one triu + masked_fill) compared to the forward pass.
         embed = _get_embedding_module(model)
         embed.to(device)
         batch_hidden_states: list[torch.Tensor] = []
         batch_pos_ids: list[torch.Tensor] = []
-        batch_causal_masks: list[torch.Tensor] = []
         batch_cache_positions: list[torch.Tensor] = []
 
         for start, end in batches:
@@ -1692,7 +1696,6 @@ class ChunkedLocalBackend(ExtractionBackend):
             pos_ids = mask.long().cumsum(-1) - 1
             pos_ids.masked_fill_(mask == 0, 1)
             batch_pos_ids.append(pos_ids)
-            batch_causal_masks.append(_make_causal_mask(mask, self.dtype))
             batch_cache_positions.append(torch.arange(seq_len))
 
             if hidden_dim is None:
@@ -1814,7 +1817,11 @@ class ChunkedLocalBackend(ExtractionBackend):
                     batch=f"{batch_idx+1}/{len(batches)}",
                 )
                 hs = batch_hidden_states[batch_idx].to(device)
-                mask_dev = batch_causal_masks[batch_idx].to(device)
+                # Build the causal mask on-the-fly and push straight to GPU;
+                # drop the CPU copy at batch-end so [B, 1, S, S] tensors
+                # don't persist across 1000s of batches.
+                mask_2d = all_attention_mask[start:end]
+                mask_dev = _make_causal_mask(mask_2d, self.dtype).to(device)
                 pos_dev = batch_pos_ids[batch_idx].to(device)
                 pe_dev = self._pe_to_device(position_embeddings, device)
 
@@ -1901,10 +1908,19 @@ class ChunkedLocalBackend(ExtractionBackend):
                     basis = external_bases[sig_name][layer_idx]
                     signal_bases[sig_name][layer_idx] = basis
                     k = basis.shape[1]
-                    stacked_proj = np.concatenate(chunks, axis=0)  # [B_total, S, k]
-                    B_total, S, _ = stacked_proj.shape
-                    projected = stacked_proj.reshape(-1, k)
-                    del stacked_proj
+                    # np.concatenate allocates a single contiguous buffer;
+                    # `projected` is a view of it and is the only copy kept
+                    # alive via all_proj_chunks. Clearing the per-batch
+                    # chunks list here (rather than waiting for the chunk
+                    # loop's `del per_layer_projected` at the bottom)
+                    # releases the duplicate per-batch storage progressively
+                    # across the assembly loop — up to 18 GB freed on a
+                    # 1000-sample sweep.
+                    B_total = sum(c.shape[0] for c in chunks)
+                    S = chunks[0].shape[1]
+                    projected = np.concatenate(chunks, axis=0).reshape(-1, k)
+                    per_layer_projected[layer_idx][sig_name] = []
+                    del chunks
                 else:
                     # Legacy path: stack → flat → PCA (or external project).
                     captures = per_layer_captures[layer_idx][sig_name]
@@ -2900,8 +2916,10 @@ class DiskOffloadBackend(ExtractionBackend):
 
         batch_hidden_states: list[torch.Tensor] = []
         batch_pos_ids: list[torch.Tensor] = []
-        batch_causal_masks: list[torch.Tensor] = []
         batch_cache_positions: list[torch.Tensor] = []
+        # Causal masks are *not* pre-computed: a [B, 1, S, S] bf16 mask is
+        # S²-heavy and, for 1000+ batches on long sequences, exceeds the
+        # residual buffer in CPU footprint. Built lazily per-batch below.
 
         with torch.no_grad():
             for start, end in batches:
@@ -2914,7 +2932,6 @@ class DiskOffloadBackend(ExtractionBackend):
                 pos_ids = mask.long().cumsum(-1) - 1
                 pos_ids.masked_fill_(mask == 0, 1)
                 batch_pos_ids.append(pos_ids)
-                batch_causal_masks.append(_make_causal_mask(mask, self.dtype))
                 batch_cache_positions.append(torch.arange(seq_len))
 
                 if hidden_dim is None:
@@ -3033,7 +3050,11 @@ class DiskOffloadBackend(ExtractionBackend):
 
             for batch_idx, (start, end) in enumerate(batches):
                 hs = batch_hidden_states[batch_idx].to(device)
-                mask_dev = batch_causal_masks[batch_idx].to(device)
+                # Build causal mask on-the-fly — see note at the batch
+                # pre-compute block above. Scoped locally so the CPU-side
+                # [B, 1, S, S] tensor is released as soon as the batch ends.
+                mask_2d = all_attention_mask[start:end]
+                mask_dev = _make_causal_mask(mask_2d, self.dtype).to(device)
                 pos_dev = batch_pos_ids[batch_idx].to(device)
                 pe_dev = ChunkedLocalBackend._pe_to_device(position_embeddings, device)
 
