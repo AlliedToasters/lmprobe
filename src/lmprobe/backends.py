@@ -1805,6 +1805,14 @@ class ChunkedLocalBackend(ExtractionBackend):
             }
 
             for batch_idx, (start, end) in enumerate(batches):
+                # Push per-batch progress onto the chunk bar so the user sees
+                # forward motion inside a chunk — a chunk-level tick can take
+                # hours on large fused sweeps (N_batches × chunk_size forward
+                # passes between ticks).
+                chunk_pbar.set_postfix(
+                    layers=f"{chunk_start}-{chunk_end-1}",
+                    batch=f"{batch_idx+1}/{len(batches)}",
+                )
                 hs = batch_hidden_states[batch_idx].to(device)
                 mask_dev = batch_causal_masks[batch_idx].to(device)
                 pos_dev = batch_pos_ids[batch_idx].to(device)
