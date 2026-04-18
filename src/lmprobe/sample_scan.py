@@ -447,7 +447,12 @@ class SampleScan:
         dict
             ``{name: accumulator.finalize()}``.
         """
-        from .backends import ChunkedLayerLoader, ChunkedLocalBackend
+        from .backends import (
+            ChunkedLayerLoader,
+            ChunkedLocalBackend,
+            DiskOffloadBackend,
+            DiskOffloadLayerLoader,
+        )
         from .sweep import sweep as _sweep
 
         if external_bases is None:
@@ -456,11 +461,12 @@ class SampleScan:
         backend = self._get_backend()
         if isinstance(backend, ChunkedLocalBackend):
             loader = ChunkedLayerLoader(backend)
+        elif isinstance(backend, DiskOffloadBackend):
+            loader = DiskOffloadLayerLoader(backend)
         else:
             raise NotImplementedError(
-                "SampleScan.sweep() currently supports ChunkedLocalBackend "
-                "only; DiskOffloadBackend sweep integration is pending a "
-                "port of DiskOffloadLayerLoader."
+                f"SampleScan.sweep() does not support backend type "
+                f"{type(backend).__name__}."
             )
 
         return _sweep(

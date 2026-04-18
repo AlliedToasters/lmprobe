@@ -2991,6 +2991,524 @@ class DiskOffloadBackend(ExtractionBackend):
         return self.extract_all(prompts, spec, batch_size=len(prompts))
 
 
+# ---------------------------------------------------------------------------
+# DiskOffloadLayerLoader — LayerLoader implementation for DiskOffloadBackend
+# ---------------------------------------------------------------------------
+#
+# Mirrors ChunkedLayerLoader's protocol so `SampleScan.sweep()` can run on
+# models too large for full-CPU-residency. Reuses DiskOffloadBackend's
+# safetensors shard-map, per-layer load/materialize/free primitives, and
+# the same memmap-backed residual buffer as ChunkedLayerLoader. Forward
+# loop is near-identical to ChunkedLayerLoader._drive_sweep — one layer
+# per group, model skeleton (meta weights) used for topology lookups.
+
+
+class DiskOffloadLayerLoader:
+    """LayerLoader wrapping :class:`DiskOffloadBackend`.
+
+    One layer per group: each group context loads the layer's weights
+    from safetensors, materializes into the skeleton's decoder module,
+    and frees on exit. The skeleton is reused across groups (cheap —
+    meta tensors). Residual buffer is the same memmap-backed
+    ``_ResidualBuffer`` used by ``ChunkedLayerLoader``.
+    """
+
+    def __init__(self, backend: DiskOffloadBackend) -> None:
+        self._backend = backend
+        self.tokenizer = backend.tokenizer
+        config = backend._get_config()
+        self.num_layers: int = int(config.num_hidden_layers)
+        self.hidden_dim: int = 0  # populated in prepare()
+        self.dtype: torch.dtype = backend.dtype
+        self.device: str = backend.device
+        self.layer_types: list[str] | None = None
+        self.router_module_template: str | None = None
+
+    # --- LayerLoader protocol ------------------------------------------------
+
+    def prepare(
+        self, prompts: list[str], batch_size: int,
+    ) -> Any:
+        """Context manager: tokenize → embed (materialize → forward → free)
+        → rotary → allocate memmap. Yields an EmbedState."""
+        from contextlib import contextmanager
+
+        from .activation_types import detect_moe_info
+        from .sweep import EmbedState
+
+        @contextmanager
+        def _prepare_ctx() -> Any:
+            import os
+            import tempfile
+
+            try:
+                moe_info = detect_moe_info(self._backend.model_name)
+                if moe_info is not None:
+                    self.router_module_template = moe_info.router_module_template
+            except Exception:
+                pass
+
+            tokenized = self.tokenizer(
+                prompts, return_tensors="pt", padding=True,
+            )
+            all_input_ids = tokenized["input_ids"]
+            all_attention_mask = tokenized["attention_mask"]
+
+            token_ids_per_sample: list[list[int]] = []
+            seq_lengths: list[int] = []
+            for i in range(len(prompts)):
+                real_len = int(all_attention_mask[i].sum().item())
+                seq_lengths.append(real_len)
+                token_ids_per_sample.append(
+                    all_input_ids[i, :real_len].tolist(),
+                )
+
+            n_samples = len(prompts)
+            batches: list[tuple[int, int]] = [
+                (s, min(s + batch_size, n_samples))
+                for s in range(0, n_samples, batch_size)
+            ]
+
+            config = self._backend._get_config()
+            model = self._backend._get_model_skeleton()
+            layer_map, non_layer = self._backend._get_shard_map()
+            device = self.device
+
+            # --- Embedding: load tensors, materialize, forward, free ---
+            embed_tensors = [(n, f) for n, f in non_layer if "embed_tokens" in n]
+            embed_weights = self._backend._load_tensors(embed_tensors, device)
+            embed = _get_embedding_module(model)
+            _materialize_module(
+                embed, embed_weights, "model.embed_tokens.", device,
+            )
+            del embed_weights
+
+            pos_ids_per_batch: list[torch.Tensor] = []
+            cache_positions_per_batch: list[torch.Tensor] = []
+
+            tmpdir = tempfile.TemporaryDirectory(prefix="lmprobe_sweep_disk_")
+            try:
+                hs_path = os.path.join(tmpdir.name, "residuals.bin")
+                S_max = int(all_input_ids.shape[1])
+                mmap: np.memmap | None = None
+                hidden_dim: int | None = None
+
+                with torch.no_grad():
+                    for start, end in batches:
+                        ids = all_input_ids[start:end]
+                        mask = all_attention_mask[start:end]
+                        hs = embed(ids.to(device)).cpu()
+                        if hidden_dim is None:
+                            hidden_dim = int(hs.shape[-1])
+                        if mmap is None:
+                            mmap = np.memmap(
+                                hs_path,
+                                dtype=_mmap_np_dtype(self.dtype),
+                                mode="w+",
+                                shape=(n_samples, S_max, hidden_dim),
+                            )
+                        _mmap_write_slice(mmap, start, end, hs)
+                        del hs
+                        pos_ids = mask.long().cumsum(-1) - 1
+                        pos_ids.masked_fill_(mask == 0, 1)
+                        pos_ids_per_batch.append(pos_ids)
+                        cache_positions_per_batch.append(
+                            torch.arange(ids.shape[1]),
+                        )
+
+                _free_module(embed)
+                if torch.cuda.is_available() and self.device != "cpu":
+                    torch.cuda.empty_cache()
+
+                assert mmap is not None and hidden_dim is not None
+                self.hidden_dim = hidden_dim
+
+                # --- Rotary (re-init from config; meta tensors have no data) ---
+                position_embeddings, layer_types = self._compute_rotary(
+                    model, config, mmap, pos_ids_per_batch, device,
+                )
+                self.layer_types = layer_types
+
+                state = EmbedState(
+                    input_ids=all_input_ids,
+                    attention_mask=all_attention_mask,
+                    batches=batches,
+                    pos_ids_per_batch=pos_ids_per_batch,
+                    cache_positions_per_batch=cache_positions_per_batch,
+                    position_embeddings=position_embeddings,
+                    layer_types=layer_types,
+                    seq_lengths=seq_lengths,
+                    token_ids_per_sample=token_ids_per_sample,
+                    hidden_dim=hidden_dim,
+                    residual_buffer=_ResidualBuffer(mmap, tmpdir),
+                )
+            except Exception:
+                tmpdir.cleanup()
+                raise
+
+            try:
+                yield state
+            finally:
+                state.residual_buffer.cleanup()
+
+        return _prepare_ctx()
+
+    def _compute_rotary(
+        self,
+        model: Any,
+        config: Any,
+        mmap: np.memmap,
+        pos_ids_per_batch: list[torch.Tensor],
+        device: str,
+    ) -> tuple[Any, list[str] | None]:
+        """Rotary init for disk-offload: re-initialize inv_freq from config
+        (meta skeleton has no data), compute PE on a single-sample slice."""
+        rotary_name = ChunkedLocalBackend._find_rotary_embedding_name(model)
+        if rotary_name is None:
+            return None, None
+        rotary_mod = model
+        for part in rotary_name.split("."):
+            rotary_mod = getattr(rotary_mod, part)
+
+        dim = getattr(config, "qk_rope_head_dim", None)
+        if dim is None:
+            head_dim = config.hidden_size // config.num_attention_heads
+            dim = head_dim
+        base = getattr(config, "rope_theta", 10000.0)
+        inv_freq = 1.0 / (
+            base ** (
+                torch.arange(0, dim, 2, dtype=torch.float32, device=device)
+                / dim
+            )
+        )
+        rotary_mod.to_empty(device=device)
+        rotary_mod.inv_freq = inv_freq
+
+        text_cfg = getattr(
+            getattr(model, "config", None), "text_config",
+            getattr(model, "config", None),
+        )
+        layer_types_cfg = getattr(text_cfg, "layer_types", None)
+        pe_hs = _mmap_read_slice(mmap, 0, 1, self.dtype).to(device)
+        pe_pos = pos_ids_per_batch[0][:1].to(device)
+
+        unique_types = set(layer_types_cfg) if layer_types_cfg is not None else set()
+        position_embeddings: Any
+        layer_types: list[str] | None
+        if layer_types_cfg is not None and len(unique_types) > 1:
+            layer_types = list(layer_types_cfg)
+            position_embeddings = {}
+            with torch.no_grad():
+                for lt in unique_types:
+                    pe = rotary_mod(pe_hs, pe_pos, layer_type=lt)
+                    position_embeddings[lt] = tuple(t.cpu() for t in pe)
+        else:
+            layer_types = (
+                list(layer_types_cfg) if layer_types_cfg is not None else None
+            )
+            with torch.no_grad():
+                pe = rotary_mod(pe_hs, pe_pos)
+                if isinstance(pe, tuple):
+                    position_embeddings = tuple(t.cpu() for t in pe)
+                else:
+                    position_embeddings = pe.cpu()
+
+        _free_module(rotary_mod)
+        if torch.cuda.is_available() and self.device != "cpu":
+            torch.cuda.empty_cache()
+        return position_embeddings, layer_types
+
+    def iter_layer_groups(self) -> Any:
+        # One layer per group — safetensors load is the bottleneck, so we
+        # never co-locate layers on device.
+        for i in range(self.num_layers):
+            yield [i]
+
+    def layer_group(self, indices: list[int]) -> Any:
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx() -> Any:
+            import gc
+
+            config = self._backend._get_config()
+            model = self._backend._get_model_skeleton()
+            layer_map, _ = self._backend._get_shard_map()
+            decoder_layers = _get_decoder_layers(model)
+
+            n_experts = getattr(config, "n_routed_experts", None)
+            first_moe = getattr(config, "first_k_dense_replace", 0)
+
+            materialized_modules: list[Any] = []
+            try:
+                for layer_idx in indices:
+                    layer_weights = self._backend._load_tensors(
+                        layer_map[layer_idx], "cpu",
+                    )
+                    prefix = f"model.layers.{layer_idx}."
+
+                    # MoE expert weight packing (no-op for dense models).
+                    if n_experts and layer_idx >= first_moe:
+                        packed = _pack_expert_weights(
+                            layer_weights, prefix, n_experts, self.device,
+                        )
+                        layer_weights.update(packed)
+                        del packed
+
+                    layer_module = decoder_layers[layer_idx]
+                    _materialize_module(
+                        layer_module, layer_weights, prefix, self.device,
+                    )
+                    del layer_weights
+                    materialized_modules.append(layer_module)
+
+                yield materialized_modules
+            finally:
+                for mod in materialized_modules:
+                    _free_module(mod)
+                gc.collect()
+                if torch.cuda.is_available() and self.device != "cpu":
+                    torch.cuda.empty_cache()
+        return _ctx()
+
+    def read_hs(
+        self,
+        state: Any,
+        start: int,
+        end: int,
+        device: str,
+    ) -> torch.Tensor:
+        return _mmap_read_slice(
+            state.residual_buffer.mmap, start, end, self.dtype,
+        ).to(device)
+
+    def write_hs(
+        self,
+        state: Any,
+        start: int,
+        end: int,
+        hs: torch.Tensor,
+    ) -> None:
+        _mmap_write_slice(state.residual_buffer.mmap, start, end, hs)
+
+    def build_layer_kwargs(
+        self,
+        state: Any,
+        batch_idx: int,
+        layer_idx: int,
+        causal_mask_dev: torch.Tensor,
+        device: str,
+    ) -> dict[str, Any]:
+        pos_dev = state.pos_ids_per_batch[batch_idx].to(device)
+        cache_position = state.cache_positions_per_batch[batch_idx]
+        pe_dev = ChunkedLocalBackend._pe_to_device(
+            state.position_embeddings, device,
+        )
+        return ChunkedLocalBackend._build_layer_kwargs(
+            causal_mask_dev, pos_dev, cache_position,
+            pe_dev, state.layer_types, layer_idx, device,
+        )
+
+    def apply_lm_head(
+        self,
+        final_hs: torch.Tensor,
+        device: str,
+    ) -> torch.Tensor:
+        """Load final_norm + lm_head from safetensors, apply, free."""
+        model = self._backend._get_model_skeleton()
+        _, non_layer = self._backend._get_shard_map()
+
+        norm_tensors = [
+            (n, f) for n, f in non_layer
+            if "norm" in n and "layer" not in n
+        ]
+        head_tensors = [(n, f) for n, f in non_layer if "lm_head" in n]
+
+        final_norm = _get_final_norm(model)
+        lm_head = _get_lm_head(model)
+
+        norm_w = self._backend._load_tensors(norm_tensors, device)
+        _materialize_module(final_norm, norm_w, "model.norm.", device)
+        del norm_w
+
+        head_w = self._backend._load_tensors(head_tensors, device)
+        _materialize_module(lm_head, head_w, "lm_head.", device)
+        del head_w
+
+        try:
+            with torch.no_grad():
+                logits = lm_head(final_norm(final_hs))
+        finally:
+            _free_module(final_norm)
+            _free_module(lm_head)
+            if torch.cuda.is_available() and self.device != "cpu":
+                torch.cuda.empty_cache()
+
+        assert isinstance(logits, torch.Tensor)
+        return logits
+
+    # --- Sweep driver --------------------------------------------------------
+
+    def _drive_sweep(
+        self,
+        *,
+        state: Any,
+        accumulators: Any,
+        plans: dict[tuple[int, str], Any],
+        basis_gpu: dict[str, torch.Tensor],
+        batch_size: int,
+        ctx: Any,
+    ) -> None:
+        """Per-layer forward loop. Structurally identical to
+        ``ChunkedLayerLoader._drive_sweep`` — the only substantive
+        difference is that ``model`` is the meta skeleton (topology only,
+        live weights are inside the currently-materialized layer module
+        from ``layer_group()``)."""
+        from tqdm import tqdm
+
+        from .sweep import (
+            SIGNAL_ATTN_DELTA,
+            SIGNAL_LOGITS,
+            SIGNAL_MLP_DELTA,
+            SIGNAL_RESIDUAL,
+            SIGNAL_ROUTER_LOGITS,
+            _dispatch_plan,
+            _notify_group_complete,
+        )
+
+        router_strategy: str | None = None
+        router_owners: list[str] = []
+        for name, acc in accumulators.items():
+            if SIGNAL_ROUTER_LOGITS in acc.signals and hasattr(acc, "strategy"):
+                s = acc.strategy
+                if router_strategy is None:
+                    router_strategy = s
+                    router_owners = [name]
+                elif s != router_strategy:
+                    router_owners.append(name)
+                    raise ValueError(
+                        f"sweep: conflicting router_logits hook strategies "
+                        f"across subscribers {router_owners!r}: "
+                        f"{router_strategy!r} vs {s!r}."
+                    )
+                else:
+                    router_owners.append(name)
+        if router_strategy is None:
+            router_strategy = "output"
+
+        device = self.device
+        model = self._backend._get_model_skeleton()
+
+        group_iter = list(self.iter_layer_groups())
+        for chunk_idx, chunk_indices in enumerate(tqdm(
+            group_iter,
+            desc="Sweep: disk-offload layers",
+        )):
+            with self.layer_group(chunk_indices) as layer_modules_in_group:
+                layer_modules = {
+                    layer_idx: layer_modules_in_group[i]
+                    for i, layer_idx in enumerate(chunk_indices)
+                }
+
+                for batch_idx, (start, end) in enumerate(state.batches):
+                    hs = self.read_hs(state, start, end, device)
+                    mask_dev = _make_causal_mask(
+                        state.attention_mask[start:end], self.dtype,
+                    ).to(device)
+                    sample_ids = np.arange(start, end, dtype=np.int32)
+                    attn_mask_np = (
+                        state.attention_mask[start:end].cpu().numpy().astype(bool)
+                    )
+
+                    with torch.no_grad():
+                        for layer_idx in chunk_indices:
+                            layer_module = layer_modules[layer_idx]
+
+                            hook_handles: list[Any] = []
+                            hook_bufs: dict[str, list[torch.Tensor]] = {}
+
+                            for sig in (
+                                SIGNAL_ATTN_DELTA,
+                                SIGNAL_MLP_DELTA,
+                                SIGNAL_ROUTER_LOGITS,
+                            ):
+                                if (layer_idx, sig) not in plans:
+                                    continue
+                                buf: list[torch.Tensor] = []
+                                hook_bufs[sig] = buf
+                                handle = _install_sweep_hook(
+                                    sig, layer_module, layer_idx, model,
+                                    self.router_module_template,
+                                    router_strategy, buf,
+                                )
+                                if handle is not None:
+                                    hook_handles.append((sig, handle))
+
+                            layer_kwargs = self.build_layer_kwargs(
+                                state, batch_idx, layer_idx, mask_dev, device,
+                            )
+                            output = layer_module(hs, **layer_kwargs)
+                            hs = output[0] if isinstance(output, tuple) else output
+
+                            for sig, handle in hook_handles:
+                                handle.remove()
+                                buf = hook_bufs[sig]
+                                if not buf:
+                                    continue
+                                plan = plans.get((layer_idx, sig))
+                                if plan is None:
+                                    continue
+                                sig_basis = basis_gpu.get(sig)
+                                per_layer_basis = (
+                                    sig_basis[layer_idx] if sig_basis is not None
+                                    else None
+                                )
+                                _dispatch_plan(
+                                    plan, buf[0], sig, layer_idx,
+                                    sample_ids, attn_mask_np,
+                                    per_layer_basis,
+                                )
+                                buf.clear()
+
+                            res_plan = plans.get((layer_idx, SIGNAL_RESIDUAL))
+                            if res_plan is not None:
+                                res_basis = basis_gpu.get(SIGNAL_RESIDUAL)
+                                res_per_layer = (
+                                    res_basis[layer_idx] if res_basis is not None
+                                    else None
+                                )
+                                _dispatch_plan(
+                                    res_plan, hs.detach(), SIGNAL_RESIDUAL,
+                                    layer_idx, sample_ids, attn_mask_np,
+                                    res_per_layer,
+                                )
+
+                    self.write_hs(state, start, end, hs)
+                    del hs, mask_dev
+
+            _notify_group_complete(accumulators, chunk_indices)
+
+        wants_logits = any(
+            SIGNAL_LOGITS in a.signals for a in accumulators.values()
+        )
+        if wants_logits:
+            for batch_idx, (start, end) in enumerate(state.batches):
+                hs = self.read_hs(state, start, end, device)
+                logits = self.apply_lm_head(hs, device)
+                sample_ids = np.arange(start, end, dtype=np.int32)
+                attn_mask_np = (
+                    state.attention_mask[start:end].cpu().numpy().astype(bool)
+                )
+                logits_cpu = logits.detach().cpu()
+                for acc in accumulators.values():
+                    if SIGNAL_LOGITS in acc.signals:
+                        acc.update(
+                            logits_cpu, SIGNAL_LOGITS, -1,
+                            sample_ids, attn_mask_np,
+                        )
+                del hs, logits, logits_cpu
+
+
 def resolve_backend(
     backend: str,
     model_name: str,
