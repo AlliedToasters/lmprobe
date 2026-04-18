@@ -288,12 +288,19 @@ class PerTokenProjection:
         B, S, k = data.shape
         block_offset = self._block_offsets[(layer_idx, sig)]
         s_max = self._ctx.s_max
-        # Write per-sample into the pre-computed slot. The sweep pads all
-        # batches to the corpus-wide S_max today (tokenizer padding=True
-        # without truncation), so `S == s_max` and the write is full-width.
-        # If a future backend ever does per-batch padding, truncate to the
-        # smaller of S or s_max to keep the write in-bounds.
-        write_cols = min(S, s_max)
+        # Invariant: the sweep pads batches to the corpus-wide ``s_max``
+        # (tokenizer ``padding=True`` without truncation), so ``S <= s_max``.
+        # A backend emitting ``S > s_max`` means per-batch padding is out of
+        # sync with the sweep's preallocation — fail loud, don't silently
+        # truncate tail columns into nowhere.
+        if S > s_max:
+            raise AssertionError(
+                f"PerTokenProjection: batch seq_len S={S} exceeds sweep "
+                f"s_max={s_max} for signal {sig!r} at layer {layer_idx}. "
+                f"This is a backend bug — per-batch padding must not exceed "
+                f"the corpus-wide padded length set by the loader."
+            )
+        write_cols = S
         for bi, sid in enumerate(sample_ids):
             row_start = block_offset + int(sid) * s_max
             self._values[

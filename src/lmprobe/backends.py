@@ -3090,15 +3090,32 @@ class ChunkedLayerLoader:
             _notify_group_complete,
         )
 
-        # Router strategy: read off the first RouterLogitCapture-like
-        # accumulator if one subscribes to router_logits. (Convention: the
-        # accumulator exposes a `strategy` attribute. Conflict between
-        # subscribers is a caller bug; we use the first declared.)
-        router_strategy = "output"
-        for acc in accumulators.values():
+        # Router strategy: unify across all router-subscribing accumulators.
+        # Convention: the accumulator exposes a `strategy` attribute (e.g.
+        # RouterLogitCapture). Two subscribers with different strategies is
+        # a caller bug — the hook can only fire one way per (layer, module),
+        # so a silent "first-wins" would drop the other capture's data.
+        router_strategy: str | None = None
+        router_owners: list[str] = []
+        for name, acc in accumulators.items():
             if SIGNAL_ROUTER_LOGITS in acc.signals and hasattr(acc, "strategy"):
-                router_strategy = acc.strategy
-                break
+                s = acc.strategy
+                if router_strategy is None:
+                    router_strategy = s
+                    router_owners = [name]
+                elif s != router_strategy:
+                    router_owners.append(name)
+                    raise ValueError(
+                        f"sweep: conflicting router_logits hook strategies "
+                        f"across subscribers {router_owners!r}: "
+                        f"{router_strategy!r} vs {s!r}. A single sweep can "
+                        f"only install one hook per layer; run two sweeps "
+                        f"or unify the strategy."
+                    )
+                else:
+                    router_owners.append(name)
+        if router_strategy is None:
+            router_strategy = "output"
 
         device = self.device
         model = self._backend._load_full_model_cpu()

@@ -236,6 +236,13 @@ class Accumulator(Protocol):
       output (e.g. LastTokenReducer, PerTokenProjection). A signal with
       BOTH raw and projection subscribers is rejected at resolve time —
       use two sweeps (fit, then project).
+
+    Attribute convention — set these on the **instance** from ``__init__``,
+    not as class-level defaults. The resolver reads them per-accumulator
+    once at sweep start, so either works today; pinning to instance form
+    avoids subclass authors accidentally sharing class-level state (e.g.
+    a mutable ``frozenset`` default that's fine, a ``None`` override that
+    isn't). Built-in accumulators follow this convention.
     """
 
     # Class- or instance-level attributes. Not properties — the driver
@@ -274,14 +281,45 @@ class Accumulator(Protocol):
         """Return the accumulator's output. Called once at sweep end."""
         ...
 
-    # Optional, duck-typed hook. Not part of the Protocol (runtime_checkable
-    # Protocols choke on optional methods) — the driver calls it via getattr.
-    #
-    # def on_layer_group_complete(self, layer_indices: list[int]) -> None:
-    #     """Called after all batches have been processed for ``layer_indices``
-    #     and weights are about to be freed. ``PCAFit`` overrides this to fit
-    #     incrementally — otherwise captures accumulate across the whole sweep
-    #     and regress the per-chunk memory ceiling spec 004 carefully holds."""
+    # Optional, duck-typed hook. Not part of this Protocol because
+    # ``runtime_checkable`` bails on Protocols with optional methods.
+    # See :class:`LifecycleAccumulator` for a non-runtime-checkable
+    # sub-protocol that mypy can type-check against.
+
+
+class LifecycleAccumulator(Protocol):
+    """Non-runtime-checkable sub-protocol for accumulators that opt into
+    layer-group lifecycle hooks.
+
+    Implement this when your accumulator needs to act after a layer group
+    completes (e.g. :class:`PCAFit` fits-and-frees incrementally per group
+    to keep captures from accumulating across the whole sweep, which would
+    regress the per-chunk memory ceiling spec 004 holds).
+
+    The driver finds the hook via ``getattr(acc, "on_layer_group_complete",
+    None)`` so a full :class:`Accumulator` needn't inherit from this —
+    declaring the attribute is enough. Inheriting just lets mypy catch
+    typos on the method name.
+    """
+
+    signals: frozenset[str]
+    layers: frozenset[int] | None
+    wants_raw: bool
+
+    def init(self, ctx: SweepContext) -> None: ...
+    def update(
+        self,
+        data: np.ndarray | torch.Tensor,
+        sig: str,
+        layer_idx: int,
+        sample_ids: np.ndarray,
+        attention_mask: np.ndarray,
+    ) -> None: ...
+    def finalize(self) -> Any: ...
+    def on_layer_group_complete(self, layer_indices: list[int]) -> None:
+        """Called after every microbatch has visited ``layer_indices`` and
+        right before the group's weights are freed."""
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -325,12 +363,20 @@ def _resolve_plans(
 
     - raw + projection on same signal → error (two-sweep rule)
     - projection without external_bases[sig] → error
+
+    ``SIGNAL_LOGITS`` is end-of-sweep, not per-layer — it is dispatched
+    once after the final layer completes (see the loader's ``_drive_sweep``)
+    and does not appear in ``plans`` at all. Excluding it from the
+    per-layer loop avoids generating spurious plan entries that would
+    double-fire if a future refactor ever routed logits through
+    :func:`_dispatch_plan`.
     """
     external_bases = external_bases or {}
     plans: dict[tuple[int, str], _SignalPlan] = {}
+    per_layer_signals = VALID_SIGNALS - {SIGNAL_LOGITS}
 
     for layer_idx in range(num_layers):
-        for sig in VALID_SIGNALS:
+        for sig in per_layer_signals:
             subs = [
                 a for a in accumulators.values()
                 if sig in a.signals
@@ -576,6 +622,7 @@ __all__ = [
     "Accumulator",
     "EmbedState",
     "LayerLoader",
+    "LifecycleAccumulator",
     "SIGNAL_ATTN_DELTA",
     "SIGNAL_LOGITS",
     "SIGNAL_MLP_DELTA",

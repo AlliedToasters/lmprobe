@@ -10,6 +10,8 @@ forward paths incrementally.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 from conftest import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
@@ -237,6 +239,104 @@ class TestPerTokenProjectionParity:
         )
 
 
+class TestStreamProjectParity:
+    """Legacy ``scan_forward(external_bases=...)`` vs. ``sweep +
+    PerTokenProjection``.
+
+    Covers the third legacy path — scan_forward's stream-project branch
+    (``backends.py:2182-2199``) — which `TestPerTokenProjectionParity`
+    doesn't hit because that test compares fit-and-project in one legacy
+    call vs. two sweeps. Here both paths consume an **externally supplied**
+    basis, so divergences are purely in projection / slot-write logic.
+    """
+
+    def test_stream_project_matches(
+        self, corpus: tuple[list[str], list[int]],
+    ) -> None:
+        from lmprobe.accumulators import PerTokenProjection
+        from lmprobe.backends import (
+            ChunkedLayerLoader,
+            ChunkedLocalBackend,
+        )
+        from lmprobe.sweep import sweep
+
+        prompts, _ = corpus
+
+        # Fit a basis once so both paths project through identical weights.
+        legacy_bases, _, _ = _run_legacy_scan(
+            prompts, n_components=4, batch_size=2,
+        )
+
+        # Path A — legacy scan_forward in pure stream-project mode.
+        backend = ChunkedLocalBackend(model_name=TEST_MODEL, device="cpu")
+        (
+            _metadata,
+            _bases_out,
+            legacy_proj,
+            legacy_coords,
+            _tokens,
+            _seq_lengths,
+            _attention_mask,
+            _signal_dims,
+        ) = backend.scan_forward(
+            prompts,
+            signals=["attn_delta", "mlp_delta"],
+            n_components=4,
+            batch_size=2,
+            external_bases=legacy_bases,
+        )
+
+        # Path B — sweep + PerTokenProjection, same basis.
+        loader = ChunkedLayerLoader(backend)
+        out = sweep(
+            prompts,
+            accumulators={"proj": PerTokenProjection(legacy_bases)},
+            loader=loader,
+            external_bases=legacy_bases,
+            batch_size=2,
+        )
+        new_values = out["proj"]["values"]
+        offset_table = out["proj"]["offset_table"]
+        signal_names = out["proj"]["signal_names"]
+
+        legacy_sample_ids = legacy_coords["sample_id"]
+        legacy_layers = legacy_coords["layer"]
+        legacy_signal = legacy_coords["signal"]
+        legacy_token_pos = legacy_coords["token_pos"]
+
+        n_samples = len(prompts)
+        n_layers = offset_table.shape[1]
+        for sid in range(n_samples):
+            for L in range(n_layers):
+                for si, _sig in enumerate(signal_names):
+                    start, end = offset_table[sid, L, si]
+                    if end <= start:
+                        continue
+                    seq_len = end - start
+                    new_rows = new_values[start:end].astype(np.float32)
+                    mask = (
+                        (legacy_sample_ids == sid)
+                        & (legacy_layers == L)
+                        & (legacy_signal == si)
+                    )
+                    legacy_rows_all = legacy_proj[mask, 0, :].astype(
+                        np.float32,
+                    )
+                    legacy_tok_pos = legacy_token_pos[mask]
+                    sort_idx = np.argsort(legacy_tok_pos)
+                    legacy_rows = legacy_rows_all[sort_idx][
+                        :seq_len, : new_rows.shape[1]
+                    ]
+                    # Both paths consume the same basis, so signs align.
+                    np.testing.assert_allclose(
+                        new_rows, legacy_rows, atol=5e-2, rtol=5e-2,
+                        err_msg=(
+                            f"(sid={sid}, L={L}, si={si}) stream-project "
+                            f"rows diverge beyond fp16 tolerance"
+                        ),
+                    )
+
+
 class TestProjectForwardParity:
     """project_forward_via_sweep should match project_forward within fp16
     tolerance, up to sign ambiguity on per-column projections."""
@@ -368,4 +468,214 @@ class TestChunkedForwardParity:
         assert new_logits.shape == legacy_logits.shape
         assert torch.allclose(
             new_logits.float(), legacy_logits.float(), atol=1e-2, rtol=1e-2,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Reducer parity: legacy reducers via scan_forward vs new-protocol
+# reducers via sweep
+# ---------------------------------------------------------------------------
+
+
+def _make_reducer_masks(
+    prompts: list[str], model_name: str,
+) -> list[np.ndarray]:
+    """Build per-sample bool masks matching lmprobe's tokenizer output.
+
+    Emulates a typical generative-token mask: the last 30% of real tokens.
+    Length per sample matches the real (unpadded) token count.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model_name)
+    masks: list[np.ndarray] = []
+    for p in prompts:
+        enc = tok(p, add_special_tokens=True)
+        n = len(enc["input_ids"])
+        m = np.zeros(n, dtype=bool)
+        cut = max(1, n - max(1, n // 3))
+        m[cut:] = True
+        masks.append(m)
+    return masks
+
+
+class TestSweepMemmapRoundtrip:
+    """Spec 004 memmap residuals must survive cross-chunk roundtrips on the
+    sweep path. Running with ``chunk_size=1`` forces the driver through the
+    memmap read/write boundary at every layer transition, catching a
+    regression where ``ChunkedLayerLoader`` silently used an in-memory
+    tensor buffer instead."""
+
+    def test_chunk_size_one_matches_default(
+        self, corpus: tuple[list[str], list[int]],
+    ) -> None:
+        from lmprobe.accumulators import PCAFit
+        from lmprobe.backends import ChunkedLayerLoader, ChunkedLocalBackend
+        from lmprobe.sweep import sweep
+
+        prompts, _ = corpus
+        # Default chunk (n_layers on CPU).
+        backend_full = ChunkedLocalBackend(model_name=TEST_MODEL, device="cpu")
+        loader_full = ChunkedLayerLoader(backend_full)
+        out_full = sweep(
+            prompts,
+            accumulators={
+                "fit": PCAFit(signals=["attn_delta"], n_components=4),
+            },
+            loader=loader_full,
+            batch_size=2,
+        )
+        # chunk_size=1: every layer boundary hits the memmap.
+        backend_small = ChunkedLocalBackend(
+            model_name=TEST_MODEL, device="cpu", chunk_size=1,
+        )
+        loader_small = ChunkedLayerLoader(backend_small)
+        out_small = sweep(
+            prompts,
+            accumulators={
+                "fit": PCAFit(signals=["attn_delta"], n_components=4),
+            },
+            loader=loader_small,
+            batch_size=2,
+        )
+        # Same fit captures regardless of chunking ⇒ paired-component
+        # overlap ~1.0 up to sign.
+        b_full = out_full["fit"]["attn_delta"].astype(np.float32)
+        b_small = out_small["fit"]["attn_delta"].astype(np.float32)
+        assert b_full.shape == b_small.shape
+        for layer in range(b_full.shape[0]):
+            if np.allclose(b_full[layer], 0) and np.allclose(b_small[layer], 0):
+                continue
+            dots = np.abs(b_full[layer].T @ b_small[layer])
+            diag = np.diagonal(dots)
+            assert np.all(diag > 0.95), (
+                f"layer {layer}: chunk_size=1 basis diverges from default; "
+                f"paired overlaps {diag}"
+            )
+
+
+class TestReducerParity:
+    """Legacy reducers (``scan_forward(reducers=...)``) vs. new-protocol
+    reducers (``sweep(accumulators=...)``). Same masks, same basis — outputs
+    must agree exactly (no sign ambiguity: both project through an
+    identical pre-fit basis)."""
+
+    def _legacy_run(
+        self,
+        prompts: list[str],
+        bases: dict[str, np.ndarray],
+        legacy_reducers: dict[str, Any],
+    ) -> dict[str, np.ndarray]:
+        from lmprobe.backends import ChunkedLocalBackend
+
+        backend = ChunkedLocalBackend(model_name=TEST_MODEL, device="cpu")
+        signals = list(bases.keys())
+        n_layers = next(iter(bases.values())).shape[0]
+        k_dim = next(iter(bases.values())).shape[-1]
+
+        bound: dict[str, tuple[Any, Any]] = {}
+        for name, red in legacy_reducers.items():
+            state = red.init_state(len(prompts), n_layers, len(signals), k_dim)
+            bound[name] = (red, state)
+        backend.scan_forward(
+            prompts,
+            signals=signals,
+            n_components=k_dim,
+            batch_size=2,
+            external_bases=bases,
+            reducers=bound,
+        )
+        return {name: red.finalize(state) for name, (red, state) in bound.items()}
+
+    def _sweep_run(
+        self,
+        prompts: list[str],
+        bases: dict[str, np.ndarray],
+        accumulators: dict[str, Any],
+    ) -> dict[str, np.ndarray]:
+        from lmprobe.backends import ChunkedLayerLoader, ChunkedLocalBackend
+        from lmprobe.sweep import sweep
+
+        backend = ChunkedLocalBackend(model_name=TEST_MODEL, device="cpu")
+        loader = ChunkedLayerLoader(backend)
+        out = sweep(
+            prompts,
+            accumulators=accumulators,
+            loader=loader,
+            external_bases=bases,
+            batch_size=2,
+        )
+        return out
+
+    def test_last_token_reducer_matches(
+        self, corpus: tuple[list[str], list[int]],
+    ) -> None:
+        from lmprobe.accumulators import (
+            LastTokenReducer as NewLastTokenReducer,
+        )
+        from lmprobe.reducers import LastTokenReducer as LegacyLastTokenReducer
+
+        prompts, _ = corpus
+        bases, _, _ = _run_legacy_scan(prompts, n_components=4, batch_size=2)
+        masks = _make_reducer_masks(prompts, TEST_MODEL)
+
+        legacy_out = self._legacy_run(
+            prompts, bases, {"red": LegacyLastTokenReducer(masks)},
+        )
+        new_out = self._sweep_run(
+            prompts, bases, {"red": NewLastTokenReducer(masks, bases=bases)},
+        )
+        np.testing.assert_allclose(
+            new_out["red"].astype(np.float32),
+            legacy_out["red"].astype(np.float32),
+            atol=5e-3, rtol=5e-3,
+        )
+
+    def test_mean_reducer_matches(
+        self, corpus: tuple[list[str], list[int]],
+    ) -> None:
+        from lmprobe.accumulators import MeanReducer as NewMeanReducer
+        from lmprobe.reducers import MeanReducer as LegacyMeanReducer
+
+        prompts, _ = corpus
+        bases, _, _ = _run_legacy_scan(prompts, n_components=4, batch_size=2)
+        masks = _make_reducer_masks(prompts, TEST_MODEL)
+
+        legacy_out = self._legacy_run(
+            prompts, bases, {"red": LegacyMeanReducer(masks)},
+        )
+        new_out = self._sweep_run(
+            prompts, bases, {"red": NewMeanReducer(masks, bases=bases)},
+        )
+        np.testing.assert_allclose(
+            new_out["red"].astype(np.float32),
+            legacy_out["red"].astype(np.float32),
+            atol=5e-3, rtol=5e-3,
+        )
+
+    def test_mean_excl_last_n_reducer_matches(
+        self, corpus: tuple[list[str], list[int]],
+    ) -> None:
+        from lmprobe.accumulators import (
+            MeanExclLastNReducer as NewMeanExclLastNReducer,
+        )
+        from lmprobe.reducers import (
+            MeanExclLastNReducer as LegacyMeanExclLastNReducer,
+        )
+
+        prompts, _ = corpus
+        bases, _, _ = _run_legacy_scan(prompts, n_components=4, batch_size=2)
+        masks = _make_reducer_masks(prompts, TEST_MODEL)
+
+        legacy_out = self._legacy_run(
+            prompts, bases, {"red": LegacyMeanExclLastNReducer(masks, n=2)},
+        )
+        new_out = self._sweep_run(
+            prompts, bases,
+            {"red": NewMeanExclLastNReducer(masks, bases=bases, n=2)},
+        )
+        np.testing.assert_allclose(
+            new_out["red"].astype(np.float32),
+            legacy_out["red"].astype(np.float32),
+            atol=5e-3, rtol=5e-3,
         )

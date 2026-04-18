@@ -240,3 +240,142 @@ class TestKEffVariance:
         # k_eff_pad = min(n_components, dim). For tiny-random-llama-2,
         # dim is small so we'll see k_eff_pad == dim.
         assert basis.shape[2] <= basis.shape[1]
+
+    def test_small_corpus_k_eff_bounded_by_fit_rows(self) -> None:
+        """n_components > n_fit_rows − 1: PCA can only extract rank-(n-1)
+        components, so the returned basis is padded with zeros to the
+        requested ``n_components`` column width (or ``dim``, whichever is
+        smaller)."""
+        from lmprobe.accumulators import PCAFit
+        from lmprobe.backends import ChunkedLayerLoader, ChunkedLocalBackend
+        from lmprobe.sweep import sweep
+
+        # Two prompts × ~short sequences × n_layers captures are the fit
+        # rows per (layer, signal). With n_components=32, we're asking for
+        # more components than rank — PCAFit should still produce a
+        # rectangular array without shape errors.
+        small_prompts = ["The cat", "A dog"]
+        backend = ChunkedLocalBackend(model_name=TEST_MODEL, device="cpu")
+        loader = ChunkedLayerLoader(backend)
+        out = sweep(
+            small_prompts,
+            accumulators={
+                "fit": PCAFit(signals=["attn_delta"], n_components=32),
+            },
+            loader=loader,
+            batch_size=2,
+        )
+        basis = out["fit"]["attn_delta"]
+        assert basis.ndim == 3
+        # Rectangular; trailing columns may be zero-padded where k_eff
+        # falls short of the requested 32.
+        n_layers, dim, k = basis.shape
+        assert k == min(32, dim)
+
+
+# ---------------------------------------------------------------------------
+# Reducer branch coverage (edge-case fixtures, not parity)
+# ---------------------------------------------------------------------------
+
+
+class TestReducerBranches:
+    """Edge branches in LastTokenReducer / MeanReducer that normal corpora
+    rarely hit, but which the accumulator protocol must handle gracefully."""
+
+    def test_last_token_reducer_no_true_mask_yields_zeros(
+        self, corpus: tuple[list[str], list[int]],
+    ) -> None:
+        """``_has_true=False`` branch: a sample whose mask has zero ``True``
+        entries should produce a zero output slice and not raise."""
+        from lmprobe.accumulators import LastTokenReducer, PCAFit
+        from lmprobe.backends import ChunkedLayerLoader, ChunkedLocalBackend
+        from lmprobe.sweep import sweep
+
+        prompts, _ = corpus
+        backend = ChunkedLocalBackend(model_name=TEST_MODEL, device="cpu")
+        loader = ChunkedLayerLoader(backend)
+        # 1) Fit bases.
+        fit_out = sweep(
+            prompts,
+            accumulators={
+                "fit": PCAFit(signals=["attn_delta"], n_components=4),
+            },
+            loader=loader,
+            batch_size=2,
+        )
+        bases = fit_out["fit"]
+
+        # 2) Build a mask list where sample 0 has all-False (no True).
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(TEST_MODEL)
+        masks: list[np.ndarray] = []
+        for i, p in enumerate(prompts):
+            n = len(tok(p, add_special_tokens=True)["input_ids"])
+            m = np.zeros(n, dtype=bool)
+            if i > 0:
+                m[-1] = True
+            masks.append(m)
+
+        # 3) Reduce.
+        loader = ChunkedLayerLoader(backend)
+        out = sweep(
+            prompts,
+            accumulators={
+                "red": LastTokenReducer(masks, bases=bases),
+            },
+            loader=loader,
+            external_bases=bases,
+            batch_size=2,
+        )
+        red_out = out["red"]  # [N, L, G, k]
+        # Sample 0 must be all zeros; others nonzero somewhere.
+        assert np.all(red_out[0] == 0)
+        assert np.any(red_out[1] != 0)
+
+    def test_mean_reducer_zero_count_yields_zeros(
+        self, corpus: tuple[list[str], list[int]],
+    ) -> None:
+        """``_count==0`` branch: samples with zero ``True`` positions must
+        produce zero-mean output — no division-by-zero, no NaN."""
+        from lmprobe.accumulators import MeanReducer, PCAFit
+        from lmprobe.backends import ChunkedLayerLoader, ChunkedLocalBackend
+        from lmprobe.sweep import sweep
+
+        prompts, _ = corpus
+        backend = ChunkedLocalBackend(model_name=TEST_MODEL, device="cpu")
+        loader = ChunkedLayerLoader(backend)
+        fit_out = sweep(
+            prompts,
+            accumulators={
+                "fit": PCAFit(signals=["attn_delta"], n_components=4),
+            },
+            loader=loader,
+            batch_size=2,
+        )
+        bases = fit_out["fit"]
+
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(TEST_MODEL)
+        masks = [
+            np.zeros(
+                len(tok(p, add_special_tokens=True)["input_ids"]), dtype=bool,
+            )
+            for p in prompts
+        ]
+        # Give sample 1 one True so divide-path also runs.
+        masks[1][-1] = True
+
+        loader = ChunkedLayerLoader(backend)
+        out = sweep(
+            prompts,
+            accumulators={"red": MeanReducer(masks, bases=bases)},
+            loader=loader,
+            external_bases=bases,
+            batch_size=2,
+        )
+        red_out = out["red"]
+        # All-False masks -> zero mean, no NaN.
+        assert np.all(red_out[0] == 0)
+        assert not np.any(np.isnan(red_out))

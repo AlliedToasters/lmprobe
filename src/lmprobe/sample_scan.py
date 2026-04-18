@@ -457,10 +457,16 @@ class SampleScan:
         """
         offset_table = self._load_offset_table()
         if offset_table is None:
-            # Legacy fallback — for scans written pre-offset-table.
+            # Legacy fallback — for scans written pre-offset-table. Trim
+            # ``get_projections`` (which sizes by ``token_pos.max()+1`` ==
+            # tokenizer-padded length) to the sample's real token count so
+            # callers see the same shape as the O(1) offset-table path.
+            seq_len = int(
+                self._samples_table.column("seq_length").to_pylist()[sample_id]
+            )
             dense = self.get_projections(sample_id, signal)
-            # dense is [seq_len, n_layers, n_sig, k] or [seq_len, n_layers, 1, k]
-            out = dense[:, layer, :, :]
+            # dense is [padded_seq_len, n_layers, n_sig, k] or [..., 1, k]
+            out = dense[:seq_len, layer, :, :]
             if signal is not None:
                 return out[:, 0, :]
             return out
