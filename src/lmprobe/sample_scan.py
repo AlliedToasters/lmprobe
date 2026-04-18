@@ -26,7 +26,7 @@ Example
 from __future__ import annotations
 
 import datetime
-from collections.abc import Hashable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,8 +34,6 @@ import numpy as np
 
 if TYPE_CHECKING:
     import matplotlib.figure
-
-    from .reducers import Reducer
 
 
 class SampleScan:
@@ -109,11 +107,6 @@ class SampleScan:
 
         # Backend for projection forward passes (lazy-loaded)
         self._backend: Any = None
-
-        # Counter for batch_project calls to warn about the N-sweep trap.
-        # See `batch_project_grouped` for the fused alternative.
-        self._batch_project_call_count = 0
-        self._batch_project_warned = False
 
     @classmethod
     def run(
@@ -209,35 +202,86 @@ class SampleScan:
                 backend_kwargs["chunk_size"] = chunk_size
             backend_obj = ChunkedLocalBackend(**backend_kwargs)
 
-        # Run the scan forward pass
-        (
-            metadata_dict,
-            bases,
-            projections,
-            coords,
-            token_ids_per_sample,
-            seq_lengths,
-            _attention_mask,
-            signal_dims,
-        ) = backend_obj.scan_forward(
-            prompts,
-            signals=signals,
-            n_components=n_components,
-            batch_size=batch_size,
-            generative_masks=generative_masks,
-        )
+        # Two-sweep run: PCAFit to derive bases, then PerTokenProjection
+        # to project every token through them. Both sweeps share the same
+        # loader so weight-loading + rotary-embedding work is paid once per
+        # sweep (not once per accumulator).
+        from .accumulators import PCAFit, PerTokenProjection
+        from .backends import ChunkedLayerLoader, ChunkedLocalBackend
+        from .sweep import sweep as _sweep
 
-        actual_signals = metadata_dict["signals"]
+        signals_list = signals or ["attn_delta", "mlp_delta"]
+
+        if not isinstance(backend_obj, ChunkedLocalBackend):
+            raise NotImplementedError(
+                "SampleScan.run currently supports ChunkedLocalBackend "
+                "only. DiskOffload integration is pending a sweep port "
+                "of DiskOffloadBackend."
+            )
+
+        # Tokenize once so ids + seq_lengths are available for metadata
+        # regardless of what the loader discards internally.
+        tokenizer = backend_obj.tokenizer
+        tok_out = tokenizer(prompts, padding=True, return_tensors="pt")
+        all_input_ids = tok_out["input_ids"]
+        all_attention_mask = tok_out["attention_mask"]
+        token_ids_per_sample = [
+            all_input_ids[i, : int(all_attention_mask[i].sum().item())].tolist()
+            for i in range(len(prompts))
+        ]
+        seq_lengths = [
+            int(all_attention_mask[i].sum().item()) for i in range(len(prompts))
+        ]
+
+        # Sweep 1: fit PCA bases.
+        loader = ChunkedLayerLoader(backend_obj)
+        fit_out = _sweep(
+            prompts,
+            accumulators={
+                "fit": PCAFit(
+                    signals=signals_list,
+                    n_components=n_components,
+                    generative_masks=generative_masks,
+                ),
+            },
+            loader=loader,
+            batch_size=batch_size,
+        )
+        bases: dict[str, np.ndarray] = fit_out["fit"]
+
+        # Sweep 2: project every token through the fit bases.
+        loader = ChunkedLayerLoader(backend_obj)
+        proj_out = _sweep(
+            prompts,
+            accumulators={"proj": PerTokenProjection(bases)},
+            loader=loader,
+            external_bases=bases,
+            batch_size=batch_size,
+        )["proj"]
+
+        projections: np.ndarray = proj_out["values"]
+        coords: dict[str, np.ndarray] = proj_out["coords"]
+        offset_table: np.ndarray = proj_out["offset_table"]
+        # PerTokenProjection sorts signals alphabetically for a stable
+        # coords/offset-table ordering; mirror that when writing metadata.
+        actual_signals: list[str] = proj_out["signal_names"]
+
+        hidden_dim = loader.hidden_dim
+        n_layers = loader.num_layers
+        signal_dims: dict[str, int] = {
+            s: int(bases[s].shape[1]) for s in actual_signals
+        }
+
         creation_date = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         scan_storage.write_metadata(
             scan_dir,
             scan_storage.ScanMetadata(
-                model_id=metadata_dict["model_id"],
-                hidden_dim=metadata_dict["hidden_dim"],
-                n_layers=metadata_dict["n_layers"],
-                n_components=metadata_dict["n_components"],
-                n_samples=metadata_dict["n_samples"],
+                model_id=model_name,
+                hidden_dim=hidden_dim,
+                n_layers=n_layers,
+                n_components=n_components,
+                n_samples=len(prompts),
                 creation_date=creation_date,
                 signals=actual_signals,
             ),
@@ -252,21 +296,19 @@ class SampleScan:
             seq_lengths=seq_lengths,
         )
 
-        # Build signal info for channel config
-        signal_info = []
-        for sig in actual_signals:
-            dim = signal_dims.get(sig, metadata_dict["hidden_dim"])
-            k_eff = min(n_components, dim)
-            signal_info.append({
+        signal_info = [
+            {
                 "name": sig,
-                "dim": dim,
-                "k_effective": k_eff,
-            })
+                "dim": signal_dims[sig],
+                "k_effective": min(n_components, signal_dims[sig]),
+            }
+            for sig in actual_signals
+        ]
 
         scan_storage.write_channel(
             scan_dir,
             channel_name="0_global",
-            bases=bases,
+            bases={s: bases[s] for s in actual_signals},
             config={
                 "name": "global",
                 "k": n_components,
@@ -275,41 +317,18 @@ class SampleScan:
             },
         )
 
+        # PerTokenProjection gives [total_rows, k_max]; storage format is
+        # [N_total, n_channels=1, k] (single channel for SampleScan today).
+        if projections.ndim == 2:
+            projections = projections[:, None, :]
         scan_storage.write_projections(
             scan_dir,
             values=projections,
-            coords_sample_id=np.array(coords["sample_id"], dtype=np.int32),
-            coords_layer=np.array(coords["layer"], dtype=np.int16),
-            coords_token_pos=np.array(coords["token_pos"], dtype=np.int16),
-            coords_signal=np.array(coords["signal"], dtype=np.int8),
+            coords_sample_id=coords["sample_id"],
+            coords_layer=coords["layer"],
+            coords_token_pos=coords["token_pos"],
+            coords_signal=coords["signal"],
         )
-
-        # Offset table — derived from the known row layout. Enables O(1)
-        # per-token slicing via `scan.per_token(...)` instead of
-        # O(N) coord-scanning. Legacy scan_forward writes rows in
-        # ``(chunk_layer_major, signal_minor, sample, token_pos)`` order
-        # with ``S == S_max`` for every batch (tokenizer pads corpus-wide);
-        # mirror that layout here.
-        n_signals_actual = len(actual_signals)
-        s_max_val = int(max(seq_lengths)) if seq_lengths else 0
-        block_size = metadata_dict["n_samples"] * s_max_val
-        offset_table = np.zeros(
-            (
-                metadata_dict["n_samples"],
-                metadata_dict["n_layers"],
-                n_signals_actual,
-                2,
-            ),
-            dtype=np.int32,
-        )
-        for L in range(metadata_dict["n_layers"]):
-            for si in range(n_signals_actual):
-                block_offset = (L * n_signals_actual + si) * block_size
-                for sid in range(metadata_dict["n_samples"]):
-                    start = block_offset + sid * s_max_val
-                    end = start + int(seq_lengths[sid])
-                    offset_table[sid, L, si, 0] = start
-                    offset_table[sid, L, si, 1] = end
         scan_storage.write_offset_table(scan_dir, offset_table)
 
         return cls(scan_dir)
@@ -695,298 +714,6 @@ class SampleScan:
                 result[layer_idx, out_idx] = max_auroc
 
         return result
-
-    # --- Batch Projection ---
-
-    def batch_project(
-        self,
-        prompts: list[str],
-        signal: str | None = None,
-        batch_size: int = 4,
-    ) -> tuple[np.ndarray, dict[str, list[Any]], list[list[int]], list[int]]:
-        """Project multiple prompts through the scan basis in a single
-        batched forward pass. Much faster than looping project_prompt().
-
-        Each call performs a full layer-streaming sweep (chunked backend)
-        or full-dataset layer load (disk_offload backend). For multiple
-        logical groups (dataset splits, train/eval/control corpora),
-        prefer :meth:`batch_project_grouped` — one sweep for the whole
-        union instead of one sweep per group.
-
-        Parameters
-        ----------
-        prompts : list[str]
-            Prompts to project.
-        signal : str or None
-            If given, only project this signal.
-        batch_size : int
-            Prompts per forward-pass batch.
-
-        Returns
-        -------
-        tuple
-            (projections, coords, token_ids_per_sample, seq_lengths)
-            - projections: np.ndarray [N_total, 1, k]
-            - coords: dict with keys sample_id, layer, token_pos, signal
-            - token_ids_per_sample: list of token ID lists
-            - seq_lengths: list of int
-
-        See Also
-        --------
-        batch_project_grouped : Fused variant for multiple labeled groups.
-        """
-        import warnings
-        warnings.warn(
-            "SampleScan.batch_project is deprecated. Use scan.sweep(..., "
-            "accumulators={'proj': PerTokenProjection(scan.bases)}) and "
-            "index via scan.per_token(sample_id, layer). batch_project will "
-            "be removed in a future release.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self._batch_project_call_count += 1
-        if (
-            self._batch_project_call_count >= 3
-            and not self._batch_project_warned
-        ):
-            warnings.warn(
-                "SampleScan.batch_project called 3+ times on the same "
-                "scan. Each call re-streams every model layer CPU→GPU. "
-                "For multiple prompt groups (e.g. dataset splits), use "
-                "scan.batch_project_grouped({...}) — same semantics, one "
-                "layer sweep for the whole union.",
-                UserWarning,
-                stacklevel=2,
-            )
-            self._batch_project_warned = True
-        return self._batch_project_impl(
-            prompts, signal=signal, batch_size=batch_size,
-        )
-
-    def _batch_project_impl(
-        self,
-        prompts: list[str],
-        signal: str | None = None,
-        batch_size: int = 4,
-    ) -> tuple[np.ndarray, dict[str, list[Any]], list[list[int]], list[int]]:
-        backend = self._get_backend()
-        proj_signals = [signal] if signal else self.signals
-
-        (
-            _metadata,
-            _bases,
-            projections,
-            coords,
-            token_ids_per_sample,
-            seq_lengths,
-            _attention_mask,
-            _signal_dims,
-        ) = backend.scan_forward(
-            prompts,
-            signals=proj_signals,
-            n_components=self._metadata.n_components,
-            batch_size=batch_size,
-            external_bases=self._bases,
-        )
-
-        return projections, coords, token_ids_per_sample, seq_lengths
-
-    def batch_project_grouped(
-        self,
-        prompt_groups: Mapping[Hashable, list[str]],
-        *,
-        signal: str | None = None,
-        batch_size: int = 4,
-    ) -> dict[
-        Hashable,
-        tuple[np.ndarray, dict[str, list[Any]], list[list[int]], list[int]],
-    ]:
-        """Project multiple labeled groups of prompts in a single
-        layer-streaming sweep.
-
-        Preferred over repeated :meth:`batch_project` calls when multiple
-        groups (e.g. dataset splits) need projecting: layer weights are
-        streamed CPU→GPU once for the whole union of prompts, rather than
-        once per call. Each per-group output is indistinguishable from
-        what :meth:`batch_project` would return if called on that group's
-        prompts alone.
-
-        Parameters
-        ----------
-        prompt_groups : mapping of hashable key → list[str]
-            Named groups of prompts. Iteration order is preserved in the
-            returned dict.
-        signal : str or None
-            If given, only project this signal.
-        batch_size : int
-            Microbatch size for the forward pass.
-
-        Returns
-        -------
-        dict
-            ``{key: (projections, coords, token_ids_per_sample, seq_lengths)}``.
-            Per-group ``coords["sample_id"]`` is rebased to 0..len(group)-1.
-        """
-        import warnings
-        warnings.warn(
-            "SampleScan.batch_project_grouped is deprecated. Use scan.sweep("
-            "flatten(groups), accumulators={'proj': PerTokenProjection(scan.bases)}"
-            ") and index via scan.per_token(sample_id, layer). "
-            "Will be removed in a future release.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        keys = list(prompt_groups.keys())
-        all_prompts: list[str] = []
-        bounds: list[tuple[Hashable, int, int]] = []
-        cursor = 0
-        for k in keys:
-            group_prompts = list(prompt_groups[k])
-            start = cursor
-            all_prompts.extend(group_prompts)
-            cursor += len(group_prompts)
-            bounds.append((k, start, cursor))
-
-        projections, coords, token_ids_per_sample, seq_lengths = (
-            self._batch_project_impl(
-                all_prompts, signal=signal, batch_size=batch_size,
-            )
-        )
-
-        sample_id_arr = np.asarray(coords["sample_id"])
-        token_pos_arr = np.asarray(coords["token_pos"])
-        coord_arrays = {c: np.asarray(v) for c, v in coords.items()}
-
-        out: dict[
-            Hashable,
-            tuple[np.ndarray, dict[str, list[Any]], list[list[int]], list[int]],
-        ] = {}
-        for key, start, end in bounds:
-            group_seq_lens = seq_lengths[start:end]
-            # Padding in standalone batch_project is max(seq_len in group);
-            # trim token positions beyond that so per-group output matches.
-            pad_len = max(group_seq_lens) if group_seq_lens else 0
-            mask = (
-                (sample_id_arr >= start)
-                & (sample_id_arr < end)
-                & (token_pos_arr < pad_len)
-            )
-            group_coords = {c: arr[mask] for c, arr in coord_arrays.items()}
-            group_coords["sample_id"] = group_coords["sample_id"] - start
-            out[key] = (
-                projections[mask],
-                {c: v.tolist() for c, v in group_coords.items()},
-                token_ids_per_sample[start:end],
-                group_seq_lens,
-            )
-        return out
-
-    def batch_project_reduced(
-        self,
-        prompt_groups: Mapping[Hashable, list[str]],
-        *,
-        reducers: Mapping[str, Reducer],
-        signal: str | None = None,
-        batch_size: int = 4,
-    ) -> dict[Hashable, dict[str, np.ndarray]]:
-        """Project groups through the scan basis and reduce per-sample in-chunk.
-
-        Spec 003. Fused single-sweep projection over the union of all
-        prompts (same pattern as :meth:`batch_project_grouped`) that applies
-        each supplied reducer to every microbatch's projection as soon as it
-        is produced, then frees it. Per-token projections never accumulate
-        across chunks — cross-chunk memory is bounded by residuals plus the
-        tiny per-sample reducer outputs, independent of sequence length and
-        chunk count.
-
-        The caller-supplied :class:`~lmprobe.reducers.Reducer` instances own
-        their masks. Mask list length must equal the total number of prompts
-        in the union (``sum(len(v) for v in prompt_groups.values())``), with
-        per-sample ordering matching the flattened union order (groups
-        concatenated in ``prompt_groups`` iteration order). Built-in
-        reducers live in :mod:`lmprobe.reducers`.
-
-        Parameters
-        ----------
-        prompt_groups : mapping of hashable key → list[str]
-            Named groups of prompts. Iteration order defines the flat
-            union ordering that reducer masks must match.
-        reducers : mapping of {name: Reducer}
-            Reducers keyed by name. Each is initialized internally via
-            ``init_state(N_total, n_layers, n_signals, k)``.
-        signal : str or None
-            If given, restrict to this signal only; ``n_signals == 1`` and
-            ``sig_idx == 0`` inside reducer state.
-        batch_size : int
-            Microbatch size for the forward pass.
-
-        Returns
-        -------
-        dict
-            ``{group_key: {reducer_name: [N_group, n_layers, n_signals, k]}}``.
-        """
-        import warnings
-        warnings.warn(
-            "SampleScan.batch_project_reduced is deprecated. Use scan.sweep("
-            "flatten(groups), accumulators={name: LastTokenReducer(masks, "
-            "bases=scan.bases), ...}) with new-protocol reducers from "
-            "lmprobe.accumulators. Will be removed in a future release.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        keys = list(prompt_groups.keys())
-        all_prompts: list[str] = []
-        bounds: list[tuple[Hashable, int, int]] = []
-        cursor = 0
-        for k in keys:
-            group_prompts = list(prompt_groups[k])
-            start = cursor
-            all_prompts.extend(group_prompts)
-            cursor += len(group_prompts)
-            bounds.append((k, start, cursor))
-
-        n_total = cursor
-        proj_signals = [signal] if signal else self.signals
-        n_layers = self._metadata.n_layers
-        n_signals = len(proj_signals)
-        k_dim = self._metadata.n_components
-
-        bases_subset = {
-            s: self._bases[s] for s in proj_signals if s in self._bases
-        }
-        if not bases_subset:
-            raise ValueError(
-                f"batch_project_reduced: no bases available for requested "
-                f"signals {proj_signals}; scan bases: {list(self._bases)}."
-            )
-        if len(bases_subset) != len(proj_signals):
-            missing = [s for s in proj_signals if s not in bases_subset]
-            raise ValueError(
-                f"batch_project_reduced: scan missing bases for signals "
-                f"{missing}; available: {list(self._bases)}."
-            )
-
-        bound: dict[str, tuple[Reducer, Any]] = {}
-        for name, red in reducers.items():
-            state = red.init_state(n_total, n_layers, n_signals, k_dim)
-            bound[name] = (red, state)
-
-        backend = self._get_backend()
-        backend.scan_forward(
-            all_prompts,
-            signals=proj_signals,
-            n_components=k_dim,
-            batch_size=batch_size,
-            external_bases=bases_subset,
-            reducers=bound,
-        )
-
-        out: dict[Hashable, dict[str, np.ndarray]] = {k: {} for k in keys}
-        for name, (red, state) in bound.items():
-            full = red.finalize(state)
-            for key, start, end in bounds:
-                out[key][name] = full[start:end]
-        return out
 
     # --- Single Projection ---
 

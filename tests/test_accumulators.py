@@ -333,6 +333,49 @@ class TestReducerBranches:
         assert np.all(red_out[0] == 0)
         assert np.any(red_out[1] != 0)
 
+    def test_chunk_size_one_matches_default_chunking(
+        self, corpus: tuple[list[str], list[int]],
+    ) -> None:
+        """Spec 004 memmap residuals must survive cross-chunk roundtrips on
+        the sweep path. ``chunk_size=1`` forces memmap read/write at every
+        layer boundary — catches regressions where the residual buffer
+        silently runs in-memory instead of going through disk."""
+        from lmprobe.accumulators import PCAFit
+        from lmprobe.backends import ChunkedLayerLoader, ChunkedLocalBackend
+        from lmprobe.sweep import sweep
+
+        prompts, _ = corpus
+        backend_full = ChunkedLocalBackend(model_name=TEST_MODEL, device="cpu")
+        loader_full = ChunkedLayerLoader(backend_full)
+        out_full = sweep(
+            prompts,
+            accumulators={"fit": PCAFit(signals=["attn_delta"], n_components=4)},
+            loader=loader_full,
+            batch_size=2,
+        )
+        backend_small = ChunkedLocalBackend(
+            model_name=TEST_MODEL, device="cpu", chunk_size=1,
+        )
+        loader_small = ChunkedLayerLoader(backend_small)
+        out_small = sweep(
+            prompts,
+            accumulators={"fit": PCAFit(signals=["attn_delta"], n_components=4)},
+            loader=loader_small,
+            batch_size=2,
+        )
+        b_full = out_full["fit"]["attn_delta"].astype(np.float32)
+        b_small = out_small["fit"]["attn_delta"].astype(np.float32)
+        assert b_full.shape == b_small.shape
+        for layer in range(b_full.shape[0]):
+            if np.allclose(b_full[layer], 0) and np.allclose(b_small[layer], 0):
+                continue
+            dots = np.abs(b_full[layer].T @ b_small[layer])
+            diag = np.diagonal(dots)
+            assert np.all(diag > 0.95), (
+                f"layer {layer}: chunk_size=1 basis diverges from default; "
+                f"paired overlaps {diag}"
+            )
+
     def test_mean_reducer_zero_count_yields_zeros(
         self, corpus: tuple[list[str], list[int]],
     ) -> None:

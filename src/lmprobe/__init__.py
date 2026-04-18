@@ -91,7 +91,6 @@ __all__ = [
     "LastTokenReducer",
     "MeanReducer",
     "MeanExclLastNReducer",
-    "Reducer",
     "set_profiling",
     "is_profiling",
     "cuml_available",
@@ -125,19 +124,17 @@ def __getattr__(name: str) -> Any:
         from .sample_scan import SampleScan
 
         return SampleScan
-    if name in ("LastTokenReducer", "MeanReducer", "MeanExclLastNReducer", "Reducer"):
-        from .reducers import (
+    if name in ("LastTokenReducer", "MeanReducer", "MeanExclLastNReducer"):
+        from .accumulators import (
             LastTokenReducer,
             MeanExclLastNReducer,
             MeanReducer,
-            Reducer,
         )
 
         return {
             "LastTokenReducer": LastTokenReducer,
             "MeanReducer": MeanReducer,
             "MeanExclLastNReducer": MeanExclLastNReducer,
-            "Reducer": Reducer,
         }[name]
     if name == "cuml_available":
         from .classifiers import cuml_available
