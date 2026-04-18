@@ -469,6 +469,35 @@ class TestRaisePaths:
                 np.ones((2, 5), dtype=np.int64),
             )
 
+    def test_per_token_projection_estimate_bytes_matches_init_allocation(
+        self,
+    ) -> None:
+        """``estimate_bytes`` must match the actual post-``init`` allocation —
+        the pre-flight warning lies if these drift."""
+        import torch
+
+        from lmprobe.accumulators import PerTokenProjection
+        from lmprobe.sweep import SweepContext
+
+        bases = {"x": np.zeros((2, 4, 3), dtype=np.float32)}
+        acc = PerTokenProjection(bases)
+        ctx = SweepContext(
+            n_samples=5,
+            num_layers=2,
+            signals=["x"],
+            signal_dims={"x": 4},
+            hidden_dim=4,
+            dtype=torch.float32,
+            device="cpu",
+            seq_lengths=[3, 2, 4, 1, 2],
+            s_max=4,
+            k_per_sig={"x": [3, 3]},
+        )
+        estimated = acc.estimate_bytes(ctx, batch_size=2)
+        acc.init(ctx)
+        assert acc._values is not None
+        assert estimated == acc._values.nbytes
+
     def test_router_strategy_conflict_raises(
         self, corpus: tuple[list[str], list[int]],
     ) -> None:
@@ -495,3 +524,118 @@ class TestRaisePaths:
                 loader=loader,
                 batch_size=2,
             )
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight memory estimate (issue #275)
+# ---------------------------------------------------------------------------
+
+
+class TestPreflightMemoryCheck:
+    """The sweep driver warns before the forward loop if projected new RAM
+    allocations approach system-available. Without this, an oversized
+    accumulator preallocation triggers a silent SIGKILL from the OOM
+    killer and the process exits with no Python traceback."""
+
+    def _call(
+        self,
+        *,
+        projected: int,
+        available: int,
+    ) -> list[Any]:
+        """Invoke ``_preflight_memory_check`` with a fake ``PerTokenProjection``
+        reporting ``projected`` bytes and monkey-patched ``psutil.virtual_memory``
+        returning ``available`` bytes. Returns captured ``UserWarning`` list."""
+        import warnings as _warnings
+
+        import psutil
+        import torch
+
+        from lmprobe.sweep import SweepContext, _preflight_memory_check
+
+        class _FakeAcc:
+            signals = frozenset({"attn_delta"})
+            layers: Any = None
+            wants_raw = False
+
+            def estimate_bytes(self, _ctx: Any, _bs: int) -> int:
+                return projected
+
+            def init(self, _ctx: Any) -> None:
+                pass
+
+            def update(self, *_a: Any, **_k: Any) -> None:
+                pass
+
+            def finalize(self) -> Any:
+                return None
+
+        class _FakeLoader:
+            num_layers = 1
+            hidden_dim = 4
+            dtype = torch.float32
+            _chunk_size = 1
+
+        class _FakeMem:
+            def __init__(self, avail: int) -> None:
+                self.available = avail
+
+        ctx = SweepContext(
+            n_samples=2,
+            num_layers=1,
+            signals=["attn_delta"],
+            signal_dims={"attn_delta": 4},
+            hidden_dim=4,
+            dtype=torch.float32,
+            device="cpu",
+            seq_lengths=[2, 2],
+            s_max=2,
+            k_per_sig={},
+        )
+        original_vm = psutil.virtual_memory
+        psutil.virtual_memory = lambda: _FakeMem(available)  # type: ignore[assignment]
+        try:
+            with _warnings.catch_warnings(record=True) as w:
+                _warnings.simplefilter("always")
+                _preflight_memory_check(
+                    _FakeLoader(),  # type: ignore[arg-type]
+                    ctx,
+                    {"proj": _FakeAcc()},
+                    batch_size=1,
+                )
+            return list(w)
+        finally:
+            psutil.virtual_memory = original_vm  # type: ignore[assignment]
+
+    def test_warns_when_projection_exceeds_available(self) -> None:
+        # 100 GB projected, 100 GB available: ≥ 90% threshold → warn.
+        warns = self._call(
+            projected=100 * 1024**3,
+            available=100 * 1024**3,
+        )
+        assert any(
+            issubclass(w.category, UserWarning)
+            and "projected new RAM allocations" in str(w.message)
+            for w in warns
+        ), [str(w.message) for w in warns]
+
+    def test_silent_when_projection_small(self) -> None:
+        # 1 GB projected, 100 GB available: 1% → no warn.
+        warns = self._call(
+            projected=1 * 1024**3,
+            available=100 * 1024**3,
+        )
+        assert not any(
+            issubclass(w.category, UserWarning)
+            and "projected new RAM allocations" in str(w.message)
+            for w in warns
+        )
+
+    def test_suggests_halved_chunk_size(self) -> None:
+        """Warning text points at the fix the user can actually apply."""
+        warns = self._call(
+            projected=200 * 1024**3,
+            available=100 * 1024**3,
+        )
+        msgs = [str(w.message) for w in warns]
+        assert any("chunk_size" in m or "signals / batch_size" in m for m in msgs)

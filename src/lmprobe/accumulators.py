@@ -253,6 +253,20 @@ class PerTokenProjection:
         self._values: np.ndarray | None = None
         self._seq_lengths: np.ndarray | None = None
 
+    def estimate_bytes(
+        self, ctx: SweepContext, batch_size: int,
+    ) -> int:
+        """Pre-``init`` size estimate for the pre-allocated values buffer.
+
+        Consumed by the sweep driver's pre-flight memory check. Matches
+        the allocation formula used in :meth:`init` (fp16, rectangular
+        to ``k_max``).
+        """
+        n_sig = len(self._signal_names)
+        k_max = max(int(self.bases[s].shape[-1]) for s in self._signal_names)
+        total_rows = ctx.num_layers * n_sig * ctx.n_samples * ctx.s_max
+        return total_rows * k_max * 2  # float16
+
     def init(self, ctx: SweepContext) -> None:
         self._ctx = ctx
         self._seq_lengths = np.asarray(ctx.seq_lengths, dtype=np.int32)
@@ -614,6 +628,16 @@ class HiddenStateCapture:
         self._dtype = dtype
         self._ctx: SweepContext | None = None
         self._out: torch.Tensor | None = None
+
+    def estimate_bytes(
+        self, ctx: SweepContext, batch_size: int,
+    ) -> int:
+        """Pre-``init`` size estimate for the preallocated ``[N, S, H * L_sub]``
+        residual capture buffer."""
+        dtype = self._dtype if self._dtype is not None else ctx.dtype
+        dtype_bytes = torch.tensor([], dtype=dtype).element_size()
+        n_sub = len(self.layer_indices)
+        return ctx.n_samples * ctx.s_max * ctx.hidden_dim * n_sub * dtype_bytes
 
     def init(self, ctx: SweepContext) -> None:
         self._ctx = ctx

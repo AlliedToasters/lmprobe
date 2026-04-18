@@ -478,6 +478,102 @@ def _notify_group_complete(
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight memory estimate (issue #275)
+# ---------------------------------------------------------------------------
+
+
+def _fmt_gib(nbytes: int) -> str:
+    return f"{nbytes / (1024**3):.1f} GiB"
+
+
+def _preflight_memory_check(
+    loader: LayerLoader,
+    ctx: SweepContext,
+    accumulators: Mapping[str, Accumulator],
+    batch_size: int,
+) -> None:
+    """Estimate peak RAM and warn if it approaches system-available RAM.
+
+    This is a *best-effort* heuristic, not a hard raise. The model is
+    already loaded (its bytes are in RSS), so we only count what the
+    sweep is about to *add*:
+
+    1. Per-microbatch capture buffers held on CPU for each active signal
+       across the current layer group:
+       ``chunk_size × n_signals_hooked × batch_size × s_max × hidden × dtype_bytes``
+    2. Accumulator pre-allocations, summed via each accumulator's optional
+       :meth:`estimate_bytes(ctx, batch_size)` (duck-typed; defaults to 0).
+
+    If (new allocations) ≥ 90% of ``psutil.virtual_memory().available``,
+    emit a :class:`UserWarning` with a breakdown and a halving suggestion.
+
+    ``psutil`` is optional — if it isn't importable, the check is a no-op.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return
+
+    dtype_bytes = torch.tensor([], dtype=loader.dtype).element_size()
+    # Signals that fire through per-layer forward hooks (router_logits only
+    # fires on MoE layers, but counting it at the ceiling is fine for a
+    # warning).
+    hooked = len([s for s in ctx.signals if s in _HOOKED_SIGNALS])
+
+    chunk_size = int(getattr(loader, "_chunk_size", 1))
+    capture_bytes = (
+        chunk_size
+        * max(hooked, 1)
+        * batch_size
+        * ctx.s_max
+        * ctx.hidden_dim
+        * dtype_bytes
+    )
+
+    acc_bytes = 0
+    acc_breakdown: list[tuple[str, int]] = []
+    for name, acc in accumulators.items():
+        est = getattr(acc, "estimate_bytes", None)
+        if est is None:
+            continue
+        n = int(est(ctx, batch_size))
+        acc_bytes += n
+        acc_breakdown.append((name, n))
+
+    projected = capture_bytes + acc_bytes
+    available = int(psutil.virtual_memory().available)
+    if projected < 0.9 * available:
+        return
+
+    suggested_cs = max(1, chunk_size // 2)
+    breakdown_lines = [
+        f"  capture (chunk_size={chunk_size} × {max(hooked, 1)} signals "
+        f"× batch={batch_size} × s_max={ctx.s_max} × hidden="
+        f"{ctx.hidden_dim} × {dtype_bytes}B): {_fmt_gib(capture_bytes)}",
+    ]
+    for name, n in acc_breakdown:
+        breakdown_lines.append(f"  accumulator {name!r}: {_fmt_gib(n)}")
+
+    import warnings
+    warnings.warn(
+        "lmprobe.sweep: projected new RAM allocations "
+        f"({_fmt_gib(projected)}) approach or exceed 90% of system-"
+        f"available ({_fmt_gib(available)}). The OOM killer will SIGKILL "
+        f"the process without a Python traceback if the sweep exceeds "
+        f"RAM. Breakdown:\n"
+        + "\n".join(breakdown_lines)
+        + (
+            f"\nTry chunk_size={suggested_cs} on the backend, or reduce "
+            f"signals / batch_size."
+            if chunk_size > 1
+            else "\nTry reducing signals / batch_size."
+        ),
+        category=UserWarning,
+        stacklevel=3,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Driver (skeleton; wiring to backends lands in Task #3)
 # ---------------------------------------------------------------------------
 
@@ -548,6 +644,9 @@ def sweep(
             s_max=int(state.attention_mask.shape[1]),
             k_per_sig=k_per_sig,
         )
+        # Pre-flight RAM estimate — catches the silent-OOM-SIGKILL class
+        # of failures (issue #275) before we allocate accumulator buffers.
+        _preflight_memory_check(loader, ctx, accumulators, batch_size)
         for acc in accumulators.values():
             acc.init(ctx)
 
