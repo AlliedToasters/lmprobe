@@ -182,42 +182,35 @@ class SampleScan:
 
         scan_dir = Path(scan_dir)
 
-        backend_obj: Any
+        # Fail fast on unsupported backends before constructing the
+        # backend itself — DiskOffloadBackend would download weights from
+        # HF just to raise below.
         if backend == "disk_offload":
-            from .backends import DiskOffloadBackend
-            backend_obj = DiskOffloadBackend(
-                model_name=model_name,
-                device=device,
-                dtype=dtype,
-            )
-        else:
-            from .backends import ChunkedLocalBackend
-            backend_kwargs: dict[str, Any] = {
-                "model_name": model_name,
-                "device": device,
-                "dtype": dtype,
-                "attn_implementation": attn_implementation,
-            }
-            if chunk_size != "auto":
-                backend_kwargs["chunk_size"] = chunk_size
-            backend_obj = ChunkedLocalBackend(**backend_kwargs)
-
-        # Two-sweep run: PCAFit to derive bases, then PerTokenProjection
-        # to project every token through them. Both sweeps share the same
-        # loader so weight-loading + rotary-embedding work is paid once per
-        # sweep (not once per accumulator).
-        from .accumulators import PCAFit, PerTokenProjection
-        from .backends import ChunkedLayerLoader, ChunkedLocalBackend
-        from .sweep import sweep as _sweep
-
-        signals_list = signals or ["attn_delta", "mlp_delta"]
-
-        if not isinstance(backend_obj, ChunkedLocalBackend):
             raise NotImplementedError(
                 "SampleScan.run currently supports ChunkedLocalBackend "
                 "only. DiskOffload integration is pending a sweep port "
                 "of DiskOffloadBackend."
             )
+
+        from .accumulators import PCAFit, PerTokenProjection
+        from .backends import ChunkedLayerLoader, ChunkedLocalBackend
+        from .sweep import sweep as _sweep
+
+        backend_kwargs: dict[str, Any] = {
+            "model_name": model_name,
+            "device": device,
+            "dtype": dtype,
+            "attn_implementation": attn_implementation,
+        }
+        if chunk_size != "auto":
+            backend_kwargs["chunk_size"] = chunk_size
+        backend_obj = ChunkedLocalBackend(**backend_kwargs)
+
+        # Two-sweep run: PCAFit to derive bases, then PerTokenProjection
+        # to project every token through them. Both sweeps share the same
+        # loader so weight-loading + rotary-embedding work is paid once per
+        # sweep (not once per accumulator).
+        signals_list = signals or ["attn_delta", "mlp_delta"]
 
         # Tokenize once so ids + seq_lengths are available for metadata
         # regardless of what the loader discards internally.
@@ -386,6 +379,38 @@ class SampleScan:
             self._offset_table_checked = True
         return self._offset_table
 
+    # --- Removed batch_project* API — migration stubs ---
+    #
+    # The pre-sweep API (``batch_project``, ``batch_project_grouped``,
+    # ``batch_project_reduced``) was removed when legacy scan/project
+    # paths were consolidated behind :meth:`sweep`. Upgraders hitting a
+    # bare ``AttributeError`` got no actionable hint, so these stubs
+    # turn the error into a pointer at the replacement.
+
+    def batch_project(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise NotImplementedError(
+            "SampleScan.batch_project was removed in the sweep+accumulator "
+            "consolidation. Use `scan.sweep(prompts, accumulators={...})` "
+            "with `PerTokenProjection(bases)` from lmprobe.accumulators."
+        )
+
+    def batch_project_grouped(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise NotImplementedError(
+            "SampleScan.batch_project_grouped was removed in the "
+            "sweep+accumulator consolidation. Use `scan.sweep(...)` with "
+            "`PerTokenProjection(bases)` and group by the returned "
+            "offset_table / coords."
+        )
+
+    def batch_project_reduced(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise NotImplementedError(
+            "SampleScan.batch_project_reduced was removed in the "
+            "sweep+accumulator consolidation. Use `scan.sweep(...)` with "
+            "a reducer accumulator "
+            "(`LastTokenReducer` / `MeanReducer` / `MeanExclLastNReducer`) "
+            "from lmprobe.accumulators."
+        )
+
     # --- New sweep-based public API (per-token as first-class product) ---
 
     def sweep(
@@ -398,9 +423,9 @@ class SampleScan:
     ) -> dict[str, Any]:
         """Run a single sweep over ``prompts`` with ``accumulators``.
 
-        The primary programmatic entry point post-deprecation of
-        ``batch_project`` / ``batch_project_grouped`` / ``batch_project_reduced``.
-        Pass any combination of accumulators from :mod:`lmprobe.accumulators`
+        The primary programmatic entry point for running arbitrary
+        accumulator combinations against this scan's backend. Pass any
+        combination of accumulators from :mod:`lmprobe.accumulators`
         (e.g. ``PerTokenProjection``, ``LastTokenReducer``, ``MeanReducer``,
         ``HiddenStateCapture``, ``LogitCapture``) or your own.
 
@@ -434,8 +459,8 @@ class SampleScan:
         else:
             raise NotImplementedError(
                 "SampleScan.sweep() currently supports ChunkedLocalBackend "
-                "only; DiskOffloadBackend sweep integration is pending. "
-                "For DiskOffload, continue to use batch_project* (DeprecationWarning)."
+                "only; DiskOffloadBackend sweep integration is pending a "
+                "port of DiskOffloadLayerLoader."
             )
 
         return _sweep(

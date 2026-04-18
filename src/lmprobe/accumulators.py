@@ -23,10 +23,11 @@ Built-ins:
 - :class:`RouterLogitCapture` — wants_raw on ``"router_logits"`` with
   optional hook strategy (``"output"`` vs DeepSeek's ``"input_gate"``).
 
-Reducer classes here follow the new Accumulator protocol. The old
-:mod:`lmprobe.reducers` module keeps its legacy Reducer protocol and
-classes for spec 003's ``scan_forward(reducers=...)`` call path; both
-coexist during the migration.
+Reducer classes here follow the new Accumulator protocol and are the
+sole home for :class:`LastTokenReducer`, :class:`MeanReducer`, and
+:class:`MeanExclLastNReducer` post-consolidation. The legacy
+``lmprobe.reducers`` module and ``scan_forward(reducers=...)`` call
+path have been removed.
 """
 
 from __future__ import annotations
@@ -331,8 +332,9 @@ class PerTokenProjection:
                     offset_table[sid, L, si, 1] = row_end
 
         # Coords — emitted full-width (every row, including padding) to
-        # match today's scan_forward layout for parity during the
-        # migration. Vectorized fill per (layer, sig) block.
+        # keep the coords table rectangular; callers that want
+        # real-token-only slices use the offset table. Vectorized fill
+        # per (layer, sig) block.
         total_rows = ctx.num_layers * n_sig * ctx.n_samples * ctx.s_max
         sample_id_arr = np.zeros(total_rows, dtype=np.int32)
         layer_arr = np.zeros(total_rows, dtype=np.int16)

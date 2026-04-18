@@ -422,3 +422,76 @@ class TestReducerBranches:
         # All-False masks -> zero mean, no NaN.
         assert np.all(red_out[0] == 0)
         assert not np.any(np.isnan(red_out))
+
+
+# ---------------------------------------------------------------------------
+# Raise-path coverage for invariants enforced by the refactor
+# ---------------------------------------------------------------------------
+
+
+class TestRaisePaths:
+    """The consolidation added two fail-loud checks. Lock them down with
+    unit tests so the next refactor doesn't silently undo them."""
+
+    def test_per_token_projection_s_exceeds_s_max_raises(self) -> None:
+        """``PerTokenProjection.update`` raises when the incoming batch seq-len
+        exceeds the sweep's preallocated ``s_max``. Backends must pad to the
+        corpus-wide max; overshooting would silently truncate tail columns."""
+        import torch
+
+        from lmprobe.accumulators import PerTokenProjection
+        from lmprobe.sweep import SweepContext
+
+        # 1 layer, 1 signal "x", dim=4, k=2.
+        bases = {"x": np.zeros((1, 4, 2), dtype=np.float32)}
+        acc = PerTokenProjection(bases)
+        ctx = SweepContext(
+            n_samples=2,
+            num_layers=1,
+            signals=["x"],
+            signal_dims={"x": 4},
+            hidden_dim=4,
+            dtype=torch.float32,
+            device="cpu",
+            seq_lengths=[3, 2],
+            s_max=3,
+            k_per_sig={"x": [2]},
+        )
+        acc.init(ctx)
+        # S=5 > s_max=3: must raise AssertionError.
+        bad_data = np.zeros((2, 5, 2), dtype=np.float16)
+        with pytest.raises(AssertionError, match=r"S=5 exceeds sweep s_max=3"):
+            acc.update(
+                bad_data,
+                "x",
+                0,
+                np.asarray([0, 1], dtype=np.int64),
+                np.ones((2, 5), dtype=np.int64),
+            )
+
+    def test_router_strategy_conflict_raises(
+        self, corpus: tuple[list[str], list[int]],
+    ) -> None:
+        """Two ``RouterLogitCapture`` accumulators with different hook
+        strategies cannot coexist in one sweep — only one hook fires per
+        (layer, module), so silent first-wins would drop data. The driver
+        must raise before installing hooks."""
+        from lmprobe.accumulators import RouterLogitCapture
+        from lmprobe.backends import ChunkedLayerLoader, ChunkedLocalBackend
+        from lmprobe.sweep import sweep
+
+        prompts, _ = corpus
+        backend = ChunkedLocalBackend(model_name=TEST_MODEL, device="cpu")
+        loader = ChunkedLayerLoader(backend)
+        with pytest.raises(
+            ValueError, match=r"conflicting router_logits hook strategies",
+        ):
+            sweep(
+                prompts,
+                accumulators={
+                    "r_out": RouterLogitCapture([0], strategy="output"),
+                    "r_gate": RouterLogitCapture([0], strategy="input_gate"),
+                },
+                loader=loader,
+                batch_size=2,
+            )
