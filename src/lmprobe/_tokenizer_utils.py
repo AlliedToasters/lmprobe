@@ -46,12 +46,44 @@ def load_tokenizer(
 
     if any(m in model_name for m in MISTRAL_MODELS_WITH_REGEX_BUG):
         kwargs.setdefault("fix_mistral_regex", True)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+    except TypeError as e:
+        # transformers>=5.3 has an upstream bug where `fix_mistral_regex`
+        # is passed to `_patch_mistral_regex` both explicitly and via
+        # `**kwargs`, raising "got multiple values for keyword argument
+        # 'fix_mistral_regex'". Fall back to loading without the flag
+        # and applying the patch post-load. See issue #280.
+        if "fix_mistral_regex" not in str(e):
+            raise
+        apply_fix = kwargs.pop("fix_mistral_regex", None) is True
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+        if apply_fix:
+            _apply_mistral_regex_fix(tokenizer, model_name)
 
     if load_chat_template and getattr(tokenizer, "chat_template", None) is None:
         _maybe_attach_chat_template(tokenizer, model_name)
 
     return tokenizer
+
+
+def _apply_mistral_regex_fix(tokenizer: PreTrainedTokenizerBase, model_name: str) -> None:
+    """Apply the Mistral pre-tokenizer regex fix to an already-loaded tokenizer.
+
+    Used as a fallback when passing ``fix_mistral_regex=True`` to
+    ``AutoTokenizer.from_pretrained`` raises on transformers>=5.3 (see #280).
+    Invokes the upstream ``TokenizersBackend._patch_mistral_regex`` classmethod
+    directly — private API, but the narrowest workaround available.
+    """
+    from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+    TokenizersBackend._patch_mistral_regex(
+        tokenizer,
+        pretrained_model_name_or_path=model_name,
+        fix_mistral_regex=True,
+    )
+    _logger.info("Applied Mistral pre-tokenizer regex fix post-load for %s", model_name)
 
 
 def _maybe_attach_chat_template(tokenizer: PreTrainedTokenizerBase, model_name: str) -> None:
