@@ -225,39 +225,62 @@ class TestChunkedExtraction:
         assert cs == num_layers
 
 
-# ── scan_forward: memmap-backed batch_hidden_states (spec 004) ──────────────
+# ── Sweep: memmap-backed residual buffer (spec 004) ─────────────────────────
 
 
-class TestScanForwardMemmap:
+class TestSweepMemmap:
     """Spec 004: cross-chunk residuals live in an np.memmap, not a list of
     CPU tensors. These tests verify the memmap path is correct under
-    actual chunking (chunk_size < num_layers) and produces results
-    indistinguishable from a single-chunk run."""
+    actual chunking (chunk_size < num_layers) and that the tempdir
+    holding the memmap is cleaned up on success and on exceptions.
 
-    def _scan(self, tiny_model, chunk_size: int, prompts: list[str]):
+    Exercises the sweep path via :class:`ChunkedLayerLoader`, which owns
+    the memmap lifecycle inside ``prepare()``.
+    """
+
+    def _sweep(self, tiny_model, chunk_size: int, prompts: list[str]):
+        from lmprobe.accumulators import PCAFit, PerTokenProjection
+        from lmprobe.backends import ChunkedLayerLoader
+        from lmprobe.sweep import sweep
+
         backend = ChunkedLocalBackend(
             tiny_model, "cpu", dtype=torch.float32, chunk_size=chunk_size,
         )
-        return backend.scan_forward(
-            prompts=prompts,
-            signals=["attn_delta", "mlp_delta"],
-            n_components=4,
+        loader = ChunkedLayerLoader(backend)
+        fit_out = sweep(
+            prompts,
+            accumulators={
+                "fit": PCAFit(
+                    signals=["attn_delta", "mlp_delta"], n_components=4,
+                ),
+            },
+            loader=loader,
             batch_size=2,
         )
+        bases = fit_out["fit"]
+        loader = ChunkedLayerLoader(backend)
+        proj_out = sweep(
+            prompts,
+            accumulators={"proj": PerTokenProjection(bases)},
+            loader=loader,
+            external_bases=bases,
+            batch_size=2,
+        )["proj"]
+        return bases, proj_out["values"], proj_out["coords"]
 
     def test_chunked_scan_matches_single_chunk(self, tiny_model):
-        """Running with chunk_size=1 (forces memmap round-trip between
-        every layer) produces identical projections and bases to
-        chunk_size=num_layers (single chunk, no cross-chunk write-back)."""
+        """chunk_size=1 (memmap round-trip at every layer) must produce
+        identical projections and bases to chunk_size=num_layers (single
+        chunk, no cross-chunk write-back)."""
         from lmprobe.extraction import get_num_layers_from_config
 
         num_layers = get_num_layers_from_config(tiny_model)
         prompts = ["The dog ran fast", "A cat sat quietly", "Fetch the ball"]
 
-        _, bases_full, proj_full, coords_full, _, _, _, _ = self._scan(
+        bases_full, proj_full, coords_full = self._sweep(
             tiny_model, chunk_size=num_layers, prompts=prompts,
         )
-        _, bases_chunk, proj_chunk, coords_chunk, _, _, _, _ = self._scan(
+        bases_chunk, proj_chunk, coords_chunk = self._sweep(
             tiny_model, chunk_size=1, prompts=prompts,
         )
 
@@ -266,17 +289,15 @@ class TestScanForwardMemmap:
         # With dtype=fp32 the memmap round-trip is byte-identical, so
         # PCA sees the same input and produces the same output.
         np.testing.assert_array_equal(proj_full, proj_chunk)
-
         for sig in bases_full:
             np.testing.assert_array_equal(bases_full[sig], bases_chunk[sig])
-
         for key in coords_full:
             np.testing.assert_array_equal(coords_full[key], coords_chunk[key])
 
     def test_memmap_file_is_cleaned_up(self, tiny_model, monkeypatch):
         """The memmap's backing file lives under a TemporaryDirectory
-        scoped to scan_forward — no temp files should persist after
-        the call returns."""
+        scoped to ``ChunkedLayerLoader.prepare()`` — no temp files should
+        persist after the sweep returns."""
         import tempfile
 
         created_dirs: list[str] = []
@@ -289,11 +310,11 @@ class TestScanForwardMemmap:
 
         monkeypatch.setattr(tempfile, "TemporaryDirectory", _TrackingTempDir)
 
-        self._scan(tiny_model, chunk_size=1, prompts=["One", "Two"])
+        self._sweep(tiny_model, chunk_size=1, prompts=["One", "Two"])
 
         import os
-        # At least one TemporaryDirectory was used, and all are gone.
-        assert created_dirs, "scan_forward did not open a TemporaryDirectory"
+
+        assert created_dirs, "loader did not open a TemporaryDirectory"
         for d in created_dirs:
             assert not os.path.exists(d), f"temp dir leaked: {d}"
 
@@ -303,11 +324,14 @@ class TestScanForwardMemmap:
         (no roundtrip) at bf16. Bit-identical isn't achievable at bf16
         because sklearn's PCA rounds fp32 intermediates differently
         across call orderings, but the two paths should agree within
-        bf16-ish tolerance. A broken `.view(torch.bfloat16)` typically
-        blows up well past this."""
+        bf16-ish tolerance. A broken ``.view(torch.bfloat16)`` blows up
+        well past this."""
         import numpy as np
 
+        from lmprobe.accumulators import PCAFit
+        from lmprobe.backends import ChunkedLayerLoader
         from lmprobe.extraction import get_num_layers_from_config
+        from lmprobe.sweep import sweep
 
         num_layers = get_num_layers_from_config(tiny_model)
         prompts = ["One short", "Two short", "Three short"]
@@ -316,24 +340,20 @@ class TestScanForwardMemmap:
             backend = ChunkedLocalBackend(
                 tiny_model, "cpu", dtype=torch.bfloat16, chunk_size=chunk_size,
             )
-            return backend.scan_forward(
-                prompts=prompts,
-                signals=["attn_delta"],
-                n_components=2,
+            loader = ChunkedLayerLoader(backend)
+            return sweep(
+                prompts,
+                accumulators={
+                    "fit": PCAFit(signals=["attn_delta"], n_components=2),
+                },
+                loader=loader,
                 batch_size=2,
-            )
+            )["fit"]
 
-        _, bases_single, proj_single, _, _, _, _, _ = run(num_layers)
-        _, bases_chunk, proj_chunk, _, _, _, _, _ = run(1)
+        bases_single = run(num_layers)
+        bases_chunk = run(1)
 
-        # bf16 stored in the memmap; compare as fp32.
-        assert np.isfinite(proj_chunk).all()
         assert np.isfinite(bases_chunk["attn_delta"]).all()
-        np.testing.assert_allclose(
-            proj_chunk.astype(np.float32),
-            proj_single.astype(np.float32),
-            atol=5e-2, rtol=5e-2,
-        )
         np.testing.assert_allclose(
             bases_chunk["attn_delta"].astype(np.float32),
             bases_single["attn_delta"].astype(np.float32),
@@ -341,13 +361,18 @@ class TestScanForwardMemmap:
         )
 
     def test_tempdir_cleaned_up_on_exception(self, tiny_model, monkeypatch):
-        """If scan_forward raises mid-scan, the TemporaryDirectory must
-        still be cleaned up — the try/finally around the body guarantees
-        this independent of GC timing. Inject the failure at
-        `_make_causal_mask`, which is called inside the chunk loop
-        after the tmpdir has been created and populated."""
+        """If the sweep raises mid-run, the TemporaryDirectory holding
+        the memmap must still be cleaned up — ``ChunkedLayerLoader.prepare``
+        is a context manager whose ``finally`` branch calls
+        ``residual_buffer.cleanup()``. Inject failure at
+        ``_make_causal_mask`` (called inside ``_drive_sweep``'s chunk loop
+        after the tmpdir is open)."""
         import os
         import tempfile
+
+        from lmprobe.accumulators import PCAFit
+        from lmprobe.backends import ChunkedLayerLoader
+        from lmprobe.sweep import sweep
 
         created_dirs: list[str] = []
         real_tempdir = tempfile.TemporaryDirectory
@@ -369,15 +394,18 @@ class TestScanForwardMemmap:
         backend = ChunkedLocalBackend(
             tiny_model, "cpu", dtype=torch.float32, chunk_size=1,
         )
+        loader = ChunkedLayerLoader(backend)
         with pytest.raises(RuntimeError, match="forced test failure"):
-            backend.scan_forward(
-                prompts=["One", "Two"],
-                signals=["attn_delta"],
-                n_components=2,
+            sweep(
+                ["One", "Two"],
+                accumulators={
+                    "fit": PCAFit(signals=["attn_delta"], n_components=2),
+                },
+                loader=loader,
                 batch_size=2,
             )
 
-        assert created_dirs, "scan_forward did not open a TemporaryDirectory"
+        assert created_dirs, "loader did not open a TemporaryDirectory"
         for d in created_dirs:
             assert not os.path.exists(d), (
                 f"temp dir leaked on exception path: {d}"

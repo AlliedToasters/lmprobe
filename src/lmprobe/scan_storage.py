@@ -224,3 +224,30 @@ def read_coords(scan_dir: Path) -> Any:
     import pyarrow.parquet as pq
 
     return pq.read_table(scan_dir / "projections" / "coords.parquet")
+
+
+def write_offset_table(scan_dir: Path, offset_table: np.ndarray) -> None:
+    """Write the per-(sample, layer, signal) offset table.
+
+    Parameters
+    ----------
+    offset_table : np.ndarray
+        Shape ``[n_samples, n_layers, n_signals, 2]`` int32. Each entry
+        ``[start_row, end_row)`` is a half-open row range into
+        ``projections/values.npy`` covering real tokens only (padding is
+        excluded). Enables O(1) per-token slicing versus the O(N)
+        boolean-scan of ``coords.parquet`` that ``get_projections`` does.
+    """
+    proj_dir = scan_dir / "projections"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    np.save(proj_dir / "offset_table.npy", offset_table)
+
+
+def open_offset_table(scan_dir: Path) -> np.memmap | None:
+    """Memory-map the offset table if present. Returns ``None`` for old
+    scans written before the offset table was introduced."""
+    path = scan_dir / "projections" / "offset_table.npy"
+    if not path.exists():
+        return None
+    result: np.memmap = np.load(path, mmap_mode="r")
+    return result

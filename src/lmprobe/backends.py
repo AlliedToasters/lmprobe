@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -24,7 +23,6 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from .activation_types import ExtractedBatch, ExtractionSpec
-    from .reducers import Reducer
 
 
 _logger = logging.getLogger(__name__)
@@ -49,7 +47,7 @@ def _mmap_np_dtype(torch_dtype: torch.dtype) -> Any:
         return _TORCH_TO_MMAP_NUMPY[torch_dtype]
     except KeyError as e:
         raise ValueError(
-            f"scan_forward: unsupported dtype for memmap residuals: {torch_dtype}"
+            f"unsupported dtype for memmap residuals: {torch_dtype}"
         ) from e
 
 
@@ -1333,229 +1331,56 @@ class ChunkedLocalBackend(ExtractionBackend):
         torch.Tensor | None,
         dict[int, torch.Tensor] | None,
     ]:
-        """Run a chunked forward pass through the model.
+        """Run a chunked forward pass, backed by the sweep primitive.
 
-        The model is loaded fully on CPU with eager attention. For each
-        chunk of layers, those layers are moved to the compute device,
-        the forward pass is run, and the layers are moved back to CPU.
-        This keeps GPU memory bounded to one chunk of layers at a time.
-
-        Returns
-        -------
-        tuple
-            (activations, attention_mask, logits, router_logits)
+        Returns ``(activations, attention_mask, logits, router_logits)``
+        matching the shape ``extract_batch`` / ``extract_batch_extended``
+        expect. ``batch_size=len(prompts)`` so the entire corpus is one
+        microbatch — matches caller assumptions.
         """
-        import gc
-
-        from .extraction import get_num_layers_from_config
-
-        tokenized = self.tokenizer(
-            prompts, return_tensors="pt", padding=True,
+        from .accumulators import (
+            HiddenStateCapture,
+            LogitCapture,
+            RouterLogitCapture,
         )
-        input_ids = tokenized["input_ids"]
-        attention_mask_2d = tokenized["attention_mask"]
+        from .sweep import sweep
 
-        num_layers = get_num_layers_from_config(self.model_name)
-        chunk_size = self._resolve_chunk_size()
-        target_set = set(layer_indices)
-        router_target_set = set(router_layer_indices or [])
+        loader = ChunkedLayerLoader(self)
+        if router_module_template is not None:
+            loader.router_module_template = router_module_template
 
-        model = self._load_full_model_cpu()
-        device = self.device
-
-        # --- Phase 1: Embedding ---
-        embed = _get_embedding_module(model)
-        embed.to(device)
-        with torch.no_grad():
-            hidden_states = embed(input_ids.to(device)).cpu()
-        embed.to("cpu")
-
-        # Build position_ids, cache_position, and causal mask
-        seq_len = input_ids.shape[1]
-        position_ids = attention_mask_2d.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask_2d == 0, 1)
-        cache_position = torch.arange(seq_len)
-        causal_mask = _make_causal_mask(attention_mask_2d, self.dtype)
-
-        # Compute rotary position embeddings
-        # Some architectures (Llama, Mistral) return (cos, sin) tuples;
-        # DeepSeek-V2 returns a single complex freqs_cis tensor.
-        # Gemma3 computes per-layer-type embeddings via a layer_type arg.
-        position_embeddings: tuple[torch.Tensor, ...] | torch.Tensor | dict | None = None
-        layer_types: list[str] | None = None
-        rotary_name = self._find_rotary_embedding_name(model)
-        if rotary_name is not None:
-            rotary_mod = model
-            for part in rotary_name.split("."):
-                rotary_mod = getattr(rotary_mod, part)
-            rotary_mod.to(device)
-
-            # Detect Gemma3-style per-layer-type rotary embeddings
-            text_cfg = getattr(
-                getattr(model, "config", None), "text_config",
-                getattr(model, "config", None),
-            )
-            layer_types_cfg = getattr(text_cfg, "layer_types", None)
-            if layer_types_cfg is not None:
-                layer_types = list(layer_types_cfg)
-                position_embeddings = {}
-                with torch.no_grad():
-                    for lt in set(layer_types):
-                        pe = rotary_mod(
-                            hidden_states.to(device),
-                            position_ids.to(device),
-                            layer_type=lt,
-                        )
-                        position_embeddings[lt] = tuple(t.cpu() for t in pe)
-            else:
-                with torch.no_grad():
-                    pe = rotary_mod(hidden_states.to(device), position_ids.to(device))
-                    if isinstance(pe, tuple):
-                        position_embeddings = tuple(t.cpu() for t in pe)
-                    else:
-                        position_embeddings = pe.cpu()
-            rotary_mod.to("cpu")
-
-        # --- Phase 2: Layer chunks ---
-        captured: dict[int, torch.Tensor] = {}
-        captured_router: dict[int, torch.Tensor] = {}
-        decoder_layers = _get_decoder_layers(model)
-
-        for chunk_start in range(0, num_layers, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, num_layers)
-
-            # Move chunk layers to device
-            for i in range(chunk_start, chunk_end):
-                decoder_layers[i].to(device)
-
-            hs = hidden_states.to(device)
-            mask_dev = causal_mask.to(device)
-            pos_dev = position_ids.to(device)
-
-            # Pre-compute position embeddings on device
-            pe_dev_map: dict | tuple | torch.Tensor | None = None
-            if position_embeddings is not None:
-                if isinstance(position_embeddings, dict):
-                    # Gemma3-style: dict of {layer_type: (cos, sin)}
-                    pe_dev_map = {
-                        lt: tuple(t.to(device) for t in pe)
-                        for lt, pe in position_embeddings.items()
-                    }
-                elif isinstance(position_embeddings, tuple):
-                    pe_dev_map = tuple(t.to(device) for t in position_embeddings)
-                else:
-                    pe_dev_map = position_embeddings.to(device)
-
-            with torch.no_grad():
-                for layer_idx in range(chunk_start, chunk_end):
-                    layer_module = decoder_layers[layer_idx]
-
-                    # Router hook if requested
-                    rh = None
-                    if layer_idx in router_target_set and router_module_template:
-                        router_hook_output: list[torch.Tensor] = []
-
-                        router_path = router_module_template.format(layer=layer_idx)
-                        # Strip leading "model." — the template is written
-                        # for nnsight's LanguageModel where the HF model is
-                        # at .model, but here we already have the HF model.
-                        if router_path.startswith("model."):
-                            router_path = router_path[len("model."):]
-                        router_mod = model
-                        for part in router_path.split("."):
-                            if part.isdigit():
-                                router_mod = router_mod[int(part)]
-                            else:
-                                router_mod = getattr(router_mod, part)
-
-                        if router_hook_strategy == "input_gate":
-                            # Hook the MoE module and compute gate logits
-                            # from its input + gate.weight. Needed for
-                            # DeepSeek which calls F.linear() directly.
-                            def _input_gate_hook(
-                                mod: Any, args: Any, out: Any,
-                                _buf: list = router_hook_output,
-                            ) -> None:
-                                hs_in = args[0] if isinstance(args, tuple) else args
-                                gate_w = mod.gate.weight
-                                logits = torch.nn.functional.linear(
-                                    hs_in.to(gate_w.dtype), gate_w,
-                                )
-                                _buf.append(logits.detach().cpu())
-
-                            rh = router_mod.register_forward_hook(_input_gate_hook)
-                        else:
-                            def _output_hook(
-                                _mod: Any, _inp: Any, out: Any,
-                                _buf: list = router_hook_output,
-                            ) -> None:
-                                if isinstance(out, tuple):
-                                    _buf.append(out[0].detach().cpu())
-                                else:
-                                    _buf.append(out.detach().cpu())
-
-                            rh = router_mod.register_forward_hook(_output_hook)
-
-                    layer_kwargs: dict[str, Any] = {
-                        "attention_mask": mask_dev,
-                        "position_ids": pos_dev,
-                        "use_cache": False,
-                        "cache_position": cache_position.to(device),
-                    }
-                    if pe_dev_map is not None:
-                        if isinstance(pe_dev_map, dict) and layer_types is not None:
-                            # Gemma3-style: select by layer type
-                            lt = layer_types[layer_idx]
-                            layer_kwargs["position_embeddings"] = pe_dev_map[lt]
-                        else:
-                            layer_kwargs["position_embeddings"] = pe_dev_map
-
-                    output = layer_module(hs, **layer_kwargs)
-                    hs = output[0] if isinstance(output, tuple) else output
-
-                    if layer_idx in target_set:
-                        captured[layer_idx] = hs.detach().cpu()
-
-                    if rh is not None:
-                        rh.remove()
-                        if router_hook_output:
-                            captured_router[layer_idx] = router_hook_output[0]
-
-            hidden_states = hs.cpu()
-            del hs, mask_dev, pos_dev, pe_dev_map
-
-            # Move chunk back to CPU
-            for i in range(chunk_start, chunk_end):
-                decoder_layers[i].to("cpu")
-            gc.collect()
-            if torch.cuda.is_available() and device != "cpu":
-                torch.cuda.empty_cache()
-
-        # --- Phase 3: Logits (optional) ---
-        logits_out: torch.Tensor | None = None
-        if include_logits:
-            final_norm = _get_final_norm(model)
-            lm_head = _get_lm_head(model)
-            final_norm.to(device)
-            lm_head.to(device)
-
-            with torch.no_grad():
-                hs_dev = hidden_states.to(device)
-                logits_out = lm_head(final_norm(hs_dev)).cpu()
-                del hs_dev
-
-            final_norm.to("cpu")
-            lm_head.to("cpu")
-
-        # Concatenate target layer activations
-        activations = None
+        accumulators: dict[str, Any] = {}
         if layer_indices:
-            activation_tensors = [captured[idx] for idx in layer_indices]
-            activations = torch.cat(activation_tensors, dim=-1)
+            accumulators["hs"] = HiddenStateCapture(
+                layer_indices, dtype=self.dtype,
+            )
+        if include_logits:
+            accumulators["logits"] = LogitCapture()
+        if router_layer_indices:
+            accumulators["router"] = RouterLogitCapture(
+                router_layer_indices, strategy=router_hook_strategy,
+            )
 
-        router_logits = captured_router if captured_router else None
+        # No accumulators subscribed ⇒ no sweep needed; just return the mask.
+        if not accumulators:
+            tokenized = self.tokenizer(
+                prompts, return_tensors="pt", padding=True,
+            )
+            return None, tokenized["attention_mask"], None, None
 
-        return activations, attention_mask_2d, logits_out, router_logits
+        out = sweep(
+            prompts,
+            accumulators=accumulators,
+            loader=loader,
+            batch_size=len(prompts),
+        )
+
+        activations = out["hs"] if "hs" in accumulators else None
+        tokenized = self.tokenizer(prompts, return_tensors="pt", padding=True)
+        attention_mask_2d = tokenized["attention_mask"]
+        logits_out = out.get("logits") if include_logits else None
+        router_out = out.get("router") if router_layer_indices else None
+        return activations, attention_mask_2d, logits_out, router_out
 
     @staticmethod
     def _find_rotary_embedding_name(model: Any) -> str | None:
@@ -1573,112 +1398,6 @@ class ChunkedLocalBackend(ExtractionBackend):
         return None
 
     # --- Shared chunked-pass setup ---
-
-    def _prepare_chunked_pass(
-        self, prompts: list[str],
-    ) -> dict[str, Any]:
-        """Run embedding phase and compute position embeddings.
-
-        Returns a dict with all state needed to iterate the layer loop:
-        hidden_states, attention_mask_2d, causal_mask, position_ids,
-        cache_position, position_embeddings, layer_types, decoder_layers,
-        num_layers, chunk_size, model, device.
-        """
-        tokenized = self.tokenizer(
-            prompts, return_tensors="pt", padding=True,
-        )
-        input_ids = tokenized["input_ids"]
-        attention_mask_2d = tokenized["attention_mask"]
-
-        num_layers = self._get_num_layers()
-        chunk_size = self._resolve_chunk_size()
-
-        model = self._load_full_model_cpu()
-        device = self.device
-
-        # --- Embedding ---
-        embed = _get_embedding_module(model)
-        embed.to(device)
-        with torch.no_grad():
-            hidden_states = embed(input_ids.to(device)).cpu()
-        embed.to("cpu")
-
-        # Position IDs, cache position, causal mask
-        seq_len = input_ids.shape[1]
-        position_ids = attention_mask_2d.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask_2d == 0, 1)
-        cache_position = torch.arange(seq_len)
-        causal_mask = _make_causal_mask(attention_mask_2d, self.dtype)
-
-        # Rotary position embeddings
-        position_embeddings: tuple[torch.Tensor, ...] | torch.Tensor | dict | None = None
-        layer_types: list[str] | None = None
-        rotary_name = self._find_rotary_embedding_name(model)
-        if rotary_name is not None:
-            rotary_mod = model
-            for part in rotary_name.split("."):
-                rotary_mod = getattr(rotary_mod, part)
-            rotary_mod.to(device)
-
-            text_cfg = getattr(
-                getattr(model, "config", None), "text_config",
-                getattr(model, "config", None),
-            )
-            layer_types_cfg = getattr(text_cfg, "layer_types", None)
-            if layer_types_cfg is not None:
-                layer_types = list(layer_types_cfg)
-                position_embeddings = {}
-                with torch.no_grad():
-                    for lt in set(layer_types):
-                        pe = rotary_mod(
-                            hidden_states.to(device),
-                            position_ids.to(device),
-                            layer_type=lt,
-                        )
-                        position_embeddings[lt] = tuple(t.cpu() for t in pe)
-            else:
-                with torch.no_grad():
-                    pe = rotary_mod(hidden_states.to(device), position_ids.to(device))
-                    if isinstance(pe, tuple):
-                        position_embeddings = tuple(t.cpu() for t in pe)
-                    else:
-                        position_embeddings = pe.cpu()
-            rotary_mod.to("cpu")
-
-        decoder_layers = _get_decoder_layers(model)
-
-        return {
-            "hidden_states": hidden_states,
-            "attention_mask_2d": attention_mask_2d,
-            "causal_mask": causal_mask,
-            "position_ids": position_ids,
-            "cache_position": cache_position,
-            "position_embeddings": position_embeddings,
-            "layer_types": layer_types,
-            "decoder_layers": decoder_layers,
-            "num_layers": num_layers,
-            "chunk_size": chunk_size,
-            "model": model,
-            "device": device,
-            "input_ids": input_ids,
-        }
-
-    def _compute_logits(
-        self, model: Any, hidden_states: torch.Tensor, device: str,
-    ) -> torch.Tensor:
-        """Run final norm + lm_head to produce logits."""
-        final_norm = _get_final_norm(model)
-        lm_head = _get_lm_head(model)
-        final_norm.to(device)
-        lm_head.to(device)
-        with torch.no_grad():
-            logits: torch.Tensor = lm_head(
-                final_norm(hidden_states.to(device)),
-            ).cpu()
-        final_norm.to("cpu")
-        lm_head.to("cpu")
-        return logits
-
     @staticmethod
     def _build_layer_kwargs(
         mask_dev: torch.Tensor,
@@ -1723,658 +1442,8 @@ class ChunkedLocalBackend(ExtractionBackend):
 
     # --- Scan methods ---
 
-    # Valid signal names for scan_forward / project_forward
+    # Valid signal names for sweep-based forward passes.
     SCAN_SIGNALS = ("residual", "attn_delta", "mlp_delta", "router_logits")
-
-    def _resolve_signal_hooks(
-        self,
-        signals: list[str],
-        layer_module: Any,
-        layer_idx: int,
-        router_module_template: str | None,
-        model: Any,
-        *,
-        stream_signals: set[str] | None = None,
-    ) -> tuple[
-        list[tuple[str, Any, list[torch.Tensor]]],  # [(signal_name, hook_handle, buffer)]
-        bool,  # capture_residual — no hook, just layer output
-    ]:
-        """Set up forward hooks for the requested signals on a single layer.
-
-        Returns list of (signal_name, hook_handle, buffer) for hookable signals,
-        plus a flag indicating whether to capture the residual (layer output).
-
-        Parameters
-        ----------
-        stream_signals : set[str] or None
-            Signals whose captures should stay on device (for downstream
-            stream-projection via an external basis — spec 002). Signals
-            *not* in this set — or always, when this is None — are
-            ``.cpu()``-ed inside the hook as before.
-        """
-        stream_signals = stream_signals or set()
-        hooks: list[tuple[str, Any, list[torch.Tensor]]] = []
-        capture_residual = False
-
-        for sig in signals:
-            if sig == "residual":
-                capture_residual = True
-                continue
-
-            buf: list[torch.Tensor] = []
-            stream = sig in stream_signals
-
-            def _hook(
-                _mod: Any, _inp: Any, out: Any,
-                _buf: list = buf,
-                _stream: bool = stream,
-            ) -> None:
-                delta = out[0] if isinstance(out, tuple) else out
-                if _stream:
-                    _buf.append(delta.detach())
-                else:
-                    _buf.append(delta.detach().cpu())
-
-            if sig == "attn_delta":
-                mod = _get_attn_submodule(layer_module)
-                h = mod.register_forward_hook(_hook)
-                hooks.append((sig, h, buf))
-            elif sig == "mlp_delta":
-                mod = _get_mlp_submodule(layer_module)
-                h = mod.register_forward_hook(_hook)
-                hooks.append((sig, h, buf))
-            elif sig == "router_logits":
-                if router_module_template is None:
-                    continue  # skip silently — no MoE in this model
-                router_path = router_module_template.format(layer=layer_idx)
-                if router_path.startswith("model."):
-                    router_path = router_path[len("model."):]
-                try:
-                    router_mod = model
-                    for part in router_path.split("."):
-                        if part.isdigit():
-                            router_mod = router_mod[int(part)]
-                        else:
-                            router_mod = getattr(router_mod, part)
-                    h = router_mod.register_forward_hook(_hook)
-                    hooks.append((sig, h, buf))
-                except (AttributeError, IndexError):
-                    continue  # skip layers without routers
-
-        return hooks, capture_residual
-
-    def scan_forward(
-        self,
-        prompts: list[str],
-        signals: list[str] | None = None,
-        n_components: int = 64,
-        batch_size: int = 4,
-        generative_masks: list[np.ndarray] | None = None,
-        external_bases: dict[str, np.ndarray] | None = None,
-        reducers: Mapping[str, tuple[Reducer, Any]] | None = None,
-    ) -> tuple[
-        dict[str, Any],                # metadata
-        dict[str, np.ndarray],          # bases: {signal_name: [n_layers, dim, k_eff]}
-        np.ndarray,                     # projections [N_total, 1, k]
-        dict[str, np.ndarray],          # coords {sample_id, layer, token_pos, signal}
-        list[list[int]],                # token_ids per sample
-        list[int],                      # seq_lengths per sample
-        torch.Tensor,                   # attention_mask [n_samples, max_seq_len]
-        dict[str, int],                 # signal_dims: {signal_name: dim}
-    ]:
-        """Run a full scan forward pass with between-chunk PCA.
-
-        Parameters
-        ----------
-        prompts : list[str]
-            Corpus prompts.
-        signals : list[str] or None
-            Which signals to capture. Defaults to ["attn_delta", "mlp_delta"].
-            Valid: "residual", "attn_delta", "mlp_delta", "router_logits".
-        n_components : int
-            Max PCA components per (layer, signal).
-        batch_size : int
-            Prompts per batch.
-        generative_masks : list of np.ndarray or None
-            Per-sample boolean masks, shape [seq_len_i] each. True =
-            generative (assistant) token. If provided, PCA is fit only
-            on generative tokens to avoid prompt leakage. All tokens
-            are still projected through the basis.
-        external_bases : dict of {signal_name: np.ndarray} or None
-            Pre-trained PCA bases to project through instead of fitting
-            new ones. Shape [n_layers, dim, k] per signal. When provided,
-            PCA fitting is skipped entirely — enables fast batched
-            projection through an existing scan's basis.
-        reducers : mapping of {name: (Reducer, state)} or None
-            Spec 003. When provided, per-microbatch projections are
-            dispatched to each reducer's ``update`` immediately after
-            ``_stream_project`` and then freed. Per-token projections
-            never accumulate across chunks, and the returned projection
-            array is empty — reducers own the output. Requires
-            ``external_bases`` to cover every signal in ``signals``.
-
-        Returns all data needed to write a SampleScan to disk.
-        """
-        import gc
-        import os
-        import tempfile
-
-        import numpy as np
-        from tqdm import tqdm
-
-        from .activation_types import detect_moe_info
-
-        if signals is None:
-            signals = ["attn_delta", "mlp_delta"]
-
-        if reducers is not None:
-            if external_bases is None:
-                raise ValueError(
-                    "scan_forward: reducers=... requires external_bases=... "
-                    "(reducers only operate on stream-projected signals)."
-                )
-            missing = [s for s in signals if s not in external_bases]
-            if missing:
-                raise ValueError(
-                    "scan_forward: reducers=... requires external_bases to "
-                    f"cover every signal; missing {missing}."
-                )
-
-        num_layers = self._get_num_layers()
-        model = self._load_full_model_cpu()
-        device = self.device
-        chunk_size = self._resolve_chunk_size()
-        hidden_dim: int | None = None
-
-        # Detect MoE for router_logits signal
-        router_module_template: str | None = None
-        if "router_logits" in signals:
-            try:
-                moe_info = detect_moe_info(self.model_name)
-                if moe_info is not None:
-                    router_module_template = moe_info.router_module_template
-                else:
-                    signals = [s for s in signals if s != "router_logits"]
-            except Exception:
-                signals = [s for s in signals if s != "router_logits"]
-
-        # Tokenize all prompts
-        tokenized = self.tokenizer(
-            prompts, return_tensors="pt", padding=True,
-        )
-        all_input_ids = tokenized["input_ids"]
-        all_attention_mask = tokenized["attention_mask"]
-
-        # Per-sample token IDs (unpadded) and seq lengths
-        token_ids_per_sample: list[list[int]] = []
-        seq_lengths: list[int] = []
-        for i in range(len(prompts)):
-            mask_i = all_attention_mask[i]
-            real_len = int(mask_i.sum().item())
-            seq_lengths.append(real_len)
-            token_ids_per_sample.append(
-                all_input_ids[i, :real_len].tolist()
-            )
-
-        # Split into batches
-        n_samples = len(prompts)
-        batches: list[tuple[int, int]] = []
-        for start in range(0, n_samples, batch_size):
-            end = min(start + batch_size, n_samples)
-            batches.append((start, end))
-
-        # Spec 004: residuals (`batch_hidden_states`) live in an
-        # np.memmap-backed buffer of shape [N_total, S_max, hidden_dim]
-        # rather than a list of CPU tensors. Linux's page cache handles
-        # residency — we only pay for what's touched in the current
-        # chunk, not the whole corpus. For a 9k-sample × 574-token ×
-        # 5120-hidden run that's the difference between 54 GB of
-        # always-resident CPU RAM and roughly `batch_size × S × H` of
-        # active pages at any moment.
-        #
-        # Per-batch causal masks are *not* persisted: a [B, 1, S, S]
-        # bf16 mask is S²-heavy and recomputing inside the batch loop
-        # is trivially cheap (one triu + masked_fill).
-        embed = _get_embedding_module(model)
-        embed.to(device)
-        batch_pos_ids: list[torch.Tensor] = []
-        batch_cache_positions: list[torch.Tensor] = []
-
-        _hs_tmpdir = tempfile.TemporaryDirectory(prefix="lmprobe_scan_")
-        try:
-            batch_hidden_states: np.memmap | None = None
-            _hs_N_total = int(all_input_ids.shape[0])
-            _hs_S_max = int(all_input_ids.shape[1])
-
-            for start, end in batches:
-                ids = all_input_ids[start:end]
-                mask = all_attention_mask[start:end]
-
-                with torch.no_grad():
-                    hs = embed(ids.to(device)).cpu()
-
-                if hidden_dim is None:
-                    hidden_dim = int(hs.shape[-1])
-                if batch_hidden_states is None:
-                    hs_path = os.path.join(_hs_tmpdir.name, "batch_hidden_states.bin")
-                    batch_hidden_states = np.memmap(
-                        hs_path,
-                        dtype=_mmap_np_dtype(self.dtype),
-                        mode="w+",
-                        shape=(_hs_N_total, _hs_S_max, hidden_dim),
-                    )
-                _mmap_write_slice(batch_hidden_states, start, end, hs)
-                del hs
-
-                seq_len = ids.shape[1]
-                pos_ids = mask.long().cumsum(-1) - 1
-                pos_ids.masked_fill_(mask == 0, 1)
-                batch_pos_ids.append(pos_ids)
-                batch_cache_positions.append(torch.arange(seq_len))
-
-            embed.to("cpu")
-            assert batch_hidden_states is not None
-
-            # Rotary embeddings
-            position_embeddings: tuple[torch.Tensor, ...] | torch.Tensor | dict | None = None
-            layer_types: list[str] | None = None
-            rotary_name = self._find_rotary_embedding_name(model)
-            if rotary_name is not None:
-                rotary_mod = model
-                for part in rotary_name.split("."):
-                    rotary_mod = getattr(rotary_mod, part)
-                rotary_mod.to(device)
-
-                text_cfg = getattr(
-                    getattr(model, "config", None), "text_config",
-                    getattr(model, "config", None),
-                )
-                layer_types_cfg = getattr(text_cfg, "layer_types", None)
-                # Use a single sample's pos_ids so cos/sin broadcast to any batch size
-                pe_hs = _mmap_read_slice(
-                    batch_hidden_states, 0, 1, self.dtype,
-                ).to(device)
-                pe_pos = batch_pos_ids[0][:1].to(device)
-
-                unique_types = set(layer_types_cfg) if layer_types_cfg is not None else set()
-                if layer_types_cfg is not None and len(unique_types) > 1:
-                    layer_types = list(layer_types_cfg)
-                    position_embeddings = {}
-                    with torch.no_grad():
-                        for lt in unique_types:
-                            pe = rotary_mod(pe_hs, pe_pos, layer_type=lt)
-                            position_embeddings[lt] = tuple(t.cpu() for t in pe)
-                else:
-                    if layer_types_cfg is not None:
-                        layer_types = list(layer_types_cfg)
-                    with torch.no_grad():
-                        pe = rotary_mod(pe_hs, pe_pos)
-                        if isinstance(pe, tuple):
-                            position_embeddings = tuple(t.cpu() for t in pe)
-                        else:
-                            position_embeddings = pe.cpu()
-                rotary_mod.to("cpu")
-
-            assert hidden_dim is not None
-            decoder_layers = _get_decoder_layers(model)
-
-            # Accumulators
-            # Per-signal basis: {signal_name: [n_layers, dim, k_eff]}
-            # We'll build these after seeing actual dims from hooks
-            signal_bases: dict[str, list[np.ndarray | None]] = {
-                sig: [None] * num_layers for sig in signals
-            }
-            signal_dims: dict[str, int] = {}  # discovered during first chunk
-            # Projections + coords are pre-allocated at full size so each chunk
-            # writes into a fixed slice rather than append-growing a list. This
-            # keeps cross-chunk memory constant: without it, all_proj_chunks
-            # (fp16) and the four coord Python-int lists grew ~1.3 GB per chunk
-            # and dominated working-set pressure on long scans. Skip allocation
-            # under the reducers path (spec 003) — nothing is written.
-            N_total = all_input_ids.shape[0]
-            S_max = all_input_ids.shape[1]
-            n_signals = len(signals)
-            if reducers is None:
-                total_rows = num_layers * n_signals * N_total * S_max
-                all_projections = np.zeros(
-                    (total_rows, 1, n_components), dtype=np.float16,
-                )
-                all_coord_sample_id = np.zeros(total_rows, dtype=np.int32)
-                all_coord_layer = np.zeros(total_rows, dtype=np.int16)
-                all_coord_token_pos = np.zeros(total_rows, dtype=np.int16)
-                all_coord_signal = np.zeros(total_rows, dtype=np.int8)
-            else:
-                all_projections = np.zeros((0, 1, n_components), dtype=np.float16)
-                all_coord_sample_id = np.zeros(0, dtype=np.int32)
-                all_coord_layer = np.zeros(0, dtype=np.int16)
-                all_coord_token_pos = np.zeros(0, dtype=np.int16)
-                all_coord_signal = np.zeros(0, dtype=np.int8)
-            proj_cursor: int = 0
-
-            # Spec 002: stream-project through pre-fit basis to avoid accumulating
-            # full [N, S, H] activation tensors on CPU. Basis stays on device for
-            # the whole sweep; only [B, S, k] projections move to CPU.
-            stream_signals: set[str] = (
-                set(external_bases.keys()) if external_bases is not None else set()
-            )
-            basis_gpu: dict[str, torch.Tensor] = {}
-            if external_bases is not None:
-                for sig, arr in external_bases.items():
-                    basis_gpu[sig] = torch.from_numpy(
-                        np.ascontiguousarray(arr),
-                    ).to(device=device, dtype=torch.float32)
-
-            def _stream_project(
-                delta: torch.Tensor, sig_name: str, layer_idx: int,
-            ) -> np.ndarray:
-                B, S, H = delta.shape
-                basis = basis_gpu[sig_name][layer_idx]
-                flat = delta.reshape(-1, H).to(torch.float32)
-                proj = (flat @ basis).reshape(B, S, -1).to(torch.float16)
-                out = proj.cpu().numpy()
-                del flat, proj
-                return out
-
-            # Spec 003: when reducers are supplied, preload signal_bases from
-            # external_bases so the final_bases assembly loop doesn't rely on
-            # per_layer_projected being populated (it won't be — reducers own
-            # the output and the per-token path is skipped).
-            signal_to_idx = {s: i for i, s in enumerate(signals)}
-            if reducers is not None and external_bases is not None:
-                for sig in stream_signals:
-                    for layer_idx_pre in range(num_layers):
-                        signal_bases[sig][layer_idx_pre] = (
-                            external_bases[sig][layer_idx_pre]
-                        )
-                    signal_dims.setdefault(sig, external_bases[sig].shape[1])
-
-            def _dispatch_reducers(
-                proj_cpu: np.ndarray,
-                sig_name: str,
-                layer_idx: int,
-                start: int,
-                end: int,
-            ) -> None:
-                """Spec 003: feed one microbatch's projection to every reducer."""
-                assert reducers is not None
-                sample_ids_batch = np.arange(start, end)
-                mask_batch_np = (
-                    all_attention_mask[start:end].cpu().numpy().astype(bool)
-                )
-                sig_idx = signal_to_idx[sig_name]
-                for _name, (red, state) in reducers.items():
-                    red.update(
-                        state, proj_cpu, sample_ids_batch,
-                        layer_idx, sig_idx, mask_batch_np,
-                    )
-
-            # --- Layer chunk loop ---
-            n_chunks = (num_layers + chunk_size - 1) // chunk_size
-            chunk_pbar = tqdm(
-                range(0, num_layers, chunk_size),
-                desc="Scan: layer chunks",
-                total=n_chunks,
-            )
-            for chunk_start in chunk_pbar:
-                chunk_end = min(chunk_start + chunk_size, num_layers)
-                chunk_pbar.set_postfix(layers=f"{chunk_start}-{chunk_end-1}")
-
-                for i in range(chunk_start, chunk_end):
-                    decoder_layers[i].to(device)
-
-                # {layer_idx: {signal_name: [tensor_per_batch, ...]}}
-                # Legacy path (PCA fit, or signals not in external_bases).
-                per_layer_captures: dict[int, dict[str, list[torch.Tensor]]] = {
-                    L: {sig: [] for sig in signals}
-                    for L in range(chunk_start, chunk_end)
-                }
-                # Stream-project path (external_bases signals).
-                per_layer_projected: dict[int, dict[str, list[np.ndarray]]] = {
-                    L: {sig: [] for sig in signals}
-                    for L in range(chunk_start, chunk_end)
-                }
-
-                for batch_idx, (start, end) in enumerate(batches):
-                    # Push per-batch progress onto the chunk bar so the user sees
-                    # forward motion inside a chunk — a chunk-level tick can take
-                    # hours on large fused sweeps (N_batches × chunk_size forward
-                    # passes between ticks).
-                    chunk_pbar.set_postfix(
-                        layers=f"{chunk_start}-{chunk_end-1}",
-                        batch=f"{batch_idx+1}/{len(batches)}",
-                    )
-                    hs = _mmap_read_slice(
-                        batch_hidden_states, start, end, self.dtype,
-                    ).to(device)
-                    # Build the causal mask on-the-fly and push straight to GPU;
-                    # drop the CPU copy at batch-end so [B, 1, S, S] tensors
-                    # don't persist across 1000s of batches.
-                    mask_2d = all_attention_mask[start:end]
-                    mask_dev = _make_causal_mask(mask_2d, self.dtype).to(device)
-                    pos_dev = batch_pos_ids[batch_idx].to(device)
-                    pe_dev = self._pe_to_device(position_embeddings, device)
-
-                    with torch.no_grad():
-                        for layer_idx in range(chunk_start, chunk_end):
-                            layer_module = decoder_layers[layer_idx]
-
-                            hook_list, capture_residual = self._resolve_signal_hooks(
-                                signals, layer_module, layer_idx,
-                                router_module_template, model,
-                                stream_signals=stream_signals,
-                            )
-
-                            layer_kwargs = self._build_layer_kwargs(
-                                mask_dev, pos_dev, batch_cache_positions[batch_idx],
-                                pe_dev, layer_types, layer_idx, device,
-                            )
-
-                            output = layer_module(hs, **layer_kwargs)
-                            hs = output[0] if isinstance(output, tuple) else output
-
-                            # Collect hooked signals. Stream-projected signals
-                            # get `(delta @ basis)` on GPU right here; legacy
-                            # signals go to CPU for between-chunk PCA.
-                            for sig_name, handle, buf in hook_list:
-                                handle.remove()
-                                if not buf:
-                                    continue
-                                if sig_name in stream_signals:
-                                    delta_gpu = buf[0]
-                                    if sig_name not in signal_dims:
-                                        signal_dims[sig_name] = delta_gpu.shape[-1]
-                                    proj_cpu = _stream_project(
-                                        delta_gpu, sig_name, layer_idx,
-                                    )
-                                    if reducers is not None:
-                                        _dispatch_reducers(
-                                            proj_cpu, sig_name, layer_idx,
-                                            start, end,
-                                        )
-                                        del proj_cpu
-                                    else:
-                                        per_layer_projected[layer_idx][sig_name].append(
-                                            proj_cpu,
-                                        )
-                                    del delta_gpu
-                                else:
-                                    per_layer_captures[layer_idx][sig_name].append(buf[0])
-
-                            # Residual = layer output (already in hs).
-                            if capture_residual:
-                                if "residual" in stream_signals:
-                                    if "residual" not in signal_dims:
-                                        signal_dims["residual"] = hs.shape[-1]
-                                    proj_cpu = _stream_project(
-                                        hs.detach(), "residual", layer_idx,
-                                    )
-                                    if reducers is not None:
-                                        _dispatch_reducers(
-                                            proj_cpu, "residual", layer_idx,
-                                            start, end,
-                                        )
-                                        del proj_cpu
-                                    else:
-                                        per_layer_projected[layer_idx]["residual"].append(
-                                            proj_cpu,
-                                        )
-                                else:
-                                    per_layer_captures[layer_idx]["residual"].append(
-                                        hs.detach().cpu()
-                                    )
-
-                    _mmap_write_slice(batch_hidden_states, start, end, hs)
-                    del hs, mask_dev, pos_dev, pe_dev
-
-                # Offload chunk
-                for i in range(chunk_start, chunk_end):
-                    decoder_layers[i].to("cpu")
-                gc.collect()
-                if torch.cuda.is_available() and device != "cpu":
-                    torch.cuda.empty_cache()
-
-                # --- Between-chunk PCA fit or basis projection ---
-                pca_items = [
-                    (layer_idx, sig_idx, sig_name)
-                    for layer_idx in range(chunk_start, chunk_end)
-                    for sig_idx, sig_name in enumerate(signals)
-                ]
-                _stage_label = (
-                    "projecting" if external_bases is not None else "PCA fit"
-                )
-                for layer_idx, sig_idx, sig_name in tqdm(
-                    pca_items,
-                    desc=f"  {_stage_label} (layers {chunk_start}-{chunk_end-1})",
-                    leave=False,
-                ):
-                    if sig_name in stream_signals:
-                        # Stream-project branch: concatenate already-projected
-                        # per-batch arrays; skip PCA and float32 upcast entirely.
-                        chunks = per_layer_projected[layer_idx][sig_name]
-                        if not chunks:
-                            continue
-                        assert external_bases is not None
-                        basis = external_bases[sig_name][layer_idx]
-                        signal_bases[sig_name][layer_idx] = basis
-                        k = basis.shape[1]
-                        # np.concatenate allocates a single contiguous buffer;
-                        # `projected` is a view of it and is the only copy kept
-                        # alive via all_proj_chunks. Clearing the per-batch
-                        # chunks list here (rather than waiting for the chunk
-                        # loop's `del per_layer_projected` at the bottom)
-                        # releases the duplicate per-batch storage progressively
-                        # across the assembly loop — up to 18 GB freed on a
-                        # 1000-sample sweep.
-                        B_total = sum(c.shape[0] for c in chunks)
-                        S = chunks[0].shape[1]
-                        projected = np.concatenate(chunks, axis=0).reshape(-1, k)
-                        per_layer_projected[layer_idx][sig_name] = []
-                        del chunks
-                    else:
-                        # Fit + project on GPU via cuml when available (falls back
-                        # to sklearn on CPU). The helper pops from the captures
-                        # list as it streams to GPU, so the entry is drained by
-                        # the time the call returns.
-                        captures = per_layer_captures[layer_idx][sig_name]
-                        if not captures:
-                            continue
-                        if sig_name not in signal_dims:
-                            signal_dims[sig_name] = int(captures[0].shape[2])
-                        basis, projected, B_total, S, dim = _fit_project_scan_pca(
-                            captures,
-                            device=device,
-                            n_components=n_components,
-                            generative_masks=generative_masks,
-                        )
-                        k = basis.shape[1]
-                        signal_bases[sig_name][layer_idx] = basis
-                        # `captures` was drained in place by the helper; make sure
-                        # the dict entry is empty too.
-                        per_layer_captures[layer_idx][sig_name] = []
-                        del captures
-                    # Write directly into the pre-allocated outputs at the
-                    # current cursor. Coords are generated vectorized — no
-                    # Python int-list overhead (~1.3 GB/chunk savings on a
-                    # 40-layer scan of 1000 samples × 611 tokens).
-                    block = B_total * S
-                    row_end = proj_cursor + block
-                    all_projections[proj_cursor:row_end, 0, :k] = projected
-                    if k < n_components:
-                        all_projections[proj_cursor:row_end, 0, k:] = 0
-                    all_coord_sample_id[proj_cursor:row_end] = np.repeat(
-                        np.arange(B_total, dtype=np.int32), S,
-                    )
-                    all_coord_layer[proj_cursor:row_end] = layer_idx
-                    all_coord_token_pos[proj_cursor:row_end] = np.tile(
-                        np.arange(S, dtype=np.int16), B_total,
-                    )
-                    all_coord_signal[proj_cursor:row_end] = sig_idx
-                    proj_cursor = row_end
-
-                    del projected
-                    gc.collect()
-
-                del per_layer_captures, per_layer_projected
-                gc.collect()
-
-            # Assemble per-signal basis arrays: {sig: [n_layers, dim, k_eff]}
-            final_bases: dict[str, np.ndarray] = {}
-            for sig_name in signals:
-                dim = signal_dims.get(sig_name, hidden_dim)
-                k_eff = min(n_components, dim)
-                basis_arr = np.zeros((num_layers, dim, k_eff), dtype=np.float16)
-                for L in range(num_layers):
-                    layer_basis = signal_bases[sig_name][L]
-                    if layer_basis is not None:
-                        actual_k = layer_basis.shape[1]
-                        basis_arr[L, :, :actual_k] = layer_basis
-                final_bases[sig_name] = basis_arr
-
-            # Truncate the pre-allocated outputs to `proj_cursor` — in the
-            # reducers path (spec 003) nothing is written, so cursor stays 0.
-            all_projections = all_projections[:proj_cursor]
-            all_coord_sample_id = all_coord_sample_id[:proj_cursor]
-            all_coord_layer = all_coord_layer[:proj_cursor]
-            all_coord_token_pos = all_coord_token_pos[:proj_cursor]
-            all_coord_signal = all_coord_signal[:proj_cursor]
-
-            metadata = {
-                "model_id": self.model_name,
-                "hidden_dim": hidden_dim,
-                "n_layers": num_layers,
-                "n_components": n_components,
-                "n_samples": n_samples,
-                "signals": signals,
-            }
-
-            coords = {
-                "sample_id": all_coord_sample_id,
-                "layer": all_coord_layer,
-                "token_pos": all_coord_token_pos,
-                "signal": all_coord_signal,
-            }
-
-
-            return (
-                metadata,
-                final_bases,
-                all_projections,
-                coords,
-                token_ids_per_sample,
-                seq_lengths,
-                all_attention_mask,
-                signal_dims,
-            )
-        finally:
-            # Deterministic memmap + tempdir cleanup. Drop the
-            # memmap reference first so Python releases the mmap
-            # before TemporaryDirectory unlinks the backing file
-            # (matters on Windows; harmless on Linux).
-            try:
-                del batch_hidden_states
-            except NameError:
-                pass
-            _hs_tmpdir.cleanup()
 
     def project_forward(
         self,
@@ -2385,136 +1454,78 @@ class ChunkedLocalBackend(ExtractionBackend):
     ) -> tuple[np.ndarray, list[int], torch.Tensor | None]:
         """Run a single-prompt forward pass, projecting deltas onto stored bases.
 
-        Parameters
-        ----------
-        prompt : str
-            The prompt to forward-pass.
-        bases : dict[str, np.ndarray]
-            Maps signal name to basis [n_layers, dim, k_eff].
-        signals : list[str]
-            Signal names in order.
-        include_logits : bool
-            Whether to compute logits for surprise strip.
-
         Returns
         -------
         tuple
-            (projections, token_ids, logits)
-            - projections: [seq_len, n_layers, n_signals, max_k] float32
-            - token_ids: list of int token IDs (unpadded)
-            - logits: [1, seq_len, vocab_size] or None
+            ``(projections, token_ids, logits)``:
+            - ``projections``: ``[seq_len, n_layers, n_signals, max_k]`` float32
+            - ``token_ids``: list of int token IDs (unpadded)
+            - ``logits``: ``[1, seq_len, vocab_size]`` or None
         """
-        import gc
+        from .accumulators import LogitCapture, PerTokenProjection
+        from .sweep import sweep
 
-        import numpy as np
+        proj_bases = {s: bases[s] for s in signals if s in bases}
+        if not proj_bases:
+            raise ValueError(
+                f"project_forward: no bases supplied for any of the "
+                f"requested signals {signals} (bases keys: "
+                f"{list(bases.keys())})."
+            )
 
-        from .activation_types import detect_moe_info
+        loader = ChunkedLayerLoader(self)
+        accumulators: dict[str, Any] = {
+            "proj": PerTokenProjection(proj_bases),
+        }
+        if include_logits:
+            accumulators["logits"] = LogitCapture()
 
-        ctx = self._prepare_chunked_pass([prompt])
-        hidden_states = ctx["hidden_states"]
-        model = ctx["model"]
-        device = ctx["device"]
-        decoder_layers = ctx["decoder_layers"]
-        num_layers = ctx["num_layers"]
-        chunk_size = ctx["chunk_size"]
-        causal_mask = ctx["causal_mask"]
-        position_ids = ctx["position_ids"]
-        cache_position = ctx["cache_position"]
-        position_embeddings = ctx["position_embeddings"]
-        layer_types = ctx["layer_types"]
-        attention_mask_2d = ctx["attention_mask_2d"]
-        input_ids = ctx["input_ids"]
-
-        seq_len = input_ids.shape[1]
-        real_len = int(attention_mask_2d[0].sum().item())
-        token_ids = input_ids[0, :real_len].tolist()
-
-        # Find max k across all signal bases
-        max_k = max(b.shape[2] for b in bases.values())
-        n_signals = len(signals)
-        projections = np.zeros(
-            (seq_len, num_layers, n_signals, max_k), dtype=np.float32,
+        out = sweep(
+            [prompt],
+            accumulators=accumulators,
+            loader=loader,
+            external_bases=proj_bases,
+            batch_size=1,
         )
 
-        # Convert bases to torch
-        bases_torch = {
-            sig: torch.from_numpy(b).float() for sig, b in bases.items()
-        }
+        proj_result = out["proj"]
+        values = proj_result["values"]               # [total_rows, k_max]
+        offset_table = proj_result["offset_table"]   # [1, n_layers, n_sig, 2]
+        sweep_signal_names = proj_result["signal_names"]
+        seq_lengths = proj_result["seq_lengths"]
 
-        # Router template for router_logits
-        router_module_template: str | None = None
-        if "router_logits" in signals:
-            try:
-                moe_info = detect_moe_info(self.model_name)
-                if moe_info is not None:
-                    router_module_template = moe_info.router_module_template
-            except Exception:
-                pass
+        # Rebuild the legacy dense shape [seq_len, n_layers, n_signals, max_k]
+        # in the caller-supplied ``signals`` order (may differ from
+        # PerTokenProjection's alphabetical order).
+        seq_len = int(seq_lengths[0])
+        num_layers = loader.num_layers
+        max_k = int(values.shape[-1])
+        sig_to_new_idx = {s: i for i, s in enumerate(sweep_signal_names)}
+        dense = np.zeros(
+            (seq_len, num_layers, len(signals), max_k), dtype=np.float32,
+        )
+        for out_si, sig_name in enumerate(signals):
+            new_si = sig_to_new_idx.get(sig_name)
+            if new_si is None:
+                continue
+            for L in range(num_layers):
+                start, end = offset_table[0, L, new_si]
+                rows = values[start:end].astype(np.float32)
+                dense[: rows.shape[0], L, out_si, :] = rows
 
-        for chunk_start in range(0, num_layers, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, num_layers)
+        tokenized = self.tokenizer([prompt], return_tensors="pt", padding=True)
+        input_ids = tokenized["input_ids"][0]
+        attention_mask = tokenized["attention_mask"][0]
+        real_len = int(attention_mask.sum().item())
+        token_ids = input_ids[:real_len].tolist()
 
-            for i in range(chunk_start, chunk_end):
-                decoder_layers[i].to(device)
-
-            hs = hidden_states.to(device)
-            mask_dev = causal_mask.to(device)
-            pos_dev = position_ids.to(device)
-            pe_dev = self._pe_to_device(position_embeddings, device)
-
-            with torch.no_grad():
-                for layer_idx in range(chunk_start, chunk_end):
-                    layer_module = decoder_layers[layer_idx]
-
-                    hook_list, capture_residual = self._resolve_signal_hooks(
-                        signals, layer_module, layer_idx,
-                        router_module_template, model,
-                    )
-
-                    layer_kwargs = self._build_layer_kwargs(
-                        mask_dev, pos_dev, cache_position,
-                        pe_dev, layer_types, layer_idx, device,
-                    )
-
-                    output = layer_module(hs, **layer_kwargs)
-                    hs = output[0] if isinstance(output, tuple) else output
-
-                    # Project hooked signals
-                    for sig_name, handle, buf in hook_list:
-                        handle.remove()
-                        if buf and sig_name in bases_torch:
-                            sig_idx = signals.index(sig_name)
-                            delta = buf[0][0].float()  # [seq_len, dim]
-                            b = bases_torch[sig_name][layer_idx]  # [dim, k]
-                            k = b.shape[1]
-                            proj = (delta @ b).numpy()
-                            projections[:, layer_idx, sig_idx, :k] = proj
-
-                    # Project residual
-                    if capture_residual and "residual" in bases_torch:
-                        sig_idx = signals.index("residual")
-                        delta = hs[0].cpu().float()
-                        b = bases_torch["residual"][layer_idx]
-                        k = b.shape[1]
-                        proj = (delta @ b).numpy()
-                        projections[:, layer_idx, sig_idx, :k] = proj
-
-            hidden_states = hs.cpu()
-            del hs, mask_dev, pos_dev, pe_dev
-
-            for i in range(chunk_start, chunk_end):
-                decoder_layers[i].to("cpu")
-            gc.collect()
-            if torch.cuda.is_available() and device != "cpu":
-                torch.cuda.empty_cache()
-
-        logits = None
+        logits_out: torch.Tensor | None = None
         if include_logits:
-            logits = self._compute_logits(model, hidden_states, device)
+            logit_tensor = out["logits"]  # [1, S_max, V] or None
+            if logit_tensor is not None:
+                logits_out = logit_tensor[:, :real_len, :]
 
-        return projections, token_ids, logits
-
-    # --- ExtractionBackend interface ---
+        return dense[:real_len], token_ids, logits_out
 
     def extract_batch(
         self,
@@ -2563,6 +1574,548 @@ class ChunkedLocalBackend(ExtractionBackend):
             logits_indices=None,
             router_logits=router_logits,
         )
+
+
+# ---------------------------------------------------------------------------
+# ChunkedLayerLoader — LayerLoader implementation for ChunkedLocalBackend
+# ---------------------------------------------------------------------------
+#
+# Backs the new sweep primitive (src/lmprobe/sweep.py). Reuses all of
+# ChunkedLocalBackend's existing model-loading + rotary + memmap infrastructure;
+# only adds protocol methods (prepare, iter_layer_groups, layer_group, read_hs,
+# write_hs, build_layer_kwargs, apply_lm_head) and the `_drive_sweep` forward
+# loop that sweep.py dispatches into.
+
+
+class _ResidualBuffer:
+    """Memmap-backed residual buffer, lifecycle-owned by ChunkedLayerLoader.prepare."""
+
+    def __init__(self, mmap: np.memmap, tmpdir: Any) -> None:
+        self.mmap = mmap
+        self._tmpdir = tmpdir
+
+    def cleanup(self) -> None:
+        # Drop memmap ref first so Python releases the mmap before the
+        # backing file is unlinked (matters on Windows; harmless on Linux).
+        del self.mmap
+        self._tmpdir.cleanup()
+
+
+class ChunkedLayerLoader:
+    """LayerLoader wrapping :class:`ChunkedLocalBackend`.
+
+    Implements the sweep primitive's :class:`~lmprobe.sweep.LayerLoader`
+    protocol: embedding + rotary in :meth:`prepare`, chunk-sized layer
+    groups via :meth:`iter_layer_groups`, memmap-backed residual buffer
+    (spec 004), and the concrete forward-loop in :meth:`_drive_sweep`.
+    ``ChunkedLocalBackend`` methods (``_chunked_forward``,
+    ``project_forward``, plus extract shims) are thin wrappers that
+    construct a loader, declare accumulators, and call
+    :func:`lmprobe.sweep.sweep` — no separate forward paths live on the
+    backend.
+    """
+
+    def __init__(self, backend: ChunkedLocalBackend) -> None:
+        self._backend = backend
+        # LayerLoader protocol attributes:
+        self.tokenizer = backend.tokenizer
+        self.num_layers: int = backend._get_num_layers()
+        self.hidden_dim: int = 0  # populated in prepare()
+        self.dtype: torch.dtype = backend.dtype
+        self.device: str = backend.device
+        self.layer_types: list[str] | None = None
+        self.router_module_template: str | None = None
+        # Lazily-resolved chunk size (same source of truth as scan_forward).
+        self._chunk_size = backend._resolve_chunk_size()
+
+    # --- LayerLoader protocol ------------------------------------------------
+
+    def prepare(
+        self, prompts: list[str], batch_size: int,
+    ) -> Any:
+        """Context manager: tokenize → embed → rotary → allocate memmap.
+
+        Yields an :class:`~lmprobe.sweep.EmbedState`. The residual buffer's
+        backing tempdir is deterministically cleaned up on exit.
+        """
+        from contextlib import contextmanager
+
+        from .activation_types import detect_moe_info
+        from .sweep import EmbedState
+
+        @contextmanager
+        def _prepare_ctx() -> Any:
+            import os
+            import tempfile
+
+            # Detect MoE routing template (surfaces for RouterLogitCapture
+            # accumulators to read off `loader.router_module_template`).
+            try:
+                moe_info = detect_moe_info(self._backend.model_name)
+                if moe_info is not None:
+                    self.router_module_template = moe_info.router_module_template
+            except Exception:
+                pass
+
+            # Tokenize with corpus-wide padding (matches scan_forward).
+            tokenized = self.tokenizer(
+                prompts, return_tensors="pt", padding=True,
+            )
+            all_input_ids = tokenized["input_ids"]
+            all_attention_mask = tokenized["attention_mask"]
+
+            token_ids_per_sample: list[list[int]] = []
+            seq_lengths: list[int] = []
+            for i in range(len(prompts)):
+                real_len = int(all_attention_mask[i].sum().item())
+                seq_lengths.append(real_len)
+                token_ids_per_sample.append(
+                    all_input_ids[i, :real_len].tolist(),
+                )
+
+            n_samples = len(prompts)
+            batches: list[tuple[int, int]] = [
+                (s, min(s + batch_size, n_samples))
+                for s in range(0, n_samples, batch_size)
+            ]
+
+            model = self._backend._load_full_model_cpu()
+            device = self.device
+            embed = _get_embedding_module(model)
+            embed.to(device)
+
+            pos_ids_per_batch: list[torch.Tensor] = []
+            cache_positions_per_batch: list[torch.Tensor] = []
+
+            tmpdir = tempfile.TemporaryDirectory(prefix="lmprobe_sweep_")
+            try:
+                hs_path = os.path.join(tmpdir.name, "residuals.bin")
+                S_max = int(all_input_ids.shape[1])
+                mmap: np.memmap | None = None
+                hidden_dim: int | None = None
+
+                for start, end in batches:
+                    ids = all_input_ids[start:end]
+                    mask = all_attention_mask[start:end]
+                    with torch.no_grad():
+                        hs = embed(ids.to(device)).cpu()
+                    if hidden_dim is None:
+                        hidden_dim = int(hs.shape[-1])
+                    if mmap is None:
+                        mmap = np.memmap(
+                            hs_path,
+                            dtype=_mmap_np_dtype(self.dtype),
+                            mode="w+",
+                            shape=(n_samples, S_max, hidden_dim),
+                        )
+                    _mmap_write_slice(mmap, start, end, hs)
+                    del hs
+                    pos_ids = mask.long().cumsum(-1) - 1
+                    pos_ids.masked_fill_(mask == 0, 1)
+                    pos_ids_per_batch.append(pos_ids)
+                    cache_positions_per_batch.append(
+                        torch.arange(ids.shape[1]),
+                    )
+                embed.to("cpu")
+                assert mmap is not None and hidden_dim is not None
+                self.hidden_dim = hidden_dim
+
+                # Rotary phase — same logic as scan_forward. Broadcast via
+                # a single-sample slice of the just-embedded residuals.
+                position_embeddings, layer_types = self._compute_rotary(
+                    model, mmap, pos_ids_per_batch, device,
+                )
+                self.layer_types = layer_types
+
+                state = EmbedState(
+                    input_ids=all_input_ids,
+                    attention_mask=all_attention_mask,
+                    batches=batches,
+                    pos_ids_per_batch=pos_ids_per_batch,
+                    cache_positions_per_batch=cache_positions_per_batch,
+                    position_embeddings=position_embeddings,
+                    layer_types=layer_types,
+                    seq_lengths=seq_lengths,
+                    token_ids_per_sample=token_ids_per_sample,
+                    hidden_dim=hidden_dim,
+                    residual_buffer=_ResidualBuffer(mmap, tmpdir),
+                )
+            except Exception:
+                tmpdir.cleanup()
+                raise
+
+            try:
+                yield state
+            finally:
+                state.residual_buffer.cleanup()
+
+        return _prepare_ctx()
+
+    def _compute_rotary(
+        self,
+        model: Any,
+        mmap: np.memmap,
+        pos_ids_per_batch: list[torch.Tensor],
+        device: str,
+    ) -> tuple[Any, list[str] | None]:
+        """Port of the rotary block in scan_forward (lines ~1978–2016)."""
+        rotary_name = ChunkedLocalBackend._find_rotary_embedding_name(model)
+        if rotary_name is None:
+            return None, None
+        rotary_mod = model
+        for part in rotary_name.split("."):
+            rotary_mod = getattr(rotary_mod, part)
+        rotary_mod.to(device)
+
+        text_cfg = getattr(
+            getattr(model, "config", None), "text_config",
+            getattr(model, "config", None),
+        )
+        layer_types_cfg = getattr(text_cfg, "layer_types", None)
+        pe_hs = _mmap_read_slice(mmap, 0, 1, self.dtype).to(device)
+        pe_pos = pos_ids_per_batch[0][:1].to(device)
+
+        unique_types = set(layer_types_cfg) if layer_types_cfg is not None else set()
+        position_embeddings: Any
+        layer_types: list[str] | None
+        if layer_types_cfg is not None and len(unique_types) > 1:
+            layer_types = list(layer_types_cfg)
+            position_embeddings = {}
+            with torch.no_grad():
+                for lt in unique_types:
+                    pe = rotary_mod(pe_hs, pe_pos, layer_type=lt)
+                    position_embeddings[lt] = tuple(t.cpu() for t in pe)
+        else:
+            if layer_types_cfg is not None:
+                layer_types = list(layer_types_cfg)
+            else:
+                layer_types = None
+            with torch.no_grad():
+                pe = rotary_mod(pe_hs, pe_pos)
+                if isinstance(pe, tuple):
+                    position_embeddings = tuple(t.cpu() for t in pe)
+                else:
+                    position_embeddings = pe.cpu()
+        rotary_mod.to("cpu")
+        return position_embeddings, layer_types
+
+    def iter_layer_groups(self) -> Any:
+        for start in range(0, self.num_layers, self._chunk_size):
+            yield list(range(start, min(start + self._chunk_size, self.num_layers)))
+
+    def layer_group(self, indices: list[int]) -> Any:
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx() -> Any:
+            import gc
+
+            model = self._backend._load_full_model_cpu()
+            decoder_layers = _get_decoder_layers(model)
+            for i in indices:
+                decoder_layers[i].to(self.device)
+            try:
+                yield [decoder_layers[i] for i in indices]
+            finally:
+                for i in indices:
+                    decoder_layers[i].to("cpu")
+                gc.collect()
+                if torch.cuda.is_available() and self.device != "cpu":
+                    torch.cuda.empty_cache()
+        return _ctx()
+
+    def read_hs(
+        self,
+        state: Any,
+        start: int,
+        end: int,
+        device: str,
+    ) -> torch.Tensor:
+        return _mmap_read_slice(
+            state.residual_buffer.mmap, start, end, self.dtype,
+        ).to(device)
+
+    def write_hs(
+        self,
+        state: Any,
+        start: int,
+        end: int,
+        hs: torch.Tensor,
+    ) -> None:
+        _mmap_write_slice(state.residual_buffer.mmap, start, end, hs)
+
+    def build_layer_kwargs(
+        self,
+        state: Any,
+        batch_idx: int,
+        layer_idx: int,
+        causal_mask_dev: torch.Tensor,
+        device: str,
+    ) -> dict[str, Any]:
+        pos_dev = state.pos_ids_per_batch[batch_idx].to(device)
+        cache_position = state.cache_positions_per_batch[batch_idx]
+        pe_dev = ChunkedLocalBackend._pe_to_device(
+            state.position_embeddings, device,
+        )
+        return ChunkedLocalBackend._build_layer_kwargs(
+            causal_mask_dev, pos_dev, cache_position,
+            pe_dev, state.layer_types, layer_idx, device,
+        )
+
+    def apply_lm_head(
+        self,
+        final_hs: torch.Tensor,
+        device: str,
+    ) -> torch.Tensor:
+        """Apply final_norm + lm_head to a batch of residuals."""
+        model = self._backend._load_full_model_cpu()
+        final_norm = _get_final_norm(model)
+        lm_head = _get_lm_head(model)
+        final_norm.to(device)
+        lm_head.to(device)
+        try:
+            with torch.no_grad():
+                logits = lm_head(final_norm(final_hs))
+        finally:
+            final_norm.to("cpu")
+            lm_head.to("cpu")
+        assert isinstance(logits, torch.Tensor)
+        return logits
+
+    # --- Sweep driver --------------------------------------------------------
+
+    def _drive_sweep(
+        self,
+        *,
+        state: Any,
+        accumulators: Any,
+        plans: dict[tuple[int, str], Any],
+        basis_gpu: dict[str, torch.Tensor],
+        batch_size: int,
+        ctx: Any,
+    ) -> None:
+        """Layer-chunk + batch forward loop. Hooks emit signals;
+        :func:`sweep._dispatch_plan` routes each capture to subscribers."""
+        from tqdm import tqdm
+
+        from .sweep import (
+            SIGNAL_ATTN_DELTA,
+            SIGNAL_LOGITS,
+            SIGNAL_MLP_DELTA,
+            SIGNAL_RESIDUAL,
+            SIGNAL_ROUTER_LOGITS,
+            _dispatch_plan,
+            _notify_group_complete,
+        )
+
+        # Router strategy: unify across all router-subscribing accumulators.
+        # Convention: the accumulator exposes a `strategy` attribute (e.g.
+        # RouterLogitCapture). Two subscribers with different strategies is
+        # a caller bug — the hook can only fire one way per (layer, module),
+        # so a silent "first-wins" would drop the other capture's data.
+        router_strategy: str | None = None
+        router_owners: list[str] = []
+        for name, acc in accumulators.items():
+            if SIGNAL_ROUTER_LOGITS in acc.signals and hasattr(acc, "strategy"):
+                s = acc.strategy
+                if router_strategy is None:
+                    router_strategy = s
+                    router_owners = [name]
+                elif s != router_strategy:
+                    router_owners.append(name)
+                    raise ValueError(
+                        f"sweep: conflicting router_logits hook strategies "
+                        f"across subscribers {router_owners!r}: "
+                        f"{router_strategy!r} vs {s!r}. A single sweep can "
+                        f"only install one hook per layer; run two sweeps "
+                        f"or unify the strategy."
+                    )
+                else:
+                    router_owners.append(name)
+        if router_strategy is None:
+            router_strategy = "output"
+
+        device = self.device
+        model = self._backend._load_full_model_cpu()
+
+        group_iter = list(self.iter_layer_groups())
+        for chunk_idx, chunk_indices in enumerate(tqdm(
+            group_iter,
+            desc="Sweep: layer groups",
+        )):
+            with self.layer_group(chunk_indices) as layer_modules_in_group:
+                # Map layer_idx -> module for O(1) lookup in the batch loop.
+                layer_modules = {
+                    layer_idx: layer_modules_in_group[i]
+                    for i, layer_idx in enumerate(chunk_indices)
+                }
+
+                for batch_idx, (start, end) in enumerate(state.batches):
+                    hs = self.read_hs(state, start, end, device)
+                    mask_dev = _make_causal_mask(
+                        state.attention_mask[start:end], self.dtype,
+                    ).to(device)
+                    sample_ids = np.arange(start, end, dtype=np.int32)
+                    attn_mask_np = (
+                        state.attention_mask[start:end].cpu().numpy().astype(bool)
+                    )
+
+                    with torch.no_grad():
+                        for layer_idx in chunk_indices:
+                            layer_module = layer_modules[layer_idx]
+
+                            # Register hooks only for signals that have
+                            # subscribers at this layer.
+                            hook_handles: list[Any] = []
+                            hook_bufs: dict[str, list[torch.Tensor]] = {}
+
+                            for sig in (
+                                SIGNAL_ATTN_DELTA,
+                                SIGNAL_MLP_DELTA,
+                                SIGNAL_ROUTER_LOGITS,
+                            ):
+                                if (layer_idx, sig) not in plans:
+                                    continue
+                                buf: list[torch.Tensor] = []
+                                hook_bufs[sig] = buf
+                                handle = _install_sweep_hook(
+                                    sig, layer_module, layer_idx, model,
+                                    self.router_module_template,
+                                    router_strategy, buf,
+                                )
+                                if handle is not None:
+                                    hook_handles.append((sig, handle))
+
+                            layer_kwargs = self.build_layer_kwargs(
+                                state, batch_idx, layer_idx, mask_dev, device,
+                            )
+                            output = layer_module(hs, **layer_kwargs)
+                            hs = output[0] if isinstance(output, tuple) else output
+
+                            # Dispatch hooked signals. Slice basis per
+                            # layer — basis_gpu[sig] is [n_layers, H, k].
+                            for sig, handle in hook_handles:
+                                handle.remove()
+                                buf = hook_bufs[sig]
+                                if not buf:
+                                    continue
+                                plan = plans.get((layer_idx, sig))
+                                if plan is None:
+                                    continue
+                                sig_basis = basis_gpu.get(sig)
+                                per_layer_basis = (
+                                    sig_basis[layer_idx] if sig_basis is not None
+                                    else None
+                                )
+                                _dispatch_plan(
+                                    plan, buf[0], sig, layer_idx,
+                                    sample_ids, attn_mask_np,
+                                    per_layer_basis,
+                                )
+                                buf.clear()
+
+                            # Residual = layer output (no hook needed).
+                            res_plan = plans.get((layer_idx, SIGNAL_RESIDUAL))
+                            if res_plan is not None:
+                                res_basis = basis_gpu.get(SIGNAL_RESIDUAL)
+                                res_per_layer = (
+                                    res_basis[layer_idx] if res_basis is not None
+                                    else None
+                                )
+                                _dispatch_plan(
+                                    res_plan, hs.detach(), SIGNAL_RESIDUAL,
+                                    layer_idx, sample_ids, attn_mask_np,
+                                    res_per_layer,
+                                )
+
+                    self.write_hs(state, start, end, hs)
+                    del hs, mask_dev
+
+            # Layer group is unloaded; fire completion hook so PCAFit can
+            # fit-and-free incrementally.
+            _notify_group_complete(accumulators, chunk_indices)
+
+        # End-of-sweep: logits. Any accumulator subscribing to SIGNAL_LOGITS
+        # receives one dispatch per microbatch with the lm_head output.
+        wants_logits = any(
+            SIGNAL_LOGITS in a.signals for a in accumulators.values()
+        )
+        if wants_logits:
+            for batch_idx, (start, end) in enumerate(state.batches):
+                hs = self.read_hs(state, start, end, device)
+                logits = self.apply_lm_head(hs, device)
+                sample_ids = np.arange(start, end, dtype=np.int32)
+                attn_mask_np = (
+                    state.attention_mask[start:end].cpu().numpy().astype(bool)
+                )
+                logits_cpu = logits.detach().cpu()
+                for acc in accumulators.values():
+                    if SIGNAL_LOGITS in acc.signals:
+                        acc.update(
+                            logits_cpu, SIGNAL_LOGITS, -1,
+                            sample_ids, attn_mask_np,
+                        )
+                del hs, logits, logits_cpu
+
+
+def _install_sweep_hook(
+    sig: str,
+    layer_module: Any,
+    layer_idx: int,
+    model: Any,
+    router_module_template: str | None,
+    router_strategy: str,
+    buf: list[torch.Tensor],
+) -> Any:
+    """Register a forward hook for a sweep signal on the appropriate
+    submodule. Returns the hook handle, or ``None`` if the signal is
+    unavailable for this layer (e.g. router_logits on a dense layer)."""
+    if sig == "attn_delta":
+        def _hook(_mod: Any, _inp: Any, out: Any) -> None:
+            delta = out[0] if isinstance(out, tuple) else out
+            buf.append(delta.detach())
+        mod = _get_attn_submodule(layer_module)
+        return mod.register_forward_hook(_hook)
+    if sig == "mlp_delta":
+        def _hook(_mod: Any, _inp: Any, out: Any) -> None:
+            delta = out[0] if isinstance(out, tuple) else out
+            buf.append(delta.detach())
+        mod = _get_mlp_submodule(layer_module)
+        return mod.register_forward_hook(_hook)
+    if sig == "router_logits":
+        if router_module_template is None:
+            return None
+        router_path = router_module_template.format(layer=layer_idx)
+        if router_path.startswith("model."):
+            router_path = router_path[len("model."):]
+        try:
+            router_mod = model
+            for part in router_path.split("."):
+                if part.isdigit():
+                    router_mod = router_mod[int(part)]
+                else:
+                    router_mod = getattr(router_mod, part)
+        except (AttributeError, IndexError):
+            return None
+
+        if router_strategy == "input_gate":
+            # DeepSeek-style: compute logits from module input × gate weight.
+            def _hook_ig(mod: Any, args: Any, out: Any) -> None:
+                hs_in = args[0] if isinstance(args, tuple) else args
+                gate_w = mod.gate.weight
+                logits = torch.nn.functional.linear(
+                    hs_in.to(gate_w.dtype), gate_w,
+                )
+                buf.append(logits.detach())
+            return router_mod.register_forward_hook(_hook_ig)
+        else:
+            def _hook_out(_mod: Any, _inp: Any, out: Any) -> None:
+                if isinstance(out, tuple):
+                    buf.append(out[0].detach())
+                else:
+                    buf.append(out.detach())
+            return router_mod.register_forward_hook(_hook_out)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -3190,493 +2743,6 @@ class DiskOffloadBackend(ExtractionBackend):
             logits_indices=None,
             router_logits=captured_router if captured_router else None,
             hidden_per_layer=captured_hidden if captured_hidden else None,
-        )
-
-    # --- Scan: full-dataset layer-by-layer with PCA ---
-
-    def scan_forward(
-        self,
-        prompts: list[str],
-        signals: list[str] | None = None,
-        n_components: int = 64,
-        batch_size: int = 4,
-        generative_masks: list[np.ndarray] | None = None,
-        external_bases: dict[str, np.ndarray] | None = None,
-        reducers: Mapping[str, tuple[Reducer, Any]] | None = None,
-    ) -> tuple[
-        dict[str, Any],                # metadata
-        dict[str, np.ndarray],          # bases
-        np.ndarray,                     # projections [N_total, 1, k]
-        dict[str, np.ndarray],          # coords
-        list[list[int]],                # token_ids per sample
-        list[int],                      # seq_lengths per sample
-        torch.Tensor,                   # attention_mask
-        dict[str, int],                 # signal_dims
-    ]:
-        """Run a full scan forward pass, loading layers from disk.
-
-        Same interface as ChunkedLocalBackend.scan_forward but loads each
-        layer's weights from safetensors files instead of keeping the full
-        model in CPU RAM. Enables scanning 70B+ models on machines with
-        limited CPU memory.
-
-        The ``reducers`` parameter (spec 003) has the same semantics as in
-        :meth:`ChunkedLocalBackend.scan_forward`: when provided, per-token
-        projections never accumulate across layers and the returned
-        projection array is empty.
-        """
-        import gc
-
-        import numpy as np
-        from tqdm import tqdm
-
-        if signals is None:
-            signals = ["attn_delta", "mlp_delta"]
-
-        if reducers is not None:
-            if external_bases is None:
-                raise ValueError(
-                    "scan_forward: reducers=... requires external_bases=... "
-                    "(reducers only operate on stream-projected signals)."
-                )
-            missing = [s for s in signals if s not in external_bases]
-            if missing:
-                raise ValueError(
-                    "scan_forward: reducers=... requires external_bases to "
-                    f"cover every signal; missing {missing}."
-                )
-
-        config = self._get_config()
-        model = self._get_model_skeleton()
-        layer_map, non_layer = self._get_shard_map()
-        device = self.device
-        num_layers = config.num_hidden_layers
-        hidden_dim: int | None = None
-
-        # --- Tokenize ---
-        tokenized = self.tokenizer(
-            prompts, return_tensors="pt", padding=True,
-        )
-        all_input_ids = tokenized["input_ids"]
-        all_attention_mask = tokenized["attention_mask"]
-
-        token_ids_per_sample: list[list[int]] = []
-        seq_lengths: list[int] = []
-        for i in range(len(prompts)):
-            mask_i = all_attention_mask[i]
-            real_len = int(mask_i.sum().item())
-            seq_lengths.append(real_len)
-            token_ids_per_sample.append(
-                all_input_ids[i, :real_len].tolist()
-            )
-
-        n_samples = len(prompts)
-        batches = [
-            (s, min(s + batch_size, n_samples))
-            for s in range(0, n_samples, batch_size)
-        ]
-
-        # --- Phase 1: Embedding ---
-        embed_tensors = [(n, f) for n, f in non_layer if "embed_tokens" in n]
-        embed_weights = self._load_tensors(embed_tensors, device)
-        embed = _get_embedding_module(model)
-        _materialize_module(embed, embed_weights, "model.embed_tokens.", device)
-        del embed_weights
-
-        batch_hidden_states: list[torch.Tensor] = []
-        batch_pos_ids: list[torch.Tensor] = []
-        batch_cache_positions: list[torch.Tensor] = []
-        # Causal masks are *not* pre-computed: a [B, 1, S, S] bf16 mask is
-        # S²-heavy and, for 1000+ batches on long sequences, exceeds the
-        # residual buffer in CPU footprint. Built lazily per-batch below.
-
-        with torch.no_grad():
-            for start, end in batches:
-                ids = all_input_ids[start:end]
-                mask = all_attention_mask[start:end]
-                hs = embed(ids.to(device)).cpu()
-                batch_hidden_states.append(hs)
-
-                seq_len = ids.shape[1]
-                pos_ids = mask.long().cumsum(-1) - 1
-                pos_ids.masked_fill_(mask == 0, 1)
-                batch_pos_ids.append(pos_ids)
-                batch_cache_positions.append(torch.arange(seq_len))
-
-                if hidden_dim is None:
-                    hidden_dim = hs.shape[-1]
-
-        _free_module(embed)
-        torch.cuda.empty_cache()
-
-        # --- Rotary embeddings ---
-        position_embeddings: tuple[torch.Tensor, ...] | torch.Tensor | dict | None = None
-        layer_types: list[str] | None = None
-        rotary_name = ChunkedLocalBackend._find_rotary_embedding_name(model)
-        if rotary_name is not None:
-            rotary_mod = model
-            for part in rotary_name.split("."):
-                rotary_mod = getattr(rotary_mod, part)
-
-            # Re-initialize rotary from config
-            text_cfg = getattr(config, "text_config", config)
-            dim = getattr(text_cfg, "qk_rope_head_dim", None)
-            if dim is None:
-                head_dim = text_cfg.hidden_size // text_cfg.num_attention_heads
-                dim = head_dim
-            base = getattr(text_cfg, "rope_theta", 10000.0)
-            inv_freq = 1.0 / (
-                base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
-            )
-            rotary_mod.to_empty(device=device)
-            rotary_mod.inv_freq = inv_freq
-
-            layer_types_cfg = getattr(text_cfg, "layer_types", None)
-            # Only use per-layer-type PE if there are actually different types
-            # (e.g. Gemma has sliding_window + global). If all the same, skip.
-            # Use a single sample's pos_ids so cos/sin broadcast to any batch size
-            pe_hs = batch_hidden_states[0][:1].to(device)
-            pe_pos = batch_pos_ids[0][:1].to(device)
-
-            unique_types = set(layer_types_cfg) if layer_types_cfg else set()
-            if layer_types_cfg and len(unique_types) > 1:
-                layer_types = list(layer_types_cfg)
-                position_embeddings = {}
-                with torch.no_grad():
-                    for lt in unique_types:
-                        pe = rotary_mod(pe_hs, pe_pos, layer_type=lt)
-                        position_embeddings[lt] = tuple(t.cpu() for t in pe)
-            else:
-                if layer_types_cfg is not None:
-                    layer_types = list(layer_types_cfg)
-                with torch.no_grad():
-                    pe = rotary_mod(pe_hs, pe_pos)
-                    if isinstance(pe, tuple):
-                        position_embeddings = tuple(t.cpu() for t in pe)
-                    else:
-                        position_embeddings = pe.cpu()
-
-            _free_module(rotary_mod)
-            torch.cuda.empty_cache()
-
-        assert hidden_dim is not None
-        decoder_layers = _get_decoder_layers(model)
-
-        # Accumulators
-        signal_bases: dict[str, list[np.ndarray | None]] = {
-            sig: [None] * num_layers for sig in signals
-        }
-        signal_dims: dict[str, int] = {}
-        # Pre-allocated per-scan outputs — same rationale as the chunked
-        # backend (see the equivalent comment there). Keeps cross-layer
-        # memory constant on multi-layer scans of long-sequence corpora.
-        # Skip under the reducers path — nothing is written there.
-        N_total = all_input_ids.shape[0]
-        S_max = all_input_ids.shape[1]
-        n_signals = len(signals)
-        if reducers is None:
-            total_rows = num_layers * n_signals * N_total * S_max
-            all_projections = np.zeros(
-                (total_rows, 1, n_components), dtype=np.float16,
-            )
-            all_coord_sample_id = np.zeros(total_rows, dtype=np.int32)
-            all_coord_layer = np.zeros(total_rows, dtype=np.int16)
-            all_coord_token_pos = np.zeros(total_rows, dtype=np.int16)
-            all_coord_signal = np.zeros(total_rows, dtype=np.int8)
-        else:
-            all_projections = np.zeros((0, 1, n_components), dtype=np.float16)
-            all_coord_sample_id = np.zeros(0, dtype=np.int32)
-            all_coord_layer = np.zeros(0, dtype=np.int16)
-            all_coord_token_pos = np.zeros(0, dtype=np.int16)
-            all_coord_signal = np.zeros(0, dtype=np.int8)
-        proj_cursor: int = 0
-
-        # Spec 002: when projecting through a pre-fit basis, keep the basis
-        # on device and project each microbatch's delta on GPU rather than
-        # accumulating full [N, S, H] activations on CPU.
-        basis_gpu: dict[str, torch.Tensor] = {}
-        if external_bases is not None:
-            for sig, arr in external_bases.items():
-                basis_gpu[sig] = torch.from_numpy(
-                    np.ascontiguousarray(arr),
-                ).to(device=device, dtype=torch.float32)
-
-        def _stream_project(
-            delta: torch.Tensor, sig_name: str, layer_idx: int,
-        ) -> np.ndarray:
-            """Project [B, S, H] on GPU through basis_gpu[sig][layer], return
-            [B, S, k] fp16 numpy on CPU. Caller is responsible for coords."""
-            B, S, H = delta.shape
-            basis = basis_gpu[sig_name][layer_idx]  # [H, k] fp32
-            flat = delta.reshape(-1, H).to(torch.float32)
-            proj = (flat @ basis).reshape(B, S, -1).to(torch.float16)
-            out = proj.cpu().numpy()
-            del flat, proj
-            return out
-
-        # Spec 003: preload signal_bases / signal_dims from external_bases
-        # for the reducers path, since the per-layer assembly loop (which
-        # normally populates these for the stream path) is skipped for
-        # signals whose chunks list is empty.
-        signal_to_idx = {s: i for i, s in enumerate(signals)}
-        if reducers is not None and external_bases is not None:
-            for sig, arr in external_bases.items():
-                for L in range(num_layers):
-                    signal_bases[sig][L] = arr[L]
-                signal_dims.setdefault(sig, arr.shape[1])
-
-        def _dispatch_reducers(
-            proj_cpu: np.ndarray,
-            sig_name: str,
-            layer_idx: int,
-            start: int,
-            end: int,
-        ) -> None:
-            """Spec 003: feed one microbatch's projection to every reducer."""
-            assert reducers is not None
-            sample_ids_batch = np.arange(start, end)
-            mask_batch_np = (
-                all_attention_mask[start:end].cpu().numpy().astype(bool)
-            )
-            sig_idx = signal_to_idx[sig_name]
-            for _name, (red, state) in reducers.items():
-                red.update(
-                    state, proj_cpu, sample_ids_batch,
-                    layer_idx, sig_idx, mask_batch_np,
-                )
-
-        # --- Phase 2: Layer-by-layer ---
-        layer_pbar = tqdm(range(num_layers), desc="Scan: layers")
-        for layer_idx in layer_pbar:
-            layer_pbar.set_postfix(layer=layer_idx)
-
-            # Load layer weights from disk to GPU
-            layer_weights = self._load_tensors(layer_map[layer_idx], "cpu")
-            prefix = f"model.layers.{layer_idx}."
-            layer_module = decoder_layers[layer_idx]
-            _materialize_module(layer_module, layer_weights, prefix, device)
-            del layer_weights
-
-            # Legacy path accumulates CPU tensors for PCA fit.
-            per_signal_captures: dict[str, list[torch.Tensor]] = {
-                sig: [] for sig in signals
-            }
-            # Stream-project path accumulates already-projected np arrays.
-            per_signal_projected: dict[str, list[np.ndarray]] = {
-                sig: [] for sig in signals
-            }
-
-            for batch_idx, (start, end) in enumerate(batches):
-                hs = batch_hidden_states[batch_idx].to(device)
-                # Build causal mask on-the-fly — see note at the batch
-                # pre-compute block above. Scoped locally so the CPU-side
-                # [B, 1, S, S] tensor is released as soon as the batch ends.
-                mask_2d = all_attention_mask[start:end]
-                mask_dev = _make_causal_mask(mask_2d, self.dtype).to(device)
-                pos_dev = batch_pos_ids[batch_idx].to(device)
-                pe_dev = ChunkedLocalBackend._pe_to_device(position_embeddings, device)
-
-                with torch.no_grad():
-                    # Set up signal hooks — keep captures on GPU when we're
-                    # going to stream-project them; else move to CPU as before.
-                    hooks: list[tuple[str, Any, list[torch.Tensor]]] = []
-                    capture_residual = False
-                    for sig in signals:
-                        if sig == "residual":
-                            capture_residual = True
-                            continue
-                        buf: list[torch.Tensor] = []
-                        stream = (
-                            external_bases is not None
-                            and sig in external_bases
-                        )
-
-                        def _hook(
-                            _mod: Any, _inp: Any, out: Any,
-                            _buf: list = buf,
-                            _stream: bool = stream,
-                        ) -> None:
-                            delta = out[0] if isinstance(out, tuple) else out
-                            if _stream:
-                                _buf.append(delta.detach())
-                            else:
-                                _buf.append(delta.detach().cpu())
-                        if sig == "attn_delta":
-                            mod = _get_attn_submodule(layer_module)
-                            h = mod.register_forward_hook(_hook)
-                            hooks.append((sig, h, buf))
-                        elif sig == "mlp_delta":
-                            mod = _get_mlp_submodule(layer_module)
-                            h = mod.register_forward_hook(_hook)
-                            hooks.append((sig, h, buf))
-
-                    layer_kwargs = ChunkedLocalBackend._build_layer_kwargs(
-                        mask_dev, pos_dev, batch_cache_positions[batch_idx],
-                        pe_dev, layer_types, layer_idx, device,
-                    )
-
-                    output = layer_module(hs, **layer_kwargs)
-                    hs = output[0] if isinstance(output, tuple) else output
-
-                    for sig_name, handle, hook_buf in hooks:
-                        handle.remove()
-                        if not hook_buf:
-                            continue
-                        if (
-                            external_bases is not None
-                            and sig_name in external_bases
-                        ):
-                            delta_gpu = hook_buf[0]
-                            if sig_name not in signal_dims:
-                                signal_dims[sig_name] = delta_gpu.shape[-1]
-                            proj_cpu = _stream_project(
-                                delta_gpu, sig_name, layer_idx,
-                            )
-                            if reducers is not None:
-                                _dispatch_reducers(
-                                    proj_cpu, sig_name, layer_idx,
-                                    start, end,
-                                )
-                                del proj_cpu
-                            else:
-                                per_signal_projected[sig_name].append(proj_cpu)
-                            del delta_gpu
-                        else:
-                            per_signal_captures[sig_name].append(hook_buf[0])
-
-                    if capture_residual:
-                        if (
-                            external_bases is not None
-                            and "residual" in external_bases
-                        ):
-                            if "residual" not in signal_dims:
-                                signal_dims["residual"] = hs.shape[-1]
-                            proj_cpu = _stream_project(
-                                hs.detach(), "residual", layer_idx,
-                            )
-                            if reducers is not None:
-                                _dispatch_reducers(
-                                    proj_cpu, "residual", layer_idx,
-                                    start, end,
-                                )
-                                del proj_cpu
-                            else:
-                                per_signal_projected["residual"].append(proj_cpu)
-                        else:
-                            per_signal_captures["residual"].append(
-                                hs.detach().cpu(),
-                            )
-
-                batch_hidden_states[batch_idx] = hs.cpu()
-                del hs, mask_dev, pos_dev, pe_dev
-
-            # Free layer weights
-            _free_module(layer_module)
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            # --- Per-layer assembly ---
-            for sig_idx, sig_name in enumerate(signals):
-                stream = (
-                    external_bases is not None
-                    and sig_name in external_bases
-                )
-
-                if stream:
-                    chunks = per_signal_projected[sig_name]
-                    if not chunks:
-                        continue
-                    assert external_bases is not None
-                    basis = external_bases[sig_name][layer_idx]
-                    signal_bases[sig_name][layer_idx] = basis
-                    k = basis.shape[1]
-                    stacked_proj = np.concatenate(chunks, axis=0)  # [B_total, S, k]
-                    B_total, S, _ = stacked_proj.shape
-                    projected = stacked_proj.reshape(-1, k)
-                    del stacked_proj
-                else:
-                    captures = per_signal_captures[sig_name]
-                    if not captures:
-                        continue
-                    if sig_name not in signal_dims:
-                        signal_dims[sig_name] = int(captures[0].shape[2])
-                    basis, projected, B_total, S, dim = _fit_project_scan_pca(
-                        captures,
-                        device=device,
-                        n_components=n_components,
-                        generative_masks=generative_masks,
-                    )
-                    k = basis.shape[1]
-                    signal_bases[sig_name][layer_idx] = basis
-                    per_signal_captures[sig_name] = []
-                    del captures
-
-                block = B_total * S
-                row_end = proj_cursor + block
-                all_projections[proj_cursor:row_end, 0, :k] = projected
-                if k < n_components:
-                    all_projections[proj_cursor:row_end, 0, k:] = 0
-                all_coord_sample_id[proj_cursor:row_end] = np.repeat(
-                    np.arange(B_total, dtype=np.int32), S,
-                )
-                all_coord_layer[proj_cursor:row_end] = layer_idx
-                all_coord_token_pos[proj_cursor:row_end] = np.tile(
-                    np.arange(S, dtype=np.int16), B_total,
-                )
-                all_coord_signal[proj_cursor:row_end] = sig_idx
-                proj_cursor = row_end
-
-                del projected
-
-            del per_signal_captures, per_signal_projected
-            gc.collect()
-
-        # Assemble bases
-        final_bases: dict[str, np.ndarray] = {}
-        for sig_name in signals:
-            dim = signal_dims.get(sig_name, hidden_dim)
-            k_eff = min(n_components, dim)
-            basis_arr = np.zeros((num_layers, dim, k_eff), dtype=np.float16)
-            for L in range(num_layers):
-                layer_basis = signal_bases[sig_name][L]
-                if layer_basis is not None:
-                    actual_k = layer_basis.shape[1]
-                    basis_arr[L, :, :actual_k] = layer_basis
-            final_bases[sig_name] = basis_arr
-
-        # Truncate pre-allocated outputs to cursor. In the reducers path
-        # (spec 003) cursor stays 0 and these become empty views.
-        all_projections = all_projections[:proj_cursor]
-        all_coord_sample_id = all_coord_sample_id[:proj_cursor]
-        all_coord_layer = all_coord_layer[:proj_cursor]
-        all_coord_token_pos = all_coord_token_pos[:proj_cursor]
-        all_coord_signal = all_coord_signal[:proj_cursor]
-
-        metadata = {
-            "model_id": self.model_name,
-            "hidden_dim": hidden_dim,
-            "n_layers": num_layers,
-            "n_components": n_components,
-            "n_samples": n_samples,
-            "signals": signals,
-        }
-
-        coords = {
-            "sample_id": all_coord_sample_id,
-            "layer": all_coord_layer,
-            "token_pos": all_coord_token_pos,
-            "signal": all_coord_signal,
-        }
-
-        return (
-            metadata,
-            final_bases,
-            all_projections,
-            coords,
-            token_ids_per_sample,
-            seq_lengths,
-            all_attention_mask,
-            signal_dims,
         )
 
     def project_forward(
