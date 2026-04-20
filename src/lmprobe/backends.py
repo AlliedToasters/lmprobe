@@ -20,6 +20,8 @@ import numpy as np
 import torch
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from transformers import PreTrainedTokenizerBase
 
     from .activation_types import ExtractedBatch, ExtractionSpec
@@ -2491,7 +2493,7 @@ class DiskOffloadBackend(ExtractionBackend):
         spec: ExtractionSpec,
         batch_size: int = 16,
         pool: str | None = None,
-        logit_callback: "Callable[[int, int, torch.Tensor, torch.Tensor], None] | None" = None,
+        logit_callback: Callable[[int, int, torch.Tensor, torch.Tensor], None] | None = None,
     ) -> ExtractedBatch:
         """Extract features from *all* prompts, loading each layer once.
 
@@ -3067,7 +3069,7 @@ class DiskOffloadBackend(ExtractionBackend):
         self,
         prompts: list[str],
         layer_indices: list[int],
-        on_batch: "Callable[[int, int, torch.Tensor, torch.Tensor], None]",
+        on_batch: Callable[[int, int, torch.Tensor, torch.Tensor], None],
         batch_size: int = 4,
     ) -> torch.Tensor:
         """Run ONE full layer sweep for ALL prompts, streaming logits per mini-batch.
