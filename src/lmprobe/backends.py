@@ -782,8 +782,9 @@ class LocalBackend(ExtractionBackend):
             for h in hooks:
                 h.remove()
 
-        # Collect and concatenate activations
-        activation_tensors = [captured[idx].cpu() for idx in layer_indices]
+        # Concatenate activations on their native device; callers handle
+        # any CPU transfer for persistence.
+        activation_tensors = [captured[idx] for idx in layer_indices]
         combined = torch.cat(activation_tensors, dim=-1)
 
         return combined, tokenized["attention_mask"]
@@ -1188,6 +1189,51 @@ def _estimate_chunk_size(
     return min(chunk_size, num_layers)
 
 
+def _estimate_disk_offload_layers_per_group(
+    model_name: str,
+    device: str,
+    dtype: torch.dtype,
+) -> int:
+    """Estimate how many transformer layers can be co-resident on GPU for disk_offload.
+
+    Same estimation logic as :func:`_estimate_chunk_size` but reserves 40%
+    headroom (instead of 30%) to leave room for activations while multiple
+    layers are on device simultaneously.
+
+    Returns
+    -------
+    int
+        Layers per group, clamped to ``[1, num_layers]``.
+    """
+    from .extraction import get_num_layers_from_config
+
+    num_layers = get_num_layers_from_config(model_name)
+
+    if device == "cpu" or not torch.cuda.is_available():
+        return num_layers
+
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model_name)
+    text_cfg = getattr(config, "text_config", config)
+    hidden_size = text_cfg.hidden_size
+    intermediate_size = getattr(text_cfg, "intermediate_size", hidden_size * 4)
+
+    bytes_per_param = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+    params_per_layer = 4 * hidden_size * hidden_size + 3 * hidden_size * intermediate_size
+    layer_bytes = params_per_layer * bytes_per_param
+
+    try:
+        free_vram, _total = torch.cuda.mem_get_info(device)
+    except Exception:
+        return 1
+
+    # Reserve 40% for activations and overhead
+    available = free_vram * 0.6
+    lpg = max(1, int(available / layer_bytes))
+    return min(lpg, num_layers)
+
+
 # ---------------------------------------------------------------------------
 # ChunkedLocalBackend
 # ---------------------------------------------------------------------------
@@ -1325,6 +1371,7 @@ class ChunkedLocalBackend(ExtractionBackend):
         router_layer_indices: list[int] | None = None,
         router_module_template: str | None = None,
         router_hook_strategy: str = "output",
+        batch_size: int | None = None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor,
@@ -1368,11 +1415,12 @@ class ChunkedLocalBackend(ExtractionBackend):
             )
             return None, tokenized["attention_mask"], None, None
 
+        effective_bs = batch_size if batch_size is not None else len(prompts)
         out = sweep(
             prompts,
             accumulators=accumulators,
             loader=loader,
-            batch_size=len(prompts),
+            batch_size=effective_bs,
         )
 
         activations = out["hs"] if "hs" in accumulators else None
@@ -1547,6 +1595,7 @@ class ChunkedLocalBackend(ExtractionBackend):
     ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         activations, attention_mask, logits, _ = self._chunked_forward(
             prompts, layer_indices, include_logits=True,
+            batch_size=kwargs.get("batch_size"),
         )
         assert logits is not None
         return activations, attention_mask, logits, None
@@ -2310,15 +2359,26 @@ class DiskOffloadBackend(ExtractionBackend):
         model_name: str,
         device: str = "cuda:0",
         dtype: torch.dtype = torch.bfloat16,
+        layers_per_group: int | str = "auto",
     ):
         super().__init__(model_name, device)
         self.dtype = dtype
+        self._layers_per_group_param: int | str = layers_per_group
         self._tokenizer_obj: Any | None = None
         self._config: Any | None = None
         self._model_skeleton: Any | None = None
         self._snapshot_dir: Any | None = None
         self._layer_to_tensors: dict | None = None
         self._non_layer_tensors: list | None = None
+
+    @property
+    def layers_per_group(self) -> int:
+        """Resolved number of layers to co-load on GPU per group."""
+        if self._layers_per_group_param == "auto":
+            return _estimate_disk_offload_layers_per_group(
+                self.model_name, self.device, self.dtype,
+            )
+        return int(self._layers_per_group_param)
 
     # --- Lazy initialization ---
 
@@ -2431,6 +2491,7 @@ class DiskOffloadBackend(ExtractionBackend):
         spec: ExtractionSpec,
         batch_size: int = 16,
         pool: str | None = None,
+        logit_callback: "Callable[[int, int, torch.Tensor, torch.Tensor], None] | None" = None,
     ) -> ExtractedBatch:
         """Extract features from *all* prompts, loading each layer once.
 
@@ -2546,152 +2607,168 @@ class DiskOffloadBackend(ExtractionBackend):
             _free_module(rotary_mod)
             torch.cuda.empty_cache()
 
-        # --- Phase 2: Layer-by-layer ---
+        # --- Phase 2: Layer-by-layer (grouped) ---
         captured_hidden: dict[int, torch.Tensor] = {}
         captured_router: dict[int, torch.Tensor] = {}
         decoder_layers = _get_decoder_layers(model)
 
-        for layer_idx in range(num_layers):
-            # Load layer weights: CPU first, then materialize on GPU
-            layer_weights = self._load_tensors(
-                layer_map[layer_idx], "cpu",
+        # Resolve layers-per-group: how many layers to hold on GPU at once.
+        lpg_param = self._layers_per_group_param
+        if lpg_param == "auto":
+            layers_per_group = _estimate_disk_offload_layers_per_group(
+                self.model_name, device, self.dtype,
             )
-            prefix = f"model.layers.{layer_idx}."
+        else:
+            layers_per_group = int(lpg_param)
 
-            # Pack expert weights for MoE layers
-            if n_experts and layer_idx >= first_moe:
-                packed = _pack_expert_weights(
-                    layer_weights, prefix, n_experts, device,
-                )
-                layer_weights.update(packed)
-                del packed
-
-            layer_module = decoder_layers[layer_idx]
-            _materialize_module(layer_module, layer_weights, prefix, device)
-            del layer_weights
-
-            # Prepare per-batch args on GPU
-            mask_dev = causal_mask.to(device)
-            pos_cache_dev = cache_position.to(device)
-            if position_embeddings is not None:
-                if isinstance(position_embeddings, tuple):
-                    pe_dev: Any = tuple(t.to(device) for t in position_embeddings)
-                else:
-                    pe_dev = position_embeddings.to(device)
+        # Shared per-device constants (same for every layer)
+        mask_dev = causal_mask.to(device)
+        pos_cache_dev = cache_position.to(device)
+        if position_embeddings is not None:
+            if isinstance(position_embeddings, tuple):
+                pe_dev: Any = tuple(t.to(device) for t in position_embeddings)
             else:
-                pe_dev = None
+                pe_dev = position_embeddings.to(device)
+        else:
+            pe_dev = None
 
-            layer_hidden_out = []
-            layer_router_out = []
+        group_start = 0
+        while group_start < num_layers:
+            group_indices = list(range(
+                group_start, min(group_start + layers_per_group, num_layers),
+            ))
+            group_start += layers_per_group
 
-            with torch.no_grad():
-                for b in range(n_batches):
-                    s = b * batch_size
-                    e = min(s + batch_size, n_prompts)
-                    hs = all_hidden[s:e].to(device)
-                    pos_dev = position_ids[s:e].to(device)
-
-                    # Expand causal mask for batch
-                    batch_mask = mask_dev.expand(e - s, -1, -1, -1)
-                    # Apply padding mask
-                    pad_mask = all_attention_mask[s:e, None, None, :].to(self.dtype).to(device)
-                    batch_mask = batch_mask.clone()
-                    batch_mask.masked_fill_(pad_mask == 0, min_val)
-
-                    # Router hook
-                    rh = None
-                    router_buf: list[torch.Tensor] = []
-                    if layer_idx in router_target and spec.router_module_template:
-                        router_path = spec.router_module_template.format(layer=layer_idx)
-                        if router_path.startswith("model."):
-                            router_path = router_path[len("model."):]
-                        rmod = model
-                        for part in router_path.split("."):
-                            rmod = rmod[int(part)] if part.isdigit() else getattr(rmod, part)
-
-                        if spec.router_hook_strategy == "input_gate":
-                            def _ig_hook(
-                                mod: Any, args: Any, out: Any,
-                                _buf: list = router_buf,
-                            ) -> None:
-                                hs_in = args[0] if isinstance(args, tuple) else args
-                                gw = mod.gate.weight
-                                _buf.append(
-                                    torch.nn.functional.linear(
-                                        hs_in.to(gw.dtype), gw,
-                                    ).detach().cpu()
-                                )
-                            rh = rmod.register_forward_hook(_ig_hook)
-                        else:
-                            def _out_hook(
-                                _mod: Any, _inp: Any, out: Any,
-                                _buf: list = router_buf,
-                            ) -> None:
-                                t = out[0] if isinstance(out, tuple) else out
-                                _buf.append(t.detach().cpu())
-                            rh = rmod.register_forward_hook(_out_hook)
-
-                    # Layer forward
-                    layer_kwargs: dict[str, Any] = {
-                        "attention_mask": batch_mask,
-                        "position_ids": pos_dev,
-                        "use_cache": False,
-                        "cache_position": pos_cache_dev,
-                    }
-                    if pe_dev is not None:
-                        layer_kwargs["position_embeddings"] = pe_dev
-
-                    output = layer_module(hs, **layer_kwargs)
-                    hs_out = output[0] if isinstance(output, tuple) else output
-
-                    # Store hidden states back to CPU buffer
-                    all_hidden[s:e] = hs_out.to(self.dtype).cpu()
-
-                    # Capture probe features (last token only is done by caller)
-                    if layer_idx in hidden_target:
-                        layer_hidden_out.append(hs_out.detach().cpu())
-
-                    if rh is not None:
-                        rh.remove()
-                        if router_buf:
-                            layer_router_out.append(router_buf[0])
-
-            # Collect captured features for this layer
-            if layer_hidden_out:
-                full = torch.cat(layer_hidden_out, dim=0)  # (N, seq, dim)
-                if pool == "mean":
-                    # Mean-pool over valid tokens: (N, seq, dim) -> (N, dim)
-                    pooled = torch.zeros(
-                        full.shape[0], full.shape[2], dtype=torch.float32,
+            # Load all layers in group onto GPU
+            for layer_idx in group_indices:
+                layer_weights = self._load_tensors(layer_map[layer_idx], "cpu")
+                prefix = f"model.layers.{layer_idx}."
+                if n_experts and layer_idx >= first_moe:
+                    packed = _pack_expert_weights(
+                        layer_weights, prefix, n_experts, device,
                     )
-                    for i in range(full.shape[0]):
-                        valid = all_attention_mask[i].bool()
-                        if valid.sum().item() > 0:
-                            pooled[i] = full[i, valid].float().mean(dim=0)
-                    captured_hidden[layer_idx] = pooled
-                else:
-                    captured_hidden[layer_idx] = full
-                del full
-            if layer_router_out:
-                full_r = torch.cat(layer_router_out, dim=0)  # (N, seq, n_experts)
-                if pool == "mean":
-                    pooled_r = torch.zeros(
-                        full_r.shape[0], full_r.shape[2], dtype=torch.float32,
-                    )
-                    for i in range(full_r.shape[0]):
-                        valid = all_attention_mask[i].bool()
-                        if valid.sum().item() > 0:
-                            pooled_r[i] = full_r[i, valid].float().mean(dim=0)
-                    captured_router[layer_idx] = pooled_r
-                else:
-                    captured_router[layer_idx] = full_r
-                del full_r
+                    layer_weights.update(packed)
+                    del packed
+                _materialize_module(
+                    decoder_layers[layer_idx], layer_weights, prefix, device,
+                )
+                del layer_weights
 
-            # Free layer
-            _free_module(layer_module)
-            del mask_dev, pos_cache_dev, pe_dev
+            # Process each layer in the group sequentially
+            for layer_idx in group_indices:
+                layer_module = decoder_layers[layer_idx]
+                layer_hidden_out = []
+                layer_router_out = []
+
+                with torch.no_grad():
+                    for b in range(n_batches):
+                        s = b * batch_size
+                        e = min(s + batch_size, n_prompts)
+                        hs = all_hidden[s:e].to(device)
+                        pos_dev = position_ids[s:e].to(device)
+
+                        # Expand causal mask for batch
+                        batch_mask = mask_dev.expand(e - s, -1, -1, -1)
+                        # Apply padding mask
+                        pad_mask = all_attention_mask[s:e, None, None, :].to(self.dtype).to(device)
+                        batch_mask = batch_mask.clone()
+                        batch_mask.masked_fill_(pad_mask == 0, min_val)
+
+                        # Router hook
+                        rh = None
+                        router_buf: list[torch.Tensor] = []
+                        if layer_idx in router_target and spec.router_module_template:
+                            router_path = spec.router_module_template.format(layer=layer_idx)
+                            if router_path.startswith("model."):
+                                router_path = router_path[len("model."):]
+                            rmod = model
+                            for part in router_path.split("."):
+                                rmod = rmod[int(part)] if part.isdigit() else getattr(rmod, part)
+
+                            if spec.router_hook_strategy == "input_gate":
+                                def _ig_hook(
+                                    mod: Any, args: Any, out: Any,
+                                    _buf: list = router_buf,
+                                ) -> None:
+                                    hs_in = args[0] if isinstance(args, tuple) else args
+                                    gw = mod.gate.weight
+                                    _buf.append(
+                                        torch.nn.functional.linear(
+                                            hs_in.to(gw.dtype), gw,
+                                        ).detach().cpu()
+                                    )
+                                rh = rmod.register_forward_hook(_ig_hook)
+                            else:
+                                def _out_hook(
+                                    _mod: Any, _inp: Any, out: Any,
+                                    _buf: list = router_buf,
+                                ) -> None:
+                                    t = out[0] if isinstance(out, tuple) else out
+                                    _buf.append(t.detach().cpu())
+                                rh = rmod.register_forward_hook(_out_hook)
+
+                        # Layer forward
+                        layer_kwargs: dict[str, Any] = {
+                            "attention_mask": batch_mask,
+                            "position_ids": pos_dev,
+                            "use_cache": False,
+                            "cache_position": pos_cache_dev,
+                        }
+                        if pe_dev is not None:
+                            layer_kwargs["position_embeddings"] = pe_dev
+
+                        output = layer_module(hs, **layer_kwargs)
+                        hs_out = output[0] if isinstance(output, tuple) else output
+
+                        # Store hidden states back to CPU buffer
+                        all_hidden[s:e] = hs_out.to(self.dtype).cpu()
+
+                        # Capture probe features (last token only is done by caller)
+                        if layer_idx in hidden_target:
+                            layer_hidden_out.append(hs_out.detach().cpu())
+
+                        if rh is not None:
+                            rh.remove()
+                            if router_buf:
+                                layer_router_out.append(router_buf[0])
+
+                # Collect captured features for this layer
+                if layer_hidden_out:
+                    full = torch.cat(layer_hidden_out, dim=0)  # (N, seq, dim)
+                    if pool == "mean":
+                        pooled = torch.zeros(
+                            full.shape[0], full.shape[2], dtype=torch.float32,
+                        )
+                        for i in range(full.shape[0]):
+                            valid = all_attention_mask[i].bool()
+                            if valid.sum().item() > 0:
+                                pooled[i] = full[i, valid].float().mean(dim=0)
+                        captured_hidden[layer_idx] = pooled
+                    else:
+                        captured_hidden[layer_idx] = full
+                    del full
+                if layer_router_out:
+                    full_r = torch.cat(layer_router_out, dim=0)  # (N, seq, n_experts)
+                    if pool == "mean":
+                        pooled_r = torch.zeros(
+                            full_r.shape[0], full_r.shape[2], dtype=torch.float32,
+                        )
+                        for i in range(full_r.shape[0]):
+                            valid = all_attention_mask[i].bool()
+                            if valid.sum().item() > 0:
+                                pooled_r[i] = full_r[i, valid].float().mean(dim=0)
+                        captured_router[layer_idx] = pooled_r
+                    else:
+                        captured_router[layer_idx] = full_r
+                    del full_r
+
+            # Free all layers in the group
+            for layer_idx in group_indices:
+                _free_module(decoder_layers[layer_idx])
             gc.collect()
             torch.cuda.empty_cache()
+
+        del mask_dev, pos_cache_dev, pe_dev
 
         # --- Phase 3: Logits (optional) ---
         logits_out: torch.Tensor | None = None
@@ -2712,16 +2789,19 @@ class DiskOffloadBackend(ExtractionBackend):
             _materialize_module(lm_head, head_w, "lm_head.", device)
             del head_w
 
-            logit_batches = []
+            logit_batches: list[torch.Tensor] = []
             with torch.no_grad():
                 for b in range(n_batches):
                     s = b * batch_size
                     e = min(s + batch_size, n_prompts)
                     hs_dev = all_hidden[s:e].to(device)
-                    logit_batches.append(
-                        lm_head(final_norm(hs_dev)).cpu()
-                    )
-            logits_out = torch.cat(logit_batches, dim=0)
+                    logits_b = lm_head(final_norm(hs_dev)).cpu()
+                    if logit_callback is not None:
+                        logit_callback(s, e, logits_b, all_attention_mask[s:e])
+                    else:
+                        logit_batches.append(logits_b)
+            if logit_batches:
+                logits_out = torch.cat(logit_batches, dim=0)
 
             _free_module(final_norm)
             _free_module(lm_head)
@@ -2978,9 +3058,36 @@ class DiskOffloadBackend(ExtractionBackend):
     ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         from .activation_types import ExtractionSpec
         spec = ExtractionSpec(hidden_layers=layer_indices, include_logits=True)
-        result = self.extract_all(prompts, spec, batch_size=len(prompts))
+        bs = kwargs.get("batch_size") or len(prompts)
+        result = self.extract_all(prompts, spec, batch_size=bs)
         assert result.logits is not None
         return result.activations, result.attention_mask, result.logits, None
+
+    def extract_batch_with_logits_streaming(
+        self,
+        prompts: list[str],
+        layer_indices: list[int],
+        on_batch: "Callable[[int, int, torch.Tensor, torch.Tensor], None]",
+        batch_size: int = 4,
+    ) -> torch.Tensor:
+        """Run ONE full layer sweep for ALL prompts, streaming logits per mini-batch.
+
+        ``on_batch(start, end, logits_b, attn_mask_b)`` is called for each
+        mini-batch of size ``batch_size``.  ``logits_b`` is CPU float32
+        ``[bs, S_max, V]``; ``attn_mask_b`` is ``[bs, S_max]``.
+
+        Returns ``attention_mask`` for the full prompt set (CPU, ``[N, S_max]``).
+
+        This avoids the ``[N, S_max, V]`` OOM that ``extract_batch_with_logits``
+        hits when N is large.  Layer weights are loaded once for the full sweep
+        instead of once per microbatch.
+        """
+        from .activation_types import ExtractionSpec
+        spec = ExtractionSpec(hidden_layers=layer_indices, include_logits=True)
+        result = self.extract_all(
+            prompts, spec, batch_size=batch_size, logit_callback=on_batch,
+        )
+        return result.attention_mask
 
     def extract_batch_extended(
         self,
@@ -3023,6 +3130,14 @@ class DiskOffloadLayerLoader:
         self.device: str = backend.device
         self.layer_types: list[str] | None = None
         self.router_module_template: str | None = None
+
+        lpg_param = backend._layers_per_group_param
+        if lpg_param == "auto":
+            self._layers_per_group: int = _estimate_disk_offload_layers_per_group(
+                backend.model_name, backend.device, backend.dtype,
+            )
+        else:
+            self._layers_per_group = int(lpg_param)
 
     # --- LayerLoader protocol ------------------------------------------------
 
@@ -3219,10 +3334,9 @@ class DiskOffloadLayerLoader:
         return position_embeddings, layer_types
 
     def iter_layer_groups(self) -> Any:
-        # One layer per group — safetensors load is the bottleneck, so we
-        # never co-locate layers on device.
-        for i in range(self.num_layers):
-            yield [i]
+        lpg = self._layers_per_group
+        for i in range(0, self.num_layers, lpg):
+            yield list(range(i, min(i + lpg, self.num_layers)))
 
     def layer_group(self, indices: list[int]) -> Any:
         from contextlib import contextmanager
@@ -3516,6 +3630,7 @@ def resolve_backend(
     remote: bool = False,
     dtype: torch.dtype | None = None,
     chunk_size: int | str | None = None,
+    layers_per_group: int | str | None = None,
 ) -> ExtractionBackend:
     """Create an ExtractionBackend from a string identifier.
 
@@ -3537,6 +3652,11 @@ def resolve_backend(
     chunk_size : int or str or None
         Number of layers per chunk for ``backend="chunked"``.
         ``"auto"`` estimates from available VRAM. Ignored for other backends.
+    layers_per_group : int or str or None
+        Number of layers to co-resident on GPU simultaneously for
+        ``backend="disk_offload"``. ``"auto"`` (default) estimates from
+        available VRAM leaving 40% headroom. Pass an int to override.
+        Ignored for other backends.
 
     Returns
     -------
@@ -3581,7 +3701,8 @@ def resolve_backend(
                 "backend='disk_offload' does not support remote=True."
             )
         offload_dtype = dtype if dtype is not None else torch.bfloat16
-        return DiskOffloadBackend(model_name, device, dtype=offload_dtype)
+        lpg = layers_per_group if layers_per_group is not None else "auto"
+        return DiskOffloadBackend(model_name, device, dtype=offload_dtype, layers_per_group=lpg)
     else:
         raise ValueError(
             f"Unknown backend: {backend!r}. "
