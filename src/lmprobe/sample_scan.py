@@ -453,12 +453,14 @@ class SampleScan:
             DiskOffloadBackend,
             DiskOffloadLayerLoader,
         )
+        from .sweep import LayerLoader
         from .sweep import sweep as _sweep
 
         if external_bases is None:
             external_bases = self._bases
 
         backend = self._get_backend()
+        loader: LayerLoader
         if isinstance(backend, ChunkedLocalBackend):
             loader = ChunkedLayerLoader(backend)
         elif isinstance(backend, DiskOffloadBackend):
