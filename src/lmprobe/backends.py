@@ -2390,6 +2390,29 @@ class DiskOffloadBackend(ExtractionBackend):
             self._config = AutoConfig.from_pretrained(self.model_name)
         return self._config
 
+    def _get_text_config(self) -> Any:
+        """Return the text-transformer config.
+
+        For multimodal checkpoints (e.g. Mistral3, Pixtral) this is
+        ``config.text_config``. For text-only models it's the config itself.
+        """
+        cfg = self._get_config()
+        return getattr(cfg, "text_config", None) or cfg
+
+    @property
+    def _skeleton_prefix(self) -> str:
+        """Prefix that safetensors use ahead of the text skeleton's module paths.
+
+        Mistral3 / Pixtral checkpoints store text weights under
+        ``language_model.*`` while the text-only skeleton we build uses plain
+        ``model.*`` / ``lm_head.*`` paths. We strip this prefix at shard-map
+        time and reapply it when reading from the underlying safetensors.
+        """
+        cfg = self._get_config()
+        if getattr(cfg, "text_config", None) is not None:
+            return "language_model."
+        return ""
+
     def _get_snapshot_dir(self) -> Any:
         if self._snapshot_dir is None:
             from pathlib import Path
@@ -2411,20 +2434,36 @@ class DiskOffloadBackend(ExtractionBackend):
             with open(index_path) as f:
                 index = json.load(f)
 
+            prefix = self._skeleton_prefix
+            # For multimodal checkpoints, drop tensors that belong to the
+            # vision tower / multi-modal projector — the text-only skeleton
+            # has no modules for them.
+            drop_prefixes = (
+                ("vision_tower.", "multi_modal_projector.") if prefix else ()
+            )
+
             layers: dict[int, list[tuple[str, str]]] = defaultdict(list)
             non_layer: list[tuple[str, str]] = []
 
             for tensor_name, shard_file in index["weight_map"].items():
-                parts = tensor_name.split(".")
+                if drop_prefixes and tensor_name.startswith(drop_prefixes):
+                    continue
+                if prefix:
+                    if not tensor_name.startswith(prefix):
+                        continue
+                    stripped = tensor_name[len(prefix):]
+                else:
+                    stripped = tensor_name
+                parts = stripped.split(".")
                 if (
                     len(parts) >= 3
                     and parts[0] == "model"
                     and parts[1] == "layers"
                     and parts[2].isdigit()
                 ):
-                    layers[int(parts[2])].append((tensor_name, shard_file))
+                    layers[int(parts[2])].append((stripped, shard_file))
                 else:
-                    non_layer.append((tensor_name, shard_file))
+                    non_layer.append((stripped, shard_file))
 
             self._layer_to_tensors = dict(layers)
             self._non_layer_tensors = non_layer
@@ -2434,11 +2473,19 @@ class DiskOffloadBackend(ExtractionBackend):
     def _load_tensors(
         self, tensor_list: list[tuple[str, str]], device: str,
     ) -> dict[str, torch.Tensor]:
-        """Load tensors from safetensors shards to *device*."""
+        """Load tensors from safetensors shards to *device*.
+
+        ``tensor_list`` uses skeleton-relative names (``model.layers.N.*``).
+        For multimodal checkpoints the stored safetensors keys are prefixed
+        with :attr:`_skeleton_prefix` (e.g. ``language_model.``); we reattach
+        it here when looking up the shard, and key the result dict by the
+        skeleton-relative name so ``_materialize_module`` finds it.
+        """
         from collections import defaultdict
 
         from safetensors.torch import load_file as st_load_file
 
+        prefix = self._skeleton_prefix
         shard_to_keys: dict[str, list[str]] = defaultdict(list)
         for tensor_name, shard_file in tensor_list:
             shard_to_keys[shard_file].append(tensor_name)
@@ -2448,22 +2495,32 @@ class DiskOffloadBackend(ExtractionBackend):
         for shard_file, keys in shard_to_keys.items():
             shard_data = st_load_file(str(snap / shard_file), device=device)
             for k in keys:
-                if k in shard_data:
+                original = prefix + k
+                if original in shard_data:
+                    result[k] = shard_data[original]
+                elif k in shard_data:
                     result[k] = shard_data[k]
             del shard_data
         return result
 
     def _get_model_skeleton(self) -> Any:
-        """Create an empty model (meta device) for the forward graph."""
+        """Create an empty model (meta device) for the forward graph.
+
+        For multimodal checkpoints (e.g. Mistral3) the outer config class
+        isn't registered for ``AutoModelForCausalLM``; we build the
+        text-only skeleton from ``config.text_config`` and let
+        :meth:`_load_tensors` strip the ``language_model.`` prefix when
+        reading safetensors.
+        """
         if self._model_skeleton is None:
             from accelerate import init_empty_weights
             from transformers import AutoModelForCausalLM
 
-            config = self._get_config()
+            skeleton_config = self._get_text_config()
             # Disable quantizer so we get standard nn.Linear modules
-            config.quantization_config = None
+            skeleton_config.quantization_config = None
             with init_empty_weights():
-                self._model_skeleton = AutoModelForCausalLM.from_config(config)
+                self._model_skeleton = AutoModelForCausalLM.from_config(skeleton_config)
             self._model_skeleton.eval()
         return self._model_skeleton
 
@@ -2527,11 +2584,12 @@ class DiskOffloadBackend(ExtractionBackend):
         from .activation_types import ExtractedBatch
 
         config = self._get_config()
+        text_config = self._get_text_config()
         model = self._get_model_skeleton()
         layer_map, non_layer = self._get_shard_map()
         device = self.device
 
-        num_layers = config.num_hidden_layers
+        num_layers = text_config.num_hidden_layers
         hidden_target = set(spec.hidden_layers)
         router_target = set(spec.router_layers or [])
         n_experts = getattr(config, "n_routed_experts", None)
@@ -2556,7 +2614,7 @@ class DiskOffloadBackend(ExtractionBackend):
 
         # Process all batches through embedding
         all_hidden = torch.zeros(
-            n_prompts, seq_len, config.hidden_size, dtype=self.dtype,
+            n_prompts, seq_len, text_config.hidden_size, dtype=self.dtype,
         )
         with torch.no_grad():
             for b in range(n_batches):
@@ -2585,12 +2643,16 @@ class DiskOffloadBackend(ExtractionBackend):
             for part in rotary_name.split("."):
                 rotary_mod = getattr(rotary_mod, part)
 
-            # Re-initialize rotary from config (meta tensors have no data)
-            dim = getattr(config, "qk_rope_head_dim", None)
+            # Re-initialize rotary from config (meta tensors have no data).
+            # Prefer explicit ``head_dim`` (e.g. Mistral-Small-3.1 sets 128 even
+            # though hidden_size/num_heads = 160) before falling back to the
+            # ratio default.
+            dim = getattr(text_config, "qk_rope_head_dim", None)
             if dim is None:
-                head_dim = config.hidden_size // config.num_attention_heads
-                dim = head_dim
-            base = getattr(config, "rope_theta", 10000.0)
+                dim = getattr(text_config, "head_dim", None)
+            if dim is None:
+                dim = text_config.hidden_size // text_config.num_attention_heads
+            base = getattr(text_config, "rope_theta", 10000.0)
             inv_freq = 1.0 / (
                 base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
             )
@@ -2842,10 +2904,11 @@ class DiskOffloadBackend(ExtractionBackend):
         import gc
 
         config = self._get_config()
+        text_config = self._get_text_config()
         model = self._get_model_skeleton()
         layer_map, non_layer = self._get_shard_map()
         device = self.device
-        num_layers = config.num_hidden_layers
+        num_layers = text_config.num_hidden_layers
 
         # Tokenize
         tokenized = self.tokenizer(
@@ -2888,8 +2951,9 @@ class DiskOffloadBackend(ExtractionBackend):
             text_cfg = getattr(config, "text_config", config)
             dim = getattr(text_cfg, "qk_rope_head_dim", None)
             if dim is None:
-                head_dim = text_cfg.hidden_size // text_cfg.num_attention_heads
-                dim = head_dim
+                dim = getattr(text_cfg, "head_dim", None)
+            if dim is None:
+                dim = text_cfg.hidden_size // text_cfg.num_attention_heads
             base = getattr(text_cfg, "rope_theta", 10000.0)
             inv_freq = 1.0 / (
                 base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)

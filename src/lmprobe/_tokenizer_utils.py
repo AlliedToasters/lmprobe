@@ -58,7 +58,10 @@ def load_tokenizer(
         if "fix_mistral_regex" not in str(e):
             raise
         apply_fix = kwargs.pop("fix_mistral_regex", None) is True
-        tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+        # Suppress the "incorrect regex pattern" warning the fallback load
+        # emits — when we post-patch below, it's misleading noise.
+        with _suppress_mistral_regex_warning():
+            tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
         if apply_fix:
             _apply_mistral_regex_fix(tokenizer, model_name)
 
@@ -66,6 +69,45 @@ def load_tokenizer(
         _maybe_attach_chat_template(tokenizer, model_name)
 
     return tokenizer
+
+
+class _MistralRegexWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover - trivial
+        return "incorrect regex pattern" not in record.getMessage()
+
+
+def _suppress_mistral_regex_warning() -> Any:
+    """Context manager that drops the transformers mistral-regex warning.
+
+    The warning fires inside :func:`AutoTokenizer.from_pretrained` whenever
+    ``fix_mistral_regex`` isn't passed. We take that code path in the
+    dup-kwarg fallback and then apply the patch ourselves, so the warning
+    is misleading noise for downstream users.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _cm() -> Any:
+        # The warning is emitted from
+        # ``transformers.tokenization_utils_tokenizers``. Logger-level filters
+        # don't apply to records propagated from children, so attach directly
+        # to that logger. Also attach to the parent handler as a safety net
+        # in case transformers restructures the logger hierarchy.
+        emitter = logging.getLogger("transformers.tokenization_utils_tokenizers")
+        parent = logging.getLogger("transformers")
+        flt = _MistralRegexWarningFilter()
+        emitter.addFilter(flt)
+        parent_handlers = list(parent.handlers)
+        for h in parent_handlers:
+            h.addFilter(flt)
+        try:
+            yield
+        finally:
+            emitter.removeFilter(flt)
+            for h in parent_handlers:
+                h.removeFilter(flt)
+
+    return _cm()
 
 
 def _apply_mistral_regex_fix(tokenizer: PreTrainedTokenizerBase, model_name: str) -> None:

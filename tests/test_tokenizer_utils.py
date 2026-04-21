@@ -124,6 +124,48 @@ def test_unrelated_typeerror_is_re_raised():
             load_tokenizer(MISTRAL_MODELS_WITH_REGEX_BUG[0])
 
 
+def test_mistral_regex_warning_silenced_on_dup_kwarg_fallback(caplog):
+    """The noisy 'incorrect regex pattern' warning must not reach downstream loggers.
+
+    When the dup-kwarg fallback loads the tokenizer without the flag,
+    transformers emits a misleading warning before we post-patch. It should
+    be filtered out.
+    """
+    import logging as _logging
+
+    mistral_name = MISTRAL_MODELS_WITH_REGEX_BUG[0]
+    fake_tok = MagicMock()
+    fake_tok.chat_template = "existing"
+
+    emitter = _logging.getLogger("transformers.tokenization_utils_tokenizers")
+
+    def fake_from_pretrained(_name, **kwargs):
+        if "fix_mistral_regex" in kwargs:
+            raise TypeError(
+                "got multiple values for keyword argument 'fix_mistral_regex'"
+            )
+        # Mimic the transformers warning that our suppressor targets.
+        emitter.warning(
+            "The tokenizer you are loading from '%s' with an incorrect "
+            "regex pattern: ...",
+            mistral_name,
+        )
+        return fake_tok
+
+    with (
+        patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            side_effect=fake_from_pretrained,
+        ),
+        patch("lmprobe._tokenizer_utils._apply_mistral_regex_fix"),
+        caplog.at_level(_logging.WARNING, logger="transformers.tokenization_utils_tokenizers"),
+    ):
+        load_tokenizer(mistral_name)
+
+    noisy = [r for r in caplog.records if "incorrect regex pattern" in r.getMessage()]
+    assert noisy == [], f"expected warning to be silenced, got: {[r.getMessage() for r in noisy]}"
+
+
 def test_mistral_regex_not_applied_when_user_opts_out():
     """If user passes fix_mistral_regex=False, the post-load patch is skipped."""
     mistral_name = MISTRAL_MODELS_WITH_REGEX_BUG[0]
