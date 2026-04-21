@@ -2643,11 +2643,15 @@ class DiskOffloadBackend(ExtractionBackend):
             for part in rotary_name.split("."):
                 rotary_mod = getattr(rotary_mod, part)
 
-            # Re-initialize rotary from config (meta tensors have no data)
+            # Re-initialize rotary from config (meta tensors have no data).
+            # Prefer explicit ``head_dim`` (e.g. Mistral-Small-3.1 sets 128 even
+            # though hidden_size/num_heads = 160) before falling back to the
+            # ratio default.
             dim = getattr(text_config, "qk_rope_head_dim", None)
             if dim is None:
-                head_dim = text_config.hidden_size // text_config.num_attention_heads
-                dim = head_dim
+                dim = getattr(text_config, "head_dim", None)
+            if dim is None:
+                dim = text_config.hidden_size // text_config.num_attention_heads
             base = getattr(text_config, "rope_theta", 10000.0)
             inv_freq = 1.0 / (
                 base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
@@ -2947,8 +2951,9 @@ class DiskOffloadBackend(ExtractionBackend):
             text_cfg = getattr(config, "text_config", config)
             dim = getattr(text_cfg, "qk_rope_head_dim", None)
             if dim is None:
-                head_dim = text_cfg.hidden_size // text_cfg.num_attention_heads
-                dim = head_dim
+                dim = getattr(text_cfg, "head_dim", None)
+            if dim is None:
+                dim = text_cfg.hidden_size // text_cfg.num_attention_heads
             base = getattr(text_cfg, "rope_theta", 10000.0)
             inv_freq = 1.0 / (
                 base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
