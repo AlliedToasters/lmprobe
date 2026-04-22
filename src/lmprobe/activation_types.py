@@ -24,6 +24,43 @@ if TYPE_CHECKING:
     pass
 
 
+@dataclass
+class PreTokenizedPrompts:
+    """Sentinel container for caller-supplied tokenized input.
+
+    Accepted anywhere the public API takes ``prompts: list[str]``, skipping
+    lmprobe's internal tokenization. Use this when you need exact control
+    over tokenization (e.g. ``add_special_tokens=False`` after external
+    ``apply_chat_template``, a specific ``padding_side``, or a ``pad_token``
+    choice different from lmprobe's ``eos_token`` default).
+
+    Attributes
+    ----------
+    input_ids : torch.Tensor
+        Shape ``(B, S)``, dtype ``int64``.
+    attention_mask : torch.Tensor
+        Shape ``(B, S)``, dtype ``int64`` or ``bool``. 1 = real, 0 = pad.
+    """
+
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if self.input_ids.shape != self.attention_mask.shape:
+            raise ValueError(
+                f"input_ids {tuple(self.input_ids.shape)} and attention_mask "
+                f"{tuple(self.attention_mask.shape)} must match."
+            )
+        if self.input_ids.dim() != 2:
+            raise ValueError(
+                f"Expected 2D input_ids (B, S); got shape "
+                f"{tuple(self.input_ids.shape)}."
+            )
+
+    def __len__(self) -> int:
+        return int(self.input_ids.shape[0])
+
+
 class ActivationType(str, Enum):
     """Known activation types.
 

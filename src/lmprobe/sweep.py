@@ -37,6 +37,8 @@ import torch
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
+from .activation_types import PreTokenizedPrompts
+
 
 # Valid signal names the driver understands natively. Accumulators may
 # declare additional custom signals, but built-in capture only handles
@@ -142,7 +144,9 @@ class LayerLoader(Protocol):
 
     # --- lifecycle -----------------------------------------------------------
     def prepare(
-        self, prompts: list[str], batch_size: int,
+        self,
+        prompts: list[str] | PreTokenizedPrompts,
+        batch_size: int,
     ) -> AbstractContextManager[EmbedState]:
         """Tokenize, embed, compute rotary PE, allocate residual buffer.
 
@@ -579,7 +583,7 @@ def _preflight_memory_check(
 
 
 def sweep(
-    prompts: list[str],
+    prompts: list[str] | PreTokenizedPrompts,
     *,
     accumulators: Mapping[str, Accumulator],
     loader: LayerLoader,
