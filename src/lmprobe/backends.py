@@ -494,12 +494,17 @@ class NnsightBackend(ExtractionBackend):
 
     def extract_batch(
         self,
-        prompts: list[str],
+        prompts: list[str] | PreTokenizedPrompts,
         layer_indices: list[int],
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from .extraction import _extract_batch
 
+        if isinstance(prompts, PreTokenizedPrompts):
+            raise NotImplementedError(
+                "NnsightBackend does not yet support PreTokenizedPrompts; "
+                "use ChunkedLocalBackend or DiskOffloadBackend.",
+            )
         remote = kwargs.get("remote", self.remote)
         model = self._get_model_for_remote() if remote else self.model
         return _extract_batch(model, prompts, layer_indices, remote=remote)
@@ -787,10 +792,15 @@ class LocalBackend(ExtractionBackend):
 
     def extract_batch(
         self,
-        prompts: list[str],
+        prompts: list[str] | PreTokenizedPrompts,
         layer_indices: list[int],
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(prompts, PreTokenizedPrompts):
+            raise NotImplementedError(
+                "LocalBackend does not yet support PreTokenizedPrompts; "
+                "use ChunkedLocalBackend or DiskOffloadBackend.",
+            )
         model = self.model
         tokenizer = self.tokenizer
         decoder_layers = _get_decoder_layers(model)
@@ -1459,11 +1469,9 @@ class ChunkedLocalBackend(ExtractionBackend):
                 router_layer_indices, strategy=router_hook_strategy,
             )
 
-        pretok = isinstance(prompts, PreTokenizedPrompts)
-
         # No accumulators subscribed ⇒ no sweep needed; just return the mask.
         if not accumulators:
-            if pretok:
+            if isinstance(prompts, PreTokenizedPrompts):
                 return None, prompts.attention_mask, None, None
             tokenized = self.tokenizer(
                 prompts, return_tensors="pt", padding=True,
@@ -1507,7 +1515,7 @@ class ChunkedLocalBackend(ExtractionBackend):
                         activations.dtype,
                     )
 
-        if pretok:
+        if isinstance(prompts, PreTokenizedPrompts):
             attention_mask_2d = prompts.attention_mask
         else:
             tokenized = self.tokenizer(
@@ -3369,10 +3377,16 @@ class DiskOffloadLayerLoader:
     # --- LayerLoader protocol ------------------------------------------------
 
     def prepare(
-        self, prompts: list[str], batch_size: int,
+        self,
+        prompts: list[str] | PreTokenizedPrompts,
+        batch_size: int,
     ) -> Any:
         """Context manager: tokenize → embed (materialize → forward → free)
-        → rotary → allocate memmap. Yields an EmbedState."""
+        → rotary → allocate memmap. Yields an EmbedState.
+
+        When ``prompts`` is a :class:`PreTokenizedPrompts`, the internal
+        tokenizer call is skipped and the caller's tensors are used verbatim.
+        """
         from contextlib import contextmanager
 
         from .activation_types import detect_moe_info
@@ -3390,22 +3404,26 @@ class DiskOffloadLayerLoader:
             except Exception:
                 pass
 
-            tokenized = self.tokenizer(
-                prompts, return_tensors="pt", padding=True,
-            )
-            all_input_ids = tokenized["input_ids"]
-            all_attention_mask = tokenized["attention_mask"]
+            if isinstance(prompts, PreTokenizedPrompts):
+                all_input_ids = prompts.input_ids
+                all_attention_mask = prompts.attention_mask
+            else:
+                tokenized = self.tokenizer(
+                    prompts, return_tensors="pt", padding=True,
+                )
+                all_input_ids = tokenized["input_ids"]
+                all_attention_mask = tokenized["attention_mask"]
+
+            n_samples = int(all_input_ids.shape[0])
 
             token_ids_per_sample: list[list[int]] = []
             seq_lengths: list[int] = []
-            for i in range(len(prompts)):
+            for i in range(n_samples):
                 real_len = int(all_attention_mask[i].sum().item())
                 seq_lengths.append(real_len)
                 token_ids_per_sample.append(
                     all_input_ids[i, :real_len].tolist(),
                 )
-
-            n_samples = len(prompts)
             batches: list[tuple[int, int]] = [
                 (s, min(s + batch_size, n_samples))
                 for s in range(0, n_samples, batch_size)
