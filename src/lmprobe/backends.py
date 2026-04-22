@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from .activation_types import PreTokenizedPrompts
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -275,7 +277,7 @@ class ExtractionBackend(ABC):
     @abstractmethod
     def extract_batch(
         self,
-        prompts: list[str],
+        prompts: list[str] | PreTokenizedPrompts,
         layer_indices: list[int],
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -283,8 +285,11 @@ class ExtractionBackend(ABC):
 
         Parameters
         ----------
-        prompts : list[str]
-            List of text prompts.
+        prompts : list[str] or PreTokenizedPrompts
+            Either raw text prompts (tokenized internally with the backend's
+            defaults) or a :class:`PreTokenizedPrompts` holding caller-supplied
+            ``input_ids`` and ``attention_mask``. Use the latter when you need
+            exact control over tokenization.
         layer_indices : list[int]
             Layer indices to extract from (positive integers).
         **kwargs
@@ -328,6 +333,49 @@ class ExtractionBackend(ABC):
             - logits: Shape (batch, seq_len, vocab_size) or (batch, seq_len, K)
             - logits_indices: None or (batch, seq_len, K) int64 indices
         """
+
+    def extract_batch_pretokenized(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        layer_indices: list[int],
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convenience wrapper: extract activations from pre-tokenized input.
+
+        Use when you've already applied the model's chat template externally
+        and need exact control over tokenization (``add_special_tokens``,
+        ``padding_side``, ``pad_token``). Equivalent to:
+
+            backend.extract_batch(
+                prompts=PreTokenizedPrompts(input_ids, attention_mask),
+                layer_indices=layer_indices,
+                **kwargs,
+            )
+
+        Parameters
+        ----------
+        input_ids : torch.Tensor
+            Shape ``(B, S)``.
+        attention_mask : torch.Tensor
+            Shape ``(B, S)``. 1 = real token, 0 = pad.
+        layer_indices : list[int]
+            Layer indices to extract from.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            - activations: Shape ``(B, S, hidden_dim * num_layers)``
+            - attention_mask: the caller's ``attention_mask`` passed back
+              unchanged
+        """
+        return self.extract_batch(
+            prompts=PreTokenizedPrompts(
+                input_ids=input_ids, attention_mask=attention_mask,
+            ),
+            layer_indices=layer_indices,
+            **kwargs,
+        )
 
     @property
     @abstractmethod
@@ -446,12 +494,17 @@ class NnsightBackend(ExtractionBackend):
 
     def extract_batch(
         self,
-        prompts: list[str],
+        prompts: list[str] | PreTokenizedPrompts,
         layer_indices: list[int],
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from .extraction import _extract_batch
 
+        if isinstance(prompts, PreTokenizedPrompts):
+            raise NotImplementedError(
+                "NnsightBackend does not yet support PreTokenizedPrompts; "
+                "use ChunkedLocalBackend or DiskOffloadBackend.",
+            )
         remote = kwargs.get("remote", self.remote)
         model = self._get_model_for_remote() if remote else self.model
         return _extract_batch(model, prompts, layer_indices, remote=remote)
@@ -739,10 +792,15 @@ class LocalBackend(ExtractionBackend):
 
     def extract_batch(
         self,
-        prompts: list[str],
+        prompts: list[str] | PreTokenizedPrompts,
         layer_indices: list[int],
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(prompts, PreTokenizedPrompts):
+            raise NotImplementedError(
+                "LocalBackend does not yet support PreTokenizedPrompts; "
+                "use ChunkedLocalBackend or DiskOffloadBackend.",
+            )
         model = self.model
         tokenizer = self.tokenizer
         decoder_layers = _get_decoder_layers(model)
@@ -1367,13 +1425,14 @@ class ChunkedLocalBackend(ExtractionBackend):
 
     def _chunked_forward(
         self,
-        prompts: list[str],
+        prompts: list[str] | PreTokenizedPrompts,
         layer_indices: list[int],
         include_logits: bool = False,
         router_layer_indices: list[int] | None = None,
         router_module_template: str | None = None,
         router_hook_strategy: str = "output",
         batch_size: int | None = None,
+        apply_final_norm: bool = False,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor,
@@ -1412,6 +1471,8 @@ class ChunkedLocalBackend(ExtractionBackend):
 
         # No accumulators subscribed ⇒ no sweep needed; just return the mask.
         if not accumulators:
+            if isinstance(prompts, PreTokenizedPrompts):
+                return None, prompts.attention_mask, None, None
             tokenized = self.tokenizer(
                 prompts, return_tensors="pt", padding=True,
             )
@@ -1426,8 +1487,41 @@ class ChunkedLocalBackend(ExtractionBackend):
         )
 
         activations = out["hs"] if "hs" in accumulators else None
-        tokenized = self.tokenizer(prompts, return_tensors="pt", padding=True)
-        attention_mask_2d = tokenized["attention_mask"]
+
+        # Optionally apply final_norm to the last layer's slot so it matches
+        # HF's ``output.hidden_states[N]`` semantics (which includes
+        # ``model.norm``). See extract_all's Phase 2.5 for the disk_offload
+        # version of this fix.
+        if (
+            apply_final_norm
+            and activations is not None
+            and layer_indices
+        ):
+            model = self._load_full_model_cpu()
+            num_layers = len(_get_decoder_layers(model))
+            if (num_layers - 1) in layer_indices:
+                slot_idx = layer_indices.index(num_layers - 1)
+                H = activations.shape[-1] // len(layer_indices)
+                col_start = slot_idx * H
+                col_end = col_start + H
+                final_norm_mod = _get_final_norm(model)
+                # Final norm's weights live on CPU (chunked keeps the full
+                # model there); we run the op on CPU to avoid moving either
+                # direction. RMSNorm is cheap.
+                with torch.no_grad():
+                    slot = activations[:, :, col_start:col_end]
+                    normed = final_norm_mod(slot.to(self.dtype))
+                    activations[:, :, col_start:col_end] = normed.to(
+                        activations.dtype,
+                    )
+
+        if isinstance(prompts, PreTokenizedPrompts):
+            attention_mask_2d = prompts.attention_mask
+        else:
+            tokenized = self.tokenizer(
+                prompts, return_tensors="pt", padding=True,
+            )
+            attention_mask_2d = tokenized["attention_mask"]
         logits_out = out.get("logits") if include_logits else None
         router_out = out.get("router") if router_layer_indices else None
         return activations, attention_mask_2d, logits_out, router_out
@@ -1579,12 +1673,13 @@ class ChunkedLocalBackend(ExtractionBackend):
 
     def extract_batch(
         self,
-        prompts: list[str],
+        prompts: list[str] | PreTokenizedPrompts,
         layer_indices: list[int],
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        apply_final_norm = bool(kwargs.pop("apply_final_norm", False))
         activations, attention_mask, _, _ = self._chunked_forward(
-            prompts, layer_indices,
+            prompts, layer_indices, apply_final_norm=apply_final_norm,
         )
         assert activations is not None
         return activations, attention_mask
@@ -1682,12 +1777,17 @@ class ChunkedLayerLoader:
     # --- LayerLoader protocol ------------------------------------------------
 
     def prepare(
-        self, prompts: list[str], batch_size: int,
+        self,
+        prompts: list[str] | PreTokenizedPrompts,
+        batch_size: int,
     ) -> Any:
         """Context manager: tokenize → embed → rotary → allocate memmap.
 
         Yields an :class:`~lmprobe.sweep.EmbedState`. The residual buffer's
         backing tempdir is deterministically cleaned up on exit.
+
+        When ``prompts`` is a :class:`PreTokenizedPrompts`, the internal
+        tokenizer call is skipped and the caller's tensors are used verbatim.
         """
         from contextlib import contextmanager
 
@@ -1708,23 +1808,28 @@ class ChunkedLayerLoader:
             except Exception:
                 pass
 
-            # Tokenize with corpus-wide padding (matches scan_forward).
-            tokenized = self.tokenizer(
-                prompts, return_tensors="pt", padding=True,
-            )
-            all_input_ids = tokenized["input_ids"]
-            all_attention_mask = tokenized["attention_mask"]
+            if isinstance(prompts, PreTokenizedPrompts):
+                all_input_ids = prompts.input_ids
+                all_attention_mask = prompts.attention_mask
+            else:
+                # Tokenize with corpus-wide padding (matches scan_forward).
+                tokenized = self.tokenizer(
+                    prompts, return_tensors="pt", padding=True,
+                )
+                all_input_ids = tokenized["input_ids"]
+                all_attention_mask = tokenized["attention_mask"]
+
+            n_samples = int(all_input_ids.shape[0])
 
             token_ids_per_sample: list[list[int]] = []
             seq_lengths: list[int] = []
-            for i in range(len(prompts)):
+            for i in range(n_samples):
                 real_len = int(all_attention_mask[i].sum().item())
                 seq_lengths.append(real_len)
                 token_ids_per_sample.append(
                     all_input_ids[i, :real_len].tolist(),
                 )
 
-            n_samples = len(prompts)
             batches: list[tuple[int, int]] = [
                 (s, min(s + batch_size, n_samples))
                 for s in range(0, n_samples, batch_size)
@@ -2517,8 +2622,13 @@ class DiskOffloadBackend(ExtractionBackend):
             from transformers import AutoModelForCausalLM
 
             skeleton_config = self._get_text_config()
-            # Disable quantizer so we get standard nn.Linear modules
-            skeleton_config.quantization_config = None
+            # Disable quantizer so we get standard nn.Linear modules. We
+            # delete the attribute rather than setting it to None because
+            # transformers>=4.57's ``PretrainedConfig.to_dict`` calls
+            # ``self.quantization_config.to_dict()`` guarded only by
+            # ``hasattr(...)``, which treats ``None`` as present and raises.
+            if hasattr(skeleton_config, "quantization_config"):
+                delattr(skeleton_config, "quantization_config")
             with init_empty_weights():
                 self._model_skeleton = AutoModelForCausalLM.from_config(skeleton_config)
             self._model_skeleton.eval()
@@ -2546,11 +2656,13 @@ class DiskOffloadBackend(ExtractionBackend):
 
     def extract_all(
         self,
-        prompts: list[str],
+        prompts: list[str] | PreTokenizedPrompts,
         spec: ExtractionSpec,
         batch_size: int = 16,
         pool: str | None = None,
         logit_callback: Callable[[int, int, torch.Tensor, torch.Tensor], None] | None = None,
+        *,
+        apply_final_norm: bool = False,
     ) -> ExtractedBatch:
         """Extract features from *all* prompts, loading each layer once.
 
@@ -2595,12 +2707,16 @@ class DiskOffloadBackend(ExtractionBackend):
         n_experts = getattr(config, "n_routed_experts", None)
         first_moe = getattr(config, "first_k_dense_replace", 0)
 
-        # --- Tokenize all prompts ---
-        tokenized = self.tokenizer(
-            prompts, return_tensors="pt", padding=True, truncation=True,
-        )
-        all_input_ids = tokenized["input_ids"]
-        all_attention_mask = tokenized["attention_mask"]
+        # --- Tokenize all prompts (or accept pre-tokenized input) ---
+        if isinstance(prompts, PreTokenizedPrompts):
+            all_input_ids = prompts.input_ids
+            all_attention_mask = prompts.attention_mask
+        else:
+            tokenized = self.tokenizer(
+                prompts, return_tensors="pt", padding=True, truncation=True,
+            )
+            all_input_ids = tokenized["input_ids"]
+            all_attention_mask = tokenized["attention_mask"]
         n_prompts = all_input_ids.shape[0]
         seq_len = all_input_ids.shape[1]
         n_batches = math.ceil(n_prompts / batch_size)
@@ -2629,11 +2745,15 @@ class DiskOffloadBackend(ExtractionBackend):
         position_ids.masked_fill_(all_attention_mask == 0, 1)
         cache_position = torch.arange(seq_len)
 
-        min_val = torch.finfo(self.dtype).min
-        causal_mask = torch.full(
-            (1, 1, seq_len, seq_len), min_val, dtype=self.dtype,
+        # Causal mask as a bool (True=attend, False=mask) — matches HF's
+        # ``_update_causal_mask`` output for SDPA. Using a float mask with
+        # -inf at masked positions is semantically equivalent but flows
+        # through a different SDPA internal dispatch path that produces
+        # slightly different bf16 numerics, accumulating ~1e-3 drift per
+        # layer vs. HF's forward pass.
+        causal_mask = torch.tril(
+            torch.ones(1, 1, seq_len, seq_len, dtype=torch.bool),
         )
-        causal_mask = torch.triu(causal_mask, diagonal=1)
 
         # --- Rotary embeddings ---
         rotary_name = ChunkedLocalBackend._find_rotary_embedding_name(model)
@@ -2644,18 +2764,34 @@ class DiskOffloadBackend(ExtractionBackend):
                 rotary_mod = getattr(rotary_mod, part)
 
             # Re-initialize rotary from config (meta tensors have no data).
-            # Prefer explicit ``head_dim`` (e.g. Mistral-Small-3.1 sets 128 even
-            # though hidden_size/num_heads = 160) before falling back to the
-            # ratio default.
-            dim = getattr(text_config, "qk_rope_head_dim", None)
-            if dim is None:
-                dim = getattr(text_config, "head_dim", None)
-            if dim is None:
-                dim = text_config.hidden_size // text_config.num_attention_heads
-            base = getattr(text_config, "rope_theta", 10000.0)
-            inv_freq = 1.0 / (
-                base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+            # Dispatch on rope_scaling.rope_type so we pick up model-family
+            # scaling logic (e.g. llama-3's frequency scaling by factor=32
+            # at long wavelengths). Plain ``1/base^(arange/dim)`` is only
+            # correct for rope_type="default"; for llama-3.x it leaves the
+            # low-frequency inv_freq entries ~32× too large, which corrupts
+            # attention at the slowest-rotating dims and shows up as a small
+            # but systematic drift vs HF's forward pass.
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+            rope_scaling = getattr(text_config, "rope_scaling", None) or {}
+            rope_type = rope_scaling.get(
+                "rope_type", rope_scaling.get("type", "default"),
             )
+            rope_init = ROPE_INIT_FUNCTIONS.get(
+                rope_type, ROPE_INIT_FUNCTIONS["default"],
+            )
+            # Compute inv_freq on CPU (fp32) then move to the target device.
+            # Matches HF's ``from_pretrained`` path, which instantiates
+            # ``LlamaRotaryEmbedding`` on CPU and moves afterward. Computing
+            # directly on CUDA yields values bit-different by ~3e-8 (1 fp32 ULP),
+            # which propagates to a 1 bf16 ULP diff in ``sin`` after the
+            # ``inv_freq @ position_ids`` matmul — the source of disk_offload's
+            # previously-unexplained per-layer drift vs. HF.
+            inv_freq, _attn_scale = rope_init(
+                text_config, device=torch.device("cpu"),
+            )
+            inv_freq = inv_freq.to(device)
+
             rotary_mod.to_empty(device=device)
             rotary_mod.inv_freq = inv_freq
 
@@ -2731,12 +2867,14 @@ class DiskOffloadBackend(ExtractionBackend):
                         hs = all_hidden[s:e].to(device)
                         pos_dev = position_ids[s:e].to(device)
 
-                        # Expand causal mask for batch
-                        batch_mask = mask_dev.expand(e - s, -1, -1, -1)
-                        # Apply padding mask
-                        pad_mask = all_attention_mask[s:e, None, None, :].to(self.dtype).to(device)
-                        batch_mask = batch_mask.clone()
-                        batch_mask.masked_fill_(pad_mask == 0, min_val)
+                        # Build the per-batch mask as a bool (True=attend).
+                        # Compose (lower-triangular causal) AND (key is non-pad)
+                        # AND (query is non-pad). Matches HF's ``_update_causal_mask``
+                        # output for SDPA bit-for-bit.
+                        batch_mask = mask_dev.expand(e - s, -1, -1, -1).clone()
+                        key_pad = all_attention_mask[s:e, None, None, :].bool().to(device)
+                        query_pad = all_attention_mask[s:e, None, :, None].bool().to(device)
+                        batch_mask = batch_mask & key_pad & query_pad
 
                         # Router hook
                         rh = None
@@ -2833,6 +2971,31 @@ class DiskOffloadBackend(ExtractionBackend):
             torch.cuda.empty_cache()
 
         del mask_dev, pos_cache_dev, pe_dev
+
+        # --- Phase 2.5: Apply final norm to last layer (optional) ---
+        # HF's ``output.hidden_states[N]`` has ``model.norm`` applied; the
+        # raw post-block-(N-1) residual we capture in ``captured_hidden``
+        # does not. When ``apply_final_norm=True`` and the last block was
+        # requested, fix the last slot to match HF's semantics.
+        if apply_final_norm and (num_layers - 1) in captured_hidden:
+            norm_tensors = [
+                (n, f) for n, f in non_layer
+                if "norm" in n and "layer" not in n
+            ]
+            norm_w = self._load_tensors(norm_tensors, device)
+            final_norm = _get_final_norm(model)
+            _materialize_module(final_norm, norm_w, "model.norm.", device)
+            del norm_w
+
+            with torch.no_grad():
+                slot = captured_hidden[num_layers - 1]
+                # slot shape: (N, seq, dim) or (N, dim) if pooled.
+                captured_hidden[num_layers - 1] = (
+                    final_norm(slot.to(device).to(self.dtype)).to(slot.dtype).cpu()
+                )
+
+            _free_module(final_norm)
+            torch.cuda.empty_cache()
 
         # --- Phase 3: Logits (optional) ---
         logits_out: torch.Tensor | None = None
@@ -3106,13 +3269,19 @@ class DiskOffloadBackend(ExtractionBackend):
 
     def extract_batch(
         self,
-        prompts: list[str],
+        prompts: list[str] | PreTokenizedPrompts,
         layer_indices: list[int],
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from .activation_types import ExtractionSpec
         spec = ExtractionSpec(hidden_layers=layer_indices)
-        result = self.extract_all(prompts, spec, batch_size=len(prompts))
+        apply_final_norm = bool(kwargs.pop("apply_final_norm", False))
+        result = self.extract_all(
+            prompts,
+            spec,
+            batch_size=len(prompts),
+            apply_final_norm=apply_final_norm,
+        )
         assert result.activations is not None
         return result.activations, result.attention_mask
 
@@ -3208,10 +3377,16 @@ class DiskOffloadLayerLoader:
     # --- LayerLoader protocol ------------------------------------------------
 
     def prepare(
-        self, prompts: list[str], batch_size: int,
+        self,
+        prompts: list[str] | PreTokenizedPrompts,
+        batch_size: int,
     ) -> Any:
         """Context manager: tokenize → embed (materialize → forward → free)
-        → rotary → allocate memmap. Yields an EmbedState."""
+        → rotary → allocate memmap. Yields an EmbedState.
+
+        When ``prompts`` is a :class:`PreTokenizedPrompts`, the internal
+        tokenizer call is skipped and the caller's tensors are used verbatim.
+        """
         from contextlib import contextmanager
 
         from .activation_types import detect_moe_info
@@ -3229,22 +3404,26 @@ class DiskOffloadLayerLoader:
             except Exception:
                 pass
 
-            tokenized = self.tokenizer(
-                prompts, return_tensors="pt", padding=True,
-            )
-            all_input_ids = tokenized["input_ids"]
-            all_attention_mask = tokenized["attention_mask"]
+            if isinstance(prompts, PreTokenizedPrompts):
+                all_input_ids = prompts.input_ids
+                all_attention_mask = prompts.attention_mask
+            else:
+                tokenized = self.tokenizer(
+                    prompts, return_tensors="pt", padding=True,
+                )
+                all_input_ids = tokenized["input_ids"]
+                all_attention_mask = tokenized["attention_mask"]
+
+            n_samples = int(all_input_ids.shape[0])
 
             token_ids_per_sample: list[list[int]] = []
             seq_lengths: list[int] = []
-            for i in range(len(prompts)):
+            for i in range(n_samples):
                 real_len = int(all_attention_mask[i].sum().item())
                 seq_lengths.append(real_len)
                 token_ids_per_sample.append(
                     all_input_ids[i, :real_len].tolist(),
                 )
-
-            n_samples = len(prompts)
             batches: list[tuple[int, int]] = [
                 (s, min(s + batch_size, n_samples))
                 for s in range(0, n_samples, batch_size)
