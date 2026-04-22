@@ -2752,18 +2752,24 @@ class DiskOffloadBackend(ExtractionBackend):
                 rotary_mod = getattr(rotary_mod, part)
 
             # Re-initialize rotary from config (meta tensors have no data).
-            # Prefer explicit ``head_dim`` (e.g. Mistral-Small-3.1 sets 128 even
-            # though hidden_size/num_heads = 160) before falling back to the
-            # ratio default.
-            dim = getattr(text_config, "qk_rope_head_dim", None)
-            if dim is None:
-                dim = getattr(text_config, "head_dim", None)
-            if dim is None:
-                dim = text_config.hidden_size // text_config.num_attention_heads
-            base = getattr(text_config, "rope_theta", 10000.0)
-            inv_freq = 1.0 / (
-                base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+            # Dispatch on rope_scaling.rope_type so we pick up model-family
+            # scaling logic (e.g. llama-3's frequency scaling by factor=32
+            # at long wavelengths). Plain ``1/base^(arange/dim)`` is only
+            # correct for rope_type="default"; for llama-3.x it leaves the
+            # low-frequency inv_freq entries ~32× too large, which corrupts
+            # attention at the slowest-rotating dims and shows up as a small
+            # but systematic drift vs HF's forward pass.
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+            rope_scaling = getattr(text_config, "rope_scaling", None) or {}
+            rope_type = rope_scaling.get(
+                "rope_type", rope_scaling.get("type", "default"),
             )
+            rope_init = ROPE_INIT_FUNCTIONS.get(
+                rope_type, ROPE_INIT_FUNCTIONS["default"],
+            )
+            inv_freq, _attn_scale = rope_init(text_config, device=device)
+
             rotary_mod.to_empty(device=device)
             rotary_mod.inv_freq = inv_freq
 
