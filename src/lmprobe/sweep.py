@@ -34,10 +34,10 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 import numpy as np
 import torch
 
+from .activation_types import PreTokenizedPrompts
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
-
-from .activation_types import PreTokenizedPrompts
 
 
 # Valid signal names the driver understands natively. Accumulators may

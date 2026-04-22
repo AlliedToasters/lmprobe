@@ -19,14 +19,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from .activation_types import PreTokenizedPrompts
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from transformers import PreTrainedTokenizerBase
 
     from .activation_types import ExtractedBatch, ExtractionSpec
-
-from .activation_types import PreTokenizedPrompts
 
 
 _logger = logging.getLogger(__name__)
