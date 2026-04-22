@@ -2772,7 +2772,17 @@ class DiskOffloadBackend(ExtractionBackend):
             rope_init = ROPE_INIT_FUNCTIONS.get(
                 rope_type, ROPE_INIT_FUNCTIONS["default"],
             )
-            inv_freq, _attn_scale = rope_init(text_config, device=device)
+            # Compute inv_freq on CPU (fp32) then move to the target device.
+            # Matches HF's ``from_pretrained`` path, which instantiates
+            # ``LlamaRotaryEmbedding`` on CPU and moves afterward. Computing
+            # directly on CUDA yields values bit-different by ~3e-8 (1 fp32 ULP),
+            # which propagates to a 1 bf16 ULP diff in ``sin`` after the
+            # ``inv_freq @ position_ids`` matmul — the source of disk_offload's
+            # previously-unexplained per-layer drift vs. HF.
+            inv_freq, _attn_scale = rope_init(
+                text_config, device=torch.device("cpu"),
+            )
+            inv_freq = inv_freq.to(device)
 
             rotary_mod.to_empty(device=device)
             rotary_mod.inv_freq = inv_freq
