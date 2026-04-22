@@ -334,6 +334,49 @@ class ExtractionBackend(ABC):
             - logits_indices: None or (batch, seq_len, K) int64 indices
         """
 
+    def extract_batch_pretokenized(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        layer_indices: list[int],
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convenience wrapper: extract activations from pre-tokenized input.
+
+        Use when you've already applied the model's chat template externally
+        and need exact control over tokenization (``add_special_tokens``,
+        ``padding_side``, ``pad_token``). Equivalent to:
+
+            backend.extract_batch(
+                prompts=PreTokenizedPrompts(input_ids, attention_mask),
+                layer_indices=layer_indices,
+                **kwargs,
+            )
+
+        Parameters
+        ----------
+        input_ids : torch.Tensor
+            Shape ``(B, S)``.
+        attention_mask : torch.Tensor
+            Shape ``(B, S)``. 1 = real token, 0 = pad.
+        layer_indices : list[int]
+            Layer indices to extract from.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            - activations: Shape ``(B, S, hidden_dim * num_layers)``
+            - attention_mask: the caller's ``attention_mask`` passed back
+              unchanged
+        """
+        return self.extract_batch(
+            prompts=PreTokenizedPrompts(
+                input_ids=input_ids, attention_mask=attention_mask,
+            ),
+            layer_indices=layer_indices,
+            **kwargs,
+        )
+
     @property
     @abstractmethod
     def tokenizer(self) -> PreTrainedTokenizerBase:
@@ -2570,7 +2613,7 @@ class DiskOffloadBackend(ExtractionBackend):
 
     def extract_all(
         self,
-        prompts: list[str],
+        prompts: list[str] | PreTokenizedPrompts,
         spec: ExtractionSpec,
         batch_size: int = 16,
         pool: str | None = None,
@@ -2619,12 +2662,16 @@ class DiskOffloadBackend(ExtractionBackend):
         n_experts = getattr(config, "n_routed_experts", None)
         first_moe = getattr(config, "first_k_dense_replace", 0)
 
-        # --- Tokenize all prompts ---
-        tokenized = self.tokenizer(
-            prompts, return_tensors="pt", padding=True, truncation=True,
-        )
-        all_input_ids = tokenized["input_ids"]
-        all_attention_mask = tokenized["attention_mask"]
+        # --- Tokenize all prompts (or accept pre-tokenized input) ---
+        if isinstance(prompts, PreTokenizedPrompts):
+            all_input_ids = prompts.input_ids
+            all_attention_mask = prompts.attention_mask
+        else:
+            tokenized = self.tokenizer(
+                prompts, return_tensors="pt", padding=True, truncation=True,
+            )
+            all_input_ids = tokenized["input_ids"]
+            all_attention_mask = tokenized["attention_mask"]
         n_prompts = all_input_ids.shape[0]
         seq_len = all_input_ids.shape[1]
         n_batches = math.ceil(n_prompts / batch_size)
@@ -3130,7 +3177,7 @@ class DiskOffloadBackend(ExtractionBackend):
 
     def extract_batch(
         self,
-        prompts: list[str],
+        prompts: list[str] | PreTokenizedPrompts,
         layer_indices: list[int],
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
