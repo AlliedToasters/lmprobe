@@ -2584,8 +2584,13 @@ class DiskOffloadBackend(ExtractionBackend):
             from transformers import AutoModelForCausalLM
 
             skeleton_config = self._get_text_config()
-            # Disable quantizer so we get standard nn.Linear modules
-            skeleton_config.quantization_config = None
+            # Disable quantizer so we get standard nn.Linear modules. We
+            # delete the attribute rather than setting it to None because
+            # transformers>=4.57's ``PretrainedConfig.to_dict`` calls
+            # ``self.quantization_config.to_dict()`` guarded only by
+            # ``hasattr(...)``, which treats ``None`` as present and raises.
+            if hasattr(skeleton_config, "quantization_config"):
+                delattr(skeleton_config, "quantization_config")
             with init_empty_weights():
                 self._model_skeleton = AutoModelForCausalLM.from_config(skeleton_config)
             self._model_skeleton.eval()
