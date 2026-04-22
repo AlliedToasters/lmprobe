@@ -2737,11 +2737,15 @@ class DiskOffloadBackend(ExtractionBackend):
         position_ids.masked_fill_(all_attention_mask == 0, 1)
         cache_position = torch.arange(seq_len)
 
-        min_val = torch.finfo(self.dtype).min
-        causal_mask = torch.full(
-            (1, 1, seq_len, seq_len), min_val, dtype=self.dtype,
+        # Causal mask as a bool (True=attend, False=mask) — matches HF's
+        # ``_update_causal_mask`` output for SDPA. Using a float mask with
+        # -inf at masked positions is semantically equivalent but flows
+        # through a different SDPA internal dispatch path that produces
+        # slightly different bf16 numerics, accumulating ~1e-3 drift per
+        # layer vs. HF's forward pass.
+        causal_mask = torch.tril(
+            torch.ones(1, 1, seq_len, seq_len, dtype=torch.bool),
         )
-        causal_mask = torch.triu(causal_mask, diagonal=1)
 
         # --- Rotary embeddings ---
         rotary_name = ChunkedLocalBackend._find_rotary_embedding_name(model)
@@ -2845,12 +2849,14 @@ class DiskOffloadBackend(ExtractionBackend):
                         hs = all_hidden[s:e].to(device)
                         pos_dev = position_ids[s:e].to(device)
 
-                        # Expand causal mask for batch
-                        batch_mask = mask_dev.expand(e - s, -1, -1, -1)
-                        # Apply padding mask
-                        pad_mask = all_attention_mask[s:e, None, None, :].to(self.dtype).to(device)
-                        batch_mask = batch_mask.clone()
-                        batch_mask.masked_fill_(pad_mask == 0, min_val)
+                        # Build the per-batch mask as a bool (True=attend).
+                        # Compose (lower-triangular causal) AND (key is non-pad)
+                        # AND (query is non-pad). Matches HF's ``_update_causal_mask``
+                        # output for SDPA bit-for-bit.
+                        batch_mask = mask_dev.expand(e - s, -1, -1, -1).clone()
+                        key_pad = all_attention_mask[s:e, None, None, :].bool().to(device)
+                        query_pad = all_attention_mask[s:e, None, :, None].bool().to(device)
+                        batch_mask = batch_mask & key_pad & query_pad
 
                         # Router hook
                         rh = None
