@@ -1422,6 +1422,7 @@ class ChunkedLocalBackend(ExtractionBackend):
         router_module_template: str | None = None,
         router_hook_strategy: str = "output",
         batch_size: int | None = None,
+        apply_final_norm: bool = False,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor,
@@ -1478,6 +1479,34 @@ class ChunkedLocalBackend(ExtractionBackend):
         )
 
         activations = out["hs"] if "hs" in accumulators else None
+
+        # Optionally apply final_norm to the last layer's slot so it matches
+        # HF's ``output.hidden_states[N]`` semantics (which includes
+        # ``model.norm``). See extract_all's Phase 2.5 for the disk_offload
+        # version of this fix.
+        if (
+            apply_final_norm
+            and activations is not None
+            and layer_indices
+        ):
+            model = self._load_full_model_cpu()
+            num_layers = len(_get_decoder_layers(model))
+            if (num_layers - 1) in layer_indices:
+                slot_idx = layer_indices.index(num_layers - 1)
+                H = activations.shape[-1] // len(layer_indices)
+                col_start = slot_idx * H
+                col_end = col_start + H
+                final_norm_mod = _get_final_norm(model)
+                # Final norm's weights live on CPU (chunked keeps the full
+                # model there); we run the op on CPU to avoid moving either
+                # direction. RMSNorm is cheap.
+                with torch.no_grad():
+                    slot = activations[:, :, col_start:col_end]
+                    normed = final_norm_mod(slot.to(self.dtype))
+                    activations[:, :, col_start:col_end] = normed.to(
+                        activations.dtype,
+                    )
+
         if pretok:
             attention_mask_2d = prompts.attention_mask
         else:
@@ -1640,8 +1669,9 @@ class ChunkedLocalBackend(ExtractionBackend):
         layer_indices: list[int],
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        apply_final_norm = bool(kwargs.pop("apply_final_norm", False))
         activations, attention_mask, _, _ = self._chunked_forward(
-            prompts, layer_indices,
+            prompts, layer_indices, apply_final_norm=apply_final_norm,
         )
         assert activations is not None
         return activations, attention_mask
@@ -2623,6 +2653,8 @@ class DiskOffloadBackend(ExtractionBackend):
         batch_size: int = 16,
         pool: str | None = None,
         logit_callback: Callable[[int, int, torch.Tensor, torch.Tensor], None] | None = None,
+        *,
+        apply_final_norm: bool = False,
     ) -> ExtractedBatch:
         """Extract features from *all* prompts, loading each layer once.
 
@@ -2910,6 +2942,31 @@ class DiskOffloadBackend(ExtractionBackend):
 
         del mask_dev, pos_cache_dev, pe_dev
 
+        # --- Phase 2.5: Apply final norm to last layer (optional) ---
+        # HF's ``output.hidden_states[N]`` has ``model.norm`` applied; the
+        # raw post-block-(N-1) residual we capture in ``captured_hidden``
+        # does not. When ``apply_final_norm=True`` and the last block was
+        # requested, fix the last slot to match HF's semantics.
+        if apply_final_norm and (num_layers - 1) in captured_hidden:
+            norm_tensors = [
+                (n, f) for n, f in non_layer
+                if "norm" in n and "layer" not in n
+            ]
+            norm_w = self._load_tensors(norm_tensors, device)
+            final_norm = _get_final_norm(model)
+            _materialize_module(final_norm, norm_w, "model.norm.", device)
+            del norm_w
+
+            with torch.no_grad():
+                slot = captured_hidden[num_layers - 1]
+                # slot shape: (N, seq, dim) or (N, dim) if pooled.
+                captured_hidden[num_layers - 1] = (
+                    final_norm(slot.to(device).to(self.dtype)).to(slot.dtype).cpu()
+                )
+
+            _free_module(final_norm)
+            torch.cuda.empty_cache()
+
         # --- Phase 3: Logits (optional) ---
         logits_out: torch.Tensor | None = None
         if spec.include_logits:
@@ -3188,7 +3245,13 @@ class DiskOffloadBackend(ExtractionBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from .activation_types import ExtractionSpec
         spec = ExtractionSpec(hidden_layers=layer_indices)
-        result = self.extract_all(prompts, spec, batch_size=len(prompts))
+        apply_final_norm = bool(kwargs.pop("apply_final_norm", False))
+        result = self.extract_all(
+            prompts,
+            spec,
+            batch_size=len(prompts),
+            apply_final_norm=apply_final_norm,
+        )
         assert result.activations is not None
         return result.activations, result.attention_mask
 
